@@ -1,0 +1,353 @@
+"""
+Cortex AI — ML Prediction API Endpoints
+=========================================
+FastAPI endpoints for ML predictions with authentication and rate limiting.
+"""
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi_limiter.depends import RateLimiter
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from backend.app.api.deps import get_current_user, get_db
+from backend.app.core.redis import get_cache_service, CacheService
+from backend.app.ml.inference import create_prediction_engine, create_shap_explainer
+from backend.app.ml.features import get_feature_engine
+from backend.app.models.ml_data import MLPrediction, MLAuditLog
+from backend.app.schemas.ml_predictions import (
+    PredictionRequest,
+    PredictionResponse,
+    BatchPredictionRequest,
+    BatchPredictionResponse,
+    PredictionError,
+)
+
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/ml", tags=["ML Predictions"])
+
+
+# Global instances (would be initialized at startup)
+_prediction_engine = None
+_shap_explainer = None
+_feature_engine = None
+
+
+def get_prediction_engine():
+    """Get prediction engine instance."""
+    global _prediction_engine
+    if _prediction_engine is None:
+        # Initialize with production model path
+        cache = get_cache_service()
+        _prediction_engine = create_prediction_engine(
+            model_path="models/production/model_quantized.onnx",
+            cache=cache,
+            num_threads=4,
+        )
+    return _prediction_engine
+
+
+def get_shap_explainer():
+    """Get SHAP explainer instance."""
+    global _shap_explainer
+    if _shap_explainer is None:
+        # Initialize SHAP explainer
+        engine = get_prediction_engine()
+        cache = get_cache_service()
+        feature_names = [f"feature_{i}" for i in range(42)]  # TODO: Load actual feature names
+        _shap_explainer = create_shap_explainer(
+            model=engine.session,
+            feature_names=feature_names,
+            cache=cache,
+            timeout_ms=50,
+        )
+    return _shap_explainer
+
+
+def get_feature_engine_instance():
+    """Get feature engine instance."""
+    global _feature_engine
+    if _feature_engine is None:
+        _feature_engine = get_feature_engine()
+    return _feature_engine
+
+
+@router.post(
+    "/predict",
+    response_model=PredictionResponse,
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RateLimiter(times=10, seconds=60))],  # 10 requests/minute
+)
+async def predict_single(
+    request: PredictionRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    cache: CacheService = Depends(get_cache_service),
+) -> PredictionResponse:
+    """
+    Generate ML prediction for a single symbol.
+
+    Rate limit: 10 requests per minute per user.
+
+    Args:
+        request: Prediction request with symbol, timeframe, user_id
+        db: Database session
+        current_user: Authenticated user
+        cache: Redis cache service
+
+    Returns:
+        Prediction response with 7 outputs and SHAP explanation
+
+    Raises:
+        HTTPException: If prediction fails
+    """
+    logger.info(
+        f"Prediction request: symbol={request.symbol}, "
+        f"timeframe={request.timeframe}, user={request.user_id}"
+    )
+
+    try:
+        # Get engines
+        prediction_engine = get_prediction_engine()
+        shap_explainer = get_shap_explainer()
+        feature_engine = get_feature_engine_instance()
+
+        # TODO: Load OHLCV data for symbol
+        # For now, using placeholder
+        import numpy as np
+        feature_vector = np.random.randn(60, 42)  # Placeholder
+
+        # Compute features
+        # features = feature_engine.compute_all_features(ohlcv_df)
+
+        # Run prediction
+        prediction = await prediction_engine.predict(
+            feature_vector=feature_vector,
+            symbol=request.symbol,
+            timeframe=request.timeframe,
+            model_version="1.0.0",
+            use_cache=True,
+        )
+
+        # Compute SHAP explanation
+        shap_explanation = await shap_explainer.explain(
+            feature_vector=feature_vector[-1],  # Last time step
+            symbol=request.symbol,
+            timeframe=request.timeframe,
+            model_version="1.0.0",
+        )
+
+        if shap_explanation:
+            prediction["shap_explanation"] = shap_explanation
+
+        # Save prediction to database
+        db_prediction = MLPrediction(
+            symbol=request.symbol,
+            timeframe=request.timeframe,
+            model_version="1.0.0",
+            direction=prediction["direction_label"],
+            confidence=prediction["confidence"],
+            entry_price=prediction["entry_price"],
+            tp1=prediction["tp1"],
+            tp2=prediction["tp2"],
+            tp3=prediction["tp3"],
+            stop_loss=prediction["stop_loss"],
+            volatility=prediction["volatility"],
+        )
+        db.add(db_prediction)
+        await db.commit()
+        await db.refresh(db_prediction)
+
+        # Log to audit trail
+        audit_log = MLAuditLog(
+            prediction_id=db_prediction.id,
+            user_id=request.user_id,
+            symbol=request.symbol,
+            model_version="1.0.0",
+            feature_vector={"placeholder": "feature_vector"},  # TODO: Store actual features
+            shap_values=shap_explanation or {},
+            request_metadata={
+                "ip": "0.0.0.0",  # TODO: Get actual IP
+                "user_agent": "unknown",  # TODO: Get actual user agent
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        db.add(audit_log)
+        await db.commit()
+
+        logger.info(
+            f"Prediction successful: {request.symbol} -> {prediction['direction_label']} "
+            f"(confidence: {prediction['confidence']:.2f})"
+        )
+
+        return PredictionResponse(**prediction)
+
+    except Exception as exc:
+        logger.error(f"Prediction failed for {request.symbol}: {exc}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Prediction failed: {str(exc)}",
+        )
+
+
+@router.post(
+    "/predict/batch",
+    response_model=BatchPredictionResponse,
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RateLimiter(times=5, seconds=60))],  # 5 batch requests/minute
+)
+async def predict_batch(
+    request: BatchPredictionRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    cache: CacheService = Depends(get_cache_service),
+) -> BatchPredictionResponse:
+    """
+    Generate ML predictions for multiple symbols.
+
+    Rate limit: 5 batch requests per minute per user.
+    Maximum 50 symbols per batch.
+
+    Args:
+        request: Batch prediction request
+        db: Database session
+        current_user: Authenticated user
+        cache: Redis cache service
+
+    Returns:
+        Batch prediction response with results for all symbols
+    """
+    logger.info(
+        f"Batch prediction request: {len(request.symbols)} symbols, "
+        f"timeframe={request.timeframe}, user={request.user_id}"
+    )
+
+    predictions = []
+    errors = []
+    successful = 0
+    failed = 0
+
+    for symbol in request.symbols:
+        try:
+            # Create individual request
+            single_request = PredictionRequest(
+                symbol=symbol,
+                timeframe=request.timeframe,
+                user_id=request.user_id,
+            )
+
+            # Get prediction
+            prediction = await predict_single(
+                request=single_request,
+                db=db,
+                current_user=current_user,
+                cache=cache,
+            )
+
+            predictions.append(prediction)
+            successful += 1
+
+        except Exception as exc:
+            logger.error(f"Batch prediction failed for {symbol}: {exc}")
+            errors.append({
+                "symbol": symbol,
+                "error": str(exc),
+            })
+            failed += 1
+
+    logger.info(
+        f"Batch prediction complete: {successful} successful, {failed} failed"
+    )
+
+    return BatchPredictionResponse(
+        predictions=predictions,
+        total=len(request.symbols),
+        successful=successful,
+        failed=failed,
+        errors=errors,
+    )
+
+
+@router.get(
+    "/predictions/{symbol}",
+    response_model=PredictionResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def get_cached_prediction(
+    symbol: str,
+    timeframe: str = "1d",
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    cache: CacheService = Depends(get_cache_service),
+) -> PredictionResponse:
+    """
+    Retrieve cached prediction for a symbol.
+
+    Args:
+        symbol: Stock symbol
+        timeframe: Timeframe (default: 1d)
+        db: Database session
+        current_user: Authenticated user
+        cache: Redis cache service
+
+    Returns:
+        Cached prediction if available
+
+    Raises:
+        HTTPException: If prediction not found in cache
+    """
+    logger.info(f"Retrieving cached prediction: {symbol} [{timeframe}]")
+
+    # Try cache first
+    cache_key = f"ml:prediction:{symbol}:{timeframe}:1.0.0"
+    cached_prediction = await cache.get(cache_key)
+
+    if cached_prediction:
+        logger.info(f"Cache hit for {symbol} [{timeframe}]")
+        return PredictionResponse(**cached_prediction)
+
+    # If not in cache, query database
+    from sqlalchemy import select, desc
+    stmt = (
+        select(MLPrediction)
+        .where(
+            MLPrediction.symbol == symbol,
+            MLPrediction.timeframe == timeframe,
+        )
+        .order_by(desc(MLPrediction.created_at))
+        .limit(1)
+    )
+
+    result = await db.execute(stmt)
+    db_prediction = result.scalar_one_or_none()
+
+    if not db_prediction:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No prediction found for {symbol} [{timeframe}]",
+        )
+
+    # Convert to response format
+    prediction = {
+        "direction": {"SELL": 0, "HOLD": 1, "BUY": 2}[db_prediction.direction],
+        "direction_label": db_prediction.direction,
+        "confidence": db_prediction.confidence,
+        "entry_price": float(db_prediction.entry_price),
+        "tp1": float(db_prediction.tp1),
+        "tp2": float(db_prediction.tp2),
+        "tp3": float(db_prediction.tp3),
+        "stop_loss": float(db_prediction.stop_loss),
+        "volatility": db_prediction.volatility,
+        "metadata": {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "model_version": db_prediction.model_version,
+            "predicted_at": db_prediction.created_at.isoformat(),
+        },
+    }
+
+    return PredictionResponse(**prediction)

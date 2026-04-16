@@ -1,0 +1,185 @@
+﻿# Cortex AI — Docker Compose
+# ============================
+# Development & staging orchestration.
+# Production: use Kubernetes or ECS with secrets manager injection.
+#
+# HOW VARIABLE RESOLUTION WORKS
+# ──────────────────────────────
+# Docker Compose resolves ${VAR} at parse time — before any container starts.
+# It reads values from (in priority order):
+#   1. Shell environment variables
+#   2. The .env file in the same directory as this docker-compose.yml
+#   3. Inline defaults: ${VAR:-default}
+#
+# The POSTGRES_PASSWORD defined inside a service's `environment:` block is
+# only available *inside* that container — it is NOT available to the
+# interpolation engine when building DATABASE_URL in another service.
+#
+# SOLUTION: all shared variables are defined ONCE in .env (or your shell).
+# Each service reads them independently from that single source.
+# Nothing is assembled inside this file — no cross-service interpolation.
+#
+# SETUP
+# ──────
+#   cp backend/.env.example .env       ← one .env at the project root
+#   # fill in POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, SECRET_KEY, etc.
+#   docker compose up --build
+
+services:
+
+  # ── TimescaleDB (PostgreSQL 16 + TimescaleDB HA) ──────────────────────────
+  db:
+    image: timescale/timescaledb-ha:pg16
+    container_name: cortex-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cortex}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cortex_pg}
+      POSTGRES_DB: ${POSTGRES_DB:-cortex_db}
+      POSTGRES_INITDB_ARGS: "-E UTF8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cortex} -d ${POSTGRES_DB:-cortex_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - cortex-network
+
+  # ── Redis ─────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: cortex-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --save 60 1
+      --loglevel warning
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cortex-network
+
+  # ── Ollama (Local LLM with GPU) ───────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: cortex-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - cortex-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ── Prometheus (Metrics) ──────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: cortex-prometheus
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - cortex-network
+
+  # ── API (FastAPI + Worker) ───────────────────────────────────────────────
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cortex-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-cortex}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-cortex_db}"
+      REDIS_URL: "redis://redis:6379/0"
+      OLLAMA_BASE_URL: "http://ollama:11434"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ml_models:/app/models
+      - ./.cache:/app/.cache
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - cortex-network
+    command: >
+      sh -c "
+        alembic upgrade head &&
+        uvicorn app.main:app
+          --host 0.0.0.0
+          --port 8000
+          --workers 1
+          --log-level info
+      "
+
+  # ── Frontend (Next.js) ────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: http://api:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
+  ollama_data:
+  ml_models:
+  prometheus_data:
+
+networks:
+  cortex-network:
+    driver: bridge

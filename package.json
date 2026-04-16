@@ -1,0 +1,7 @@
+{
+  "name": "cortex-merge-monorepo",
+  "private": true,
+  "workspaces": [
+    "frontend"
+  ]
+}

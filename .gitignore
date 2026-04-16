@@ -1,0 +1,408 @@
+# ============================================
+# Python
+# ============================================
+# Virtual environments
+backend/venv/
+backend/.venv/
+backend/env/
+backend/ENV/
+venv/
+.venv/
+env/
+ENV/
+__pypackages__/
+.pythonlibs/
+backend/.pythonlibs/
+
+# Python cache
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+backend/build/
+backend/develop-eggs/
+backend/dist/
+backend/downloads/
+backend/eggs/
+backend/.eggs/
+backend/lib/
+backend/lib64/
+backend/parts/
+backend/sdist/
+backend/var/
+backend/wheels/
+backend/pip-wheel-metadata/
+backend/share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.log
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath
+*.sage.py
+
+# Spyder
+.spyderproject
+.spyproject
+
+# Rope
+.ropeproject
+
+# mkdocs
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre
+.pyre/
+
+# ============================================
+# Node.js / Frontend
+# ============================================
+# Dependencies
+frontend/node_modules/
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+.cache/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+
+# Next.js
+frontend/.next/
+frontend/out/
+.next/
+out/
+
+# Production build
+frontend/build/
+frontend/dist/
+
+# Misc
+.DS_Store
+*.pem
+
+# Debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Vercel
+.vercel
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+
+# ============================================
+# Environment Variables
+# ============================================
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+backend/.env
+backend/.env.local
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local
+
+# Root .env file (contains actual credentials)
+/.env
+
+# ============================================
+# Database
+# ============================================
+*.db
+*.sqlite
+*.sqlite3
+backend/cortex_terminal_v1.db
+
+# ============================================
+# ML Artifacts / Large Data
+# ============================================
+backend/logs/
+backend/ml_artifacts/
+backend/models/cache/
+backend/hyperparameter_tuning/
+*.parquet
+*.joblib
+*.pkl
+*.h5
+*.pt
+*.pth
+# Keep production models
+!backend/models/production/*.onnx
+!backend/models/production/metadata.json
+
+# Training logs
+backend/final_training_*.log
+backend/production_training_*.log
+backend/training_*.log
+backend/validation_output.log
+
+# Test artifacts
+backend/test-*.html
+backend/test-*.txt
+backend/test-*.log
+backend/load_test_*.html
+backend/load_test_*.csv
+backend/load_test_*.json
+
+# ============================================
+# Docker
+# ============================================
+# Don't ignore docker-compose.yml but ignore volumes
+docker-compose.override.yml
+
+# ============================================
+# IDE / Editor
+# ============================================
+# VSCode
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+.idea_modules/
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# ============================================
+# OS
+# ============================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# ============================================
+# Local Artifacts / Large Files
+# ============================================
+code_dump.txt
+dump_*.txt
+backend/.cache/
+backend/.hypothesis/
+wsl.localhost/
+temp_*.py
+temp_*.txt
+*.Zone.Identifier
+
+# Archive directory (conversation history, dumps)
+archive/
+
+# Code dump chunks
+code_dump_chunks/
+
+# Reference codebase (already extracted)
+cortex_v4_w_aimsvc-master.zip
+cortex_v4_w_aimsvc-master/
+
+# Installation artifacts
+*.deb
+*.rpm
+
+# Kiro/Axon/Codex directories (AI assistant artifacts)
+.axon/
+.codex
+.kiro/
+
+# WSL artifacts
+wsl.localhost/
+
+# ============================================
+# Local WIP / Untracked (Excluded From Commits)
+# ============================================
+BACKEND_RESTART_SUCCESS.md
+PURE_ASGI_MIDDLEWARE_IMPLEMENTATION.md
+TASK_3.8_COMPLETION.md
+TASK_3_PURE_ASGI_COMPLETION.md
+WINDOWS_WSL_NETWORKING_SOLUTION.md
+issues_found.md
+test_cors_config.py
+verify_cors.py
+backend/CONFIGURATION.md
+backend/alembic.ini
+backend/alembic/
+backend/app/api/v1/ml.py
+backend/app/middleware/
+backend/app/ml/
+backend/app/models/ml_data.py
+backend/app/schemas/ml.py
+backend/app/services/ml_*.py
+backend/fix_test.py
+backend/run_ml_backfill.py
+backend/run_ml_prune.py
+backend/run_ml_training.py
+backend/test_middleware_quick.py
+backend/tests/
+docs/
+frontend/HEALTH_CHECK_INTEGRATION.md
+frontend/TASK_3.6_COMPLETION.md
+frontend/TASK_3.7_COMPLETION.md
+frontend/src/components/HealthCheckWrapper.tsx
+frontend/src/lib/AXIOS_INTERCEPTORS.md
+frontend/src/lib/ERROR_HANDLER.md
+frontend/src/lib/ERROR_HANDLER_INTEGRATION.md
+frontend/src/lib/HEALTH_CHECK.md
+frontend/src/lib/HEALTH_CHECK_IMPLEMENTATION.md
+frontend/src/lib/errorHandler.example.tsx
+frontend/src/lib/errorHandler.test.ts
+frontend/src/lib/errorHandler.ts
+frontend/src/lib/healthCheck.example.tsx
+frontend/src/lib/healthCheck.manual-test.ts
+frontend/src/lib/healthCheck.test.ts
+frontend/src/lib/healthCheck.ts
+*.lnk
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# ============================================
+# Logs
+# ============================================
+logs/
+*.log
+backend/logs/*.log
+backend/backend.log
+!backend/logs/.gitkeep
+
+# Worker service logs
+backend/cortex-worker.service
+
+# ============================================
+# ML Artifacts
+# ============================================
+backend/ml_artifacts/
+*.pkl
+*.joblib
+*.h5
+*.hdf5
+*.pt
+*.pth
+# Keep production ONNX models
+!backend/models/production/*.onnx
+
+# ============================================
+# Cache
+# ============================================
+.cache/
+backend/.cache/
+frontend/.cache/
+.pytest_cache/
+
+# ============================================
+# Temporary Files
+# ============================================
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# ============================================
+# Project Specific
+# ============================================
+# Large data files
+backend/data/
+*.csv
+*.parquet
+*.feather
+
+# NSE holiday cache
+backend/.cache/nse_holidays.json
+
+# Evidently workspace
+backend/evidently_workspace/
+
+# Transformers cache
+backend/models/cache/
+
+# ============================================
+# Keep These Files
+# ============================================
+!.gitignore
+!.gitkeep
+!README.md
+!requirements.txt
+!package.json
+!package-lock.json
+
+# ============================================
+# Working Files / Conversation History
+# ============================================
+# Conversation transcripts
+~*.md
+~*.json
+
+# Web search results
+*_for_ml.txt
+results_for_*.txt
+web_search_*.txt

@@ -1,0 +1,283 @@
+{
+  "config": {
+    "n_symbols": 50,
+    "lookback_years": 3,
+    "sequence_length": 60,
+    "n_features": 47,
+    "gru_best_params": {
+      "gru_units_1": 192,
+      "gru_units_2": 48,
+      "dense_units": 16,
+      "dropout": 0.1,
+      "recurrent_dropout": 0.2,
+      "l2_reg": 0.0004918694064742597,
+      "learning_rate": 0.0007492836137711606,
+      "clipnorm": 0.5,
+      "clipvalue": null,
+      "patience": 15,
+      "reduce_lr_patience": 5
+    },
+    "xgboost_best_params": {
+      "max_depth": 6,
+      "learning_rate": 0.1,
+      "n_estimators": 300,
+      "min_child_weight": 3,
+      "subsample": 0.8,
+      "colsample_bytree": 0.8,
+      "gamma": 0.1,
+      "reg_alpha": 0.1,
+      "reg_lambda": 1.0,
+      "objective": "multi:softprob",
+      "num_class": 3,
+      "random_state": 42,
+      "eval_metric": [
+        "mlogloss",
+        "merror"
+      ]
+    },
+    "batch_size": 256,
+    "max_epochs": 100,
+    "early_stopping_patience": 15,
+    "model_version": "1.0.0",
+    "output_dir": "models/production",
+    "tuner_dir": "hyperparameter_tuning/gru_stock_prediction"
+  },
+  "training_results": {
+    "xgboost": {
+      "params": {
+        "max_depth": 6,
+        "learning_rate": 0.1,
+        "n_estimators": 300,
+        "min_child_weight": 3,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "gamma": 0.1,
+        "reg_alpha": 0.1,
+        "reg_lambda": 1.0,
+        "objective": "multi:softprob",
+        "num_class": 3,
+        "random_state": 42,
+        "eval_metric": [
+          "mlogloss",
+          "merror"
+        ]
+      },
+      "metrics": {
+        "accuracy": 0.4685466377440347,
+        "precision": {
+          "sell": 0.304635761589404,
+          "hold": 0.4810475534114404,
+          "buy": 0.18867924528301888
+        },
+        "recall": {
+          "sell": 0.03724696356275304,
+          "hold": 0.935656836461126,
+          "buy": 0.01759014951627089
+        },
+        "f1_score": {
+          "sell": 0.06637806637806638,
+          "hold": 0.6354119253527537,
+          "buy": 0.032180209171359615
+        },
+        "confusion_matrix": [
+          [
+            46,
+            1169,
+            20
+          ],
+          [
+            78,
+            2094,
+            66
+          ],
+          [
+            27,
+            1090,
+            20
+          ]
+        ],
+        "log_loss": 1.0551378707741932,
+        "sharpe_ratio": 0.0,
+        "sortino_ratio": 0.0,
+        "max_drawdown": 0.0,
+        "win_rate": 0.0,
+        "profit_factor": 0.0,
+        "total_return": 0.0,
+        "n_samples": 4610,
+        "n_trades": 0,
+        "avg_return_per_trade": 0.0
+      },
+      "train_samples": 18444,
+      "val_samples": 4610
+    },
+    "gru": {
+      "params": {
+        "gru_units_1": 192,
+        "gru_units_2": 48,
+        "dense_units": 16,
+        "dropout": 0.1,
+        "recurrent_dropout": 0.2,
+        "l2_reg": 0.0004918694064742597,
+        "learning_rate": 0.0007492836137711606,
+        "clipnorm": 0.5,
+        "clipvalue": null,
+        "patience": 15,
+        "reduce_lr_patience": 5
+      },
+      "metrics": {
+        "accuracy": 0.47787418655097613,
+        "precision": {
+          "sell": 0.328125,
+          "hold": 0.4894957983193277,
+          "buy": 0.3142857142857143
+        },
+        "recall": {
+          "sell": 0.0680161943319838,
+          "hold": 0.9369973190348525,
+          "buy": 0.019349164467897976
+        },
+        "f1_score": {
+          "sell": 0.11267605633802817,
+          "hold": 0.6430542778288868,
+          "buy": 0.03645401822700911
+        },
+        "confusion_matrix": [
+          [
+            84,
+            1135,
+            16
+          ],
+          [
+            109,
+            2097,
+            32
+          ],
+          [
+            63,
+            1052,
+            22
+          ]
+        ],
+        "log_loss": 1.0525926190862709,
+        "sharpe_ratio": 0.0,
+        "sortino_ratio": 0.0,
+        "max_drawdown": 0.0,
+        "win_rate": 0.0,
+        "profit_factor": 0.0,
+        "total_return": 0.0,
+        "n_samples": 4610,
+        "n_trades": 0,
+        "avg_return_per_trade": 0.0
+      },
+      "train_samples": 18444,
+      "val_samples": 4610,
+      "final_epoch": 0
+    },
+    "ensemble": {
+      "weights": {
+        "xgboost": 0.6,
+        "gru": 0.4
+      },
+      "metrics": {
+        "accuracy": 0.4770065075921909,
+        "precision": {
+          "sell": 0.32407407407407407,
+          "hold": 0.4834155087404751,
+          "buy": 0.175
+        },
+        "recall": {
+          "sell": 0.02834008097165992,
+          "hold": 0.9638069705093834,
+          "buy": 0.006156552330694811
+        },
+        "f1_score": {
+          "sell": 0.05212211466865227,
+          "hold": 0.6438805970149254,
+          "buy": 0.0118946474086661
+        },
+        "confusion_matrix": [
+          [
+            35,
+            1194,
+            6
+          ],
+          [
+            54,
+            2157,
+            27
+          ],
+          [
+            19,
+            1111,
+            7
+          ]
+        ],
+        "log_loss": 1.0497440411043306,
+        "sharpe_ratio": 0.0,
+        "sortino_ratio": 0.0,
+        "max_drawdown": 0.0,
+        "win_rate": 0.0,
+        "profit_factor": 0.0,
+        "total_return": 0.0,
+        "n_samples": 4610,
+        "n_trades": 0,
+        "avg_return_per_trade": 0.0
+      },
+      "val_samples": 4610
+    }
+  },
+  "symbols": [
+    "NSE_EQ|INE669E01016",
+    "NSE_EQ|INE528G01035",
+    "NSE_EQ|INE040H01021",
+    "NSE_EQ|INE221H01019",
+    "NSE_EQ|INE351F01018",
+    "NSE_EQ|INE614G01033",
+    "NSE_EQ|INE758T01015",
+    "NSE_EQ|INE053F01010",
+    "NSE_EQ|INE785M01021",
+    "NSE_EQ|INE07O001026",
+    "NSE_EQ|INE399K01017",
+    "NSE_EQ|INE160A01022",
+    "NSE_EQ|INE814H01029",
+    "NSE_EQ|INE848E01016",
+    "NSE_EQ|INE081A01020",
+    "NSE_EQ|INE092T01019",
+    "NSE_EQ|INE584A01023",
+    "NSE_EQ|INE476A01022",
+    "NSE_EQ|INE040A01034",
+    "NSE_EQ|INE549A01026",
+    "NSE_EQ|INE683A01023",
+    "NSE_EQ|INE095N01031",
+    "NSE_EQ|INE775A08105",
+    "NSE_EQ|INE457A01014",
+    "NSE_EQ|INE114A01011",
+    "NSE_EQ|INE821I01022",
+    "NSE_EQ|INE237A01036",
+    "NSE_EQ|INE483S01020",
+    "NSE_EQ|INE039A01010",
+    "NSE_EQ|INE263A01024",
+    "NSE_EQ|INE208A01029",
+    "NSE_EQ|INE776C01039",
+    "NSE_EQ|INE257A01026",
+    "NSE_EQ|INE836F01026",
+    "NSE_EQ|INE230R01035",
+    "NSE_EQ|INE548A01028",
+    "NSE_EQ|INE565A01014",
+    "NSE_EQ|INE415G01027",
+    "NSE_EQ|INE242A01010",
+    "NSE_EQ|INE002L01015",
+    "NSE_EQ|INF204KC1402",
+    "NSE_EQ|INF204KB17I5",
+    "NSE_EQ|INE509F01029",
+    "NSE_EQ|INE692A01016",
+    "NSE_EQ|INE139A01034",
+    "NSE_EQ|INE129A01019",
+    "NSE_EQ|INE691A01018",
+    "NSE_EQ|INE270A01029",
+    "NSE_EQ|INE306A01021",
+    "NSE_EQ|INE154A01025"
+  ],
+  "duration_seconds": 1013.639999,
+  "timestamp": "2026-04-14T14:23:01.463048"
+}

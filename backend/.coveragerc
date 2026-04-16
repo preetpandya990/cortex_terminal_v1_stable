@@ -1,0 +1,77 @@
+# Coverage.py configuration for Cortex AI
+# Production-grade coverage settings for billion-dollar application standards
+
+[run]
+source = app
+omit =
+    # Test files
+    */tests/*
+    */test_*.py
+    */__pycache__/*
+    
+    # Virtual environment
+    */.venv/*
+    */venv/*
+    
+    # Alembic migrations (tested via migration tests)
+    */alembic/*
+    
+    # Configuration files
+    */config.py
+    
+    # Main entry points (tested via integration tests)
+    */main.py
+    */__main__.py
+    
+    # Type stubs
+    *.pyi
+
+branch = True
+parallel = True
+
+[report]
+# Fail if coverage falls below thresholds
+precision = 2
+show_missing = True
+skip_covered = False
+skip_empty = True
+
+# Sort by coverage percentage (lowest first) to identify gaps
+sort = Cover
+
+exclude_lines =
+    # Standard pragma
+    pragma: no cover
+    
+    # Defensive programming
+    raise AssertionError
+    raise NotImplementedError
+    
+    # Type checking blocks
+    if TYPE_CHECKING:
+    if typing.TYPE_CHECKING:
+    
+    # Abstract methods
+    @abstractmethod
+    @abc.abstractmethod
+    
+    # Debug-only code
+    if __name__ == .__main__.:
+    if settings.DEBUG:
+    
+    # Unreachable code
+    return NotImplemented
+    
+    # Protocol methods
+    \.\.\.
+
+[html]
+directory = htmlcov
+title = Cortex AI - Test Coverage Report
+
+[xml]
+output = coverage.xml
+
+[json]
+output = coverage.json
+show_contexts = True
