@@ -1,751 +1,374 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { useMutation } from "@tanstack/react-query";
-import { Radar, Loader2, Calendar } from "lucide-react";
-import { WS_BASE_URL, upstoxAPI } from "@/lib/api";
-import { mergeCandles } from "@/lib/candle-transforms";
-import {
-  addDays,
-  INTERVAL_PRESETS,
-  RANGE_PRESETS,
-  applyPreset,
-  clampRange,
-  diffDaysInclusive,
-  getDefaultHistoricalState,
-  getMinAvailableDateForUnit,
-  getISTTodayYMD,
-  includesTodayOrYesterday,
-  resolveCandleSourceMode,
-  shouldApplyAutoUpgrade,
-  type HistoricalState,
-  type RangePreset,
-  type IntervalPreset,
-} from "@/lib/chart-policy";
-import { Button } from "@/components/ui/button";
+import { useState, useEffect, useCallback } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useSearchParams, useRouter } from "next/navigation";
+import { Radar, Loader2, AlertCircle, Star } from "lucide-react";
+import { tradeSuggestionsAPI, isNetworkError } from "@/lib/api";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { CandlestickChart } from "@/components/charts/CandlestickChart";
 import { InstrumentSearchCombobox } from "@/components/market/InstrumentSearchCombobox";
-import { AnalysisCardsSection } from "@/components/AnalysisCardsSection";
-import type {
-  UpstoxCandlesResponse,
-  UpstoxInstrument,
-  UpstoxLtpTick,
-  UpstoxTickStreamMessage,
-} from "@/types/upstox";
-
-const TICK_STREAM_INTERVAL_MS = 500;
-const TICK_RECONNECT_INITIAL_MS = 800;
-const TICK_RECONNECT_MAX_MS = 8000;
-const HISTORY_CHUNK_DAYS_INTRADAY = 10;
-const HISTORY_CHUNK_DAYS_DAILY = 120;
-const HISTORY_CHUNK_DAYS_WEEKLY = 365;
-const HISTORY_CHUNK_DAYS_MONTHLY = 730;
-
-function buildTickStreamUrl(instrumentKey: string): string {
-  const wsBase = WS_BASE_URL.replace(/\/$/, "");
-  const hasApiV1Prefix = /\/api\/v1$/i.test(wsBase);
-  const path = hasApiV1Prefix ? "/upstox/ticks/ws" : "/api/v1/upstox/ticks/ws";
-  const url = new URL(`${wsBase}${path}`);
-  url.searchParams.set("instrument_key", instrumentKey);
-  url.searchParams.set("interval_ms", String(TICK_STREAM_INTERVAL_MS));
-  return url.toString();
-}
-
-
-function getHistoryChunkDays(unit: HistoricalState["unit"]): number {
-  if (unit === "minutes" || unit === "hours") return HISTORY_CHUNK_DAYS_INTRADAY;
-  if (unit === "days") return HISTORY_CHUNK_DAYS_DAILY;
-  if (unit === "weeks") return HISTORY_CHUNK_DAYS_WEEKLY;
-  return HISTORY_CHUNK_DAYS_MONTHLY;
-}
-
+import { TradeSuggestionCard } from "./components/TradeSuggestionCard";
+import { WatchlistCard } from "./components/WatchlistCard";
+import { DetailPane } from "./components/DetailPane";
+import { SuggestionFilters } from "./components/SuggestionFilters";
+import { SuggestionStats } from "./components/SuggestionStats";
+import { useWebSocket, type WebSocketMessage } from "@/hooks/useWebSocket";
+import { useWatchlist } from "@/hooks/useWatchlist";
+import { useDragReorder } from "@/hooks/useDragReorder";
+import { useAuth } from "@/contexts/AuthContext";
+import type { UpstoxInstrument } from "@/types/upstox";
+import type { TradeSuggestion, SuggestionFilters as Filters } from "@/types/trade_suggestions";
 
 export default function HawkEyeRadarPage() {
-  const calendarRef = useRef<HTMLDivElement | null>(null);
-  const [selected, setSelected] = useState<UpstoxInstrument | null>(null);
-  const [candles, setCandles] = useState<UpstoxCandlesResponse | null>(null);
-  const [historicalState, setHistoricalState] = useState<HistoricalState>(() => getDefaultHistoricalState());
-  const [isCalendarOpen, setIsCalendarOpen] = useState(false);
-  const [calendarMode, setCalendarMode] = useState<"day" | "range">("range");
-  const [singleDate, setSingleDate] = useState(() => getISTTodayYMD());
-  const [rangeStart, setRangeStart] = useState(() => getISTTodayYMD());
-  const [rangeEnd, setRangeEnd] = useState(() => getISTTodayYMD());
-  const [liveTick, setLiveTick] = useState<UpstoxLtpTick | null>(null);
-  const [tickStreamStatus, setTickStreamStatus] = useState<"idle" | "connecting" | "live" | "reconnecting" | "error">("idle");
-  const [tickStreamError, setTickStreamError] = useState<string | null>(null);
-  const [intervalNotice, setIntervalNotice] = useState<string | null>(null);
-  const [isCandleSizeLocked, setIsCandleSizeLocked] = useState(false);
-  const [isLoadingOlderCandles, setIsLoadingOlderCandles] = useState(false);
-  const [hasMoreHistory, setHasMoreHistory] = useState(true);
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const { isAuthenticated, isAuthReady, accessToken, isLoading: authLoading } = useAuth();
+  const [selectedInstrument, setSelectedInstrument] = useState<UpstoxInstrument | null>(null);
+  const [detailSuggestion, setDetailSuggestion] = useState<TradeSuggestion | null>(null);
+  const [filters, setFilters] = useState<Filters>({ status: "active", page: 1, page_size: 50 });
+  const queryClient = useQueryClient();
 
-  const tickSocketRef = useRef<WebSocket | null>(null);
-  const reconnectTimerRef = useRef<number | null>(null);
-  const reconnectAttemptRef = useRef(0);
-  const historyCursorToDateRef = useRef<string | null>(null);
-  const currentCandleQueryKeyRef = useRef<string>("");
+  // Watchlist hook
+  const {
+    items: watchlistItems,
+    removeFromWatchlist,
+    reorderWatchlist,
+    isLoading: watchlistLoading,
+  } = useWatchlist();
 
-  const candleUnit = historicalState.unit;
-  const candleInterval = historicalState.interval;
-  const fromDate = historicalState.fromDate;
-  const toDate = historicalState.toDate;
-  const selectedRangeDays = diffDaysInclusive(fromDate, toDate);
-  const candleSourceMode = resolveCandleSourceMode(selectedRangeDays, candleUnit, fromDate, toDate);
-  const liveMergeEnabled = includesTodayOrYesterday(fromDate, toDate);
-  const candleQueryKey = selected
-    ? `${selected.instrument_key}|${candleUnit}|${candleInterval}|${fromDate}|${toDate}|${candleSourceMode}`
-    : "";
-
-  const candlesMutation = useMutation<UpstoxCandlesResponse, Error, void>({
-    mutationFn: async (): Promise<UpstoxCandlesResponse> => {
-      if (!selected) {
-        throw new Error("No instrument selected");
-      }
-      if (candleSourceMode === "intraday") {
-        return upstoxAPI.getIntradayCandles(selected.instrument_key, {
-          unit: candleUnit,
-          interval: candleInterval,
-        });
-      }
-      if (candleSourceMode === "hybrid") {
-        const today = getISTTodayYMD();
-        const yesterday = addDays(today, -1);
-        const shouldLoadHistorical = fromDate <= yesterday;
-
-        const [historical, intraday] = await Promise.all([
-          shouldLoadHistorical
-            ? upstoxAPI.getHistoricalCandles(selected.instrument_key, {
-                unit: candleUnit,
-                interval: candleInterval,
-                to_date: yesterday,
-                from_date: fromDate,
-              })
-            : Promise.resolve({ status: "success", data: { candles: [] } } as UpstoxCandlesResponse),
-          upstoxAPI.getIntradayCandles(selected.instrument_key, {
-            unit: candleUnit,
-            interval: candleInterval,
-          }),
-        ]);
-
-        const merged = mergeCandles(
-          (historical?.data?.candles ?? []) as UpstoxCandlesResponse["data"]["candles"],
-          (intraday?.data?.candles ?? []) as UpstoxCandlesResponse["data"]["candles"],
-        );
-        return { status: "success", data: { candles: merged } } as UpstoxCandlesResponse;
-      }
-
-      const historical = await upstoxAPI.getHistoricalCandles(selected.instrument_key, {
-        unit: candleUnit,
-        interval: candleInterval,
-        to_date: toDate,
-        from_date: fromDate,
-      });
-      const historicalCandles = (historical?.data?.candles ?? []) as UpstoxCandlesResponse["data"]["candles"];
-
-      // Fallback requested: if recent-day historical is empty, try intraday.
-      if (historicalCandles.length === 0 && fromDate <= getISTTodayYMD() && toDate >= getISTTodayYMD()) {
-        const intraday = await upstoxAPI.getIntradayCandles(selected.instrument_key, {
-          unit: candleUnit,
-          interval: candleInterval,
-        });
-        const intradayCandles = (intraday?.data?.candles ?? []) as UpstoxCandlesResponse["data"]["candles"];
-        if (intradayCandles.length > 0) {
-          return { status: "success", data: { candles: intradayCandles } } as UpstoxCandlesResponse;
+  const { draggingId, overId, clickPreventedRef, getGripHandlers } = useDragReorder(
+    useCallback(
+      async (draggedId: number, targetId: number) => {
+        const targetItem = watchlistItems.find((i) => i.id === targetId);
+        if (!targetItem) return;
+        try {
+          await reorderWatchlist({ itemId: draggedId, newPosition: targetItem.position });
+        } catch (error) {
+          if (!isNetworkError(error)) console.error('[Hawk-Eye] Failed to reorder watchlist:', error);
         }
-      }
+      },
+      [watchlistItems, reorderWatchlist],
+    ),
+  );
 
-      return historical;
+  // WebSocket connection for real-time updates.
+  // Only opens once auth is confirmed; token is sent in-band on connect.
+  const { isConnected } = useWebSocket({
+    url: process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000/api/v1/trade-suggestions/ws',
+    token: accessToken ?? undefined,
+    enabled: isAuthReady && isAuthenticated,
+    onMessage: (data: WebSocketMessage) => {
+      if (data.type === 'new_suggestion') {
+        console.log('[Hawk-Eye] New suggestion received:', data.suggestion_id);
+        queryClient.invalidateQueries({ queryKey: ["trade-suggestions"] });
+      }
     },
-    onSuccess: (data: UpstoxCandlesResponse) => {
-      setCandles((prev) => {
-        const incoming = (data?.data?.candles ?? []) as UpstoxCandlesResponse["data"]["candles"];
-        if (currentCandleQueryKeyRef.current !== candleQueryKey) {
-          currentCandleQueryKeyRef.current = candleQueryKey;
-          return { status: "success", data: { candles: incoming } };
-        }
-        const merged = mergeCandles(
-          (prev?.data?.candles ?? []) as UpstoxCandlesResponse["data"]["candles"],
-          incoming,
-        );
-        return { status: "success", data: { candles: merged } };
-      });
+    onConnect: () => {
+      console.log('[Hawk-Eye] WebSocket connected');
     },
+    onDisconnect: () => {
+      console.log('[Hawk-Eye] WebSocket disconnected');
+    },
+    reconnect: true,
+    reconnectAttempts: 10,
   });
 
-  const handleSelect = (instrument: UpstoxInstrument) => {
-    setSelected(instrument);
-    setIsCandleSizeLocked(false);
-    setIntervalNotice(null);
-    setHistoricalState(() => getDefaultHistoricalState());
-  };
+  // Fetch active trade suggestions (only when authenticated)
+  const {
+    data: suggestionsData,
+    isLoading,
+    isError,
+    error,
+  } = useQuery({
+    queryKey: ["trade-suggestions", filters],
+    queryFn: () => tradeSuggestionsAPI.getSuggestions(filters),
+    enabled: isAuthenticated && !authLoading, // Only fetch when authenticated
+    refetchInterval: isConnected ? false : 30000, // Only poll if WebSocket disconnected
+    retry: (failureCount, error: any) => {
+      // Don't retry 401 errors (authentication required)
+      if (error?.response?.status === 401) {
+        return false;
+      }
+      // Retry other errors up to 3 times
+      return failureCount < 3;
+    },
+    retryDelay: (attemptIndex) => Math.min(1000 * 2 ** attemptIndex, 30000), // Exponential backoff
+    staleTime: 30000, // Consider data fresh for 30 seconds
+  });
 
-  const applyHistoricalPreset = (preset: RangePreset) => {
-    setIsCandleSizeLocked(false);
-    setHistoricalState(() => applyPreset(preset));
-  };
-
-  const updateHistoricalState = (updater: (prev: HistoricalState) => HistoricalState) => {
-    setHistoricalState((prev) => {
-      const next = updater(prev);
-      const maxInterval =
-        next.unit === "minutes" ? 300 : next.unit === "hours" ? 5 : 1;
-      const normalizedInterval = Math.min(Math.max(next.interval, 1), maxInterval);
-      const range = clampRange(next.unit, normalizedInterval, next.fromDate, next.toDate);
-      return {
-        ...next,
-        interval: normalizedInterval,
-        fromDate: range.fromDate,
-        toDate: range.toDate,
-      };
-    });
-  };
-
+  // Read instrument_key from URL on mount
   useEffect(() => {
-    if (!shouldApplyAutoUpgrade(candleUnit, selectedRangeDays, isCandleSizeLocked)) return;
-
-    setHistoricalState((prev) => {
-      if (!shouldApplyAutoUpgrade(prev.unit, diffDaysInclusive(prev.fromDate, prev.toDate), isCandleSizeLocked)) {
-        return prev;
-      }
-      return {
-        ...prev,
-        unit: "days",
-        interval: 1,
-      };
-    });
-    setIntervalNotice("Interval auto-adjusted to 1D for long-range historical view.");
-
-    const timeoutId = window.setTimeout(() => {
-      setIntervalNotice(null);
-    }, 5000);
-    return () => window.clearTimeout(timeoutId);
-  }, [candleUnit, selectedRangeDays, isCandleSizeLocked]);
-
-  useEffect(() => {
-    if (!selected) return;
-    currentCandleQueryKeyRef.current = candleQueryKey;
-    const minDate = getMinAvailableDateForUnit(candleUnit);
-    const initialCursor = addDays(fromDate, -1);
-    historyCursorToDateRef.current = initialCursor >= minDate ? initialCursor : null;
-    setHasMoreHistory(historyCursorToDateRef.current !== null);
-    setIsLoadingOlderCandles(false);
-    setCandles(null);
-    candlesMutation.mutate();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    selected,
-    candleUnit,
-    candleInterval,
-    fromDate,
-    toDate,
-    candleSourceMode,
-    candleQueryKey,
-  ]);
-
-  useEffect(() => {
-    if (!selected) return;
-    const intervalId = window.setInterval(() => {
-      candlesMutation.mutate();
-    }, 45_000);
-    return () => window.clearInterval(intervalId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected, candleUnit, candleInterval, fromDate, toDate, candleSourceMode]);
-
-  const loadMoreHistory = async () => {
-    if (!selected || isLoadingOlderCandles || !hasMoreHistory) {
-      return;
-    }
-    const cursorToDate = historyCursorToDateRef.current;
-    if (!cursorToDate) {
-      setHasMoreHistory(false);
-      return;
-    }
-
-    const minDate = getMinAvailableDateForUnit(candleUnit);
-    if (cursorToDate < minDate) {
-      historyCursorToDateRef.current = null;
-      setHasMoreHistory(false);
-      return;
-    }
-
-    const chunkDays = getHistoryChunkDays(candleUnit);
-    const chunkFrom = addDays(cursorToDate, -(chunkDays - 1)) < minDate
-      ? minDate
-      : addDays(cursorToDate, -(chunkDays - 1));
-
-    setIsLoadingOlderCandles(true);
-    try {
-      const historical = await upstoxAPI.getHistoricalCandles(selected.instrument_key, {
-        unit: candleUnit,
-        interval: candleInterval,
-        to_date: cursorToDate,
-        from_date: chunkFrom,
-      });
-
-      const olderCandles = (historical?.data?.candles ?? []) as UpstoxCandlesResponse["data"]["candles"];
-      if (olderCandles.length > 0) {
-        setCandles((prev) => {
-          const merged = mergeCandles(
-            olderCandles,
-            (prev?.data?.candles ?? []) as UpstoxCandlesResponse["data"]["candles"],
-          );
-          return { status: "success", data: { candles: merged } };
-        });
-      }
-    } finally {
-      const nextCursor = addDays(chunkFrom, -1);
-      historyCursorToDateRef.current = nextCursor >= minDate ? nextCursor : null;
-      setHasMoreHistory(historyCursorToDateRef.current !== null);
-      setIsLoadingOlderCandles(false);
-    }
-  };
-
-  useEffect(() => {
-    if (!selected) {
-      setTickStreamStatus("idle");
-      setTickStreamError(null);
-      setLiveTick(null);
-      if (tickSocketRef.current) {
-        tickSocketRef.current.close();
-        tickSocketRef.current = null;
-      }
-      if (reconnectTimerRef.current !== null) {
-        window.clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
-      }
-      reconnectAttemptRef.current = 0;
-      return;
-    }
-
-    let cancelled = false;
-
-    const clearReconnectTimer = () => {
-      if (reconnectTimerRef.current !== null) {
-        window.clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
-      }
-    };
-
-    const closeSocket = () => {
-      if (tickSocketRef.current) {
-        tickSocketRef.current.onopen = null;
-        tickSocketRef.current.onmessage = null;
-        tickSocketRef.current.onerror = null;
-        tickSocketRef.current.onclose = null;
-        tickSocketRef.current.close();
-        tickSocketRef.current = null;
-      }
-    };
-
-    const scheduleReconnect = () => {
-      if (cancelled) return;
-      clearReconnectTimer();
-      reconnectAttemptRef.current += 1;
-      const delay = Math.min(
-        TICK_RECONNECT_MAX_MS,
-        TICK_RECONNECT_INITIAL_MS * 2 ** (reconnectAttemptRef.current - 1)
+    const instrumentKey = searchParams.get('instrument_key');
+    if (instrumentKey && !selectedInstrument && suggestionsData) {
+      // Find suggestion with this instrument_key
+      const suggestion = suggestionsData.suggestions.find(
+        s => s.instrument_key === instrumentKey
       );
-      setTickStreamStatus("reconnecting");
-      reconnectTimerRef.current = window.setTimeout(() => {
-        connect();
-      }, delay);
-    };
-
-    const connect = () => {
-      if (cancelled) return;
-      closeSocket();
-      setTickStreamStatus(reconnectAttemptRef.current > 0 ? "reconnecting" : "connecting");
-      setTickStreamError(null);
-
-      const socket = new WebSocket(buildTickStreamUrl(selected.instrument_key));
-      tickSocketRef.current = socket;
-
-      socket.onopen = () => {
-        if (cancelled) return;
-        reconnectAttemptRef.current = 0;
-        setTickStreamStatus("live");
-        setTickStreamError(null);
-      };
-
-      socket.onmessage = (event) => {
-        if (cancelled) return;
-        try {
-          const payload = JSON.parse(event.data) as UpstoxTickStreamMessage;
-          if (payload.type === "tick") {
-            setLiveTick(payload.data);
-            return;
-          }
-          if (payload.type === "error") {
-            setTickStreamStatus("error");
-            setTickStreamError(payload.data.message || "Tick stream error");
-          }
-        } catch {
-          setTickStreamStatus("error");
-          setTickStreamError("Invalid tick stream payload");
-        }
-      };
-
-      socket.onerror = () => {
-        if (cancelled) return;
-        setTickStreamStatus("error");
-        setTickStreamError("Tick stream socket error");
-      };
-
-      socket.onclose = () => {
-        if (cancelled) return;
-        scheduleReconnect();
-      };
-    };
-
-    setLiveTick(null);
-    connect();
-
-    return () => {
-      cancelled = true;
-      clearReconnectTimer();
-      closeSocket();
-    };
-  }, [selected]);
-
-  useEffect(() => {
-    const handlePointerDown = (event: PointerEvent) => {
-      const target = event.target as Node;
-      if (calendarRef.current && !calendarRef.current.contains(target)) {
-        setIsCalendarOpen(false);
+      if (suggestion) {
+        setDetailSuggestion(suggestion);
       }
-    };
+    }
+  }, [searchParams, suggestionsData, selectedInstrument]);
 
-    window.addEventListener("pointerdown", handlePointerDown);
-    return () => window.removeEventListener("pointerdown", handlePointerDown);
-  }, []);
-
+  // Read suggestion_id from URL on mount (deep linking support)
   useEffect(() => {
-    if (!isCalendarOpen) return;
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setIsCalendarOpen(false);
+    const suggestionId = searchParams.get('suggestion_id');
+    if (suggestionId && !detailSuggestion && suggestionsData) {
+      const suggestion = suggestionsData.suggestions.find(
+        s => s.suggestion_id === suggestionId
+      );
+      if (suggestion) {
+        // Open DetailPane for deep-linked suggestions
+        setDetailSuggestion(suggestion);
+        // Update URL to use instrument_key (canonical parameter)
+        const params = new URLSearchParams(searchParams.toString());
+        params.delete('suggestion_id'); // Remove legacy parameter
+        params.set('instrument_key', suggestion.instrument_key);
+        router.replace(`?${params.toString()}`, { scroll: false });
       }
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [isCalendarOpen]);
+    }
+  }, [searchParams, suggestionsData, detailSuggestion, router]);
 
-  const intervalPresets = INTERVAL_PRESETS;
-
-  const applyIntervalPreset = (preset: IntervalPreset) => {
-    setIsCandleSizeLocked(true);
-    updateHistoricalState((prev) => ({
-      ...prev,
-      unit: preset.unit,
-      interval: preset.interval,
-    }));
-    setIntervalNotice("Candle size locked by manual selection. Date range auto-clamped to provider limits.");
-    window.setTimeout(() => {
-      setIntervalNotice(null);
-    }, 5000);
+  const handleViewDetails = (suggestionId: string) => {
+    const suggestion = suggestionsData?.suggestions.find((s) => s.suggestion_id === suggestionId);
+    if (suggestion) {
+      // Open DetailPane with chart for technical analysis
+      setDetailSuggestion(suggestion);
+      // Update URL with instrument_key for shareability and deep linking
+      const params = new URLSearchParams(searchParams.toString());
+      params.set('instrument_key', suggestion.instrument_key);
+      router.push(`?${params.toString()}`, { scroll: false });
+    }
   };
+
+  const handleManualSelect = (instrument: UpstoxInstrument) => {
+    setSelectedInstrument(instrument);
+    // Update URL with instrument_key
+    const params = new URLSearchParams(searchParams.toString());
+    params.set('instrument_key', instrument.instrument_key);
+    router.push(`?${params.toString()}`, { scroll: false });
+  };
+
+  const handleCloseDetail = () => {
+    setDetailSuggestion(null);
+    setSelectedInstrument(null);
+    // Remove instrument_key from URL
+    const params = new URLSearchParams(searchParams.toString());
+    params.delete('instrument_key');
+    const newUrl = params.toString() ? `?${params.toString()}` : '/hawk-eye-radar';
+    router.push(newUrl, { scroll: false });
+  };
+
+  const handleWatchlistItemClick = useCallback((instrumentKey: string) => {
+    // Suppress navigation when the click was synthesised at the end of a drag.
+    if (clickPreventedRef.current) return;
+
+    const item = watchlistItems.find(w => w.instrument_key === instrumentKey);
+    if (item) {
+      const instrument: UpstoxInstrument = {
+        instrument_key: item.instrument_key,
+        trading_symbol: item.trading_symbol,
+        name: item.name || "",
+        exchange: item.exchange || "NSE",
+      };
+      setSelectedInstrument(instrument);
+      const params = new URLSearchParams(searchParams.toString());
+      params.set('instrument_key', instrument.instrument_key);
+      router.push(`?${params.toString()}`, { scroll: false });
+    }
+  }, [clickPreventedRef, watchlistItems, searchParams, router]);
+
+  const handleRemoveFromWatchlist = async (itemId: number) => {
+    try {
+      await removeFromWatchlist(itemId);
+    } catch (error) {
+      if (!isNetworkError(error)) console.error('[Hawk-Eye] Failed to remove from watchlist:', error);
+    }
+  };
+
+  // Determine which instrument to show in detail pane
+  const detailInstrument = selectedInstrument || (detailSuggestion ? {
+    instrument_key: detailSuggestion.instrument_key,
+    trading_symbol: detailSuggestion.trading_symbol || detailSuggestion.symbol,
+    name: detailSuggestion.symbol,
+    exchange: "NSE",
+  } as UpstoxInstrument : null);
+
+  if (!isAuthReady || !isAuthenticated) return null;
 
   return (
     <div className="space-y-8">
-      <Card className="border-slate-200/80 bg-white/90">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-3 text-2xl">
-            <Radar className="h-6 w-6 text-blue-600" />
-            Hawk-Eye Radar
-          </CardTitle>
-          <CardDescription>
-            Unified chart mode: historical candles with live tick overlays on recent windows.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-6">
-          <div className="grid gap-4 md:grid-cols-[1fr]">
-            <InstrumentSearchCombobox
-              onSelect={handleSelect}
-              selectedInstrumentKey={selected?.instrument_key ?? null}
-              placeholder="Type symbol or company name (e.g. RELIANCE)"
-              helperText="Minimum 1 character. NSE equities only."
-              segment="NSE_EQ"
-              limit={12}
-              showQuickLtp
-            />
+      {/* Page Header */}
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-semibold text-slate-900">Hawk-Eye Radar</h1>
+      </div>
+
+      {/* Stats Dashboard */}
+      {/* <SuggestionStats /> */}
+
+      {/* Watchlist Section */}
+      {isAuthenticated && (
+        <div>
+          <div className="mb-4 flex items-center gap-3">
+            <Star className="h-5 w-5 text-yellow-500 fill-yellow-500" />
+            <div>
+              <h2 className="text-lg font-semibold text-slate-900">My Watchlist</h2>
+              <p className="text-sm text-slate-500">
+                Track your favorite stocks with live prices
+              </p>
+            </div>
           </div>
 
-          <div className="space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="space-y-1">
-                <div className="text-sm font-semibold uppercase tracking-widest text-slate-500">
-                  Candlestick Chart
-                </div>
-                {selected && (
-                  <div className="text-sm text-slate-600">
-                    <span className="font-semibold text-slate-900">
-                      {selected.trading_symbol}
-                    </span>
-                    <span className="text-slate-400"> · </span>
-                    <span>{selected.name || "—"}</span>
-                  </div>
-                )}
-              </div>
-              <div className="flex flex-wrap items-center gap-3">
-                <div className="flex items-center gap-2">
-                  <label className="text-xs font-medium text-slate-500">Candle Size</label>
-                  <select
-                    value={`${candleUnit}:${candleInterval}`}
-                    onChange={(event) => {
-                      const [unitValue, intervalValue] = event.target.value.split(":");
-                      const preset = intervalPresets.find(
-                        (item) => item.unit === unitValue && item.interval === Number(intervalValue)
-                      );
-                      if (preset) {
-                        applyIntervalPreset(preset);
-                      }
-                    }}
-                    className="h-9 rounded-lg border border-slate-200 px-3 text-xs shadow-sm"
-                  >
-                    {intervalPresets.map((preset) => (
-                      <option key={preset.id} value={`${preset.unit}:${preset.interval}`}>
-                        {preset.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="rounded-full bg-slate-100 px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-slate-700">
-                  {candleSourceMode === "intraday"
-                    ? "Data: intraday"
-                    : candleSourceMode === "hybrid"
-                      ? "Data: hybrid"
-                      : "Data: historical"}
-                </div>
-                <div className="rounded-full bg-slate-100 px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-slate-700">
-                  {liveMergeEnabled ? "Live merge: on" : "Live merge: off"}
-                </div>
-                <div
-                  className={`rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-wide ${
-                    tickStreamStatus === "live"
-                      ? "bg-emerald-100 text-emerald-700"
-                      : tickStreamStatus === "connecting" || tickStreamStatus === "reconnecting"
-                        ? "bg-amber-100 text-amber-700"
-                        : tickStreamStatus === "error"
-                          ? "bg-rose-100 text-rose-700"
-                          : "bg-slate-100 text-slate-600"
-                  }`}
-                >
-                  {tickStreamStatus}
-                </div>
-              </div>
+          {watchlistLoading && (
+            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+              {[...Array(3)].map((_, i) => (
+                <Card key={i} className="border-slate-200 bg-white animate-pulse">
+                  <CardHeader className="pb-3">
+                    <div className="h-6 w-32 bg-slate-200 rounded" />
+                    <div className="h-4 w-48 bg-slate-100 rounded mt-2" />
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    <div className="h-8 w-24 bg-slate-200 rounded" />
+                    <div className="h-4 w-full bg-slate-100 rounded" />
+                  </CardContent>
+                </Card>
+              ))}
             </div>
+          )}
 
-            <div className="rounded-2xl border border-slate-200 bg-slate-950/95 p-4 shadow-sm">
-              {!selected && (
-                <div className="text-sm text-slate-400">
-                  Search and select a stock to render its candlestick chart.
-                </div>
-              )}
-              {selected && candlesMutation.isPending && (
-                <div className="flex items-center gap-2 text-sm text-slate-300">
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Loading candles...
-                </div>
-              )}
-              {selected && candlesMutation.isError && (
-                <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-600">
-                  Failed to load candles. Confirm Upstox credentials and try again.
-                </div>
-              )}
-              {selected && intervalNotice && (
-                <div className="mb-3 rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-xs text-blue-700">
-                  {intervalNotice}
-                </div>
-              )}
-              {selected && tickStreamError && (
-                <div className="mb-3 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-700">
-                  {tickStreamError}
-                </div>
-              )}
-              {selected && candles?.data?.candles?.length ? (
-                <div className="h-[460px]">
-                  <CandlestickChart
-                    candles={candles.data.candles}
-                    liveTick={liveMergeEnabled ? liveTick : null}
-                    candleUnit={candleUnit}
-                    candleInterval={candleInterval}
-                    canLoadMoreHistory={hasMoreHistory}
-                    isLoadingMoreHistory={isLoadingOlderCandles}
-                    onLoadMoreHistory={loadMoreHistory}
-                    height={460}
-                  />
-                </div>
-              ) : selected && !candlesMutation.isPending ? (
-                <div className="text-sm text-slate-400">No candle data available.</div>
-              ) : null}
+          {!watchlistLoading && watchlistItems.length === 0 && (
+            <Card className="border-slate-200 bg-slate-50">
+              <CardContent className="flex flex-col items-center justify-center py-12 text-center">
+                <Star className="h-12 w-12 text-slate-400 mb-4" />
+                <h3 className="text-lg font-semibold text-slate-900 mb-2">No Stocks in Watchlist</h3>
+                <p className="text-sm text-slate-500 max-w-md">
+                  Search for stocks above and add them to your watchlist to track live prices and performance.
+                </p>
+              </CardContent>
+            </Card>
+          )}
+
+          {!watchlistLoading && watchlistItems.length > 0 && (
+            // touch-action:none prevents browser scroll from interfering while
+            // the user is pressing on a grip handle.
+            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 mb-8 touch-none">
+              {watchlistItems.map((item) => (
+                <WatchlistCard
+                  key={item.id}
+                  item={item}
+                  ltp={item.ltp}
+                  prevClose={item.prevClose}
+                  onRemove={handleRemoveFromWatchlist}
+                  onViewDetails={handleWatchlistItemClick}
+                  isDragging={draggingId === item.id}
+                  isOver={overId === item.id}
+                  gripHandlers={getGripHandlers(item.id)}
+                />
+              ))}
             </div>
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
-                  Time Frame
-                </span>
-                <div className="flex flex-wrap items-center gap-2">
-                  {RANGE_PRESETS.map((preset) => {
-                    const isActive =
-                      !historicalState.isCustom && historicalState.presetId === preset.id;
-                    return (
-                      <button
-                        key={preset.id}
-                        type="button"
-                        onClick={() => applyHistoricalPreset(preset)}
-                        className={`rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-wide transition ${
-                          isActive
-                            ? "bg-slate-900 text-white"
-                            : "border border-slate-200 bg-white text-slate-600 hover:border-slate-300"
-                        }`}
-                        aria-pressed={isActive}
-                      >
-                        {preset.label}
-                      </button>
-                    );
-                  })}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setCalendarMode("range");
-                      setSingleDate(historicalState.fromDate);
-                      setRangeStart(historicalState.fromDate);
-                      setRangeEnd(historicalState.toDate);
-                      setIsCalendarOpen(true);
-                    }}
-                    className={`flex items-center gap-2 rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-wide transition ${
-                      historicalState.isCustom
-                        ? "bg-blue-600 text-white"
-                        : "border border-slate-200 bg-white text-slate-600 hover:border-slate-300"
-                    }`}
-                  >
-                    <Calendar className="h-3.5 w-3.5" />
-                    Custom
-                  </button>
-                </div>
-              </div>
-            </div>
-            {isCalendarOpen && (
-              <div className="fixed inset-0 z-40" ref={calendarRef}>
-                <div className="absolute inset-0 bg-slate-950/40 backdrop-blur-sm" />
-                <div className="relative mx-auto mt-24 w-full max-w-lg rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
-                  <div className="flex items-center justify-between">
-                    <div className="text-sm font-semibold text-slate-900">Custom Time Frame</div>
-                    <button
-                      type="button"
-                      onClick={() => setIsCalendarOpen(false)}
-                      className="text-xs font-semibold text-slate-500 hover:text-slate-800"
-                    >
-                      Close
-                    </button>
-                  </div>
-                  <div className="mt-4 flex gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setCalendarMode("day")}
-                      className={`rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-wide transition ${
-                        calendarMode === "day"
-                          ? "bg-slate-900 text-white"
-                          : "border border-slate-200 bg-white text-slate-600 hover:border-slate-300"
-                      }`}
-                    >
-                      Single Day
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setCalendarMode("range")}
-                      className={`rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-wide transition ${
-                        calendarMode === "range"
-                          ? "bg-slate-900 text-white"
-                          : "border border-slate-200 bg-white text-slate-600 hover:border-slate-300"
-                      }`}
-                    >
-                      Custom Range
-                    </button>
-                  </div>
-                  {calendarMode === "day" ? (
-                    <div className="mt-4 space-y-2">
-                      <label className="text-xs font-medium text-slate-500">Select Date</label>
-                      <input
-                        type="date"
-                        value={singleDate}
-                        max={getISTTodayYMD()}
-                        onChange={(event) => setSingleDate(event.target.value)}
-                        className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm shadow-sm"
-                      />
-                    </div>
-                  ) : (
-                    <div className="mt-4 grid gap-3 md:grid-cols-2">
-                      <div className="space-y-2">
-                        <label className="text-xs font-medium text-slate-500">From</label>
-                        <input
-                          type="date"
-                          value={rangeStart}
-                          max={rangeEnd}
-                          onChange={(event) => setRangeStart(event.target.value)}
-                          className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm shadow-sm"
-                        />
-                      </div>
-                      <div className="space-y-2">
-                        <label className="text-xs font-medium text-slate-500">To</label>
-                        <input
-                          type="date"
-                          value={rangeEnd}
-                          max={getISTTodayYMD()}
-                          onChange={(event) => setRangeEnd(event.target.value)}
-                          className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm shadow-sm"
-                        />
-                      </div>
-                    </div>
-                  )}
-                  <div className="mt-4 flex justify-end gap-2">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => setIsCalendarOpen(false)}
-                    >
-                      Cancel
-                    </Button>
-                    <Button
-                      size="sm"
-                      onClick={() => {
-                        setIsCandleSizeLocked(false);
-                        if (calendarMode === "day") {
-                          updateHistoricalState((prev) => ({
-                            ...prev,
-                            fromDate: singleDate,
-                            toDate: singleDate,
-                            isCustom: true,
-                            presetId: "CUSTOM",
-                          }));
-                        } else {
-                          updateHistoricalState((prev) => ({
-                            ...prev,
-                            fromDate: rangeStart,
-                            toDate: rangeEnd,
-                            isCustom: true,
-                            presetId: "CUSTOM",
-                          }));
-                        }
-                        setIsCalendarOpen(false);
-                      }}
-                    >
-                      Apply
-                    </Button>
-                  </div>
-                </div>
-              </div>
-            )}
+          )}
+        </div>
+      )}
+
+      {/* Trade Suggestions Grid */}
+      <div>
+        <div className="mb-4 flex items-center justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-semibold text-slate-900">Active Trade Suggestions</h2>
+            <p className="text-sm text-slate-500">
+              Multi-agent validated opportunities with high consensus scores
+            </p>
           </div>
-        </CardContent>
-      </Card>
+        </div>
 
-      {/* Analysis Cards Section */}
-      <AnalysisCardsSection
-        symbol={selected?.trading_symbol ?? null}
-        exchange="NSE_EQ"
-        className="mt-8"
-      />
+        {/* Filters */}
+        <div className="mb-6">
+          <SuggestionFilters filters={filters} onFiltersChange={setFilters} />
+        </div>
+
+        {/* Loading State */}
+        {isLoading && (
+          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+            {[...Array(6)].map((_, i) => (
+              <Card key={i} className="border-slate-200 bg-white animate-pulse">
+                <CardHeader className="pb-3">
+                  <div className="h-6 w-32 bg-slate-200 rounded" />
+                  <div className="h-4 w-48 bg-slate-100 rounded mt-2" />
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="h-2 w-full bg-slate-100 rounded" />
+                  <div className="flex gap-2">
+                    <div className="h-6 w-20 bg-slate-100 rounded-full" />
+                    <div className="h-6 w-20 bg-slate-100 rounded-full" />
+                    <div className="h-6 w-20 bg-slate-100 rounded-full" />
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="h-12 bg-slate-100 rounded" />
+                    <div className="h-12 bg-slate-100 rounded" />
+                  </div>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+        )}
+
+        {/* Error State */}
+        {isError && (
+          <Card className="border-red-200 bg-red-50">
+            <CardContent className="flex items-center gap-3 py-6">
+              <AlertCircle className="h-5 w-5 text-red-600" />
+              <div>
+                <p className="font-medium text-red-900">Failed to load trade suggestions</p>
+                <p className="text-sm text-red-700">
+                  {error instanceof Error ? error.message : "Please try again later"}
+                </p>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Empty State */}
+        {!isLoading && !isError && suggestionsData?.suggestions.length === 0 && (
+          <Card className="border-slate-200 bg-slate-50">
+            <CardContent className="flex flex-col items-center justify-center py-12 text-center">
+              <Radar className="h-12 w-12 text-slate-400 mb-4" />
+              <h3 className="text-lg font-semibold text-slate-900 mb-2">No Active Suggestions</h3>
+              <p className="text-sm text-slate-500 max-w-md">
+                The correlation engine is analyzing market conditions. New trade suggestions will appear here when
+                multi-agent consensus is reached.
+              </p>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Suggestions Grid */}
+        {!isLoading && !isError && suggestionsData && suggestionsData.suggestions.length > 0 && (
+          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+            {suggestionsData.suggestions.map((suggestion) => (
+              <TradeSuggestionCard
+                key={suggestion.suggestion_id}
+                suggestion={suggestion}
+                onViewDetails={handleViewDetails}
+              />
+            ))}
+          </div>
+        )}
+
+        {/* Pagination Info */}
+        {suggestionsData && suggestionsData.total > 0 && (
+          <div className="mt-6 text-center text-sm text-slate-500">
+            Showing {suggestionsData.suggestions.length} of {suggestionsData.total} suggestions
+          </div>
+        )}
+      </div>
+
+      {/* Detail Pane Overlay */}
+      {detailInstrument && (
+        <DetailPane
+          instrument={detailInstrument}
+          onClose={handleCloseDetail}
+        />
+      )}
     </div>
   );
 }

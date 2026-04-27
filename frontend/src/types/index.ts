@@ -73,7 +73,7 @@ export type {
 // Market Data Types
 export type {
   StockAnalysis,
-  ScanResults,
+  LatestScanResponse,
   ScannerContext,
   ScanType,
   RunScanResponse,

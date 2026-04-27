@@ -177,10 +177,6 @@ async def rotate_refresh_token(
         if revoked:
             raise CortexInvalidTokenError("Token family has been revoked")
     
-    # Issue new token pair with same family and role
-    role = getattr(payload, "role", "viewer")
-    return create_token_pair(payload.sub, family_id=payload.family, role=role)
-    # Issue new token pair with same family and role
     role = getattr(payload, "role", "viewer")
     return create_token_pair(payload.sub, family_id=payload.family, role=role)
 

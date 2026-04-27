@@ -46,6 +46,10 @@ class TokenResponse(BaseModel):
     expires_in: int
 
 
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
 class UserResponse(BaseModel):
     id: int
     username: str
@@ -292,45 +296,35 @@ async def dev_login(
 
 @router.post("/refresh", response_model=TokenResponse)
 async def refresh_access_token(
-    request: dict,
+    body: RefreshRequest,
     db: AsyncSession = Depends(get_db),
-    redis = Depends(get_redis),
+    redis=Depends(get_redis),
 ):
     """
     Refresh access token using refresh token.
-    
+
     Implements token rotation: each refresh token can only be used once.
     Reuse detection triggers family revocation for security.
     """
     from app.core.security import rotate_refresh_token
-    
-    refresh_token = request.get("refresh_token")
-    if not refresh_token:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="refresh_token is required"
-        )
-    
+
     try:
-        # Rotate token (validates, marks as used, issues new pair)
-        token_pair = await rotate_refresh_token(refresh_token, redis)
-        
-        # Get user to update last_login
+        token_pair = await rotate_refresh_token(body.refresh_token, redis)
+
         payload = decode_token(token_pair.access_token)
         user = await get_user_by_id(db, int(payload.sub))
-        
         if user:
             stmt = update(User).where(User.id == user.id).values(
                 last_login=datetime.now(timezone.utc)
             )
             await db.execute(stmt)
             await db.commit()
-        
+
         return token_pair
-    except Exception as e:
+    except Exception:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=str(e)
+            detail="Token refresh failed",
         )
 
 

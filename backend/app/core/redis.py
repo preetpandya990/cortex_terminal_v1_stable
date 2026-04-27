@@ -27,24 +27,142 @@ _client: Redis | None = None
 
 # ── Redis Channels ─────────────────────────────────────────────────────────────
 class RedisChannels:
-    """Redis pub/sub channel constants."""
+    """
+    Redis pub/sub channel constants for real-time event streaming.
+    
+    Channel Naming Convention:
+    - Format: `cai:<category>:<subcategory>[:<detail>]`
+    - Namespace: `cai` (Cortex AI)
+    - Category: signals, regime, events, safety, models, suggestions, correlations
+    - Subcategory: Specific event type or entity
+    
+    Message Format:
+    - All messages are JSON-serialized dictionaries
+    - Use `PubSubClient.publish_json()` for publishing
+    - Subscribers receive parsed JSON via `PubSubClient.listen()`
+    
+    Best Practices:
+    - Fire-and-forget: Pub/sub does NOT persist messages
+    - At-most-once delivery: Lost if no subscriber is active
+    - Use Redis Streams for durable messaging requirements
+    - Pattern matching: Use `psubscribe` for wildcard subscriptions
+    
+    Example Usage:
+        # Publishing
+        await pubsub.publish_json(
+            RedisChannels.SUGGESTIONS_NEW,
+            {"suggestion_id": str(uuid), "symbol": "AAPL", "direction": "BUY"}
+        )
+        
+        # Subscribing
+        ps = await pubsub.subscribe(RedisChannels.SUGGESTIONS_NEW)
+        async for message in pubsub.listen(ps):
+            print(message["channel"], message["data"])
+    """
+    
+    # ── Trading Signals ────────────────────────────────────────────────────────
     SIGNALS_SYMBOL = "cai:signals:{symbol}"
+    """Per-symbol trading signals. Payload: {signal_id, symbol, score, confidence}"""
+    
     SIGNALS_ALL = "cai:signals:all"
+    """All trading signals broadcast. Payload: {signal_id, symbol, score, confidence}"""
+    
+    # ── Market Regime ──────────────────────────────────────────────────────────
     REGIME_SYMBOL = "cai:regime:{symbol}"
+    """Per-symbol regime changes. Payload: {symbol, regime, confidence, timestamp}"""
+    
     REGIME_ALL = "cai:regime:all"
+    """All regime changes broadcast. Payload: {symbol, regime, confidence, timestamp}"""
+    
+    # ── News Events ────────────────────────────────────────────────────────────
     EVENTS_HIGH_IMPACT = "cai:events:high_impact"
+    """High-impact news events. Payload: {event_id, type, impact_score, symbols}"""
+    
     EVENTS_ALL = "cai:events:all"
+    """All classified news events. Payload: {event_id, type, impact_score, symbols}"""
+    
+    # ── Safety & Risk Management ───────────────────────────────────────────────
     SAFETY_KILL_SWITCHES = "cai:safety:kill_switches"
+    """Kill switch activations/deactivations. Payload: {switch_id, status, reason}"""
+    
     SAFETY_TRIGGERS = "cai:safety:triggers"
+    """Safety trigger events. Payload: {trigger_id, type, severity, action}"""
+    
+    # ── Model Governance ───────────────────────────────────────────────────────
     MODELS_STATE_CHANGES = "cai:models:state_changes"
+    """Model state transitions. Payload: {model_id, old_state, new_state, reason}"""
+    
     MODELS_DRIFT_ALERTS = "cai:models:drift_alerts"
+    """Model drift detection alerts. Payload: {model_id, metric, threshold, value}"""
+    
+    # ── Trade Suggestions ──────────────────────────────────────────────────────
+    SUGGESTIONS_NEW = "cai:suggestions:new"
+    """
+    New trade suggestion generated.
+    
+    Payload:
+        {
+            "suggestion_id": "uuid",
+            "symbol": "AAPL",
+            "signal_direction": "BUY" | "SELL",
+            "consensus_score": 85.5,
+            "confidence_level": "HIGH" | "MEDIUM" | "LOW",
+            "trigger_type": "SCANNER_ANOMALY" | "NEWS_EVENT",
+            "generated_at": "2026-04-22T12:00:00Z"
+        }
+    """
+    
+    SUGGESTIONS_EXPIRED = "cai:suggestions:expired"
+    """
+    Trade suggestion expired (TTL reached).
+    
+    Payload:
+        {
+            "suggestion_id": "uuid",
+            "symbol": "AAPL",
+            "expired_at": "2026-04-22T12:30:00Z",
+            "reason": "TTL_EXPIRED" | "MARKET_CLOSED" | "MANUAL_EXPIRY"
+        }
+    """
+    
+    # ── Correlation Events ─────────────────────────────────────────────────────
+    CORRELATIONS_COMPLETED = "cai:correlations:completed"
+    """
+    Correlation analysis completed successfully.
+    
+    Payload:
+        {
+            "correlation_id": "uuid",
+            "trigger_type": "SCANNER_ANOMALY" | "NEWS_EVENT",
+            "suggestion_id": "uuid",
+            "consensus_score": 85.5,
+            "latencies": {"scanner_ms": 45, "ai_ms": 120, "ml_ms": 230},
+            "completed_at": "2026-04-22T12:00:00Z"
+        }
+    """
+    
+    CORRELATIONS_REJECTED = "cai:correlations:rejected"
+    """
+    Correlation analysis rejected (low consensus).
+    
+    Payload:
+        {
+            "correlation_id": "uuid",
+            "trigger_type": "SCANNER_ANOMALY" | "NEWS_EVENT",
+            "rejection_reason": "LOW_CONSENSUS" | "CONFLICTING_SIGNALS" | "TIMEOUT",
+            "consensus_score": 45.2,
+            "rejected_at": "2026-04-22T12:00:00Z"
+        }
+    """
 
     @staticmethod
     def signals_for_symbol(symbol: str) -> str:
+        """Get per-symbol signals channel."""
         return RedisChannels.SIGNALS_SYMBOL.format(symbol=symbol)
 
     @staticmethod
     def regime_for_symbol(symbol: str) -> str:
+        """Get per-symbol regime channel."""
         return RedisChannels.REGIME_SYMBOL.format(symbol=symbol)
 
 

@@ -45,18 +45,28 @@ class DriftMetricListResponse(BaseModel):
 
 
 class PredictionResponse(_MLBase):
-    """Response schema for ML prediction."""
-    model_config = ConfigDict(from_attributes=True, protected_namespaces=())
+    """Response schema for ML prediction.
 
-    id: int
-    model_id: str
-    timestamp: datetime
-    features: Optional[Dict[str, Any]] = None
-    prediction: float
-    prediction_proba: Optional[Dict[str, Any]] = None
-    symbol: Optional[str] = None
-    prediction_type: Optional[str] = None
+    When `available` is False the prediction fields are None and `unavailable_reason`
+    describes why (e.g. "insufficient_data"). Callers must check `available` first.
+    """
+    model_config = ConfigDict(protected_namespaces=())
+
+    symbol: str
+    available: bool = True
+    unavailable_reason: Optional[str] = None
+
+    direction: Optional[str] = None
+    confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
+    entry_price: Optional[float] = None
+    stop_loss: Optional[float] = None
+    take_profit_1: Optional[float] = None
+    take_profit_2: Optional[float] = None
+    take_profit_3: Optional[float] = None
+    volatility: Optional[float] = None
+    probabilities: Optional[Dict[str, float]] = None
     model_version: Optional[str] = None
+    predicted_at: Optional[datetime] = None
 
 
 class ModelMetadataResponse(_MLBase):
@@ -91,10 +101,8 @@ class DriftDetectionRequest(_MLBase):
 class PredictionRequest(_MLBase):
     """Request schema for ML prediction."""
 
-    model_id: str = Field(..., description="Model ID to use for prediction")
-    features: Dict[str, Any] = Field(..., description="Feature values for prediction")
-    symbol: Optional[str] = Field(None, description="Stock symbol")
-    prediction_type: Optional[str] = Field("price", description="Type of prediction")
+    symbol: str = Field(..., description="NSE instrument key, e.g. NSE_EQ|INE002A01018")
+    timeframe: str = Field("1d", description="Candle timeframe: 1d, 1w")
 
 
 class BatchPredictionRequest(_MLBase):

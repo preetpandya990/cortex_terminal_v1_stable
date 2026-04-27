@@ -67,6 +67,31 @@ class UpstoxConnectionError(UpstoxAPIError):
     status_code = 503
 
 
+class UpstoxRateLimitError(UpstoxAPIError):
+    """
+    Raised when Upstox / Cloudflare returns HTTP 429 (rate limited).
+
+    This is a transient, self-correcting condition — back off and retry.
+    It must NOT count toward the circuit breaker threshold, which is reserved
+    for signals that the upstream service itself is unavailable.
+    """
+    default_message = "Upstox API rate limit exceeded — backing off"
+    status_code = 429
+
+
+class UpstoxInvalidInstrumentError(UpstoxAPIError):
+    """
+    Raised when Upstox rejects an instrument key as invalid (HTTP 400 UDAPI100011).
+
+    This is a permanent, non-transient error — the instrument is delisted, renamed,
+    or never existed in the historical candle API.  It must NOT count toward the
+    circuit breaker threshold, which is reserved for signals that the API itself
+    is degraded.
+    """
+    default_message = "Instrument key not recognised by Upstox API"
+    status_code = 400
+
+
 class MarketDataUnavailableError(CortexBaseError):
     default_message = "Market data is temporarily unavailable"
     status_code = 503

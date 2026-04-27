@@ -1,28 +1,21 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api-client';
 import { useAuth } from '@/contexts/AuthContext';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { RefreshCw, AlertTriangle, Clock3, ChartColumnBig } from 'lucide-react';
-import { RunScanResponse, ScanResultsData, ScanType, ScannerContext } from '@/types/market';
-import { StockCard } from '@/components/scanner/StockCard';
-import { ScanResults } from '@/components/scanner/ScanResults';
-
-const scanTypeLabels: Record<ScanType, string> = {
-  market_open: 'Market Open',
-  market_close: 'Market Close',
-  intraday: 'Intraday',
-};
+import { RefreshCw, AlertTriangle, Clock3, ChartColumnBig, DatabaseZap } from 'lucide-react';
+import { RunScanResponse, ScanResultsData, ScanType, ScannerContext, StockAnalysis } from '@/types/market';
+import { ScanResults, type ScannerTab } from '@/components/scanner/ScanResults';
+import { ScannerDetailPane } from '@/components/scanner/ScannerDetailPane';
 
 const emptyResults: ScanResultsData = {
   top_gainers: [],
   top_losers: [],
   volume_spikes: [],
-  breakouts: [],
   total_scanned: 0,
   errors: [],
   metadata: {},
@@ -30,9 +23,19 @@ const emptyResults: ScanResultsData = {
 
 export default function ScannerPage() {
   const queryClient = useQueryClient();
-  const { isAuthenticated } = useAuth();
-  const [scanType, setScanType] = useState<ScanType>('market_close');
-  const [selectedCloseDate, setSelectedCloseDate] = useState<string>('');
+  const { isAuthenticated, isAuthReady } = useAuth();
+
+  const [selectedStock, setSelectedStock] = useState<StockAnalysis | null>(null);
+  const [selectedListType, setSelectedListType] = useState<ScannerTab>('gainers');
+
+  const handleStockSelect = useCallback((stock: StockAnalysis, listType: ScannerTab) => {
+    setSelectedStock(stock);
+    setSelectedListType(listType);
+  }, []);
+
+  const handlePaneClose = useCallback(() => {
+    setSelectedStock(null);
+  }, []);
 
   const {
     data: scanData,
@@ -48,7 +51,7 @@ export default function ScannerPage() {
       return response.data;
     },
     enabled: isAuthenticated,
-    refetchInterval: 60000,
+    refetchInterval: 60_000,
   });
 
   const {
@@ -63,58 +66,52 @@ export default function ScannerPage() {
       return response.data;
     },
     enabled: isAuthenticated,
-    refetchInterval: 60000,
+    refetchInterval: 60_000,
   });
 
   const runScanMutation = useMutation({
-    mutationFn: async ({ selectedType, tradeDate }: { selectedType: ScanType; tradeDate?: string }) => {
-      const params: Record<string, string> = {
-        scan_type: selectedType,
-        include_ml: 'true'
-      };
-      if (tradeDate) {
-        params.trade_date = tradeDate;
-      }
-      const response = await api.post('/scanner/run', params);
-      return response.data;
+    mutationFn: async ({ selectedType }: { selectedType: ScanType }) => {
+      const response = await api.post('/scanner/run', { scan_type: selectedType });
+      return response.data as RunScanResponse;
     },
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ['scanner', 'latest'] });
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['scanner', 'latest'] });
     },
   });
 
   const latestScanTimestamp = scanData?.timestamp
-    ? new Date(scanData.timestamp).toLocaleString()
+    ? new Date(scanData.timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
     : null;
 
-  const resultSet = useMemo(() => scanData?.results ?? emptyResults, [scanData]);
-  const quoteAnalyses = useMemo(() => {
+  // Prefer fresh mutation results — POST /scanner/run returns the full results
+  // in its body. Using them directly avoids a stale-cache race on the GET /latest refetch.
+  const resultSet = useMemo(() => {
+    if (runScanMutation.isSuccess && runScanMutation.data?.results) {
+      return runScanMutation.data.results;
+    }
+    return scanData?.results ?? emptyResults;
+  }, [scanData?.results, runScanMutation.isSuccess, runScanMutation.data?.results]);
+  const totalScanned: number = useMemo(() => {
     const raw = resultSet.metadata?.quote_analyses;
-    return typeof raw === 'number' && Number.isFinite(raw) ? raw : null;
-  }, [resultSet.metadata]);
-  const totalScanned = quoteAnalyses ?? scanData?.total_scanned ?? resultSet.total_scanned;
+    return typeof raw === 'number' && Number.isFinite(raw)
+      ? raw
+      : (scanData?.total_scanned ?? resultSet.total_scanned);
+  }, [resultSet, scanData?.total_scanned]);
 
   const isRunDisabled = runScanMutation.isPending || isFetching || isContextLoading;
-  const isModeSelectionLocked = Boolean(scannerContext && !scannerContext.is_market_open);
-  const closeDateOptions = scannerContext?.selectable_market_close_dates ?? [];
-  const effectiveScanType: ScanType = isModeSelectionLocked ? 'market_close' : scanType;
-  const effectiveCloseDate = selectedCloseDate || closeDateOptions[0] || '';
 
   const runScan = () => {
-    const tradeDate = effectiveScanType === 'market_close' ? effectiveCloseDate : undefined;
-    runScanMutation.mutate({ selectedType: effectiveScanType, tradeDate });
+    runScanMutation.mutate({ selectedType: 'market_close' });
   };
 
-  const latestErrorLabel = getErrorLabel(latestScanError);
-  const contextErrorLabel = getErrorLabel(scannerContextError);
-  const runErrorLabel = getErrorLabel(runScanMutation.error);
+  if (!isAuthReady || !isAuthenticated) return null;
 
   if (isLoading || isContextLoading) {
     return (
       <div className="flex items-center justify-center min-h-[40vh]">
         <div className="flex items-center gap-2 text-lg text-muted-foreground">
           <RefreshCw className="h-4 w-4 animate-spin" />
-          Loading scanner data...
+          Loading scanner...
         </div>
       </div>
     );
@@ -123,156 +120,137 @@ export default function ScannerPage() {
   if (isLatestScanError && !scanData) {
     return (
       <div className="space-y-6">
-        <Card className="border-red-200 bg-red-50/70">
-          <CardHeader className="pb-3">
-            <CardTitle className="flex items-center gap-2 text-red-700">
-              <AlertTriangle className="h-4 w-4" />
-              Scanner API unavailable
-            </CardTitle>
-            <CardDescription className="text-red-600">
-              {latestErrorLabel}
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <Button variant="outline" onClick={() => refetch()}>
-              Retry
-            </Button>
-          </CardContent>
-        </Card>
+        <ErrorCard title="Scanner unavailable" message={getErrorLabel(latestScanError)}>
+          <Button variant="outline" onClick={() => refetch()}>
+            Retry
+          </Button>
+        </ErrorCard>
       </div>
     );
   }
 
   return (
-    <div className="space-y-6">
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div className="space-y-2">
-          <h1 className="text-3xl font-bold">Market Scanner</h1>
-          <p className="text-sm text-muted-foreground">
-            {latestScanTimestamp ? `Last scan: ${latestScanTimestamp}` : 'No scan has been executed yet.'}
-          </p>
-          {scanData ? (
-            <div className="flex items-center gap-2">
-              <Badge variant="outline">{scanTypeLabels[scanData.scan_type]}</Badge>
-              {typeof scanData.processing_time_ms === 'number' ? (
+    <div className="space-y-4">
+      {/* ── Header ── */}
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div className="flex flex-wrap items-center gap-6">
+          <div>
+            <div className="flex items-center gap-3">
+              <h1 className="text-2xl font-bold">Market Scanner</h1>
+              {typeof scanData?.processing_time_ms === 'number' ? (
                 <Badge variant="secondary" className="font-mono">
                   <Clock3 className="mr-1 h-3 w-3" />
                   {scanData.processing_time_ms} ms
                 </Badge>
               ) : null}
             </div>
+            <p className="mt-0.5 text-sm text-muted-foreground">
+              {latestScanTimestamp
+                ? `Last scan: ${latestScanTimestamp} IST`
+                : 'No scan has been run yet.'}
+            </p>
+          </div>
+
+          {/* ── Market status indicator ── */}
+          {scannerContext ? (
+            <MarketStatusIndicator scannerContext={scannerContext} />
+          ) : null}
+
+          {/* ── Inline stats ── */}
+          {scanData ? (
+            <div className="flex items-center gap-5 border-l border-slate-200 pl-6">
+              <div className="text-center">
+                <p className="text-lg font-semibold tabular-nums">{totalScanned}</p>
+                <p className="text-xs text-muted-foreground">Scanned</p>
+              </div>
+              <div className="text-center">
+                <p className="text-lg font-semibold tabular-nums text-emerald-600">
+                  {resultSet.top_gainers.length}
+                </p>
+                <p className="text-xs text-muted-foreground">Gainers</p>
+              </div>
+              <div className="text-center">
+                <p className="text-lg font-semibold tabular-nums text-red-600">
+                  {resultSet.top_losers.length}
+                </p>
+                <p className="text-xs text-muted-foreground">Losers</p>
+              </div>
+            </div>
           ) : null}
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
-          {(Object.keys(scanTypeLabels) as ScanType[]).map((type) => (
-            <Button
-              key={type}
-              variant={effectiveScanType === type ? 'default' : 'outline'}
-              onClick={() => setScanType(type)}
-              disabled={runScanMutation.isPending || (isModeSelectionLocked && type !== 'market_close')}
-            >
-              {scanTypeLabels[type]}
-            </Button>
-          ))}
-
-          {effectiveScanType === 'market_close' ? (
-            <select
-              aria-label="Select market close trading day"
-              className="h-9 rounded-md border bg-background px-3 text-sm"
-              value={effectiveCloseDate}
-              onChange={(e) => setSelectedCloseDate(e.target.value)}
-              disabled={runScanMutation.isPending || closeDateOptions.length === 0}
-            >
-              {closeDateOptions.map((day) => (
-                <option key={day} value={day}>
-                  {day}
-                </option>
-              ))}
-            </select>
-          ) : null}
-
-          <Button onClick={runScan} disabled={isRunDisabled}>
-            <RefreshCw className={`mr-2 h-4 w-4 ${runScanMutation.isPending ? 'animate-spin' : ''}`} />
-            {runScanMutation.isPending ? 'Running...' : 'Run Scan'}
-          </Button>
-        </div>
+        {/* ── Controls ── */}
+        <Button onClick={runScan} disabled={isRunDisabled}>
+          <RefreshCw
+            className={`mr-2 h-4 w-4 ${runScanMutation.isPending ? 'animate-spin' : ''}`}
+          />
+          {runScanMutation.isPending ? 'Scanning...' : 'Run Scan'}
+        </Button>
       </div>
 
-      {scannerContext ? <SessionBanner scannerContext={scannerContext} /> : null}
-
+      {/* ── Banners ── */}
       {isLatestScanError ? (
-        <Card className="border-red-200 bg-red-50/70">
-          <CardHeader className="pb-3">
-            <CardTitle className="flex items-center gap-2 text-red-700">
-              <AlertTriangle className="h-4 w-4" />
-              Failed to load latest scan
-            </CardTitle>
-            <CardDescription className="text-red-600">
-              {latestErrorLabel}
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <Button variant="outline" onClick={() => refetch()}>
-              Retry
-            </Button>
-          </CardContent>
-        </Card>
+        <ErrorCard title="Failed to load latest scan" message={getErrorLabel(latestScanError)}>
+          <Button variant="outline" size="sm" onClick={() => refetch()}>
+            Retry
+          </Button>
+        </ErrorCard>
       ) : null}
 
       {isScannerContextError ? (
-        <Card className="border-red-200 bg-red-50/70">
-          <CardHeader className="pb-3">
-            <CardTitle className="flex items-center gap-2 text-red-700">
-              <AlertTriangle className="h-4 w-4" />
-              Failed to load scanner market context
-            </CardTitle>
-            <CardDescription className="text-red-600">
-              {contextErrorLabel}
-            </CardDescription>
-          </CardHeader>
-        </Card>
+        <ErrorCard
+          title="Failed to load market context"
+          message={getErrorLabel(scannerContextError)}
+        />
       ) : null}
 
       {runScanMutation.isError ? (
-        <Card className="border-red-200 bg-red-50/70">
-          <CardHeader className="pb-3">
-            <CardTitle className="flex items-center gap-2 text-red-700">
-              <AlertTriangle className="h-4 w-4" />
-              Scan execution failed
-            </CardTitle>
-            <CardDescription className="text-red-600">
-              {runErrorLabel}
-            </CardDescription>
-          </CardHeader>
-        </Card>
+        <ErrorCard title="Scan failed" message={getErrorLabel(runScanMutation.error)} />
       ) : null}
 
       {runScanMutation.isSuccess ? (
         <ScanSuccessBanner payload={runScanMutation.data} />
       ) : null}
 
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
-        <StockCard title="Total Scanned" value={totalScanned} />
-        <StockCard title="Top Gainers" value={resultSet.top_gainers.length} tone="positive" />
-        <StockCard title="Top Losers" value={resultSet.top_losers.length} tone="negative" />
-        <StockCard title="Volume Spikes" value={resultSet.volume_spikes.length} tone="info" />
-      </div>
+      {scanData && scanData.live_prices_available === false ? (
+        <Card className="border-amber-200 bg-amber-50/70">
+          <CardHeader className="py-3">
+            <CardTitle className="flex items-center gap-2 text-amber-700 text-sm font-medium">
+              <DatabaseZap className="h-4 w-4" />
+              Live prices unavailable — results reflect last stored close prices. Connect your Upstox account to enable live data.
+            </CardTitle>
+          </CardHeader>
+        </Card>
+      ) : null}
 
+      {scanData && scanData.stale_instrument_count > 0 ? (
+        <Card className="border-amber-200 bg-amber-50/70">
+          <CardHeader className="py-3">
+            <CardTitle className="flex items-center gap-2 text-amber-700 text-sm font-medium">
+              <DatabaseZap className="h-4 w-4" />
+              {scanData.stale_instrument_count} instrument{scanData.stale_instrument_count !== 1 ? 's' : ''} showing stale data — live prices unavailable for these symbols. Hover the ⚠ icon on a row for details.
+            </CardTitle>
+          </CardHeader>
+        </Card>
+      ) : null}
+
+      {/* ── Results ── */}
       {!scanData ? (
         <Card className="border-dashed">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <ChartColumnBig className="h-5 w-5" />
-              Scanner is ready
+              Scanner ready
             </CardTitle>
             <CardDescription>
-              Execute your first market scan to populate gainers, losers, volume spikes, and breakouts.
+              Run a scan to see top gainers, top losers, and volume spikes across all NSE instruments.
             </CardDescription>
           </CardHeader>
           <CardContent>
             <Button onClick={runScan} disabled={isRunDisabled}>
-              <RefreshCw className={`mr-2 h-4 w-4 ${runScanMutation.isPending ? 'animate-spin' : ''}`} />
+              <RefreshCw
+                className={`mr-2 h-4 w-4 ${runScanMutation.isPending ? 'animate-spin' : ''}`}
+              />
               Run First Scan
             </Button>
           </CardContent>
@@ -282,38 +260,82 @@ export default function ScannerPage() {
           topGainers={resultSet.top_gainers}
           topLosers={resultSet.top_losers}
           volumeSpikes={resultSet.volume_spikes}
-          breakouts={resultSet.breakouts}
+          onStockSelect={handleStockSelect}
         />
       )}
+
+      <ScannerDetailPane
+        stock={selectedStock}
+        listType={selectedListType}
+        open={selectedStock !== null}
+        onClose={handlePaneClose}
+      />
+    </div>
+  );
+}
+
+// ── Sub-components ─────────────────────────────────────────────────────────────
+
+function MarketStatusIndicator({ scannerContext }: { scannerContext: ScannerContext }) {
+  const isOpen = scannerContext.is_market_open;
+
+  return (
+    <div className={`flex items-start gap-3 rounded-xl border px-4 py-2.5 ${
+      isOpen
+        ? 'border-emerald-200 bg-emerald-50'
+        : 'border-slate-200 bg-slate-50'
+    }`}>
+      <div className="mt-0.5 flex-shrink-0">
+        <span className={`relative flex h-2.5 w-2.5`}>
+          {isOpen && (
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+          )}
+          <span className={`relative inline-flex h-2.5 w-2.5 rounded-full ${
+            isOpen ? 'bg-emerald-500' : 'bg-slate-400'
+          }`} />
+        </span>
+      </div>
+      <div>
+        <p className={`text-sm font-semibold leading-none ${
+          isOpen ? 'text-emerald-700' : 'text-slate-700'
+        }`}>
+          {isOpen ? 'Market Open' : 'Market Closed'}
+        </p>
+        {!isOpen && scannerContext.closed_reason ? (
+          <p className="mt-1 text-xs text-slate-500">{scannerContext.closed_reason}</p>
+        ) : isOpen && scannerContext.market_close_utc ? (
+          <p className="mt-1 text-xs text-emerald-600">
+            Closes at 3:30 PM IST
+          </p>
+        ) : null}
+      </div>
     </div>
   );
 }
 
 function ScanSuccessBanner({ payload }: { payload: RunScanResponse }) {
   const firstError = payload.results.errors[0] as Record<string, unknown> | undefined;
-  const firstErrorCode = (firstError?.code as string | undefined) ?? payload.primary_error_code ?? 'unknown_error';
-  const firstErrorMessage = (firstError?.message as string | undefined) ?? 'No additional error details provided.';
+  const errorCode =
+    (firstError?.code as string | undefined) ?? payload.primary_error_code ?? 'unknown_error';
+  const errorMessage =
+    (firstError?.message as string | undefined) ?? 'No additional details.';
 
   if (payload.status === 'failed') {
     return (
-      <Card className="border-red-200 bg-red-50/70">
-        <CardHeader className="pb-3">
-          <CardTitle className="text-red-700">Scan failed</CardTitle>
-          <CardDescription className="text-red-600">
-            {scanTypeLabels[payload.scan_type]} scan could not fetch market data. Code: {firstErrorCode}. {firstErrorMessage}
-          </CardDescription>
-        </CardHeader>
-      </Card>
+      <ErrorCard
+        title="Scan failed"
+        message={payload.message || `Code: ${errorCode}. ${errorMessage}`}
+      />
     );
   }
 
   if (payload.status === 'partial') {
     return (
       <Card className="border-amber-200 bg-amber-50/70">
-        <CardHeader className="pb-3">
+        <CardHeader className="py-3">
           <CardTitle className="text-amber-700">{payload.message}</CardTitle>
           <CardDescription className="text-amber-600">
-            {scanTypeLabels[payload.scan_type]} scan processed {payload.total_scanned} symbols with {payload.error_count} error(s). First code: {firstErrorCode}.
+            {payload.total_scanned} instruments evaluated, {payload.error_count} error(s). Code: {errorCode}.
           </CardDescription>
         </CardHeader>
       </Card>
@@ -322,43 +344,49 @@ function ScanSuccessBanner({ payload }: { payload: RunScanResponse }) {
 
   return (
     <Card className="border-emerald-200 bg-emerald-50/70">
-      <CardHeader className="pb-3">
+      <CardHeader className="py-3">
         <CardTitle className="text-emerald-700">{payload.message}</CardTitle>
         <CardDescription className="text-emerald-600">
-          {scanTypeLabels[payload.scan_type]} scan completed. {payload.total_scanned} symbols evaluated.
+          {payload.total_scanned} instruments evaluated.
         </CardDescription>
       </CardHeader>
     </Card>
   );
 }
 
-function SessionBanner({ scannerContext }: { scannerContext: ScannerContext }) {
-  const marketStatusText = scannerContext.is_market_open
-    ? 'Market is open. All scan modes are enabled.'
-    : 'Market is closed. Only Market Close mode is enabled.';
-
+function ErrorCard({
+  title,
+  message,
+  children,
+}: {
+  title: string;
+  message?: string;
+  children?: React.ReactNode;
+}) {
   return (
-    <Card className="border-slate-200 bg-slate-50/70">
+    <Card className="border-red-200 bg-red-50/70">
       <CardHeader className="pb-3">
-        <CardTitle className="text-slate-800">Session Control</CardTitle>
-        <CardDescription className="text-slate-600">{marketStatusText}</CardDescription>
+        <CardTitle className="flex items-center gap-2 text-red-700">
+          <AlertTriangle className="h-4 w-4" />
+          {title}
+        </CardTitle>
+        {message ? (
+          <CardDescription className="text-red-600">{message}</CardDescription>
+        ) : null}
       </CardHeader>
+      {children ? <CardContent>{children}</CardContent> : null}
     </Card>
   );
 }
 
 function getErrorLabel(error: unknown): string {
   if (error && typeof error === 'object' && 'response' in error) {
-    const axiosError = error as any;
+    const axiosError = error as { response?: { status?: number; data?: { detail?: string } }; message?: string };
     const status = axiosError.response?.status;
-    const message = axiosError.response?.data?.detail || axiosError.message;
-    if (status && message) {
-      return `HTTP ${status}: ${message}`;
-    }
-    return message || 'Request failed.';
+    const message = axiosError.response?.data?.detail ?? (axiosError as { message?: string }).message;
+    if (status && message) return `HTTP ${status}: ${message}`;
+    return message ?? 'Request failed.';
   }
-  if (error instanceof Error) {
-    return error.message;
-  }
+  if (error instanceof Error) return error.message;
   return 'Please try again.';
 }

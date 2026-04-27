@@ -41,8 +41,8 @@ export interface DriftReportsResponse {
 }
 
 export interface ModelFilters {
+  state?: string;
   model_type?: string;
-  deployment_state?: ModelState;
   page?: number;
   limit?: number;
 }

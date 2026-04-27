@@ -6,7 +6,6 @@ import { api } from "@/lib/api-client";
 import { useAuth } from '@/contexts/AuthContext';
 import type {
   TradingSignalsResponse,
-  TradingSignal,
   SignalFilters,
   SignalAuditResponse,
 } from "@/types/signals";
@@ -40,37 +39,21 @@ export function useSignals(filters: SignalFilters = {}) {
 }
 
 /**
- * Fetch a single signal by ID
- */
-export function useSignal(signalId: string) {
-  const { isAuthenticated } = useAuth();
-  
-  return useQuery<TradingSignal>({
-    queryKey: ["signal", signalId],
-    queryFn: async () => {
-      const response = await api.get<TradingSignal>(
-        `fusion/signals/${signalId}`
-      );
-      return response.data;
-    },
-    enabled: isAuthenticated && !!signalId,
-  });
-}
-
-/**
  * Fetch signal audit trail
  */
 export function useSignalAudit(signalId: string) {
   const { isAuthenticated } = useAuth();
-  
+
   return useQuery<SignalAuditResponse>({
     queryKey: ["signal-audit", signalId],
     queryFn: async () => {
       const response = await api.get<SignalAuditResponse>(
-        `fusion/signals/${signalId}/audit`
+        `fusion/signals/by-id/${signalId}/audit`
       );
       return response.data;
     },
     enabled: isAuthenticated && !!signalId,
+    // Audit is supplementary — don't retry on 404
+    retry: (count, error: any) => count < 1 && error?.response?.status !== 404,
   });
 }

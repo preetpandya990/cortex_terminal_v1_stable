@@ -17,7 +17,6 @@ from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.redis import CacheService, get_cache_service
 from app.core.security import get_current_user_id
-from app.exceptions import DataNotFoundError
 from app.core.limiter import limiter
 from app.schemas.market_data import InstrumentSearchResult, InstrumentSearchResponse, LivePriceResponse, OHLCVResponse
 from app.models.upstox_data import UpstoxOHLCV
@@ -52,15 +51,17 @@ async def get_live_price(
     # V3 API returns data with trading symbol key (e.g., "NSE_EQ:RELIANCE")
     # instead of instrument_key, so we get the first value
     data_dict = data.get("data", {})
+    # Some instruments (suspended, unlisted, or BE-group) have no active quote.
+    # Return null last_price rather than 404 so callers can handle it gracefully.
     if not data_dict:
-        raise DataNotFoundError(f"No market data found for instrument: {instrument_key}")
-    
-    # Get the first (and only) quote from the response
-    quote = next(iter(data_dict.values()))
+        result = LivePriceResponse(instrument_key=instrument_key, last_price=None)
+        await cache.set(cache_key, result.model_dump(mode="json"), ttl=settings.CACHE_TTL_LIVE_QUOTE)
+        return result
 
+    quote = next(iter(data_dict.values()))
     result = LivePriceResponse(
         instrument_key=instrument_key,
-        last_price=quote["last_price"],
+        last_price=quote.get("last_price"),
         timestamp=quote.get("timestamp"),
     )
     await cache.set(cache_key, result.model_dump(mode="json"), ttl=settings.CACHE_TTL_LIVE_QUOTE)

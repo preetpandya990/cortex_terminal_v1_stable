@@ -6,7 +6,7 @@
  */
 import React from 'react';
 import { useSignalsRealtime } from '@/hooks/useSignalsRealtime';
-import { useRegimeRealtime } from '@/hooks/useRegimeRealtime';
+import { useMarketOverview } from '@/hooks/useRegime';
 import { useEventsRealtime } from '@/hooks/useEventsRealtime';
 import { useModelsRealtime } from '@/hooks/useModelsRealtime';
 import { ConnectionStatusIndicator } from './ConnectionStatus';
@@ -14,7 +14,7 @@ import { ConnectionStatusIndicator } from './ConnectionStatus';
 export function CAIRealtimeDemo() {
   // Use real-time hooks with WebSocket integration
   const signals = useSignalsRealtime({ limit: 10 });
-  const regime = useRegimeRealtime('RELIANCE');
+  const regime = useMarketOverview();
   const events = useEventsRealtime({ min_impact: 70, limit: 10 });
   const models = useModelsRealtime();
 

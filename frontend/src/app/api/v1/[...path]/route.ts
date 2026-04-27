@@ -29,6 +29,16 @@ async function handleRequest(
       headers['Authorization'] = authHeader;
     }
 
+    // Forward real client IP so the backend rate limiter keys per-user rather
+    // than treating all proxied requests as coming from 127.0.0.1.
+    const clientIp =
+      request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
+      request.headers.get('x-real-ip') ||
+      '';
+    if (clientIp) {
+      headers['X-Forwarded-For'] = clientIp;
+    }
+
     // Prepare request options
     const options: RequestInit = {
       method: request.method,

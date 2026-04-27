@@ -1,3 +1,5 @@
+'use client';
+
 /**
  * Analysis Cards Section
  * Displays ML predictions, trend analysis, and volatility metrics
@@ -7,20 +9,28 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { TrendingUp, Activity, BarChart3, TrendingDown, Minus, Loader2 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
+import { useAuth } from "@/contexts/AuthContext";
 
 interface AnalysisCardsSectionProps {
-  symbol: string | null;
-  exchange: string;
+  instrumentKey: string | null;
   className?: string;
 }
 
 interface MLPrediction {
-  prediction: number;
-  confidence: number;
-  model_id: string;
-  model_version: string;
-  features_used: string[];
-  timestamp: string;
+  symbol: string;
+  available: boolean;
+  unavailable_reason?: string | null;
+  direction?: string | null;
+  confidence?: number | null;
+  entry_price?: number | null;
+  stop_loss?: number | null;
+  take_profit_1?: number | null;
+  take_profit_2?: number | null;
+  take_profit_3?: number | null;
+  volatility?: number | null;
+  probabilities?: { up: number; down: number; hold: number } | null;
+  model_version?: string | null;
+  predicted_at?: string | null;
 }
 
 interface HawkEyeAnalysis {
@@ -39,21 +49,21 @@ interface HawkEyeAnalysis {
   };
 }
 
-export function AnalysisCardsSection({ symbol, exchange, className }: AnalysisCardsSectionProps) {
-  const instrumentKey = symbol ? `${exchange}|${symbol}` : null;
+export function AnalysisCardsSection({ instrumentKey, className }: AnalysisCardsSectionProps) {
+  const { isAuthenticated, isAuthReady } = useAuth();
+  const canQuery = isAuthReady && isAuthenticated && !!instrumentKey;
 
   // Fetch ML prediction
   const mlQuery = useQuery({
     queryKey: ["ml-prediction", instrumentKey],
     queryFn: async () => {
       const response = await api.post(`/ml/predict`, {
-        model_id: "latest",
-        features: {}, // Empty for now - will use default features
-        instrument_key: instrumentKey,
+        symbol: instrumentKey,
+        timeframe: "1d",
       });
       return response.data as MLPrediction;
     },
-    enabled: !!instrumentKey,
+    enabled: canQuery,
     staleTime: 60_000, // 1 minute
   });
 
@@ -69,13 +79,28 @@ export function AnalysisCardsSection({ symbol, exchange, className }: AnalysisCa
       });
       return response.data as HawkEyeAnalysis;
     },
-    enabled: !!instrumentKey,
+    enabled: canQuery,
     staleTime: 300_000, // 5 minutes
   });
 
-  if (!symbol) {
+  if (!instrumentKey) {
     return null;
   }
+
+  // Map backend direction to display format
+  const getDirectionColor = (direction: string | null | undefined) => {
+    const dir = direction?.toUpperCase();
+    if (dir === "BUY") return "text-emerald-600";
+    if (dir === "SELL") return "text-red-600";
+    return "text-slate-600";
+  };
+
+  const getDirectionBgColor = (direction: string | null | undefined) => {
+    const dir = direction?.toUpperCase();
+    if (dir === "BUY") return "bg-emerald-500";
+    if (dir === "SELL") return "bg-red-500";
+    return "bg-slate-400";
+  };
 
   const getTrendIcon = (trend: string) => {
     if (trend === "bullish") return <TrendingUp className="h-5 w-5 text-emerald-600" />;
@@ -193,29 +218,42 @@ export function AnalysisCardsSection({ symbol, exchange, className }: AnalysisCa
                 <Loader2 className="h-4 w-4 animate-spin" />
                 Loading prediction...
               </div>
-            ) : mlQuery.data ? (
+            ) : mlQuery.data && !mlQuery.data.available ? (
+              <div className="space-y-1">
+                <p className="text-sm text-slate-500">No historical data ingested yet.</p>
+                <p className="text-xs text-slate-400">
+                  Run the data ingestion pipeline to enable ML predictions for this symbol.
+                </p>
+              </div>
+            ) : mlQuery.data?.available && mlQuery.data.direction != null ? (
               <div className="space-y-3 text-sm">
                 <div>
-                  <span className="text-slate-600">Prediction: </span>
-                  <span className={`font-semibold ${mlQuery.data.prediction === 1 ? 'text-emerald-600' : 'text-red-600'}`}>
-                    {mlQuery.data.prediction === 1 ? 'Bullish' : 'Bearish'}
+                  <span className="text-slate-600">Direction: </span>
+                  <span className={`font-semibold capitalize ${getDirectionColor(mlQuery.data.direction)}`}>
+                    {mlQuery.data.direction}
                   </span>
                 </div>
                 <div>
                   <span className="text-slate-600">Confidence: </span>
-                  <span className="font-semibold">{(mlQuery.data.confidence * 100).toFixed(1)}%</span>
+                  <span className="font-semibold">{((mlQuery.data.confidence ?? 0) * 100).toFixed(1)}%</span>
                 </div>
-                <div className="pt-2">
+                <div className="pt-1">
                   <div className="h-2 w-full rounded-full bg-slate-200">
-                    <div 
-                      className="h-2 rounded-full bg-purple-600 transition-all"
-                      style={{ width: `${mlQuery.data.confidence * 100}%` }}
+                    <div
+                      className={`h-2 rounded-full transition-all ${getDirectionBgColor(mlQuery.data.direction)}`}
+                      style={{ width: `${(mlQuery.data.confidence ?? 0) * 100}%` }}
                     />
                   </div>
                 </div>
-                <div className="text-xs text-slate-500">
-                  Model: {mlQuery.data.model_id} v{mlQuery.data.model_version}
-                </div>
+                {mlQuery.data.entry_price != null && mlQuery.data.stop_loss != null && (
+                  <div className="flex justify-between text-xs text-slate-500">
+                    <span>Entry ₹{mlQuery.data.entry_price.toFixed(2)}</span>
+                    <span>SL ₹{mlQuery.data.stop_loss.toFixed(2)}</span>
+                  </div>
+                )}
+                {mlQuery.data.model_version && (
+                  <div className="text-xs text-slate-400">{mlQuery.data.model_version}</div>
+                )}
               </div>
             ) : (
               <p className="text-sm text-slate-400">No prediction available</p>

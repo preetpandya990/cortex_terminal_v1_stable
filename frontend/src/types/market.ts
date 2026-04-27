@@ -5,8 +5,6 @@
  * These types mirror the backend API response structures.
  */
 
-import type { PredictionSignal } from './ml';
-
 /**
  * OHLCV (Open, High, Low, Close, Volume) data point
  * Returned by: GET /api/v1/market/stocks/{symbol}/data
@@ -65,6 +63,9 @@ export interface StockIndicatorsResponse {
  */
 export interface StockAnalysis {
   symbol: string;
+  trading_symbol: string | null;
+  name: string | null;
+  sector: string | null;
   current_price: number;
   previous_close: number;
   price_change: number;
@@ -72,15 +73,9 @@ export interface StockAnalysis {
   volume: number;
   avg_volume: number;
   volume_ratio: number;
-  above_ema200?: boolean;
   rsi: number | null;
   timestamp: string;
-  ml?: {
-    signal: PredictionSignal;
-    prob_up: number;
-    confidence: number;
-    model_name: string;
-  } | null;
+  warnings: string[];
 }
 
 /**
@@ -96,7 +91,6 @@ export interface ScanResultsData {
   top_gainers: StockAnalysis[];
   top_losers: StockAnalysis[];
   volume_spikes: StockAnalysis[];
-  breakouts: StockAnalysis[];
   total_scanned: number;
   errors: Array<Record<string, unknown>>;
   metadata: Record<string, unknown>;
@@ -106,12 +100,15 @@ export interface ScanResultsData {
  * Market scan results
  * Returned by: GET /api/v1/scanner/latest
  */
-export interface ScanResults {
+export interface LatestScanResponse {
   scan_id: number;
   timestamp: string;
   scan_type: ScanType;
+  timeframe: string;
   total_scanned: number;
   processing_time_ms: number;
+  stale_instrument_count: number;
+  live_prices_available: boolean;
   results: ScanResultsData;
 }
 
@@ -125,6 +122,8 @@ export interface RunScanResponse {
   total_scanned: number;
   error_count: number;
   primary_error_code: string | null;
+  stale_instrument_count: number;
+  live_prices_available: boolean;
   results: ScanResultsData;
 }
 
@@ -136,6 +135,7 @@ export interface ScannerContext {
   market_close_utc: string | null;
   default_scan_type: ScanType;
   selectable_market_close_dates: string[];
+  closed_reason: string | null;
 }
 
 /**

@@ -15,6 +15,59 @@ from app.core.redis import PubSubClient
 router = APIRouter()
 
 
+# ── JSONB normalisers ──────────────────────────────────────────────────────────
+# The DB stores contributing_events / ml_predictions / technical_indicators in
+# compact internal formats. These helpers translate them to the typed shapes the
+# frontend TradingSignal interface expects.
+
+def _normalise_events(raw) -> list[dict]:
+    if not raw or not isinstance(raw, list):
+        return []
+    result = []
+    for i, e in enumerate(raw):
+        if not isinstance(e, dict):
+            continue
+        result.append({
+            "event_id": str(e.get("id", i)),
+            "event_type": e.get("type", "unknown"),
+            "impact_score": round(float(e.get("impact", 0)) / 100, 4),
+            "summary": e.get("summary") or e.get("type") or "—",
+        })
+    return result
+
+
+def _normalise_ml_predictions(raw) -> list[dict]:
+    if not raw or not isinstance(raw, dict):
+        return []
+    confidence = float(raw.get("confidence", 0))
+    score = float(raw.get("score", 0))
+    model = raw.get("model") or "ensemble"
+    if confidence == 0.0 and score == 0.0:
+        return []
+    return [{
+        "model_id": str(model),
+        "model_name": str(model).capitalize(),
+        "prediction": "bullish" if score > 0.5 else "bearish",
+        "confidence": confidence,
+    }]
+
+
+def _normalise_technical(raw) -> list[dict]:
+    if not raw or not isinstance(raw, dict):
+        return []
+    indicators = raw.get("indicators")
+    if not indicators or not isinstance(indicators, dict):
+        return []
+    return [
+        {
+            "indicator": k,
+            "value": float(v) if isinstance(v, (int, float)) else 0.0,
+            "signal": "neutral",
+        }
+        for k, v in indicators.items()
+    ]
+
+
 @router.post("/signals/generate/{symbol}")
 @limiter.limit("10000/minute")  # Increased for load testing
 async def generate_signal(
@@ -84,9 +137,9 @@ async def get_all_signals(
                 "time_horizon": "intraday",  # Default, should be in DB
                 "reasoning": s.reasoning or "",
                 "contributing_factors": {
-                    "events": s.contributing_events or [],
-                    "ml_predictions": s.ml_predictions or [],
-                    "technical": s.technical_indicators or [],
+                    "events": _normalise_events(s.contributing_events),
+                    "ml_predictions": _normalise_ml_predictions(s.ml_predictions),
+                    "technical": _normalise_technical(s.technical_indicators),
                 },
                 "regime_type": s.regime_type,
                 "generated_at": s.signal_timestamp.isoformat(),
@@ -98,6 +151,40 @@ async def get_all_signals(
         "page": page,
         "limit": limit,
     }
+
+
+@router.get("/signals/by-id/{signal_id}/audit")
+async def get_signal_audit(
+    signal_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """Return audit trail entries for a specific signal ID."""
+    from sqlalchemy import select
+    from app.ai.fusion.models import AITradingSignal
+
+    try:
+        signal_id_int = int(signal_id)
+    except (ValueError, TypeError):
+        return {"audit_log": [], "total": 0}
+
+    stmt = select(AITradingSignal).where(AITradingSignal.id == signal_id_int)
+    result = await db.execute(stmt)
+    signal = result.scalar_one_or_none()
+
+    if not signal:
+        return {"audit_log": [], "total": 0}
+
+    entry = {
+        "audit_id": signal.id,
+        "signal_id": str(signal.id),
+        "symbol": signal.symbol,
+        "signal_type": signal.action.lower(),
+        "confidence": float(signal.confidence_score),
+        "generated_at": signal.signal_timestamp.isoformat(),
+        "outcome": None,
+    }
+    return {"audit_log": [entry], "total": 1}
 
 
 @router.get("/signals/{symbol}")

@@ -14,11 +14,16 @@ import { SignalsPanel } from '@/components/ai/SignalsPanel';
 import { RegimePanel } from '@/components/ai/RegimePanel';
 import { EventsPanel } from '@/components/ai/EventsPanel';
 import { MLModelsPanel } from '@/components/ai/MLModelsPanel';
+import { DeprecatedModelsPanel } from '@/components/ai/DeprecatedModelsPanel';
 import { ConnectionStatusIndicator } from '@/components/ai/ConnectionStatus';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { useAuth } from '@/contexts/AuthContext';
 
 export default function CortexAIPage() {
+  const { isAuthenticated, isAuthReady } = useAuth();
   const [activeTab, setActiveTab] = useState('signals');
+
+  if (!isAuthReady || !isAuthenticated) return null;
 
   return (
     <div className="container mx-auto p-6 space-y-6">
@@ -54,8 +59,9 @@ export default function CortexAIPage() {
           <EventsPanel />
         </TabsContent>
 
-        <TabsContent value="models" className="mt-6">
+        <TabsContent value="models" className="mt-6 space-y-4">
           <MLModelsPanel isAdmin={true} />
+          <DeprecatedModelsPanel isAdmin={true} />
         </TabsContent>
       </Tabs>
     </div>

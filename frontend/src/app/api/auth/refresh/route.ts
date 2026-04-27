@@ -20,13 +20,13 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Forward to backend with cookie
+    // Forward to backend with refresh token in body (backend reads from JSON body)
     const response = await fetch(`${BACKEND_URL}/api/v1/auth/refresh`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Cookie': `refresh_token=${refreshToken}`,
       },
+      body: JSON.stringify({ refresh_token: refreshToken }),
     });
 
     if (!response.ok) {
@@ -38,20 +38,22 @@ export async function POST(request: NextRequest) {
     }
 
     const data = await response.json();
-    
-    // Extract new refresh token cookie from backend
-    const setCookieHeader = response.headers.get('set-cookie');
-    
-    // Create response with new access token
+
     const nextResponse = NextResponse.json({
       access_token: data.access_token,
       token_type: data.token_type,
       expires_in: data.expires_in,
     });
 
-    // Forward new refresh token cookie
-    if (setCookieHeader) {
-      nextResponse.headers.set('set-cookie', setCookieHeader);
+    // Rotate the cookie — update it with the new refresh token from the backend body
+    if (data.refresh_token) {
+      nextResponse.cookies.set('refresh_token', data.refresh_token, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'strict',
+        path: '/api/auth',
+        maxAge: 7 * 24 * 60 * 60,
+      });
     }
 
     return nextResponse;

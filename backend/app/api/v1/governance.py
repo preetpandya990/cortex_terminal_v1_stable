@@ -25,6 +25,11 @@ class PromoteModelRequest(BaseModel):
     target_state: str
 
 
+class UpdateModelStateRequest(BaseModel):
+    new_state: str
+    reason: str = ""
+
+
 class TriggerDriftCheckRequest(BaseModel):
     lookback_hours: int = Field(24, ge=1, le=168, description="Hours of prediction history to analyze (1-168)")
 
@@ -41,6 +46,48 @@ class DriftReportResponse(BaseModel):
     distribution_metrics: dict | None
     action_taken: str | None
     created_at: datetime
+
+
+@router.post("/models/{model_id}/state")
+async def update_model_state(
+    model_id: int,
+    request: UpdateModelStateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(require_role("admin")),
+):
+    """Update model deployment state by ID (admin only)."""
+    from app.core.redis import get_redis
+
+    model = (await db.execute(
+        select(AIMLModel).where(AIMLModel.id == model_id)
+    )).scalar_one_or_none()
+
+    if not model:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Model {model_id} not found")
+
+    registry = UnifiedModelRegistry()
+    redis    = await get_redis()
+    pubsub   = PubSubClient(redis)
+
+    try:
+        updated = await registry.promote_model(
+            db=db,
+            pubsub=pubsub,
+            model_name=model.model_name,
+            target_state=request.new_state,
+            evaluation_results={"reason": request.reason} if request.reason else None,
+            bypass_gates=False,
+        )
+        return {
+            "model_id":    updated.id,
+            "model_name":  updated.model_name,
+            "state":       updated.deployment_state,
+            "updated_at":  updated.updated_at.isoformat(),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
 
 
 @router.post("/models/{model_name}/promote")

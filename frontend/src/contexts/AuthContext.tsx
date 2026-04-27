@@ -6,6 +6,9 @@ import { setAccessToken as setAPIAccessToken } from '@/lib/api-client';
 interface AuthContextType {
   accessToken: string | null;
   isAuthenticated: boolean;
+  /** True once the initial token-refresh attempt has completed (regardless of outcome).
+   *  Use this alongside isAuthenticated to prevent queries firing during the boot window. */
+  isAuthReady: boolean;
   isLoading: boolean;
   login: (token: string) => void;
   logout: () => Promise<void>;
@@ -27,6 +30,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       });
 
       if (!response.ok) {
+        // Silently fail - user just needs to log in
         setAccessToken(null);
         setAPIAccessToken(null);
         return false;
@@ -46,6 +50,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       return true;
     } catch (error) {
+      // Silently fail - user just needs to log in
       setAccessToken(null);
       setAPIAccessToken(null);
       return false;
@@ -97,6 +102,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const value: AuthContextType = {
     accessToken,
     isAuthenticated: !!accessToken,
+    isAuthReady: !isLoading,
     isLoading,
     login,
     logout,

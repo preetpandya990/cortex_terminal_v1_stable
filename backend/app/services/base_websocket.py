@@ -4,6 +4,9 @@ Cortex AI — Base WebSocket Service
 Eliminates the maintenance fork between TickStreamService and
 UpstoxStreamIngestionService by extracting the shared WebSocket lifecycle
 into a proper abstract base class with hook methods for subclass behaviour.
+
+Supports dynamic WebSocket URLs for services requiring fresh authorization
+(e.g., Upstox API v3 one-time-use URLs).
 """
 from __future__ import annotations
 
@@ -29,10 +32,13 @@ class BaseWebSocketService(ABC):
 
     TLS: default ssl.create_default_context() — certificate verification fully enabled.
     No CERT_NONE, no check_hostname=False.
+    
+    Supports dynamic WebSocket URLs via _get_websocket_url() hook for services
+    that require fresh authorization URLs (e.g., Upstox v3).
     """
 
     def __init__(self, ws_url: str | None = None) -> None:
-        self._ws_url = ws_url or settings.UPSTOX_WS_URL
+        self._ws_url = ws_url
         self._ws: WebSocketClientProtocol | None = None
         self._running = False
         self._reconnect_delay = 1.0
@@ -46,6 +52,21 @@ class BaseWebSocketService(ABC):
     async def on_connected(self) -> None:
         """Called after successful connection. Override to send subscriptions."""
 
+    def _get_connection_headers(self) -> dict[str, str]:
+        """Return extra HTTP headers for the WebSocket handshake. Override in subclass."""
+        return {}
+
+    async def _get_websocket_url(self) -> str:
+        """
+        Return WebSocket URL to connect to. Override for dynamic URLs.
+        
+        Default: Returns static URL from constructor.
+        Override: Fetch fresh authorization URL (e.g., Upstox v3).
+        """
+        if not self._ws_url:
+            raise UpstoxConnectionError("WebSocket URL not configured")
+        return self._ws_url
+
     # ── Lifecycle ──────────────────────────────────────────────────────────────
     async def connect(self) -> None:
         """Connect and start the message loop with exponential back-off."""
@@ -54,17 +75,23 @@ class BaseWebSocketService(ABC):
 
         while self._running:
             try:
+                # Fetch fresh WebSocket URL (may be dynamic for Upstox v3)
+                ws_url = await self._get_websocket_url()
+                
                 ssl_context = ssl.create_default_context()  # CERT_REQUIRED, verify ON
+                # websockets 13.x ships the legacy client on Python 3.11;
+                # the legacy client uses `extra_headers`, not `additional_headers`.
                 async with websockets.connect(
-                    self._ws_url,
+                    ws_url,
                     ssl=ssl_context,
+                    extra_headers=self._get_connection_headers(),
                     ping_interval=20,
                     ping_timeout=10,
                     close_timeout=5,
                 ) as ws:
                     self._ws = ws
                     delay = self._reconnect_delay  # reset on successful connect
-                    logger.info("%s connected to %s", self.__class__.__name__, self._ws_url)
+                    logger.info("%s connected to WebSocket", self.__class__.__name__)
                     await self.on_connected()
                     async for message in ws:
                         if not self._running:
@@ -75,6 +102,31 @@ class BaseWebSocketService(ABC):
                             logger.exception(
                                 "%s error processing message", self.__class__.__name__
                             )
+            except websockets.InvalidStatusCode as exc:
+                # Authentication failure (401) or permission denied (403)
+                if exc.status_code == 401:
+                    logger.warning(
+                        "%s authentication failed (401). Token may be expired or invalid. Waiting 30s...",
+                        self.__class__.__name__,
+                    )
+                    # Don't spam reconnect attempts on auth failure
+                    await asyncio.sleep(30)
+                elif exc.status_code == 403:
+                    logger.warning(
+                        "%s permission denied (403). App may not be approved for WebSocket access. Waiting 60s...",
+                        self.__class__.__name__,
+                    )
+                    # Longer wait for permission issues
+                    await asyncio.sleep(60)
+                else:
+                    logger.warning(
+                        "%s connection failed with status %d. Reconnecting in %.1fs",
+                        self.__class__.__name__,
+                        exc.status_code,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, self._max_reconnect_delay)
             except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as exc:
                 if not self._running:
                     break

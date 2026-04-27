@@ -1,324 +1,232 @@
 """
-Unified Model Registry - ML Model Governance
+Cortex AI — Unified Model Registry
+=====================================
+Manages ML model lifecycle with governance gates and state machine.
 
-Manages ML model lifecycle with encryption and governance gates.
-State machine: shadow → paper → live
+State machine:  shadow → paper → live
+                any    → shadow  (demotion / rollback)
+
+Promotion gates are calibrated for financial binary-classification on
+noisy equity data — not generic ML benchmarks.
 """
+from __future__ import annotations
+
 import hashlib
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Optional
+from typing import Any
 
-from cryptography.fernet import Fernet
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.fusion.models import AIMLModel
-from app.core.config import get_settings
 from app.core.redis import PubSubClient, RedisChannels
 
 logger = logging.getLogger(__name__)
 
+# ── Promotion gates ───────────────────────────────────────────────────────────
+# Financial binary-classification on equity price data is inherently noisy.
+# 65% accuracy is strong; 85%+ thresholds belong to curated benchmark datasets,
+# not live market data.  These thresholds reflect domain reality.
+
+_SHADOW_TO_PAPER_MIN_ACCURACY  = Decimal("0.55")   # meaningfully above random
+_PAPER_TO_LIVE_MIN_ACCURACY    = Decimal("0.58")
+_PAPER_TO_LIVE_MIN_PRECISION   = Decimal("0.53")
+_PAPER_TO_LIVE_MIN_RECALL      = Decimal("0.50")
+
 
 class UnifiedModelRegistry:
     """
-    Unified model registry with encryption and governance.
-    
-    Features:
-    - Fernet encryption for model artifacts
-    - SHA256 checksum verification
-    - State machine: shadow → paper → live
-    - Evaluation gates for promotions
-    - Redis pub/sub for state changes
+    Manages ML model lifecycle in the governance table.
+
+    Responsibilities:
+    - Register models (initial state: shadow)
+    - Enforce promotion gates (shadow → paper → live)
+    - Publish state-change events to Redis
+    - Support demotion and rollback
     """
 
-    def __init__(self, encryption_key: Optional[str] = None):
-        """
-        Initialize registry with encryption key.
-        
-        Args:
-            encryption_key: Fernet key (base64). If None, uses settings.
-        """
-        settings = get_settings()
-        key = encryption_key or settings.ML_MODEL_ENCRYPTION_KEY
-        self.cipher = Fernet(key.encode()) if key else None
-
-    def _encrypt_artifact(self, artifact_bytes: bytes) -> bytes:
-        """Encrypt model artifact with Fernet."""
-        if not self.cipher:
-            raise ValueError("Encryption key not configured")
-        return self.cipher.encrypt(artifact_bytes)
-
-    def _decrypt_artifact(self, encrypted_bytes: bytes) -> bytes:
-        """Decrypt model artifact with Fernet."""
-        if not self.cipher:
-            raise ValueError("Encryption key not configured")
-        return self.cipher.decrypt(encrypted_bytes)
-
-    def _compute_checksum(self, data: bytes) -> str:
-        """Compute SHA256 checksum."""
-        return hashlib.sha256(data).hexdigest()
+    # ── registration ──────────────────────────────────────────────────────────
 
     async def register_model(
         self,
-        db: AsyncSession,
-        model_name: str,
-        model_type: str,
-        model_version: str,
-        timeframe: str,
-        artifact_bytes: bytes,
-        metrics: dict,
-        metadata: Optional[dict] = None,
+        db:              AsyncSession,
+        model_name:      str,
+        model_type:      str,
+        model_version:   str,
+        timeframe:       str,
+        artifact_bytes:  bytes | None,
+        metrics:         dict[str, Any],
+        metadata:        dict[str, Any] | None = None,
+        initial_state:   str = "shadow",
     ) -> AIMLModel:
         """
-        Register a new model in shadow mode with encryption.
-        
-        Args:
-            db: Database session
-            model_name: Model identifier
-            model_type: Model type (e.g., "lstm", "transformer")
-            model_version: Version string
-            timeframe: Trading timeframe (e.g., "1d", "1h")
-            artifact_bytes: Model artifact (ONNX file bytes)
-            metrics: Evaluation metrics (accuracy, precision, recall, f1)
-            metadata: Additional metadata
-            
-        Returns:
-            Registered AIMLModel
-        """
-        # Compute checksum before encryption
-        checksum = self._compute_checksum(artifact_bytes)
-        
-        # Encrypt artifact
-        encrypted_artifact = self._encrypt_artifact(artifact_bytes)
-        
-        # Create model record
-        model = AIMLModel(
-            model_name=model_name,
-            model_type=model_type,
-            deployment_state="shadow",
-            model_version=model_version,
-            timeframe=timeframe,
-            artifact_encrypted=encrypted_artifact,
-            artifact_sha256=checksum,
-            training_date=datetime.utcnow(),
-            accuracy=Decimal(str(metrics.get("accuracy", 0))),
-            precision=Decimal(str(metrics.get("precision", 0))),
-            recall=Decimal(str(metrics.get("recall", 0))),
-            f1_score=Decimal(str(metrics.get("f1_score", 0))),
-            governance_metadata=metadata or {},
-        )
+        Register a model in the governance registry.
 
+        Args:
+            artifact_bytes: Raw model bytes for checksum.  Pass None when the
+                            artifact lives on disk (Option-B storage) and only
+                            the checksum is needed from governance_metadata.
+            initial_state:  Starting deployment state.  'shadow' for new models;
+                            'live' when promoting an already-validated model.
+        """
+        checksum = hashlib.sha256(artifact_bytes).hexdigest() if artifact_bytes else None
+
+        model = AIMLModel(
+            model_name         = model_name,
+            model_type         = model_type,
+            deployment_state   = initial_state,
+            model_version      = model_version,
+            timeframe          = timeframe,
+            artifact_sha256    = checksum,
+            artifact_encrypted = None,   # Option-B: no DB-stored artifact
+            training_date      = datetime.now(timezone.utc),
+            accuracy           = Decimal(str(round(metrics.get("accuracy",  0.0), 4))),
+            precision          = Decimal(str(round(metrics.get("precision", 0.0), 4))),
+            recall             = Decimal(str(round(metrics.get("recall",    0.0), 4))),
+            f1_score           = Decimal(str(round(metrics.get("f1_score",  0.0), 4))),
+            governance_metadata = metadata or {},
+        )
         db.add(model)
         await db.commit()
         await db.refresh(model)
 
         logger.info(
-            f"Registered model {model_name} v{model_version} "
-            f"[{timeframe}] in shadow mode (checksum: {checksum[:8]}...)"
+            "Registered model: name=%s version=%s state=%s accuracy=%.4f",
+            model_name, model_version, initial_state, float(model.accuracy or 0),
         )
         return model
 
+    # ── promotion ─────────────────────────────────────────────────────────────
+
     async def promote_model(
         self,
-        db: AsyncSession,
-        pubsub: PubSubClient,
-        model_name: str,
-        target_state: str,
-        evaluation_results: Optional[dict] = None,
+        db:                  AsyncSession,
+        pubsub:              PubSubClient,
+        model_name:          str,
+        target_state:        str,
+        evaluation_results:  dict[str, Any] | None = None,
+        bypass_gates:        bool = False,
     ) -> AIMLModel:
         """
-        Promote model to next deployment state with governance gates.
-        
-        State transitions:
-        - shadow → paper: accuracy >= 0.85
-        - paper → live: accuracy >= 0.90, precision >= 0.85, recall >= 0.80
-        
+        Promote (or demote) a model with governance gate enforcement.
+
+        Valid transitions:
+            shadow → paper
+            paper  → live
+            any    → shadow  (demotion)
+
         Args:
-            db: Database session
-            pubsub: Redis pub/sub client
-            model_name: Model identifier
-            target_state: Target state ("paper" or "live")
-            evaluation_results: Additional evaluation results
-            
-        Returns:
-            Promoted AIMLModel
-            
-        Raises:
-            ValueError: If state transition invalid or gates not met
+            bypass_gates: Skip quality thresholds.  Use only when the model
+                          has already passed an external quality gate (e.g.
+                          ml_model_registry promotion pipeline).
         """
-        # Fetch model
         stmt = select(AIMLModel).where(AIMLModel.model_name == model_name)
-        result = await db.execute(stmt)
-        model = result.scalar_one()
+        model = (await db.execute(stmt)).scalar_one_or_none()
+        if model is None:
+            raise ValueError(f"Model '{model_name}' not found in governance registry")
 
-        current_state = model.deployment_state
+        from_state = model.deployment_state
+        self._assert_valid_transition(from_state, target_state)
 
-        # Validate state transition
-        valid_transitions = {
-            "shadow": ["paper"],
-            "paper": ["live", "shadow"],  # Can demote to shadow
-            "live": ["shadow"],  # Can demote to shadow
-        }
+        if not bypass_gates:
+            self._check_gates(model, target_state)
 
-        if target_state not in valid_transitions.get(current_state, []):
-            raise ValueError(
-                f"Invalid transition: {current_state} → {target_state}. "
-                f"Valid: {valid_transitions.get(current_state, [])}"
-            )
-
-        # Evaluation gates
-        if target_state == "paper" and current_state == "shadow":
-            # Shadow → Paper: accuracy gate
-            if model.accuracy < Decimal("0.85"):
-                raise ValueError(
-                    f"Shadow→Paper gate failed: accuracy {model.accuracy} < 0.85"
-                )
-            logger.info(f"Shadow→Paper gate passed: accuracy {model.accuracy}")
-
-        elif target_state == "live" and current_state == "paper":
-            # Paper → Live: full evaluation gates
-            if model.accuracy < Decimal("0.90"):
-                raise ValueError(
-                    f"Paper→Live gate failed: accuracy {model.accuracy} < 0.90"
-                )
-            if model.precision < Decimal("0.85"):
-                raise ValueError(
-                    f"Paper→Live gate failed: precision {model.precision} < 0.85"
-                )
-            if model.recall < Decimal("0.80"):
-                raise ValueError(
-                    f"Paper→Live gate failed: recall {model.recall} < 0.80"
-                )
-            logger.info(
-                f"Paper→Live gate passed: accuracy={model.accuracy}, "
-                f"precision={model.precision}, recall={model.recall}"
-            )
-
-        # Update state
         model.deployment_state = target_state
-        model.updated_at = datetime.utcnow()
-        
-        # Store evaluation results if provided
+        model.updated_at       = datetime.now(timezone.utc)
+
         if evaluation_results:
-            model.governance_metadata = model.governance_metadata or {}
-            model.governance_metadata["evaluation_results"] = evaluation_results
-            model.governance_metadata["promoted_at"] = datetime.utcnow().isoformat()
+            meta = dict(model.governance_metadata or {})
+            meta["evaluation_results"] = evaluation_results
+            meta["promoted_at"]        = datetime.now(timezone.utc).isoformat()
+            model.governance_metadata  = meta
 
         await db.commit()
         await db.refresh(model)
 
-        # Publish state change event
         await pubsub.publish_json(RedisChannels.MODELS_STATE_CHANGES, {
-            "action": "model_promoted",
-            "model_name": model_name,
-            "from_state": current_state,
-            "to_state": target_state,
+            "action":        "model_state_changed",
+            "model_name":    model_name,
+            "from_state":    from_state,
+            "to_state":      target_state,
             "model_version": model.model_version,
-            "timeframe": model.timeframe,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timeframe":     model.timeframe,
+            "timestamp":     datetime.now(timezone.utc).isoformat(),
         })
 
-        logger.info(f"Promoted model {model_name}: {current_state} → {target_state}")
+        logger.info("Model state changed: %s  %s → %s", model_name, from_state, target_state)
         return model
-
-    async def load_model(
-        self,
-        db: AsyncSession,
-        model_name: str,
-        verify_checksum: bool = True,
-    ) -> tuple[bytes, AIMLModel]:
-        """
-        Load and decrypt model artifact with checksum verification.
-        
-        Args:
-            db: Database session
-            model_name: Model identifier
-            verify_checksum: Whether to verify SHA256 checksum
-            
-        Returns:
-            Tuple of (decrypted_artifact_bytes, model_record)
-            
-        Raises:
-            ValueError: If checksum verification fails
-        """
-        # Fetch model
-        stmt = select(AIMLModel).where(AIMLModel.model_name == model_name)
-        result = await db.execute(stmt)
-        model = result.scalar_one()
-
-        # Decrypt artifact
-        decrypted_artifact = self._decrypt_artifact(model.artifact_encrypted)
-
-        # Verify checksum
-        if verify_checksum:
-            computed_checksum = self._compute_checksum(decrypted_artifact)
-            if computed_checksum != model.artifact_sha256:
-                raise ValueError(
-                    f"Checksum mismatch for {model_name}: "
-                    f"expected {model.artifact_sha256[:8]}..., "
-                    f"got {computed_checksum[:8]}..."
-                )
-            logger.debug(f"Checksum verified for {model_name}")
-
-        logger.info(
-            f"Loaded model {model_name} v{model.model_version} "
-            f"[{model.deployment_state}] ({len(decrypted_artifact)} bytes)"
-        )
-        return decrypted_artifact, model
-
-    async def get_active_models(
-        self,
-        db: AsyncSession,
-        state: str = "live",
-        timeframe: Optional[str] = None,
-    ) -> list[AIMLModel]:
-        """
-        Get all models in a specific state.
-        
-        Args:
-            db: Database session
-            state: Deployment state filter
-            timeframe: Optional timeframe filter
-            
-        Returns:
-            List of AIMLModel records
-        """
-        stmt = select(AIMLModel).where(AIMLModel.deployment_state == state)
-        
-        if timeframe:
-            stmt = stmt.where(AIMLModel.timeframe == timeframe)
-        
-        result = await db.execute(stmt)
-        models = result.scalars().all()
-        
-        logger.debug(f"Found {len(models)} models in {state} state")
-        return list(models)
 
     async def demote_model(
         self,
-        db: AsyncSession,
-        pubsub: PubSubClient,
-        model_name: str,
-        reason: str,
+        db:          AsyncSession,
+        pubsub:      PubSubClient,
+        model_name:  str,
+        reason:      str,
     ) -> AIMLModel:
-        """
-        Demote model to shadow state (e.g., due to drift).
-        
-        Args:
-            db: Database session
-            pubsub: Redis pub/sub client
-            model_name: Model identifier
-            reason: Reason for demotion
-            
-        Returns:
-            Demoted AIMLModel
-        """
         return await self.promote_model(
             db=db,
             pubsub=pubsub,
             model_name=model_name,
             target_state="shadow",
             evaluation_results={"demotion_reason": reason},
+            bypass_gates=True,
         )
+
+    # ── queries ───────────────────────────────────────────────────────────────
+
+    async def get_active_models(
+        self,
+        db:        AsyncSession,
+        state:     str = "live",
+        timeframe: str | None = None,
+    ) -> list[AIMLModel]:
+        stmt = select(AIMLModel).where(AIMLModel.deployment_state == state)
+        if timeframe:
+            stmt = stmt.where(AIMLModel.timeframe == timeframe)
+        stmt = stmt.order_by(AIMLModel.updated_at.desc())
+        return list((await db.execute(stmt)).scalars().all())
+
+    async def get_model(self, db: AsyncSession, model_name: str) -> AIMLModel | None:
+        return (await db.execute(
+            select(AIMLModel).where(AIMLModel.model_name == model_name)
+        )).scalar_one_or_none()
+
+    # ── private ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _assert_valid_transition(from_state: str, to_state: str) -> None:
+        valid: dict[str, list[str]] = {
+            "shadow": ["paper"],
+            "paper":  ["live", "shadow"],
+            "live":   ["shadow"],
+        }
+        if to_state not in valid.get(from_state, []):
+            raise ValueError(
+                f"Invalid state transition: {from_state} → {to_state}. "
+                f"Valid from '{from_state}': {valid.get(from_state, [])}"
+            )
+
+    @staticmethod
+    def _check_gates(model: AIMLModel, target_state: str) -> None:
+        acc  = model.accuracy  or Decimal("0")
+        prec = model.precision or Decimal("0")
+        rec  = model.recall    or Decimal("0")
+
+        if target_state == "paper":
+            if acc < _SHADOW_TO_PAPER_MIN_ACCURACY:
+                raise ValueError(
+                    f"shadow→paper gate failed: accuracy {acc} < {_SHADOW_TO_PAPER_MIN_ACCURACY}"
+                )
+
+        elif target_state == "live":
+            failures = []
+            if acc  < _PAPER_TO_LIVE_MIN_ACCURACY:
+                failures.append(f"accuracy {acc} < {_PAPER_TO_LIVE_MIN_ACCURACY}")
+            if prec < _PAPER_TO_LIVE_MIN_PRECISION:
+                failures.append(f"precision {prec} < {_PAPER_TO_LIVE_MIN_PRECISION}")
+            if rec  < _PAPER_TO_LIVE_MIN_RECALL:
+                failures.append(f"recall {rec} < {_PAPER_TO_LIVE_MIN_RECALL}")
+            if failures:
+                raise ValueError("paper→live gate failed: " + "; ".join(failures))

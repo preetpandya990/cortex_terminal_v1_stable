@@ -5,6 +5,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Loader2, Search } from "lucide-react";
 
 import { upstoxAPI } from "@/lib/api";
+import { useAuth } from "@/contexts/AuthContext";
 import type { UpstoxInstrument, UpstoxInstrumentSearchResponse } from "@/types/upstox";
 
 const SEARCH_DEBOUNCE_MS = 200;
@@ -86,12 +87,14 @@ export function InstrumentSearchCombobox({
   const isPumpingLtpQueueRef = useRef(false);
   const isMountedRef = useRef(true);
 
+  const { isAuthenticated, isAuthReady } = useAuth();
+
   const debouncedQuery = useDebouncedValue(query.trim(), SEARCH_DEBOUNCE_MS);
 
   const searchQuery = useQuery({
     queryKey: ["upstox", "instruments", debouncedQuery, segment, limit],
     queryFn: () => upstoxAPI.searchInstruments(debouncedQuery, { segment, limit }),
-    enabled: debouncedQuery.length >= 1,
+    enabled: isAuthReady && isAuthenticated && debouncedQuery.length >= 1,
     staleTime: 30_000,
     gcTime: 3 * 60_000,
   });
@@ -219,14 +222,14 @@ export function InstrumentSearchCombobox({
   );
 
   useEffect(() => {
-    if (!isDropdownOpen || !showQuickLtp || results.length === 0) {
+    if (!isDropdownOpen || !showQuickLtp || results.length === 0 || !isAuthenticated) {
       return;
     }
 
     results
       .slice(0, QUICK_LTP_MAX_RESULTS)
       .forEach((instrument) => enqueueLtpLookup(instrument.instrument_key));
-  }, [enqueueLtpLookup, isDropdownOpen, results, showQuickLtp]);
+  }, [enqueueLtpLookup, isDropdownOpen, results, showQuickLtp, isAuthenticated]);
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -244,9 +247,11 @@ export function InstrumentSearchCombobox({
       setIsDropdownOpen(false);
       return;
     }
-
+    // Only update the highlighted index — never touch isDropdownOpen here.
+    // Opening is driven exclusively by user input events (onChange / onFocus /
+    // onKeyDown) so programmatic query changes (e.g. after selection) cannot
+    // accidentally re-open the dropdown.
     if (searchQuery.isSuccess) {
-      setIsDropdownOpen(true);
       setHighlightedIndex(results.length ? 0 : -1);
     }
   }, [debouncedQuery.length, results.length, searchQuery.isSuccess]);

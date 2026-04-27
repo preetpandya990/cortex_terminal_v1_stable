@@ -30,16 +30,18 @@ async def search_instruments_db(
     Opens its own session (called from router without session param).
     Applies the filter server-side — never fetches the full table.
     """
+    # ilike is case-insensitive; pattern is already uppercased which matches the
+    # stored symbols. Name comparison is also case-insensitive via ilike.
     pattern = f"%{q.upper()}%"
     async with AsyncSessionFactory() as session:
         try:
             stmt = (
                 select(InstrumentMaster)
                 .where(
-                    InstrumentMaster.symbol.ilike(pattern)
+                    InstrumentMaster.trading_symbol.ilike(pattern)
                     | InstrumentMaster.name.ilike(pattern)
                 )
-                .order_by(InstrumentMaster.symbol)
+                .order_by(InstrumentMaster.trading_symbol)
                 .limit(limit)
             )
             rows = (await session.execute(stmt)).scalars().all()
@@ -49,10 +51,10 @@ async def search_instruments_db(
     return [
         InstrumentSearchResult(
             instrument_key=r.instrument_key,
-            trading_symbol=r.symbol,
+            trading_symbol=r.trading_symbol,
             name=r.name or "",
-            exchange=r.exchange_segment,
-            instrument_type="EQ",  # Default since not in DB
+            exchange=r.exchange,
+            instrument_type=r.instrument_type or "EQ",
         )
         for r in rows
     ]

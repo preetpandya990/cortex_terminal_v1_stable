@@ -317,6 +317,35 @@ export function includesTodayOrYesterday(fromDate: string, toDate: string): bool
   return fromDate <= today && toDate >= yesterday;
 }
 
+/**
+ * Calculate adjusted date range when switching timeframes.
+ * Preserves the center date and adjusts range based on new timeframe's default.
+ * 
+ * @param centerDate - The date to keep centered (typically current visible center)
+ * @param newRangeDays - Number of days for the new timeframe
+ * @returns Adjusted from/to dates
+ */
+export function adjustDateRangeForTimeframe(
+  centerDate: string,
+  newRangeDays: number
+): { fromDate: string; toDate: string } {
+  const today = getISTTodayYMD();
+  const halfRange = Math.floor(newRangeDays / 2);
+  
+  // Calculate ideal range centered on centerDate
+  let fromDate = addDays(centerDate, -halfRange);
+  let toDate = addDays(centerDate, halfRange);
+  
+  // Clamp to not exceed today
+  if (toDate > today) {
+    const overflow = diffDaysInclusive(today, toDate) - 1;
+    toDate = today;
+    fromDate = addDays(fromDate, -overflow);
+  }
+  
+  return { fromDate, toDate };
+}
+
 export function shouldUseIntradaySource(
   rangeDays: number,
   unit: CandleUnit,
@@ -357,4 +386,50 @@ export function resolveCandleSourceMode(
     return "hybrid";
   }
   return "historical";
+}
+
+export type MarketSession = "pre-market" | "open" | "post-market";
+
+/** Returns the current NSE market session based on IST wall-clock time. */
+export function getISTMarketSession(): MarketSession {
+  const { hour, minute } = getISTNowParts();
+  if (hour < 9 || (hour === 9 && minute < 15)) return "pre-market";
+  if (hour < 15 || (hour === 15 && minute <= 30)) return "open";
+  return "post-market";
+}
+
+/**
+ * Returns a human-readable explanation for why no candle data is available.
+ * Accounts for pre-market, live-market, and post-market windows.
+ */
+export function getNoDataMessage(
+  tradingSymbol: string,
+  fromDate: string,
+  toDate: string
+): string {
+  const session = getISTMarketSession();
+  const dateRange = fromDate === toDate ? fromDate : `${fromDate} to ${toDate}`;
+
+  if (session === "pre-market") {
+    return (
+      "Market hasn't opened yet (opens at 9:15 AM IST). Historical data for today will be " +
+      "available after market close. Previous trading day's data may be shown if available."
+    );
+  }
+  if (session === "open") {
+    return (
+      "Market is currently open. If you're seeing this message, there may be a data " +
+      "ingestion delay or this instrument may not be actively trading today."
+    );
+  }
+  if (session === "post-market") {
+    return (
+      "Market is closed. Today's data should be available shortly. If this persists, " +
+      "the instrument may not have traded today or there's a data ingestion delay."
+    );
+  }
+  return (
+    `No market data found for ${tradingSymbol} on ${dateRange}. ` +
+    "This could be a market holiday or data ingestion delay."
+  );
 }

@@ -3,7 +3,7 @@
 /**
  * Cortex Terminal V1 - Application Providers
  *
- * Client-side providers for React Query, Authentication, and other context providers.
+ * Client-side providers for React Query, Authentication, Toast Notifications, and Error Boundaries.
  * This component wraps the application to provide global state management.
  */
 
@@ -11,16 +11,23 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { useState, useEffect } from 'react';
 import { HealthCheckWrapper } from '@/components/HealthCheckWrapper';
 import { AuthProvider, useAuth } from '@/contexts/AuthContext';
+import { ChartPreferencesProvider } from '@/contexts/ChartPreferencesContext';
+import { ToastProvider } from '@/components/ui/toast';
+import { ErrorBoundary } from '@/components/ui/error-boundary';
 import { setAccessToken } from '@/lib/api-client';
+import { setAuthToken } from '@/lib/api';
 
 /**
- * Sync auth token with API client
+ * Sync auth token with both API clients.
+ * api-client.ts (BFF proxy) and api.ts (direct backend) are separate axios
+ * instances — both must receive the token whenever auth state changes.
  */
 function AuthSync({ children }: { children: React.ReactNode }) {
   const { accessToken } = useAuth();
 
   useEffect(() => {
-    setAccessToken(accessToken);
+    setAccessToken(accessToken);   // api-client.ts instance
+    setAuthToken(accessToken);     // api.ts instance (used by upstoxAPI, mlAPI, etc.)
   }, [accessToken]);
 
   return <>{children}</>;
@@ -44,12 +51,24 @@ export function Providers({ children }: { children: React.ReactNode }) {
   );
 
   return (
-    <QueryClientProvider client={queryClient}>
-      <AuthProvider>
-        <AuthSync>
-          <HealthCheckWrapper>{children}</HealthCheckWrapper>
-        </AuthSync>
-      </AuthProvider>
-    </QueryClientProvider>
+    <ErrorBoundary
+      onError={(error, errorInfo) => {
+        // Log to monitoring service (Sentry, DataDog, etc.)
+        console.error('Application Error:', error, errorInfo);
+        // TODO: Send to error monitoring service
+      }}
+    >
+      <QueryClientProvider client={queryClient}>
+        <AuthProvider>
+          <ChartPreferencesProvider>
+            <ToastProvider>
+              <AuthSync>
+                <HealthCheckWrapper>{children}</HealthCheckWrapper>
+              </AuthSync>
+            </ToastProvider>
+          </ChartPreferencesProvider>
+        </AuthProvider>
+      </QueryClientProvider>
+    </ErrorBoundary>
   );
 }

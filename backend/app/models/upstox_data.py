@@ -135,17 +135,22 @@ class InstrumentMaster(Base):
 
     __tablename__ = "instrument_master"
     __table_args__ = (
-        Index("idx_instrument_symbol", "symbol"),
-        Index("idx_instrument_exchange", "exchange_segment"),
+        # Indexes exist in DB under these names; defined here for ORM awareness only.
+        Index("idx_instrument_symbol", "trading_symbol"),
+        Index("idx_instrument_exchange", "exchange"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     instrument_key: Mapped[str] = mapped_column(String(200), unique=True, nullable=False, index=True)
-    symbol: Mapped[str] = mapped_column(String(50), nullable=False)
+    trading_symbol: Mapped[str] = mapped_column(String(50), nullable=False)
     name: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    exchange_segment: Mapped[str] = mapped_column(String(20), nullable=False)
-    isin: Mapped[str | None] = mapped_column(String(12), nullable=True)
-    source: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    exchange: Mapped[str] = mapped_column(String(20), nullable=False)
+    instrument_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

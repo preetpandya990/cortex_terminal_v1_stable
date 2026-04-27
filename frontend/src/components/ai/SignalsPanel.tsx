@@ -17,7 +17,7 @@ import {
 } from "@/components/ui/table";
 import { useSignals } from "@/hooks/useSignals";
 import { SignalDetailModal } from "@/components/ai/SignalDetailModal";
-import { SignalType, TimeHorizon, type SignalFilters } from "@/types/signals";
+import { SignalType, TimeHorizon, type SignalFilters, type TradingSignal } from "@/types/signals";
 import {
   TrendingUp,
   TrendingDown,
@@ -32,14 +32,19 @@ interface SignalsPanelProps {
   className?: string;
 }
 
+function safeFormatDate(value: string | null | undefined, fmt: string): string {
+  if (!value) return "—";
+  const d = new Date(value);
+  if (isNaN(d.getTime())) return "—";
+  return format(d, fmt);
+}
+
 export function SignalsPanel({ className }: SignalsPanelProps) {
   const [filters, setFilters] = React.useState<SignalFilters>({
     page: 1,
     limit: 10,
   });
-  const [selectedSignalId, setSelectedSignalId] = React.useState<string | null>(
-    null
-  );
+  const [selectedSignal, setSelectedSignal] = React.useState<TradingSignal | null>(null);
   const [showFilters, setShowFilters] = React.useState(false);
 
   const { data, isLoading, refetch, isRefetching } = useSignals(filters);
@@ -260,13 +265,13 @@ export function SignalsPanel({ className }: SignalsPanelProps) {
                           {signal.reasoning}
                         </TableCell>
                         <TableCell className="text-muted-foreground text-sm">
-                          {format(new Date(signal.generated_at), "MMM d, HH:mm")}
+                          {safeFormatDate(signal.generated_at, "MMM d, HH:mm")}
                         </TableCell>
                         <TableCell className="text-right">
                           <Button
                             variant="ghost"
                             size="sm"
-                            onClick={() => setSelectedSignalId(signal.signal_id)}
+                            onClick={() => setSelectedSignal(signal)}
                           >
                             View Details
                           </Button>
@@ -323,9 +328,9 @@ export function SignalsPanel({ className }: SignalsPanelProps) {
 
       {/* Signal Detail Modal */}
       <SignalDetailModal
-        signalId={selectedSignalId}
-        open={!!selectedSignalId}
-        onOpenChange={(open) => !open && setSelectedSignalId(null)}
+        signal={selectedSignal}
+        open={!!selectedSignal}
+        onOpenChange={(open) => !open && setSelectedSignal(null)}
       />
     </>
   );

@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 class LivePriceResponse(BaseModel):
     instrument_key: str
-    last_price: float
+    last_price: float | None = None  # None when instrument has no active quote
     timestamp: str | None = None
 
 

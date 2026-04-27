@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Literal
-from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -22,6 +21,8 @@ class ScanSignal(BaseModel):
 
 class ScanResult(BaseModel):
     instrument_key: str
+    trading_symbol: str | None = None
+    name: str | None = None
     signal: Literal["buy", "sell", "neutral"]
     score: float
     signals: list[ScanSignal] = Field(default_factory=list)
@@ -53,10 +54,14 @@ class ScannerContextResponse(BaseModel):
     market_close_utc: datetime | None
     default_scan_type: Literal["market_open", "market_close", "intraday"]
     selectable_market_close_dates: list[str]
+    closed_reason: str | None = None
 
 
 class StockAnalysis(BaseModel):
     symbol: str
+    trading_symbol: str | None = None
+    name: str | None = None
+    sector: str | None = None
     current_price: float
     previous_close: float
     price_change: float
@@ -64,27 +69,33 @@ class StockAnalysis(BaseModel):
     volume: float
     avg_volume: float
     volume_ratio: float
-    above_ema200: bool | None = None
     rsi: float | None = None
     timestamp: datetime
+    warnings: list[str] = Field(default_factory=list)
 
 
 class ScanResultsData(BaseModel):
     top_gainers: list[StockAnalysis]
     top_losers: list[StockAnalysis]
     volume_spikes: list[StockAnalysis]
-    breakouts: list[StockAnalysis]
     total_scanned: int
     errors: list[dict]
     metadata: dict
+
+
+class RunScanRequest(BaseModel):
+    scan_type: Literal["market_open", "market_close", "intraday"] = "market_close"
 
 
 class LatestScanResponse(BaseModel):
     scan_id: int
     timestamp: datetime
     scan_type: Literal["market_open", "market_close", "intraday"]
+    timeframe: str
     total_scanned: int
     processing_time_ms: int
+    stale_instrument_count: int = 0
+    live_prices_available: bool = True
     results: ScanResultsData
 
 
@@ -95,4 +106,6 @@ class RunScanResponse(BaseModel):
     total_scanned: int
     error_count: int
     primary_error_code: str | None
+    stale_instrument_count: int = 0
+    live_prices_available: bool = True
     results: ScanResultsData

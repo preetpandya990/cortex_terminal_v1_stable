@@ -32,10 +32,7 @@ export function getAccessToken(): string | null {
  * Refresh access token
  */
 async function refreshAccessToken(): Promise<string | null> {
-  // If refresh is already in progress, wait for it
-  if (tokenRefreshPromise) {
-    return tokenRefreshPromise;
-  }
+  if (tokenRefreshPromise) return tokenRefreshPromise;
 
   tokenRefreshPromise = (async () => {
     try {
@@ -45,17 +42,14 @@ async function refreshAccessToken(): Promise<string | null> {
       });
 
       if (!response.ok) {
-        console.error('[API Client] Token refresh failed:', response.status);
         accessToken = null;
         return null;
       }
 
       const data = await response.json();
       accessToken = data.access_token;
-      console.log('[API Client] Token refreshed successfully');
       return accessToken;
-    } catch (error) {
-      console.error('[API Client] Token refresh error:', error);
+    } catch {
       accessToken = null;
       return null;
     } finally {
@@ -77,77 +71,41 @@ export const api: AxiosInstance = axios.create({
   withCredentials: true, // Include cookies
 });
 
-/**
- * Request interceptor - inject auth token
- */
+// Inject the bearer token on every outgoing request.
 api.interceptors.request.use(
   (config: InternalAxiosRequestConfig) => {
-    // Inject access token if available
     if (accessToken && !config.headers.Authorization) {
       config.headers.Authorization = `Bearer ${accessToken}`;
     }
-
-    // Log request
-    console.log('[API Request]', {
-      method: config.method?.toUpperCase(),
-      url: config.url,
-      params: config.params,
-    });
-
     return config;
   },
-  (error) => {
-    console.error('[API Request Error]', error);
-    return Promise.reject(error);
-  }
+  (error) => Promise.reject(error),
 );
 
-/**
- * Response interceptor - handle 401 and retry with refresh
- */
+// Handle 401s with silent token refresh; let all other errors pass through
+// to callers without logging (api.ts already handles error logging).
 api.interceptors.response.use(
-  (response) => {
-    // Log successful response
-    console.log('[API Response]', {
-      method: response.config.method?.toUpperCase(),
-      url: response.config.url,
-      status: response.status,
-    });
-    return response;
-  },
+  (response) => response,
   async (error: AxiosError) => {
     const originalRequest = error.config as InternalAxiosRequestConfig & { _retry?: boolean };
 
-    // Log error
-    console.error('[API Error]', {
-      method: originalRequest?.method?.toUpperCase(),
-      url: originalRequest?.url,
-      status: error.response?.status,
-      message: error.message,
-    });
-
-    // Handle 401 Unauthorized - try to refresh token
     if (error.response?.status === 401 && originalRequest && !originalRequest._retry) {
       originalRequest._retry = true;
-
-      console.log('[API Client] 401 detected, attempting token refresh...');
 
       const newToken = await refreshAccessToken();
 
       if (newToken) {
-        // Retry original request with new token
         originalRequest.headers.Authorization = `Bearer ${newToken}`;
         return api(originalRequest);
-      } else {
-        // Refresh failed - redirect to login or emit event
-        console.error('[API Client] Token refresh failed, user needs to re-authenticate');
-        // Emit custom event for auth failure
-        window.dispatchEvent(new CustomEvent('auth:required'));
       }
+
+      // Refresh failed — notify the app so auth state can be cleared.
+      console.error('[API Client] Session expired — re-authentication required');
+      window.dispatchEvent(new CustomEvent('auth:required'));
     }
 
     return Promise.reject(error);
-  }
+  },
 );
 
 /**

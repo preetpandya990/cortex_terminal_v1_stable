@@ -27,6 +27,7 @@ class User(Base):
 
     # Relationships
     refresh_tokens: Mapped[list["RefreshToken"]] = relationship("RefreshToken", back_populates="user", cascade="all, delete-orphan")
+    watchlist_items: Mapped[list["WatchlistItem"]] = relationship("WatchlistItem", back_populates="user", cascade="all, delete-orphan", order_by="WatchlistItem.position")
 
 
 class RefreshToken(Base):

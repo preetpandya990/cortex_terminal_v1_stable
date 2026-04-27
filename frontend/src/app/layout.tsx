@@ -42,14 +42,14 @@ export default function RootLayout({
                   <Link href="/" className="transition-colors hover:text-slate-900">
                     Dashboard
                   </Link>
-                  <Link href="/cortex-ai" className="transition-colors hover:text-slate-900">
-                    Cortex AI
-                  </Link>
                   <Link href="/hawk-eye-radar" className="transition-colors hover:text-slate-900">
                     Hawk-Eye-Radar
                   </Link>
                   <Link href="/scanner" className="transition-colors hover:text-slate-900">
                     Scanner
+                  </Link>
+                  <Link href="/cortex-ai" className="transition-colors hover:text-slate-900">
+                    Cortex AI
                   </Link>
                 </nav>
                 <div className="flex items-center gap-4">

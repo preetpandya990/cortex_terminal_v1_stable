@@ -94,11 +94,10 @@ async def sync_instrument_master(
         stmt = pg_insert(InstrumentMaster).values(batch).on_conflict_do_update(
             index_elements=["instrument_key"],
             set_={
+                "trading_symbol": pg_insert(InstrumentMaster).excluded.trading_symbol,
                 "name": pg_insert(InstrumentMaster).excluded.name,
-                "symbol": pg_insert(InstrumentMaster).excluded.symbol,
-                "exchange_segment": pg_insert(InstrumentMaster).excluded.exchange_segment,
-                "isin": pg_insert(InstrumentMaster).excluded.isin,
-                "source": pg_insert(InstrumentMaster).excluded.source,
+                "exchange": pg_insert(InstrumentMaster).excluded.exchange,
+                "instrument_type": pg_insert(InstrumentMaster).excluded.instrument_type,
                 "updated_at": pg_insert(InstrumentMaster).excluded.updated_at,
             },
         )

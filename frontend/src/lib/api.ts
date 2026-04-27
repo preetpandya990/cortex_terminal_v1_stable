@@ -1,5 +1,4 @@
 import axios, { AxiosError, AxiosResponse } from 'axios';
-import { RunScanResponse, ScanResults, ScannerContext, ScanType } from '@/types/market';
 import type {
   CachedPrediction,
   MLAlert,
@@ -10,6 +9,31 @@ import type {
   PredictResponse,
 } from '@/types/ml';
 import type { UpstoxCandlesResponse } from '@/types/upstox';
+import type { SuggestionsListResponse, SuggestionFilters } from '@/types/trade_suggestions';
+
+// Watchlist types
+export interface WatchlistItem {
+  id: number;
+  instrument_key: string;
+  trading_symbol: string;
+  name: string | null;
+  exchange: string | null;
+  position: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WatchlistItemCreate {
+  instrument_key: string;
+  trading_symbol: string;
+  name?: string | null;
+  exchange?: string | null;
+}
+
+export interface WatchlistReorderRequest {
+  item_id: number;
+  new_position: number;
+}
 
 export const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
 export const WS_BASE_URL = API_BASE_URL.replace(/^http/i, 'ws');
@@ -30,107 +54,52 @@ export function setAuthToken(token: string | null) {
   }
 }
 
-// Generate unique request ID for tracking
+// Attach a per-request ID and timing metadata for tracing.
 function generateRequestId(): string {
   return `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 }
 
-// Request interceptor for logging
 api.interceptors.request.use(
   (config) => {
     const requestId = generateRequestId();
     config.headers['X-Request-ID'] = requestId;
-
-    // Log outgoing request (excluding sensitive data)
-    const logData = {
-      requestId,
-      method: config.method?.toUpperCase(),
-      url: config.url,
-      baseURL: config.baseURL,
-      fullURL: `${config.baseURL}${config.url}`,
-      params: config.params,
-      timestamp: new Date().toISOString(),
-    };
-
-    console.log('[API Request]', logData);
-
-    // Store request start time for response time calculation
     (config as any).metadata = { startTime: Date.now(), requestId };
-
     return config;
   },
-  (error) => {
-    console.error('[API Request Error]', {
-      message: error.message,
-      timestamp: new Date().toISOString(),
-    });
-    return Promise.reject(error);
-  }
+  (error) => Promise.reject(error),
 );
 
-// Response interceptor for logging
 api.interceptors.response.use(
-  (response) => {
-    const metadata = (response.config as any).metadata;
-    const responseTime = metadata ? Date.now() - metadata.startTime : 0;
+  // Success — pass through without logging (use network tab for that).
+  (response) => response,
 
-    // Log successful response
-    const logData = {
-      requestId: metadata?.requestId,
-      method: response.config.method?.toUpperCase(),
-      url: response.config.url,
-      status: response.status,
-      statusText: response.statusText,
-      responseTime: `${responseTime}ms`,
-      timestamp: new Date().toISOString(),
-    };
-
-    console.log('[API Response]', logData);
-
-    return response;
-  },
+  // Error — suppress expected conditions; log only genuinely unexpected ones.
   (error) => {
-    const metadata = (error.config as any)?.metadata;
-    const responseTime = metadata ? Date.now() - metadata.startTime : 0;
+    const status = error.response?.status as number | undefined;
 
-    // Determine error type
-    let errorType = 'Unknown Error';
-    let errorDetails: any = {
-      requestId: metadata?.requestId,
-      method: error.config?.method?.toUpperCase(),
-      url: error.config?.url,
-      responseTime: `${responseTime}ms`,
-      timestamp: new Date().toISOString(),
-    };
+    const isSuppressed =
+      // Request aborted: component unmounted or page navigated away.
+      error.code === 'ERR_CANCELED' ||
+      error.message === 'canceled' ||
+      // Backend unreachable: React Query handles retry; callers render error state.
+      error.code === 'ERR_NETWORK' ||
+      error.message === 'Network Error' ||
+      // Auth errors: handled by the token-refresh flow in AuthContext.
+      status === 401;
 
-    if (error.code === 'ERR_NETWORK' || error.message === 'Network Error') {
-      errorType = 'Network Error';
-      errorDetails.message = 'Cannot connect to server. Please check if the backend is running.';
-    } else if (error.response) {
-      // Server responded with error status
-      errorType = 'HTTP Error';
-      errorDetails.status = error.response.status;
-      errorDetails.statusText = error.response.statusText;
-      errorDetails.data = error.response.data;
-    } else if (error.request) {
-      // Request was made but no response received (could be CORS)
-      errorType = 'No Response';
-      errorDetails.message = 'Request sent but no response received. This could be a CORS issue.';
-    }
-
-    // Only log if there's meaningful error info
-    if (errorDetails.status || errorDetails.message) {
-      // Filter out undefined values for cleaner logs
-      const cleanDetails = Object.fromEntries(
-        Object.entries(errorDetails).filter(([_, v]) => v !== undefined)
-      );
-      if (Object.keys(cleanDetails).length > 0) {
-        console.error(`[API ${errorType}]`, cleanDetails);
-      }
+    if (!isSuppressed) {
+      const payload = error.response?.data as { detail?: string; message?: string } | undefined;
+      const detail = payload?.detail ?? payload?.message;
+      console.error('[API Error]', {
+        method: error.config?.method?.toUpperCase(),
+        url: error.config?.url,
+        status,
+        ...(detail ? { detail } : { message: error.message }),
+      });
     }
 
     return Promise.reject(error);
-  }
+  },
 );
 
 interface APIErrorPayload {
@@ -148,6 +117,34 @@ export class APIRequestError extends Error {
     this.statusCode = options?.statusCode;
     this.errorCode = options?.errorCode;
   }
+}
+
+/**
+ * Returns true when `error` represents a transient network failure (backend
+ * unreachable, request aborted, or connection reset).
+ *
+ * Use this in catch blocks to avoid polluting the console with expected errors
+ * during development or when the backend is temporarily down.
+ * React Query surfaces these in component error state; no logging needed.
+ */
+export function isNetworkError(error: unknown): boolean {
+  // APIRequestError thrown by requestData()
+  if (error instanceof APIRequestError) {
+    return (
+      error.errorCode === 'ERR_NETWORK' ||
+      error.errorCode === 'ERR_CANCELED' ||
+      error.message === 'Network Error' ||
+      error.message === 'canceled'
+    );
+  }
+  // Raw AxiosError from direct api.get() / api.post() calls
+  const e = error as { code?: string; message?: string } | null;
+  return (
+    e?.code === 'ERR_NETWORK' ||
+    e?.code === 'ERR_CANCELED' ||
+    e?.message === 'Network Error' ||
+    e?.message === 'canceled'
+  );
 }
 
 function toAPIError(error: unknown, fallbackMessage: string): Error {
@@ -217,42 +214,6 @@ export const marketDataAPI = {
       signal,
     });
     return response.data?.data ?? response.data;
-  },
-};
-
-// Scanner API
-export const scannerAPI = {
-  getLatestScan: async (): Promise<ScanResults | null> => {
-    return requestData(
-      api.get<ScanResults | null>('/scanner/latest'),
-      'Failed to fetch latest scanner results'
-    );
-  },
-
-  getContext: async (): Promise<ScannerContext> => {
-    return requestData(
-      api.get<ScannerContext>('/scanner/context'),
-      'Failed to fetch scanner context'
-    );
-  },
-
-  runScan: async (
-    scanType: ScanType = 'market_close',
-    tradeDate?: string
-  ): Promise<RunScanResponse> => {
-    const params: Record<string, string> = {
-      scan_type: scanType,
-      include_ml: 'true'
-    };
-    if (tradeDate) {
-      params.trade_date = tradeDate;
-    }
-    return requestData(
-      api.post<RunScanResponse>('/scanner/run', null, {
-        params
-      }),
-      'Failed to run scanner'
-    );
   },
 };
 
@@ -547,6 +508,16 @@ export const safetyAPI = {
 };
 
 // AI Ingestion API (RSS Sources)
+
+// Trade Suggestions API
+export const tradeSuggestionsAPI = {
+  getSuggestions: async (filters?: SuggestionFilters): Promise<SuggestionsListResponse> => {
+    return requestData(
+      api.get('/trade-suggestions', { params: filters }),
+      'Failed to fetch trade suggestions'
+    );
+  },
+};
 export const ingestionAPI = {
   getSources: async () => {
     return requestData(
@@ -599,5 +570,43 @@ export const caiAPI = {
   getVerdictAnalysis: async (symbol: string) => {
     const response = await api.get(`/analysis/verdict/${symbol}`);
     return response.data;
+  },
+};
+
+// Watchlist API
+export const watchlistAPI = {
+  getWatchlist: async (): Promise<WatchlistItem[]> => {
+    return requestData(
+      api.get<WatchlistItem[]>('/watchlist'),
+      'Failed to fetch watchlist'
+    );
+  },
+
+  addToWatchlist: async (item: WatchlistItemCreate): Promise<WatchlistItem> => {
+    return requestData(
+      api.post<WatchlistItem>('/watchlist', item),
+      'Failed to add to watchlist'
+    );
+  },
+
+  removeFromWatchlist: async (itemId: number): Promise<void> => {
+    return requestData(
+      api.delete(`/watchlist/${itemId}`),
+      'Failed to remove from watchlist'
+    );
+  },
+
+  reorderWatchlist: async (reorder: WatchlistReorderRequest): Promise<void> => {
+    return requestData(
+      api.put('/watchlist/reorder', reorder),
+      'Failed to reorder watchlist'
+    );
+  },
+
+  checkInWatchlist: async (instrumentKey: string): Promise<{ in_watchlist: boolean; item_id: number | null }> => {
+    return requestData(
+      api.get(`/watchlist/check/${encodeURIComponent(instrumentKey)}`),
+      'Failed to check watchlist status'
+    );
   },
 };

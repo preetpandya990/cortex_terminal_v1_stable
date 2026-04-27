@@ -1,13 +1,21 @@
 /**
  * CORTEX AI Microservice - WebSocket Hook
- * 
+ *
  * Provides real-time updates from CAI via WebSocket connection to Redis pub/sub.
  * Implements automatic reconnection with exponential backoff.
- * 
+ *
+ * Auth contract:
+ * - Auto-connect is gated: the socket only opens once isAuthReady && isAuthenticated.
+ * - An in-band auth handshake ({ type: 'auth', token }) is sent immediately on open
+ *   so the backend can validate the session without embedding the token in the URL
+ *   (URL tokens are visible in server logs and browser history).
+ * - On logout the socket is intentionally closed and reconnect is suppressed.
+ *
  * Requirements: 21.1, 21.2, 21.3, 21.4
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { useAuth } from '@/contexts/AuthContext';
 
 export type ConnectionStatus = 'connected' | 'connecting' | 'disconnected' | 'reconnecting';
 
@@ -34,12 +42,6 @@ export interface UseCAIWebSocketReturn {
   sendPing: () => void;
 }
 
-/**
- * Custom hook for CAI WebSocket connection with automatic reconnection.
- * 
- * @param options Configuration options
- * @returns WebSocket connection state and controls
- */
 export function useCAIWebSocket(options: UseCAIWebSocketOptions = {}): UseCAIWebSocketReturn {
   const {
     onMessage,
@@ -52,29 +54,36 @@ export function useCAIWebSocket(options: UseCAIWebSocketOptions = {}): UseCAIWeb
     baseReconnectDelay = 1000,
   } = options;
 
+  const { isAuthenticated, isAuthReady, accessToken } = useAuth();
+
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const intentionalDisconnectRef = useRef(false);
 
-  /**
-   * Calculate exponential backoff delay for reconnection.
-   * Implements exponential backoff: delay = baseDelay * 2^attempt (capped at 30s)
-   */
-  const getReconnectDelay = useCallback((attempt: number): number => {
-    const delay = baseReconnectDelay * Math.pow(2, attempt);
-    return Math.min(delay, 30000); // Cap at 30 seconds
-  }, [baseReconnectDelay]);
+  // Keep the latest token in a ref so the connect callback always sends the
+  // current value without needing it as a dep (which would cause reconnects on refresh).
+  const accessTokenRef = useRef(accessToken);
+  useEffect(() => {
+    accessTokenRef.current = accessToken;
+  }, [accessToken]);
 
-  /**
-   * Handle incoming WebSocket messages and route to appropriate handlers.
-   */
+  // Keep callbacks in a ref so they can be updated without recreating connect/disconnect.
+  const callbacksRef = useRef({ onMessage, onSignal, onRegime, onEvent, onModelAlert });
+  useEffect(() => {
+    callbacksRef.current = { onMessage, onSignal, onRegime, onEvent, onModelAlert };
+  }, [onMessage, onSignal, onRegime, onEvent, onModelAlert]);
+
+  const getReconnectDelay = useCallback(
+    (attempt: number): number => Math.min(baseReconnectDelay * Math.pow(2, attempt), 30_000),
+    [baseReconnectDelay]
+  );
+
   const handleMessage = useCallback((event: MessageEvent) => {
     try {
       const message = JSON.parse(event.data);
 
-      // Handle connection confirmation
       if (message.type === 'connected') {
         console.log('[CAI WebSocket] Connected to channels:', message.channels);
         setStatus('connected');
@@ -82,41 +91,32 @@ export function useCAIWebSocket(options: UseCAIWebSocketOptions = {}): UseCAIWeb
         return;
       }
 
-      // Handle heartbeat
-      if (message.type === 'heartbeat') {
-        return;
-      }
+      if (message.type === 'heartbeat') return;
 
-      // Handle channel messages
       if (message.channel && message.data) {
         const caiMessage: CAIMessage = message;
+        callbacksRef.current.onMessage?.(caiMessage);
 
-        // Call generic message handler
-        onMessage?.(caiMessage);
-
-        // Route to specific handlers based on channel
         if (message.channel === 'cai:signals:all') {
-          onSignal?.(message.data);
+          callbacksRef.current.onSignal?.(message.data);
         } else if (message.channel === 'cai:regime:all') {
-          onRegime?.(message.data);
+          callbacksRef.current.onRegime?.(message.data);
         } else if (message.channel === 'cai:events:high_impact') {
-          onEvent?.(message.data);
+          callbacksRef.current.onEvent?.(message.data);
         } else if (message.channel === 'cai:models:drift_alerts') {
-          onModelAlert?.(message.data);
+          callbacksRef.current.onModelAlert?.(message.data);
         }
       }
     } catch (error) {
       console.error('[CAI WebSocket] Failed to parse message:', error);
     }
-  }, [onMessage, onSignal, onRegime, onEvent, onModelAlert]);
+  }, []);
 
-  /**
-   * Attempt to reconnect with exponential backoff.
-   */
+  // Forward-declared via ref so scheduleReconnect can call connect before it is defined.
+  const connectRef = useRef<() => void>(() => {});
+
   const scheduleReconnect = useCallback(() => {
-    if (intentionalDisconnectRef.current) {
-      return;
-    }
+    if (intentionalDisconnectRef.current) return;
 
     if (reconnectAttemptsRef.current >= maxReconnectAttempts) {
       console.error('[CAI WebSocket] Max reconnection attempts reached');
@@ -125,27 +125,21 @@ export function useCAIWebSocket(options: UseCAIWebSocketOptions = {}): UseCAIWeb
     }
 
     const delay = getReconnectDelay(reconnectAttemptsRef.current);
-    console.log(`[CAI WebSocket] Reconnecting in ${delay}ms (attempt ${reconnectAttemptsRef.current + 1}/${maxReconnectAttempts})`);
-    
+    console.log(
+      `[CAI WebSocket] Reconnecting in ${delay}ms (attempt ${reconnectAttemptsRef.current + 1}/${maxReconnectAttempts})`
+    );
+
     setStatus('reconnecting');
     reconnectAttemptsRef.current += 1;
-
-    reconnectTimeoutRef.current = setTimeout(() => {
-      connect();
-    }, delay);
+    reconnectTimeoutRef.current = setTimeout(() => connectRef.current(), delay);
   }, [maxReconnectAttempts, getReconnectDelay]);
 
-  /**
-   * Connect to CAI WebSocket endpoint.
-   */
   const connect = useCallback(() => {
-    // Clean up existing connection
     if (wsRef.current) {
       wsRef.current.close();
       wsRef.current = null;
     }
 
-    // Clear any pending reconnection
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current);
       reconnectTimeoutRef.current = null;
@@ -155,9 +149,9 @@ export function useCAIWebSocket(options: UseCAIWebSocketOptions = {}): UseCAIWeb
     setStatus('connecting');
 
     try {
-      // Determine WebSocket URL based on current location
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const host = process.env.NEXT_PUBLIC_API_URL?.replace(/^https?:\/\//, '') || window.location.host;
+      const host =
+        process.env.NEXT_PUBLIC_API_URL?.replace(/^https?:\/\//, '') || window.location.host;
       const wsUrl = `${protocol}//${host}/api/v1/cai/stream`;
 
       console.log('[CAI WebSocket] Connecting to:', wsUrl);
@@ -165,6 +159,11 @@ export function useCAIWebSocket(options: UseCAIWebSocketOptions = {}): UseCAIWeb
 
       ws.onopen = () => {
         console.log('[CAI WebSocket] Connection opened');
+        // In-band auth handshake — credentials never appear in URLs or server logs.
+        const token = accessTokenRef.current;
+        if (token) {
+          ws.send(JSON.stringify({ type: 'auth', token }));
+        }
         setStatus('connected');
         reconnectAttemptsRef.current = 0;
       };
@@ -194,9 +193,11 @@ export function useCAIWebSocket(options: UseCAIWebSocketOptions = {}): UseCAIWeb
     }
   }, [handleMessage, scheduleReconnect]);
 
-  /**
-   * Disconnect from WebSocket.
-   */
+  // Keep the ref current so scheduleReconnect always calls the latest connect.
+  useEffect(() => {
+    connectRef.current = connect;
+  }, [connect]);
+
   const disconnect = useCallback(() => {
     intentionalDisconnectRef.current = true;
 
@@ -214,30 +215,32 @@ export function useCAIWebSocket(options: UseCAIWebSocketOptions = {}): UseCAIWeb
     reconnectAttemptsRef.current = 0;
   }, []);
 
-  /**
-   * Send ping to keep connection alive.
-   */
   const sendPing = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send('ping');
     }
   }, []);
 
-  // Auto-connect on mount if enabled
+  // Auth-gated auto-connect.
+  // Conditions: hook must be configured for autoConnect, auth init must have
+  // completed (isAuthReady), and the user must be authenticated.
+  // On logout (isAuthenticated flips to false) the socket is closed immediately
+  // to avoid stale sessions receiving live trading data.
+  const canConnect = isAuthReady && isAuthenticated;
+
   useEffect(() => {
-    if (autoConnect) {
+    if (autoConnect && canConnect) {
       connect();
+    } else if (!canConnect) {
+      disconnect();
     }
 
     return () => {
       disconnect();
     };
-  }, [autoConnect]); // Only run on mount/unmount
+    // connect/disconnect are stable useCallbacks; auth state drives re-evaluation.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoConnect, canConnect]);
 
-  return {
-    status,
-    connect,
-    disconnect,
-    sendPing,
-  };
+  return { status, connect, disconnect, sendPing };
 }

@@ -24,20 +24,22 @@ export async function POST(request: NextRequest) {
     }
 
     const data = await response.json();
-    
-    // Extract refresh token from backend response cookies
-    const setCookieHeader = response.headers.get('set-cookie');
-    
-    // Create response with access token
+
     const nextResponse = NextResponse.json({
       access_token: data.access_token,
       token_type: data.token_type,
       expires_in: data.expires_in,
     });
 
-    // Forward refresh token cookie from backend
-    if (setCookieHeader) {
-      nextResponse.headers.set('set-cookie', setCookieHeader);
+    // BFF owns cookie lifecycle — set with path scoped to BFF auth routes, not backend paths
+    if (data.refresh_token) {
+      nextResponse.cookies.set('refresh_token', data.refresh_token, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'strict',
+        path: '/api/auth',
+        maxAge: 7 * 24 * 60 * 60,
+      });
     }
 
     return nextResponse;

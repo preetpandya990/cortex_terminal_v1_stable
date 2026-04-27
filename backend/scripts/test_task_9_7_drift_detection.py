@@ -169,7 +169,7 @@ class TestRunner:
                         "max": 1.0
                     },
                     is_active=True,
-                    status="production",
+                    status="development",   # never "production" for test fixtures
                 )
                 db.add(ml_model)
                 await db.commit()
@@ -513,17 +513,32 @@ class TestRunner:
         return True
     
     async def cleanup(self):
-        """Cleanup test resources."""
+        """Archive test models and dispose resources."""
         print("\n" + "="*80)
         print("CLEANUP")
         print("="*80)
-        
-        # Note: In production, we'd delete test data
-        # For now, we leave it for inspection
-        print(f"✅ Test model ID: {self.test_model_id}")
-        print(f"✅ Drift report IDs: {self.drift_report_ids}")
-        print(f"   (Test data left in database for inspection)")
-        
+
+        from app.models.ml_data import MLModelMetadata
+        from app.ai.fusion.models import AIMLModel
+        from sqlalchemy import update
+
+        async with self.async_session() as db:
+            # Archive MLModelMetadata test entry
+            await db.execute(
+                update(MLModelMetadata)
+                .where(MLModelMetadata.model_name == self.test_model_name)
+                .values(status="archived", is_active=False)
+            )
+            # Retire AIMLModel test entry
+            await db.execute(
+                update(AIMLModel)
+                .where(AIMLModel.model_name == self.test_model_name)
+                .values(deployment_state="retired")
+            )
+            await db.commit()
+            print(f"✅ Archived test model: {self.test_model_name}")
+            print(f"✅ Drift report IDs: {self.drift_report_ids}")
+
         await self.client.aclose()
         await self.engine.dispose()
     

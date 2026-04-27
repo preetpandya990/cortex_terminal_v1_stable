@@ -26,6 +26,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        env_prefix="",
     )
 
     # ── Application ────────────────────────────────────────────────────────────
@@ -61,8 +62,7 @@ class Settings(BaseSettings):
     UPSTOX_API_SECRET: str = Field(..., min_length=8)
     UPSTOX_REDIRECT_URI: AnyHttpUrl
     UPSTOX_ACCESS_TOKEN: str | None = None
-    UPSTOX_BASE_URL: str = "https://api.upstox.com/v3"
-    UPSTOX_WS_URL: str = "wss://api.upstox.com/v3/feed/market-data-feed"
+    UPSTOX_BASE_URL: str = "https://api.upstox.com/v3/"
     UPSTOX_INSTRUMENTS_URL: AnyHttpUrl = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 
     # ── Worker ─────────────────────────────────────────────────────────────────
@@ -91,6 +91,17 @@ class Settings(BaseSettings):
     DRIFT_CHECK_INTERVAL_SECONDS: int = Field(300, ge=60, le=3600)
     SAFETY_CHECK_INTERVAL_SECONDS: int = Field(30, ge=10, le=300)
 
+    # ── Data Ingestion Worker ──────────────────────────────────────────────────
+    DATA_INGESTION_ENABLED: bool = Field(True, description="Enable automated OHLCV data ingestion")
+    DATA_INGESTION_CHECK_INTERVAL: int = Field(3600, ge=60, description="Maintenance gap-check interval (seconds)")
+    DATA_INGESTION_REQUESTS_PER_MINUTE: int = Field(40, ge=10, le=490, description="API rate limit budget — 40/min (1 req every 1.5s) stays comfortably below Cloudflare's burst threshold on the historical-candle endpoint")
+    DATA_INGESTION_CONCURRENCY: int = Field(1, ge=1, le=20, description="Parallel in-flight API requests — 1 = fully serial, eliminates all request bursting, safest for Cloudflare-guarded endpoints")
+    DATA_INGESTION_BACKFILL_ENABLED: bool = Field(True, description="Run Phase 1 historical backfill on startup")
+    DATA_INGESTION_MAX_RETRIES: int = Field(3, ge=1, le=10, description="Max retries per failed chunk before DLQ")
+    DATA_INGESTION_CIRCUIT_BREAKER_THRESHOLD: int = Field(5, ge=3, le=20, description="Consecutive failures before circuit opens")
+    DATA_INGESTION_CIRCUIT_BREAKER_TIMEOUT: int = Field(300, ge=60, le=3600, description="Seconds before circuit attempts recovery")
+    BULK_INSERT_BATCH_SIZE: int = Field(1000, ge=100, le=10000, description="Database bulk insert batch size")
+
     # ── ML System ──────────────────────────────────────────────────────────────
     ML_MODEL_ENCRYPTION_KEY: str | None = Field(None, description="Fernet key for model encryption")
     ML_MODEL_STORAGE_PATH: str = "backend/ml_models"
@@ -115,6 +126,11 @@ class Settings(BaseSettings):
     CACHE_TTL_MARKET_STATUS: int = 30
     ML_CACHE_TTL_DAILY: int = 300
     ML_CACHE_TTL_WEEKLY: int = 3600
+    
+    # API Response Caching
+    CACHE_TTL_SUGGESTIONS_LIST: int = Field(30, ge=5, le=300, description="Cache TTL for suggestions list endpoint (seconds)")
+    CACHE_TTL_SUGGESTIONS_DETAIL: int = Field(60, ge=5, le=300, description="Cache TTL for suggestions detail endpoint (seconds)")
+    ENABLE_API_RESPONSE_CACHING: bool = Field(True, description="Enable API response caching")
 
     # ── Observability ──────────────────────────────────────────────────────────
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"

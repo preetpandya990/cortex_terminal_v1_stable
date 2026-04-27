@@ -13,25 +13,31 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { useSignal, useSignalAudit } from "@/hooks/useSignals";
-import { SignalType } from "@/types/signals";
+import { useSignalAudit } from "@/hooks/useSignals";
+import { SignalType, type TradingSignal } from "@/types/signals";
 import { TrendingUp, TrendingDown, Minus, X } from "lucide-react";
 
+// Never call format() directly on untrusted date strings — the DB may store
+// nulls or malformed values that crash date-fns with RangeError.
+function safeFormat(value: string | null | undefined, fmt: string): string {
+  if (!value) return "—";
+  const d = new Date(value);
+  if (isNaN(d.getTime())) return "—";
+  return format(d, fmt);
+}
+
 interface SignalDetailModalProps {
-  signalId: string | null;
+  signal: TradingSignal | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }
 
 export function SignalDetailModal({
-  signalId,
+  signal,
   open,
   onOpenChange,
 }: SignalDetailModalProps) {
-  const { data: signal, isLoading: signalLoading } = useSignal(signalId || "");
-  const { data: auditData, isLoading: auditLoading } = useSignalAudit(
-    signalId || ""
-  );
+  const { data: auditData } = useSignalAudit(signal?.signal_id ?? "");
 
   const getSignalIcon = (type: SignalType) => {
     switch (type) {
@@ -55,38 +61,41 @@ export function SignalDetailModal({
     }
   };
 
-  if (!signal && !signalLoading) {
-    return null;
-  }
+  if (!signal) return null;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-4xl">
-        <DialogHeader>
-          <div className="flex items-center justify-between">
-            <DialogTitle>Signal Details</DialogTitle>
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              onClick={() => onOpenChange(false)}
-            >
-              <X className="size-4" />
-            </Button>
-          </div>
-          {signal && (
-            <DialogDescription>
-              {signal.symbol} • Generated{" "}
-              {format(new Date(signal.generated_at), "PPp")}
-            </DialogDescription>
-          )}
-        </DialogHeader>
+      {/*
+       * !flex overrides the default `grid` on DialogContent.
+       * !p-0 removes the default p-6 so we control padding per section.
+       * max-h-[90vh] + overflow-hidden constrains to the viewport.
+       * flex-col lets the header pin at top and body grow+scroll.
+       */}
+      <DialogContent className="max-w-4xl !flex flex-col max-h-[90vh] overflow-hidden !p-0">
 
-        {signalLoading ? (
-          <div className="py-8 text-center text-muted-foreground">
-            Loading signal details...
-          </div>
-        ) : signal ? (
-          <div className="space-y-6">
+        {/* ── Sticky header — always visible, close button always reachable ── */}
+        <div className="flex-shrink-0 border-b border-slate-100 px-6 pt-6 pb-4">
+          <DialogHeader>
+            <div className="flex items-center justify-between">
+              <DialogTitle>Signal Details</DialogTitle>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onClick={() => onOpenChange(false)}
+              >
+                <X className="size-4" />
+              </Button>
+            </div>
+            <DialogDescription>
+              {signal.symbol} • Generated {safeFormat(signal.generated_at, "PPp")}
+            </DialogDescription>
+          </DialogHeader>
+        </div>
+
+        {/* ── Scrollable body ── */}
+        {signal ? (
+          <div className="flex-1 min-h-0 overflow-y-auto px-6 py-6">
+            <div className="space-y-6">
             {/* Signal Overview */}
             <Card>
               <CardHeader>
@@ -167,9 +176,9 @@ export function SignalDetailModal({
                   <div>
                     <h4 className="mb-2 font-semibold">Events</h4>
                     <div className="space-y-2">
-                      {signal.contributing_factors.events.map((event) => (
+                      {signal.contributing_factors.events.map((event, idx) => (
                         <div
-                          key={event.event_id}
+                          key={event.event_id ?? `event-${idx}`}
                           className="rounded-lg border p-3"
                         >
                           <div className="flex items-center justify-between">
@@ -194,9 +203,9 @@ export function SignalDetailModal({
                     <h4 className="mb-2 font-semibold">ML Predictions</h4>
                     <div className="space-y-2">
                       {signal.contributing_factors.ml_predictions.map(
-                        (pred) => (
+                        (pred, idx) => (
                           <div
-                            key={pred.model_id}
+                            key={pred.model_id ?? `pred-${idx}`}
                             className="rounded-lg border p-3"
                           >
                             <div className="flex items-center justify-between">
@@ -257,7 +266,7 @@ export function SignalDetailModal({
                             {entry.symbol} • {entry.signal_type.toUpperCase()}
                           </div>
                           <div className="text-muted-foreground text-xs">
-                            {format(new Date(entry.generated_at), "PPp")}
+                            {safeFormat(entry.generated_at, "PPp")}
                           </div>
                         </div>
                         <div className="text-right">
@@ -276,6 +285,7 @@ export function SignalDetailModal({
                 </CardContent>
               </Card>
             )}
+            </div>
           </div>
         ) : null}
       </DialogContent>

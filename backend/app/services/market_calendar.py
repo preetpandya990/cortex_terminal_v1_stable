@@ -22,6 +22,7 @@ class TradingSession:
     is_open_now: bool
     market_open_utc: datetime | None
     market_close_utc: datetime | None
+    closed_reason: str | None = None
 
 
 def _parse_hhmm(value: str) -> time:
@@ -35,7 +36,7 @@ class NSECalendarService:
     """
 
     def __init__(self) -> None:
-        self._holidays: set[date] = set()
+        self._holidays: dict[date, str] = {}  # date → holiday name
         self._last_refresh_utc: datetime | None = None
         self._cache_path = Path(settings.NSE_HOLIDAY_CACHE_FILE)
         self._open_time = _parse_hhmm(settings.NSE_MARKET_OPEN_IST)
@@ -76,18 +77,18 @@ class NSECalendarService:
             logger.warning("NSE holiday API returned no usable holiday dates")
             return False
 
-        self._holidays = holidays
+        self._holidays = holidays  # type: ignore[assignment]
         self._write_cache()
         logger.info("Loaded %d NSE holiday dates from official API", len(holidays))
         return True
 
     @staticmethod
-    def _extract_holidays(payload: object) -> set[date]:
-        holidays: set[date] = set()
+    def _extract_holidays(payload: object) -> dict[date, str]:
+        holidays: dict[date, str] = {}
         if not isinstance(payload, dict):
             return holidays
 
-        # NSE payload typically has "FO" and "CM" arrays with "tradingDate".
+        # NSE payload typically has "FO" and "CM" arrays with "tradingDate" + "description".
         for key, value in payload.items():
             if not isinstance(value, list):
                 continue
@@ -98,8 +99,14 @@ class NSECalendarService:
                 if not isinstance(raw_date, str):
                     continue
                 parsed = NSECalendarService._parse_nse_date(raw_date)
-                if parsed:
-                    holidays.add(parsed)
+                if parsed and parsed not in holidays:
+                    name = (
+                        item.get("description")
+                        or item.get("purpose")
+                        or item.get("name")
+                        or "NSE Holiday"
+                    )
+                    holidays[parsed] = str(name).strip()
         return holidays
 
     @staticmethod
@@ -118,7 +125,7 @@ class NSECalendarService:
                 json.dumps(
                     {
                         "updated_at": datetime.now(UTC).isoformat(),
-                        "holidays": sorted(d.isoformat() for d in self._holidays),
+                        "holidays": {d.isoformat(): name for d, name in self._holidays.items()},
                     },
                     indent=2,
                 ),
@@ -132,10 +139,15 @@ class NSECalendarService:
             if not self._cache_path.exists():
                 return
             payload = json.loads(self._cache_path.read_text(encoding="utf-8"))
-            holidays = payload.get("holidays", [])
-            restored = set()
-            for value in holidays:
-                restored.add(datetime.fromisoformat(value).date())
+            raw = payload.get("holidays", {})
+            restored: dict[date, str] = {}
+            if isinstance(raw, dict):
+                for iso, name in raw.items():
+                    restored[datetime.fromisoformat(iso).date()] = name
+            elif isinstance(raw, list):
+                # backwards-compat with old cache format (list of ISO strings)
+                for iso in raw:
+                    restored[datetime.fromisoformat(iso).date()] = "NSE Holiday"
             if restored:
                 self._holidays = restored
                 logger.info("Loaded %d NSE holidays from local cache", len(restored))
@@ -148,15 +160,21 @@ class NSECalendarService:
         day = now_ist.date()
 
         is_weekend = now_ist.weekday() >= 5
-        is_holiday = day in self._holidays
-        is_trading_day = not is_weekend and not is_holiday
+        holiday_name = self._holidays.get(day)
+        is_trading_day = not is_weekend and holiday_name is None
 
         if not is_trading_day:
+            if is_weekend:
+                day_name = now_ist.strftime("%A")  # "Saturday" or "Sunday"
+                closed_reason = f"Weekend ({day_name})"
+            else:
+                closed_reason = holiday_name or "NSE Holiday"
             return TradingSession(
                 is_trading_day=False,
                 is_open_now=False,
                 market_open_utc=None,
                 market_close_utc=None,
+                closed_reason=closed_reason,
             )
 
         open_ist = datetime.combine(day, self._open_time, tzinfo=IST)
@@ -171,7 +189,7 @@ class NSECalendarService:
     def is_trading_day(self, day: date) -> bool:
         if day.weekday() >= 5:
             return False
-        return day not in self._holidays
+        return day not in self._holidays  # dict membership check
 
     def get_recent_trading_days(self, count: int, end_day: date | None = None) -> list[date]:
         """

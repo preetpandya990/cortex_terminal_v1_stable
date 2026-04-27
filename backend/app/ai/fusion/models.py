@@ -5,7 +5,7 @@ Import from migration 0005 table definitions.
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Integer, LargeBinary, Numeric, String, Text, text
+from sqlalchemy import BigInteger, Boolean, DateTime, Index, Integer, LargeBinary, Numeric, String, Text, text
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -135,8 +135,13 @@ class AIDriftReport(Base):
 
 class AIRegimeDetection(Base):
     __tablename__ = "ai_regime_detections"
+    __table_args__ = (
+        Index("idx_regime_symbol", "symbol"),
+        Index("idx_regime_symbol_ts", "symbol", "detection_timestamp"),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    symbol: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
     detection_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     regime_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     confidence_score: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)

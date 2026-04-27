@@ -6,21 +6,21 @@ Production-grade FastAPI with lifespan management, CORS, rate limiting, and midd
 from __future__ import annotations
 
 import logging
-import logging.config
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse, Response
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from app.api.v1 import (
     auth, cai, fusion, governance, hawk_eye, ingestion, intelligence,
-    market_data, ml_drift, ml_predictions, safety, scanner, strategy, upstox, health
+    market_data, ml_drift, ml_predictions, safety, scanner, strategy, trade_suggestions, upstox, health, watchlist
 )
 from app.core.config import get_settings
 from app.core.database import engine, worker_engine
@@ -31,29 +31,15 @@ from app.services.data_ingestion import DataIngestionService
 from app.services.tick_stream import TickStreamService
 from app.services.upstox_client import UpstoxClient
 
+# Import circuit breaker to initialize metrics
+from app.core import circuit_breaker
+
 settings = get_settings()
 
 # ── Logging ────────────────────────────────────────────────────────────────────
-logging.config.dictConfig(
-    {
-        "version": 1,
-        "disable_existing_loggers": False,
-        "formatters": {
-            "json": {
-                "()": "pythonjsonlogger.jsonlogger.JsonFormatter",
-                "format": "%(asctime)s %(name)s %(levelname)s %(message)s",
-            }
-        },
-        "handlers": {
-            "console": {
-                "class": "logging.StreamHandler",
-                "formatter": "json",
-            }
-        },
-        "root": {"level": settings.LOG_LEVEL, "handlers": ["console"]},
-    }
-)
+from app.core.logging_config import setup_logging
 
+setup_logging(log_level=settings.LOG_LEVEL, environment=settings.ENVIRONMENT)
 logger = logging.getLogger(__name__)
 
 
@@ -83,26 +69,50 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     ingestion_service = DataIngestionService(upstox_client=upstox_client)
     app.state.ingestion_service = ingestion_service
 
-    # Pre-load ML prediction engine for faster inference
+    # Load production ML models from registry
+    app.state.ml_ensemble  = None
+    app.state.ml_predictor = None
     try:
-        from app.ml.inference import create_prediction_engine
+        from app.ml.inference.registry_loader import RegistryModelLoader
+        from app.ml.inference.ensemble_predictor import EnsemblePredictor
+        from app.core.database import AsyncSessionLocal
         from app.core.redis import get_cache_service
-        cache = get_cache_service()
-        prediction_engine = create_prediction_engine(
-            model_path="models/production/model_quantized.onnx",
-            cache=cache,
-            num_threads=4,
+
+        # Session is only needed for the DB query inside load_production_ensemble.
+        # LoadedEnsemble stores plain scalars (no ORM objects), so it safely
+        # outlives this session.
+        async with AsyncSessionLocal() as session:
+            loader   = RegistryModelLoader(session=session, num_threads=4, use_gpu=False)
+            ensemble = await loader.load_production_ensemble()
+
+        predictor = EnsemblePredictor.from_loaded_ensemble(
+            ensemble,
+            cache=get_cache_service(),
         )
-        app.state.prediction_engine = prediction_engine
-        logger.info("ML prediction engine pre-loaded")
-    except Exception as e:
-        logger.warning(f"Could not pre-load prediction engine: {e}")
-        app.state.prediction_engine = None
+        app.state.ml_ensemble  = ensemble
+        app.state.ml_predictor = predictor
+
+        logger.info(
+            "Production ML models loaded: XGBoost v%s + GRU v%s",
+            ensemble.xgboost_version, ensemble.gru_version,
+        )
+    except Exception as exc:
+        logger.error("Failed to load production ML models: %s", exc, exc_info=True)
+        if settings.is_production:
+            raise RuntimeError(f"Critical: failed to load production ML models: {exc}") from exc
+        logger.warning("Continuing without ML models (non-production environment)")
 
     logger.info("All services initialized — ready")
     yield
 
     logger.info("Cortex AI shutting down")
+    
+    # Cleanup ML models
+    if hasattr(app.state, "ml_predictor") and app.state.ml_predictor:
+        logger.info("Cleaning up ML models...")
+        app.state.ml_predictor = None
+        app.state.ml_ensemble = None
+    
     await tick_service.disconnect()
     await upstox_client.stop()
     await close_redis()
@@ -131,8 +141,13 @@ def create_app() -> FastAPI:
         allow_origins=settings.cors_origins_str,
         allow_credentials=settings.CORS_ALLOW_CREDENTIALS,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["*"] if not settings.is_production else ["Authorization", "Content-Type", "X-Request-ID"],
+        allow_headers=["*"] if not settings.is_production else ["Authorization", "Content-Type", "X-Request-ID", "X-Correlation-ID"],
     )
+    
+    # Add request ID middleware (for structured logging and tracing)
+    from app.middleware.request_id import RequestIDMiddleware
+    app.add_middleware(RequestIDMiddleware)
+    
     app.add_middleware(GZipMiddleware, minimum_size=1024)
     app.add_middleware(SlowAPIMiddleware)
     
@@ -147,11 +162,14 @@ def create_app() -> FastAPI:
 
     # API routes - ML
     app.include_router(auth.router, prefix=f"{settings.API_V1_PREFIX}/auth", tags=["Authentication"])
+    app.include_router(watchlist.router, prefix=f"{settings.API_V1_PREFIX}/watchlist", tags=["Watchlist"])
     app.include_router(market_data.router, prefix=f"{settings.API_V1_PREFIX}/market-data", tags=["Market Data"])
     app.include_router(scanner.router, prefix=f"{settings.API_V1_PREFIX}/scanner", tags=["Scanner"])
     app.include_router(upstox.router, prefix=f"{settings.API_V1_PREFIX}/upstox", tags=["Upstox"])
     app.include_router(upstox.ws_router, prefix=f"{settings.API_V1_PREFIX}/upstox", tags=["Upstox WebSocket"])
     app.include_router(hawk_eye.router, prefix=f"{settings.API_V1_PREFIX}/hawk-eye", tags=["HawkEye"])
+    app.include_router(trade_suggestions.router, prefix=f"{settings.API_V1_PREFIX}/trade-suggestions", tags=["Trade Suggestions"])
+    app.include_router(trade_suggestions.ws_router, prefix=f"{settings.API_V1_PREFIX}/trade-suggestions", tags=["Trade Suggestions WebSocket"])
     app.include_router(ml_predictions.router, prefix=f"{settings.API_V1_PREFIX}/ml", tags=["ML Predictions"])
     app.include_router(ml_drift.router, prefix=settings.API_V1_PREFIX, tags=["ML Drift"])
     
@@ -167,15 +185,57 @@ def create_app() -> FastAPI:
     # Health
     app.include_router(health.router, prefix=settings.API_V1_PREFIX, tags=["Health"])
 
+    # Production health check endpoints (Kubernetes-compatible)
+    from app.core.health_checks import liveness_check, readiness_check, detailed_check
+    from fastapi import status as http_status
+
     @app.get("/health", include_in_schema=False)
-    async def basic_health() -> dict[str, str]:
-        return {"status": "ok", "version": settings.APP_VERSION}
+    async def health_liveness() -> dict[str, str]:
+        """
+        Liveness probe for Kubernetes.
+        
+        Checks if the process is alive and responsive.
+        Does NOT check external dependencies (DB, Redis).
+        
+        Returns:
+            Always 200 unless process is broken
+        """
+        return await liveness_check()
+
+    @app.get("/health/ready", include_in_schema=False)
+    async def health_readiness() -> JSONResponse:
+        """
+        Readiness probe for Kubernetes.
+        
+        Checks if service can handle traffic by verifying critical dependencies.
+        
+        Returns:
+            200: Ready to accept traffic
+            503: Not ready (dependencies unavailable)
+        """
+        is_ready, status_data = await readiness_check()
+        
+        return JSONResponse(
+            status_code=http_status.HTTP_200_OK if is_ready else http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            content=status_data
+        )
+
+    @app.get("/health/detailed", include_in_schema=False)
+    async def health_detailed() -> dict[str, Any]:
+        """
+        Detailed health check for monitoring and debugging.
+        
+        Provides comprehensive status of all components.
+        
+        Returns:
+            Detailed status including all checks
+        """
+        return await detailed_check()
 
     @app.get("/metrics", include_in_schema=False)
     async def metrics():
         """Prometheus metrics endpoint."""
         from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-        from fastapi.responses import Response
         
         return Response(
             content=generate_latest(),

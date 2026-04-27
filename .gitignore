@@ -177,6 +177,16 @@ backend/production_training_*.log
 backend/training_*.log
 backend/validation_output.log
 
+# Keep checkpoints directory structure, but do not commit checkpoint contents
+backend/models/production/checkpoints/**
+!backend/models/production/checkpoints/
+!backend/models/production/checkpoints/.gitkeep
+
+# Keep test_artifacts directory structure, but do not commit artifact contents
+backend/test_artifacts/**
+!backend/test_artifacts/
+!backend/test_artifacts/.gitkeep
+
 # Test artifacts
 backend/test-*.html
 backend/test-*.txt
@@ -196,11 +206,10 @@ docker-compose.override.yml
 # ============================================
 # VSCode
 .vscode/
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
 *.code-workspace
+
+# Claude local settings
+.claude/
 
 # PyCharm
 .idea/
@@ -257,6 +266,18 @@ archive/
 
 # Code dump chunks
 code_dump_chunks/
+
+# ============================================
+# Root-level files
+# ============================================
+# Ignore all files created at repository root, but keep root directories visible.
+/*
+!/*/
+!.gitignore
+
+# Keep local editor/assistant directories ignored even with root unignore rules
+.claude/
+.vscode/
 
 # Reference codebase (already extracted)
 cortex_v4_w_aimsvc-master.zip
