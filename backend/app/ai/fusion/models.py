@@ -177,6 +177,13 @@ class AITradingSignal(Base):
     confidence_score: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)
     strategy_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     regime_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    # Derived from prediction timeframe: intraday / swing / positional
+    time_horizon: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    # Computed TTL anchored to NSE market hours
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    # Price levels from ML ensemble (TP1 and ATR-based stop loss)
+    target_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    stop_loss: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
     contributing_events: Mapped[dict | None] = mapped_column(JSONB)
     ml_predictions: Mapped[dict | None] = mapped_column(JSONB)
     technical_indicators: Mapped[dict | None] = mapped_column(JSONB)

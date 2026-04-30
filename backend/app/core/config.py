@@ -113,6 +113,14 @@ class Settings(BaseSettings):
     ML_DRIFT_THRESHOLD_SIGMA: float = Field(2.0, ge=1.0, le=5.0)
     ML_ACCURACY_ALERT_THRESHOLD: float = Field(0.83, ge=0.5, le=1.0)
 
+    # ── Market Feed ────────────────────────────────────────────────────────────
+    MARKET_FEED_THROTTLE_MS: int = Field(
+        default=250,
+        ge=100,
+        le=5000,
+        description="Per-instrument tick throttle (ms) before publishing to Redis",
+    )
+
     # ── Rate Limiting ──────────────────────────────────────────────────────────
     RATE_LIMIT_SCANNER: str = "10/minute"
     RATE_LIMIT_SEARCH: str = "60/minute"
@@ -120,7 +128,8 @@ class Settings(BaseSettings):
     RATE_LIMIT_ML_PREDICTION: str = "100/minute"
 
     # ── Caching TTLs ───────────────────────────────────────────────────────────
-    CACHE_TTL_SCANNER: int = 60
+    CACHE_TTL_SCANNER_OPEN:   int = 30    # seconds during market hours — prices update each tick
+    CACHE_TTL_SCANNER_CLOSED: int = 900   # seconds off-hours — data is static between sessions
     CACHE_TTL_INSTRUMENTS: int = 300
     CACHE_TTL_LIVE_QUOTE: int = 1
     CACHE_TTL_MARKET_STATUS: int = 30
@@ -141,6 +150,38 @@ class Settings(BaseSettings):
     NSE_HOLIDAY_CACHE_FILE: str = "backend/.cache/nse_holidays.json"
     NSE_MARKET_OPEN_IST: str = "09:15"
     NSE_MARKET_CLOSE_IST: str = "15:30"
+
+    # ── Signal Scheduler ───────────────────────────────────────────────────────
+    # Nifty 50 + Nifty Next 50 — scheduled signal generation every 15 minutes
+    # during NSE market hours.  Override via env var as a comma-separated string.
+    SIGNAL_SCHEDULED_UNIVERSE: list[str] = [
+        # ── Nifty 50 ──────────────────────────────────────────────────────────
+        "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
+        "HINDUNILVR", "SBIN", "BAJFINANCE", "BHARTIARTL", "KOTAKBANK",
+        "ITC", "LT", "HCLTECH", "AXISBANK", "ASIANPAINT",
+        "MARUTI", "ULTRACEMCO", "NESTLEIND", "TITAN", "WIPRO",
+        "SUNPHARMA", "BAJAJFINSV", "ONGC", "NTPC", "POWERGRID",
+        "TECHM", "TATAMOTORS", "JSWSTEEL", "TATASTEEL", "HINDALCO",
+        "ADANIENT", "ADANIPORTS", "DRREDDY", "DIVISLAB", "CIPLA",
+        "BAJAJ-AUTO", "HEROMOTOCO", "COALINDIA", "BPCL", "INDUSINDBK",
+        "EICHERMOT", "GRASIM", "BRITANNIA", "APOLLOHOSP", "TATACONSUM",
+        "PIDILITIND", "SHREECEM", "HDFCLIFE", "SBILIFE", "UPL",
+        # ── Nifty Next 50 ─────────────────────────────────────────────────────
+        "HAVELLS", "GODREJCP", "BERGEPAINT", "COLPAL", "MARICO",
+        "LUPIN", "BIOCON", "TORNTPHARM", "DABUR", "VOLTAS",
+        "MPHASIS", "COFORGE", "LTIM", "PERSISTENT", "TATAELXSI",
+        "CANBK", "BANKBARODA", "PNB", "FEDERALBNK", "IDFCFIRSTB",
+        "LICI", "NAUKRI", "ZOMATO", "IRCTC", "HAL",
+        "BEL", "TRENT", "VEDL", "NMDC", "SAIL",
+        "GAIL", "IOC", "HPCL", "ATGL", "TORNTPOWER",
+        "SIEMENS", "ABB", "CHOLAFIN", "BAJAJHLDNG", "PIIND",
+        "CONCOR", "OFSS", "MUTHOOTFIN", "ABCAPITAL", "MFSL",
+        "ICICIGI", "POLICYBZR", "PAYTM", "NYKAA", "DELHIVERY",
+    ]
+    SIGNAL_SCHEDULER_INTERVAL_MINUTES: int = Field(15, ge=5, le=60)
+    SIGNAL_SCHEDULER_FEATURE_CONCURRENCY: int = Field(20, ge=5, le=50)
+    SIGNAL_SCHEDULER_ASSEMBLY_CONCURRENCY: int = Field(10, ge=2, le=20)
+    SIGNAL_ON_DEMAND_CACHE_TTL: int = Field(900, ge=60, le=3600)  # 15 minutes
 
     # ── Computed Properties ────────────────────────────────────────────────────
     @property

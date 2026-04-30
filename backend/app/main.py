@@ -5,6 +5,7 @@ Production-grade FastAPI with lifespan management, CORS, rate limiting, and midd
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
@@ -28,7 +29,7 @@ from app.core.exception_handlers import register_exception_handlers
 from app.core.limiter import limiter
 from app.core.redis import close_redis, init_redis
 from app.services.data_ingestion import DataIngestionService
-from app.services.tick_stream import TickStreamService
+from app.services.market_feed import MarketFeedService
 from app.services.upstox_client import UpstoxClient
 
 # Import circuit breaker to initialize metrics
@@ -63,8 +64,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         upstox_client.set_access_token(settings.UPSTOX_ACCESS_TOKEN)
         logger.info("Loaded Upstox access token")
 
-    tick_service = TickStreamService(upstox_client=upstox_client)
-    app.state.tick_service = tick_service
+    from app.core.redis import get_redis
+    market_feed_service = MarketFeedService(
+        upstox_client=upstox_client,
+        redis=get_redis(),
+        throttle_ms=settings.MARKET_FEED_THROTTLE_MS,
+    )
+    await market_feed_service.start()
+    app.state.market_feed_service = market_feed_service
 
     ingestion_service = DataIngestionService(upstox_client=upstox_client)
     app.state.ingestion_service = ingestion_service
@@ -102,6 +109,32 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             raise RuntimeError(f"Critical: failed to load production ML models: {exc}") from exc
         logger.warning("Continuing without ML models (non-production environment)")
 
+    # Signal Scheduler — automated generation for Nifty 50 + Next 50 every 15 min
+    from app.services.signal_scheduler import SignalScheduler
+    from app.core.redis import get_pubsub_client, get_redis
+
+    signal_scheduler = SignalScheduler(
+        db_factory=AsyncSessionLocal,
+        ml_predictor=app.state.ml_predictor,
+        pubsub=get_pubsub_client(),
+        redis=get_redis(),
+        scheduled_universe=settings.SIGNAL_SCHEDULED_UNIVERSE,
+    )
+    await signal_scheduler.start()
+    app.state.signal_scheduler = signal_scheduler
+
+    # Register SignalPipeline with the scheduler injected so that the
+    # event-driven on-demand trigger fires for high-impact classifications.
+    from app.ai.fusion.signal_pipeline import SignalPipeline
+    app.state.signal_pipeline = SignalPipeline(scheduler=signal_scheduler)
+
+    # Start CAI WebSocket Redis listener — fans out all 4 CAI pub/sub channels
+    # to connected browser clients via the in-process CAIConnectionManager.
+    from app.api.v1.cai import cai_redis_listener
+    cai_listener_task = asyncio.create_task(cai_redis_listener(), name="cai_redis_listener")
+    app.state.cai_listener_task = cai_listener_task
+    logger.info("CAI Redis listener started")
+
     logger.info("All services initialized — ready")
     yield
 
@@ -113,7 +146,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.ml_predictor = None
         app.state.ml_ensemble = None
     
-    await tick_service.disconnect()
+    # Stop signal scheduler
+    if hasattr(app.state, "signal_scheduler") and app.state.signal_scheduler:
+        await app.state.signal_scheduler.stop()
+
+    # Cancel CAI Redis listener
+    if hasattr(app.state, "cai_listener_task") and app.state.cai_listener_task:
+        app.state.cai_listener_task.cancel()
+        try:
+            await asyncio.wait_for(app.state.cai_listener_task, timeout=5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
+    await market_feed_service.stop()
     await upstox_client.stop()
     await close_redis()
     await engine.dispose()
@@ -181,6 +226,7 @@ def create_app() -> FastAPI:
     app.include_router(fusion.router, prefix=f"{settings.API_V1_PREFIX}/fusion", tags=["AI Fusion"])
     app.include_router(safety.router, prefix=f"{settings.API_V1_PREFIX}/safety", tags=["AI Safety"])
     app.include_router(cai.router, prefix=f"{settings.API_V1_PREFIX}/cai", tags=["Cortex AI"])
+    app.include_router(cai.ws_router, prefix=f"{settings.API_V1_PREFIX}/cai", tags=["Cortex AI WebSocket"])
     
     # Health
     app.include_router(health.router, prefix=settings.API_V1_PREFIX, tags=["Health"])

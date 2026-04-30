@@ -2,44 +2,63 @@
 """
 Cortex AI — Upstox Router
 ===========================
-Candle data proxy and real-time tick WebSocket endpoints.
+Candle data proxy and unified real-time market-feed WebSocket endpoint.
 
 Candle endpoints:
   - Forward requests to Upstox v3 API using path-param URL format
   - Normalise response to { status, data: { candles: [] } }
   - Cache in Redis (30 s intraday, 300 s historical)
 
-WebSocket tick endpoint:
-  - With Upstox token: bridges TickStreamService fan-out to each client
-  - Without token (dev/test): emits a realistic mock based on recent candle data
+Market-feed WebSocket (/upstox/market-feed/ws):
+  - Authenticated via JWT query param (?token=<jwt>)
+  - Client sends  {type:"sub",   instrument_keys:[...]} to subscribe
+  - Client sends  {type:"unsub", instrument_keys:[...]} to unsubscribe
+  - Server sends  {type:"ltpc",  instrument_key, ltp, cp, ts} on every tick
+  - Server sends  {type:"ping",  ts} heartbeat every 30 s
+  - Uses MarketFeedService (singleton) + Redis fan-out for horizontal scale
 
 All HTTP endpoints require JWT authentication.
-The WebSocket endpoint is on a separate unauthenticated router (browser WS
-APIs cannot set Authorization headers; token-in-query-param auth is handled
-at the application gateway layer in production).
 """
 import asyncio
+import json
 import logging
 import uuid
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
+from jose import JWTError, jwt
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.limiter import limiter
-from app.core.redis import CacheService, get_cache_service
+from app.core.redis import CacheService, RedisChannels, get_cache_service, get_redis
 from app.core.security import get_current_user_id
-from app.exceptions import UpstoxConnectionError
-from app.schemas.upstox import IngestRequest, IngestResponse, StreamStatusResponse
+from app.schemas.market_feed import (
+    ErrorEvent,
+    HeartbeatEvent,
+    LtpcMessage,
+    SubCommand,
+    UnsubCommand,
+    SubscribedEvent,
+    UnsubscribedEvent,
+)
 from app.services.data_ingestion import DataIngestionService
-from app.services.tick_stream import TickStreamService, get_tick_service
+from app.services.market_feed import MarketFeedService, get_market_feed_service
+from app.exceptions import UpstoxRateLimitError
 from app.services.upstox_client import UpstoxClient, get_upstox_client
+from app.schemas.upstox import IngestRequest, IngestResponse
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
 
-router = APIRouter(dependencies=[Depends(get_current_user_id)])
+router    = APIRouter(dependencies=[Depends(get_current_user_id)])
 ws_router = APIRouter()
+
+_WS_HEARTBEAT_S   = 30.0
+_WS_QUEUE_MAXSIZE = 256
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -81,53 +100,6 @@ def _empty_candles_response(
     }
 
 
-# ── Stream management ──────────────────────────────────────────────────────────
-
-@router.post("/stream/start", response_model=StreamStatusResponse)
-@limiter.limit("30/minute")
-async def start_stream(
-    request: Request,
-    instrument_keys: list[str],
-    user_id: str = Depends(get_current_user_id),
-    tick_service: TickStreamService = Depends(get_tick_service),
-) -> StreamStatusResponse:
-    if not instrument_keys:
-        return StreamStatusResponse(status="no-op", message="No instrument keys provided")
-    await tick_service.add_symbols(instrument_keys)
-    if not tick_service._running:
-        asyncio.create_task(tick_service.connect())
-    return StreamStatusResponse(
-        status="subscribed",
-        message=f"Subscribed to {len(instrument_keys)} instruments",
-        instrument_count=len(instrument_keys),
-    )
-
-
-@router.post("/stream/stop", response_model=StreamStatusResponse)
-@limiter.limit("10/minute")
-async def stop_stream(
-    request: Request,
-    user_id: str = Depends(get_current_user_id),
-    tick_service: TickStreamService = Depends(get_tick_service),
-) -> StreamStatusResponse:
-    await tick_service.disconnect()
-    return StreamStatusResponse(status="disconnected", message="Stream stopped")
-
-
-@router.get("/stream/status", response_model=StreamStatusResponse)
-@limiter.limit("60/minute")
-async def stream_status(
-    request: Request,
-    user_id: str = Depends(get_current_user_id),
-    tick_service: TickStreamService = Depends(get_tick_service),
-) -> StreamStatusResponse:
-    connected = tick_service._ws is not None and not tick_service._ws.closed
-    return StreamStatusResponse(
-        status="connected" if connected else "disconnected",
-        instrument_count=len(tick_service._subscribed_symbols),
-    )
-
-
 # ── Candle ingestion ───────────────────────────────────────────────────────────
 
 @router.post("/ingest", response_model=IngestResponse)
@@ -166,7 +138,7 @@ async def ingest_candles(
 # ── Candle endpoints ───────────────────────────────────────────────────────────
 
 @router.get("/candles/intraday")
-@limiter.limit("60/minute")
+@limiter.limit("200/minute")
 async def get_intraday_candles(
     request: Request,
     instrument_key: str = Query(..., description="Upstox instrument key, e.g. NSE_EQ|INE002A01018"),
@@ -179,7 +151,7 @@ async def get_intraday_candles(
 ) -> dict[str, Any]:
     """
     Intraday candles for the current trading session with DB-first strategy.
-    
+
     Data Flow:
       1. Check Redis cache (30s TTL)
       2. Check database for recent intraday data
@@ -187,25 +159,18 @@ async def get_intraday_candles(
       4. Otherwise → fetch from Upstox API
       5. Store fetched data in DB for future requests
       6. Cache result in Redis
-    
-    Upstox v3 path: /historical-candle/intraday/{key}/{unit}/{interval}
     """
     from app.services.candle_service import candle_service
-    
-    # Check Redis cache first (fastest)
+
     cache_key = f"candles:intraday:{instrument_key}:{unit}:{interval}"
     cached = await cache.get(cache_key)
     if cached:
-        logger.debug(f"[Intraday] Cache hit for {instrument_key}")
         return cached
 
-    # Check database for recent data (second fastest)
     db_candles, is_from_db = await candle_service.get_intraday_candles(
         db, instrument_key, unit, interval
     )
-    
     if is_from_db and db_candles:
-        logger.info(f"[Intraday] DB hit for {instrument_key}, {len(db_candles)} candles")
         result = {
             "status": "success",
             "data": {"candles": db_candles},
@@ -216,27 +181,28 @@ async def get_intraday_candles(
         await cache.set(cache_key, result, ttl=30)
         return result
 
-    # Fetch from Upstox API (slowest, but most up-to-date)
     try:
-        logger.info(f"[Intraday] Fetching from API for {instrument_key}")
         path = f"historical-candle/intraday/{instrument_key}/{unit}/{interval}"
         raw = await upstox.get(path)
         result = _candles_response(raw, instrument_key, unit, interval)
-        
-        # Store in database for future requests (background task)
         if result.get("status") == "success" and result.get("data", {}).get("candles"):
-            candles = result["data"]["candles"]
-            await candle_service.store_candles(db, instrument_key, unit, interval, candles)
-        
+            await candle_service.store_candles(db, instrument_key, unit, interval, result["data"]["candles"])
         await cache.set(cache_key, result, ttl=30)
         return result
+    except UpstoxRateLimitError:
+        logger.warning("Upstox rate limit exhausted for intraday %s %s/%s", instrument_key, unit, interval)
+        return JSONResponse(
+            status_code=429,
+            content=_empty_candles_response(instrument_key, unit, interval, "Rate limit exceeded — please retry"),
+            headers={"Retry-After": "2"},
+        )
     except Exception:
         logger.exception("Intraday candles error for %s", instrument_key)
         return _empty_candles_response(instrument_key, unit, interval)
 
 
 @router.get("/candles/historical")
-@limiter.limit("60/minute")
+@limiter.limit("200/minute")
 async def get_historical_candles(
     request: Request,
     instrument_key: str = Query(..., description="Upstox instrument key, e.g. NSE_EQ|INE002A01018"),
@@ -255,7 +221,7 @@ async def get_historical_candles(
 ) -> dict[str, Any]:
     """
     Historical OHLCV candles for a date range with intelligent gap-filling.
-    
+
     Data Flow:
       1. Check Redis cache (5 min TTL)
       2. Check database for historical data
@@ -263,75 +229,42 @@ async def get_historical_candles(
       4. If no DB data → fetch complete range from Upstox API
       5. Store fetched data in DB for future requests
       6. Cache complete result in Redis
-    
-    Benefits:
-      - Always returns complete data (no gaps)
-      - Reduces API calls (uses DB when possible)
-      - Automatic gap detection and filling
-      - Fast response times (DB + selective API calls)
-      - Data persistence for historical analysis
-    
-    Upstox v3 path: /historical-candle/{key}/{unit}/{interval}/{to_date}/{from_date}
     """
     from app.services.candle_service import candle_service
-    
-    # Check Redis cache first (fastest)
+    from collections import Counter as PyCounter
+
     cache_key = f"candles:historical:{instrument_key}:{unit}:{interval}:{from_date}:{to_date}"
     cached = await cache.get(cache_key)
     if cached:
-        logger.debug(f"[Historical] Cache hit for {instrument_key} {from_date}-{to_date}")
         return cached
 
-    # Check database for historical data (second fastest)
     db_candles, is_from_db, missing_ranges = await candle_service.get_historical_candles(
         db, instrument_key, unit, interval, from_date, to_date
     )
-    
+
     if is_from_db and db_candles:
-        logger.info(
-            f"[Historical] DB hit for {instrument_key} {from_date}-{to_date}, "
-            f"{len(db_candles)} candles, {len(missing_ranges)} gap(s)"
-        )
-        
-        # If gaps exist, fetch them from API and merge
         if missing_ranges:
-            logger.info(f"[Historical] Filling {len(missing_ranges)} gap(s) from API")
             all_candles = db_candles
-            
             for gap in missing_ranges:
                 try:
                     gap_from = gap["from_date"]
-                    gap_to = gap["to_date"]
-                    logger.debug(f"[Historical] Fetching gap: {gap_from} to {gap_to}")
-                    
-                    # Fetch gap from Upstox API
+                    gap_to   = gap["to_date"]
                     path = f"historical-candle/{instrument_key}/{unit}/{interval}/{gap_to}/{gap_from}"
                     raw = await upstox.get(path)
                     gap_candles = raw.get("data", {}).get("candles", [])
-                    
                     if gap_candles:
-                        logger.debug(f"[Historical] Gap filled with {len(gap_candles)} candles")
-                        # Merge gap candles with DB candles
                         all_candles = candle_service.merge_candles(all_candles, gap_candles)
-                        
-                        # Store gap candles in DB for future requests
                         await candle_service.store_candles(db, instrument_key, unit, interval, gap_candles)
-                    else:
-                        logger.debug(f"[Historical] Gap {gap_from} to {gap_to} returned no data (holiday/weekend)")
+                except UpstoxRateLimitError:
+                    logger.warning("Rate limit hit during gap-fill for %s — returning partial DB data", instrument_key)
+                    break  # stop gap-filling; return whatever DB data we have
                 except Exception as gap_error:
-                    logger.warning(f"[Historical] Failed to fetch gap {gap}: {gap_error}")
-                    # Continue with other gaps even if one fails
-            
-            logger.info(f"[Historical] Gap filling complete: {len(all_candles)} total candles")
-            
-            # Debug: Check for duplicate timestamps
+                    logger.warning("Failed to fetch gap %s: %s", gap, gap_error)
+
             timestamps = [c[0] for c in all_candles]
             if len(timestamps) != len(set(timestamps)):
-                logger.warning(f"[Historical] Duplicate timestamps detected after merge!")
-                from collections import Counter
-                dupes = [ts for ts, count in Counter(timestamps).items() if count > 1]
-                logger.warning(f"[Historical] Duplicate timestamps: {dupes[:5]}")
-            
+                logger.warning("Duplicate timestamps detected after merge for %s", instrument_key)
+
             result = {
                 "status": "success",
                 "data": {"candles": all_candles},
@@ -339,182 +272,291 @@ async def get_historical_candles(
                 "interval": interval,
                 "unit": unit,
             }
-            # Cache the complete data
-            await cache.set(cache_key, result, ttl=300)
-            return result
-        else:
-            # No gaps, return DB data as-is
-            result = {
-                "status": "success",
-                "data": {"candles": db_candles},
-                "instrument_key": instrument_key,
-                "interval": interval,
-                "unit": unit,
-            }
             await cache.set(cache_key, result, ttl=300)
             return result
 
-    # Fetch from Upstox API (slowest, but complete data)
+        result = {
+            "status": "success",
+            "data": {"candles": db_candles},
+            "instrument_key": instrument_key,
+            "interval": interval,
+            "unit": unit,
+        }
+        await cache.set(cache_key, result, ttl=300)
+        return result
+
     try:
-        logger.info(f"[Historical] Fetching from API for {instrument_key} {from_date}-{to_date}")
-        # Upstox v3 uses path params: unit and interval are passed as separate segments.
-        # to_date comes before from_date in the URL (Upstox convention).
         path = f"historical-candle/{instrument_key}/{unit}/{interval}/{to_date}/{from_date}"
         raw = await upstox.get(path)
         result = _candles_response(raw, instrument_key, unit, interval)
-        
-        # Store in database for future requests (background task)
         if result.get("status") == "success" and result.get("data", {}).get("candles"):
-            candles = result["data"]["candles"]
-            await candle_service.store_candles(db, instrument_key, unit, interval, candles)
-        
+            await candle_service.store_candles(db, instrument_key, unit, interval, result["data"]["candles"])
         await cache.set(cache_key, result, ttl=300)
         return result
+    except UpstoxRateLimitError:
+        logger.warning("Upstox rate limit exhausted for historical %s %s/%s", instrument_key, unit, interval)
+        return JSONResponse(
+            status_code=429,
+            content=_empty_candles_response(instrument_key, unit, interval, "Rate limit exceeded — please retry"),
+            headers={"Retry-After": "2"},
+        )
     except Exception:
         logger.exception("Historical candles error for %s", instrument_key)
         return _empty_candles_response(instrument_key, unit, interval)
 
 
-# ── WebSocket tick stream ──────────────────────────────────────────────────────
+# ── LTP quote ──────────────────────────────────────────────────────────────────
 
-_HEARTBEAT_INTERVAL_S = 10.0
-_MOCK_TICK_VOLATILITY = 0.0015  # 0.15 % per tick — realistic intraday noise
-
-
-@ws_router.websocket("/ticks/ws")
-async def websocket_ticks(
-    websocket: WebSocket,
+@router.get("/ltp")
+@limiter.limit("120/minute")
+async def get_ltp_quote(
+    request: Request,
     instrument_key: str = Query(..., description="Upstox instrument key"),
-    interval_ms: int = Query(500, ge=100, le=5000, description="Tick emission interval in ms"),
+    user_id: str = Depends(get_current_user_id),
+    upstox: UpstoxClient = Depends(get_upstox_client),
+    cache: CacheService = Depends(get_cache_service),
+) -> dict[str, Any]:
+    """Single-instrument LTP quote. Use market-feed WebSocket for continuous prices."""
+    cache_key = f"ltp:{instrument_key}"
+    cached = await cache.get(cache_key)
+    if cached:
+        return cached
+    try:
+        raw = await upstox.get(f"market-quote/ltp?instrument_key={instrument_key}")
+        data = raw.get("data", {}).get(instrument_key, {})
+        result = {
+            "last_price": data.get("last_price"),
+            "prev_close_price": data.get("cp"),
+            "instrument_key": instrument_key,
+        }
+        await cache.set(cache_key, result, ttl=settings.CACHE_TTL_LIVE_QUOTE)
+        return result
+    except Exception:
+        logger.exception("LTP quote error for %s", instrument_key)
+        return {"last_price": None, "prev_close_price": None, "instrument_key": instrument_key}
+
+
+# ── Market-feed WebSocket ──────────────────────────────────────────────────────
+
+def _verify_ws_token(token: str) -> str | None:
+    """Decode JWT and return user_id, or None on failure."""
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        return payload.get("sub")
+    except JWTError:
+        return None
+
+
+async def _redis_listener(
+    pubsub: Any,
+    queue: asyncio.Queue[dict[str, Any]],
+    subscribed_keys: set[str],
+) -> None:
+    """Subscribe to Redis market-feed channel, forward matching ticks to queue."""
+    try:
+        async for message in pubsub.listen():
+            if message["type"] != "message":
+                continue
+            try:
+                data = json.loads(message["data"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if data.get("instrument_key") not in subscribed_keys:
+                continue
+            try:
+                queue.put_nowait(data)
+            except asyncio.QueueFull:
+                # Drop oldest tick to make room for the fresh one
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                queue.put_nowait(data)
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("Market-feed Redis listener error")
+
+
+async def _sender(
+    websocket: WebSocket,
+    queue: asyncio.Queue[dict[str, Any]],
+) -> None:
+    """Drain the outbound queue and write frames to the WebSocket client."""
+    try:
+        while True:
+            message = await queue.get()
+            await websocket.send_json(message)
+    except asyncio.CancelledError:
+        pass
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        logger.exception("Market-feed sender error")
+
+
+async def _heartbeat(queue: asyncio.Queue[dict[str, Any]]) -> None:
+    """Enqueue a server ping every 30 s."""
+    try:
+        while True:
+            await asyncio.sleep(_WS_HEARTBEAT_S)
+            try:
+                queue.put_nowait(HeartbeatEvent().model_dump())
+            except asyncio.QueueFull:
+                pass
+    except asyncio.CancelledError:
+        pass
+
+
+@ws_router.websocket("/market-feed/ws")
+async def websocket_market_feed(
+    websocket: WebSocket,
+    token: str | None = Query(None, description="JWT access token"),
 ) -> None:
     """
-    Real-time price tick stream for a single instrument.
+    Unified real-time ltpc market-feed WebSocket.
 
-    With a valid Upstox token:
-      - Subscribes the instrument to TickStreamService (connects Upstox WS if
-        not already running), registers a per-client asyncio.Queue callback,
-        and forwards decoded ticks at up to the requested interval_ms rate.
-      - Heartbeat frames are emitted every 10 s when no tick arrives.
+    Authentication:
+      Pass JWT as ?token=<jwt> query param.
+      Unauthenticated connections are rejected immediately.
 
-    Without a token (development / CI):
-      - Emits realistic mock ticks using Gaussian noise around a base price.
+    Client → Server:
+      {type: "sub",   instrument_keys: [...]}  — start receiving ltpc ticks
+      {type: "unsub", instrument_keys: [...]}  — stop receiving ltpc ticks
+      {type: "pong"}                           — heartbeat reply (optional)
+
+    Server → Client:
+      {type: "ltpc",         instrument_key, ltp, cp, ts}
+      {type: "subscribed",   instrument_keys, ts}
+      {type: "unsubscribed", instrument_keys, ts}
+      {type: "ping",         ts}   — server heartbeat every 30 s
+      {type: "error",        code, message}   — validation error (connection stays open)
     """
     await websocket.accept()
 
-    upstox_client: UpstoxClient = websocket.app.state.upstox_client
-    tick_service: TickStreamService = websocket.app.state.tick_service
+    # ── Auth ───────────────────────────────────────────────────────────────────
+    if not token:
+        await websocket.send_json(ErrorEvent(code="AUTH_REQUIRED", message="Missing token").model_dump())
+        await websocket.close(code=4001)
+        return
 
-    subscriber_id = f"ws:{uuid.uuid4().hex}:{instrument_key}"
-    # Bounded queue — if the client is slow we drop the oldest tick rather than
-    # accumulating unbounded memory.
-    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=64)
+    user_id = _verify_ws_token(token)
+    if not user_id:
+        await websocket.send_json(ErrorEvent(code="AUTH_REQUIRED", message="Invalid or expired token").model_dump())
+        await websocket.close(code=4001)
+        return
 
-    async def _enqueue_tick(tick_payload: dict[str, Any]) -> None:
-        feeds = tick_payload.get("feeds", {})
-        feed = feeds.get(instrument_key)
-        if not feed:
-            return
-        ltp = feed.get("ltpc", {}).get("ltp")
-        if ltp is None:
-            return
-        msg = {
-            "type": "tick",
-            "data": {
-                "instrument_key": instrument_key,
-                "last_price": ltp,
-                "server_timestamp": tick_payload.get("currentTs"),
-            },
-        }
-        try:
-            queue.put_nowait(msg)
-        except asyncio.QueueFull:
-            # Drop the oldest tick then insert the fresh one
-            try:
-                queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-            queue.put_nowait(msg)
+    market_feed: MarketFeedService = websocket.app.state.market_feed_service
+    redis: Redis = get_redis()
+
+    conn_id = uuid.uuid4().hex
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=_WS_QUEUE_MAXSIZE)
+    subscribed_keys: set[str] = set()
+
+    # Dedicated pub/sub connection for this client (redis-py requires a fresh pubsub per coroutine)
+    pubsub = redis.pubsub()
+    await pubsub.subscribe(RedisChannels.MARKET_FEED_LTPC)
+
+    listener_task  = asyncio.create_task(_redis_listener(pubsub, queue, subscribed_keys), name=f"mf_listener_{conn_id}")
+    sender_task    = asyncio.create_task(_sender(websocket, queue), name=f"mf_sender_{conn_id}")
+    heartbeat_task = asyncio.create_task(_heartbeat(queue), name=f"mf_heartbeat_{conn_id}")
+
+    logger.info("Market-feed WS connected: user=%s conn=%s", user_id, conn_id)
 
     try:
-        await websocket.send_json({
-            "type": "connected",
-            "data": {"instrument_key": instrument_key, "interval_ms": interval_ms},
-        })
+        while True:
+            try:
+                raw = await asyncio.wait_for(websocket.receive_text(), timeout=60.0)
+            except asyncio.TimeoutError:
+                # Client hasn't sent anything in 60 s — connection is healthy (sender handles heartbeats)
+                continue
 
-        if upstox_client.has_token:
-            await _run_live_stream(
-                websocket, tick_service, instrument_key,
-                subscriber_id, queue, _enqueue_tick, interval_ms,
-            )
-        else:
-            await _run_mock_stream(websocket, instrument_key, interval_ms)
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                await websocket.send_json(
+                    ErrorEvent(code="INVALID_MESSAGE", message="Message must be valid JSON").model_dump()
+                )
+                continue
+
+            msg_type = data.get("type")
+
+            if msg_type == "sub":
+                try:
+                    cmd = SubCommand(**data)
+                except Exception as exc:
+                    await websocket.send_json(
+                        ErrorEvent(code="INVALID_KEY", message=str(exc)).model_dump()
+                    )
+                    continue
+
+                new_keys = [k for k in cmd.instrument_keys if k not in subscribed_keys]
+                if new_keys:
+                    subscribed_keys.update(new_keys)
+                    await market_feed.subscribe_many(new_keys)
+
+                await websocket.send_json(
+                    SubscribedEvent(instrument_keys=cmd.instrument_keys).model_dump()
+                )
+
+            elif msg_type == "unsub":
+                try:
+                    cmd = UnsubCommand(**data)
+                except Exception as exc:
+                    await websocket.send_json(
+                        ErrorEvent(code="INVALID_KEY", message=str(exc)).model_dump()
+                    )
+                    continue
+
+                removed = [k for k in cmd.instrument_keys if k in subscribed_keys]
+                if removed:
+                    subscribed_keys.difference_update(removed)
+                    await market_feed.unsubscribe_many(removed)
+
+                await websocket.send_json(
+                    UnsubscribedEvent(instrument_keys=cmd.instrument_keys).model_dump()
+                )
+
+            elif msg_type == "pong":
+                pass  # Heartbeat reply — no action needed
+
+            else:
+                await websocket.send_json(
+                    ErrorEvent(
+                        code="INVALID_MESSAGE",
+                        message=f"Unknown message type: {msg_type!r}",
+                    ).model_dump()
+                )
 
     except WebSocketDisconnect:
-        logger.info("WS client disconnected: %s", instrument_key)
+        logger.info("Market-feed WS disconnected: user=%s conn=%s", user_id, conn_id)
     except Exception:
-        logger.exception("WS tick stream error for %s", instrument_key)
+        logger.exception("Market-feed WS error: conn=%s", conn_id)
         try:
             await websocket.close(code=1011)
         except Exception:
             pass
     finally:
-        if upstox_client.has_token:
-            tick_service.unsubscribe(subscriber_id)
+        listener_task.cancel()
+        sender_task.cancel()
+        heartbeat_task.cancel()
+        await asyncio.gather(listener_task, sender_task, heartbeat_task, return_exceptions=True)
 
-
-async def _run_live_stream(
-    websocket: WebSocket,
-    tick_service: TickStreamService,
-    instrument_key: str,
-    subscriber_id: str,
-    queue: asyncio.Queue[dict[str, Any]],
-    enqueue_cb: Any,
-    interval_ms: int,
-) -> None:
-    """Bridge TickStreamService → WebSocket client for a single instrument."""
-    await tick_service.add_symbols([instrument_key])
-    if not tick_service._running:
-        asyncio.create_task(tick_service.connect())
-
-    tick_service.subscribe(subscriber_id, enqueue_cb)
-    timeout_s = interval_ms / 1000.0
-
-    try:
-        while True:
+        # Drain the queue to free memory
+        while not queue.empty():
             try:
-                tick = await asyncio.wait_for(queue.get(), timeout=_HEARTBEAT_INTERVAL_S)
-                await websocket.send_json(tick)
-            except asyncio.TimeoutError:
-                await websocket.send_json({"type": "heartbeat"})
-    finally:
-        tick_service.unsubscribe(subscriber_id)
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
+        # Unsubscribe instruments from the feed (decrements ref counts)
+        if subscribed_keys:
+            await market_feed.unsubscribe_many(list(subscribed_keys))
 
-async def _run_mock_stream(
-    websocket: WebSocket,
-    instrument_key: str,
-    interval_ms: int,
-) -> None:
-    """
-    Development mock: emits Gaussian-noise ticks around a stable base price.
-    Uses 1 000 as the starting price when no candle history is available.
-    """
-    import random
-    import math
+        try:
+            await pubsub.unsubscribe(RedisChannels.MARKET_FEED_LTPC)
+            await pubsub.aclose()
+        except Exception:
+            pass
 
-    base_price = 1_000.0
-    price = base_price
-    sleep_s = interval_ms / 1000.0
-
-    while True:
-        # Geometric Brownian Motion step — realistic price walk
-        price *= math.exp(random.gauss(0, _MOCK_TICK_VOLATILITY))
-        await websocket.send_json({
-            "type": "tick",
-            "data": {
-                "instrument_key": instrument_key,
-                "last_price": round(price, 2),
-                "server_timestamp": None,
-            },
-        })
-        await asyncio.sleep(sleep_s)
+        logger.info("Market-feed WS cleanup complete: conn=%s", conn_id)

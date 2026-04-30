@@ -28,6 +28,9 @@ export interface ContributingEvent {
   event_type: string;
   impact_score: number;
   summary: string;
+  source_url?: string;
+  source_name?: string;
+  article_title?: string;
 }
 
 export interface ContributingMLPrediction {

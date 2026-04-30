@@ -149,10 +149,19 @@ export function useCAIWebSocket(options: UseCAIWebSocketOptions = {}): UseCAIWeb
     setStatus('connecting');
 
     try {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const host =
-        process.env.NEXT_PUBLIC_API_URL?.replace(/^https?:\/\//, '') || window.location.host;
-      const wsUrl = `${protocol}//${host}/api/v1/cai/stream`;
+      // Build the WebSocket URL from the dedicated CAI env var, or fall back to
+      // deriving it from NEXT_PUBLIC_API_URL.  Never fall back to window.location.host
+      // — the Next.js dev server cannot handle WebSocket upgrades and the connection
+      // would fail silently, cycling through exponential backoff forever.
+      const wsUrl = (() => {
+        if (process.env.NEXT_PUBLIC_CAI_WS_URL) {
+          return process.env.NEXT_PUBLIC_CAI_WS_URL;
+        }
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const apiHost =
+          process.env.NEXT_PUBLIC_API_URL?.replace(/^https?:\/\//, '') ?? 'localhost:8000';
+        return `${protocol}//${apiHost}/api/v1/cai/stream`;
+      })();
 
       console.log('[CAI WebSocket] Connecting to:', wsUrl);
       const ws = new WebSocket(wsUrl);
@@ -170,8 +179,16 @@ export function useCAIWebSocket(options: UseCAIWebSocketOptions = {}): UseCAIWeb
 
       ws.onmessage = handleMessage;
 
-      ws.onerror = (error) => {
-        console.error('[CAI WebSocket] Error:', error);
+      ws.onerror = () => {
+        // WebSocket ErrorEvent objects are intentionally opaque by the browser spec —
+        // no message or reason is exposed.  This fires for every connection attempt
+        // while the backend is starting up, so log at warn to avoid flooding the
+        // Next.js error overlay during normal reconnect cycles.
+        // The definitive failure is logged by scheduleReconnect() once max attempts
+        // are exhausted.
+        console.warn(
+          `[CAI WebSocket] Connection failed — url: ${wsUrl} | readyState: ${ws.readyState}`,
+        );
       };
 
       ws.onclose = (event) => {

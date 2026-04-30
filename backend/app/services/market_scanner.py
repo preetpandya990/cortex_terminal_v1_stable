@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -47,7 +48,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.core.redis import CacheService
 from app.exceptions import DatabaseError
-from app.schemas.scanner import ScanResult, ScanSignal
+from app.schemas.scanner import ScanProgressEvent, ScanResult, ScanSignal
 from app.services.indicators import TechnicalIndicators
 from app.services.market_calendar import nse_calendar
 from app.services.upstox_client import UpstoxClient
@@ -125,8 +126,8 @@ class MarketScannerService:
         Returns cached results when available unless force_refresh=True.
         Always returns an empty list rather than raising on data unavailability.
 
-        live_prices_available=False means results are sourced from DB close
-        prices only — the UI should surface this to the user.
+        Delegates to scan_all_stream() so the streaming and non-streaming paths
+        share a single implementation.
         """
         cache_key = f"scanner:results:v2:{timeframe}"
 
@@ -139,54 +140,86 @@ class MarketScannerService:
                     cached.get("live_prices_available", True),
                 )
 
-        results, live_prices_available = await self._run_scan(session, upstox_client, timeframe)
+        results: list[ScanResult] = []
+        live_prices_available = False
 
+        async for event in self.scan_all_stream(session, upstox_client, timeframe):
+            if event.results is not None:
+                results = event.results
+                live_prices_available = event.live_prices_available
+
+        ttl = (
+            settings.CACHE_TTL_SCANNER_OPEN
+            if nse_calendar.get_session().is_open_now
+            else settings.CACHE_TTL_SCANNER_CLOSED
+        )
         await self._cache.set(
             cache_key,
             {
                 "results": [r.model_dump(mode="json") for r in results],
                 "live_prices_available": live_prices_available,
             },
-            ttl=settings.CACHE_TTL_SCANNER,
+            ttl=ttl,
         )
         return results, live_prices_available
 
-    # ── Orchestration ──────────────────────────────────────────────────────
-
-    async def _run_scan(
+    async def scan_all_stream(
         self,
         session: AsyncSession,
         upstox_client: UpstoxClient,
-        timeframe: str,
-    ) -> tuple[list[ScanResult], bool]:
+        timeframe: str = "1d",
+    ) -> AsyncGenerator[ScanProgressEvent, None]:
+        """
+        Async generator that yields ScanProgressEvent at each pipeline stage.
+
+        Progress events carry pct/stage/message only.
+        The terminal event additionally carries results + live_prices_available.
+        Always performs a fresh scan — cache logic lives in scan_all().
+        """
+        from zoneinfo import ZoneInfo
+        _IST = ZoneInfo("Asia/Kolkata")
+
         db_timeframe = _TIMEFRAME_MAP.get(timeframe, timeframe)
 
-        # 1. Quorum-based reference session
+        yield ScanProgressEvent(pct=2, stage="init", message="Initializing scan…")
+
+        # ── Stage 1: quorum-based reference session ────────────────────────
         ref_ts = await self._get_reference_session(session, db_timeframe)
         if ref_ts is None:
             logger.warning(
-                "Scanner: no complete reference session found (timeframe=%s). "
-                "Ensure ingestion has run recently.",
+                "Scanner stream: no complete reference session (timeframe=%s) — "
+                "ensure ingestion has run recently.",
                 timeframe,
             )
-            return [], False
+            yield ScanProgressEvent(
+                pct=2,
+                stage="error",
+                message="No complete reference session found — ensure ingestion has run recently.",
+            )
+            return
 
-        from zoneinfo import ZoneInfo
-        _IST = ZoneInfo("Asia/Kolkata")
-        logger.info(
-            "Scanner reference session: %s (IST)  timeframe=%s",
-            ref_ts.astimezone(_IST).strftime("%Y-%m-%d"), timeframe,
-        )
+        ref_label = ref_ts.astimezone(_IST).strftime("%d %b %Y")
+        logger.info("Scanner stream reference session: %s  timeframe=%s", ref_label, timeframe)
+        yield ScanProgressEvent(pct=15, stage="reference_session", message=f"Reference session: {ref_label}")
 
-        # 2. DB baselines — prev_close, volume history, RSI candles
+        # ── Stage 2: DB baselines ─────────────────────────────────────────
         instrument_data = await self._fetch_db_baselines(session, ref_ts, db_timeframe)
         if not instrument_data:
             logger.warning(
-                "Scanner: no instrument data after staleness filter  ref=%s", ref_ts.isoformat()
+                "Scanner stream: no instrument data after staleness filter  ref=%s",
+                ref_ts.isoformat(),
             )
-            return [], False
+            yield ScanProgressEvent(
+                pct=15,
+                stage="error",
+                message="No instrument data found after staleness filter.",
+            )
+            return
 
-        # 3. Market state
+        n = len(instrument_data)
+        yield ScanProgressEvent(pct=40, stage="db_baselines", message=f"Loaded baselines for {n:,} instruments")
+
+        # ── Stage 3: market state ─────────────────────────────────────────
         now_utc = datetime.now(timezone.utc)
         try:
             await asyncio.wait_for(nse_calendar.refresh_if_needed(), timeout=1.0)
@@ -194,36 +227,63 @@ class MarketScannerService:
             pass
         market_session = nse_calendar.get_session(now_utc)
         is_market_open = market_session.is_open_now
+        yield ScanProgressEvent(
+            pct=45,
+            stage="market_state",
+            message="Market open — fetching live prices" if is_market_open else "Market closed — using end-of-day data",
+        )
 
-        # 4. Live quotes from Upstox — always attempt when token is available.
-        #    Upstox returns last_price (LTP) and cp (official previous close)
-        #    regardless of market state: during hours it's the live price;
-        #    after close it's today's closing price vs yesterday's close.
-        #    This eliminates any dependency on DB freshness for price comparison.
+        # ── Stage 4: live quotes ──────────────────────────────────────────
         live_quotes: dict[str, _LiveQuote] = {}
         live_prices_available = False
-        if upstox_client.has_token:
+        if upstox_client.has_token and is_market_open:
+            yield ScanProgressEvent(
+                pct=50,
+                stage="live_quotes",
+                message=f"Fetching live quotes for {n:,} instruments…",
+            )
             live_quotes = await self._fetch_live_quotes(
                 upstox_client, list(instrument_data.keys()), instrument_data
             )
             live_prices_available = len(live_quotes) > 0
-            logger.info(
-                "Scanner: Upstox returned %d/%d quotes (ltp+cp)",
-                len(live_quotes), len(instrument_data),
+            logger.info("Scanner stream: Upstox returned %d/%d quotes (ltp+cp)", len(live_quotes), n)
+            yield ScanProgressEvent(
+                pct=80,
+                stage="live_quotes",
+                message=f"Received {len(live_quotes):,} live quotes from Upstox",
             )
         else:
-            logger.warning("Scanner: no Upstox token — falling back to DB close prices")
+            if not upstox_client.has_token:
+                logger.warning("Scanner stream: no Upstox token — falling back to DB close prices")
+                fallback_msg = "No Upstox token — using stored close prices"
+            else:
+                logger.debug("Scanner stream: market closed — skipping live quotes, using DB close prices")
+                fallback_msg = "Market closed — using end-of-day close prices"
+            yield ScanProgressEvent(
+                pct=80,
+                stage="live_quotes",
+                message=fallback_msg,
+            )
 
-        # 5. Assemble, score, sort
+        # ── Stage 5: score + sort ─────────────────────────────────────────
+        yield ScanProgressEvent(pct=85, stage="scoring", message="Computing signals and scores…")
         results = self._build_results(instrument_data, live_quotes, is_market_open, now_utc)
-        # Primary sort: absolute % change (largest movers first, regardless of direction)
         results.sort(key=lambda r: abs(r.price_change_pct), reverse=True)
 
         logger.info(
-            "Scanner complete: %d instruments scored  live=%d  market_open=%s",
+            "Scanner stream complete: %d instruments scored  live=%d  market_open=%s",
             len(results), len(live_quotes), is_market_open,
         )
-        return results, live_prices_available
+        yield ScanProgressEvent(pct=95, stage="scoring", message=f"Scored {len(results):,} instruments")
+
+        # ── Terminal: complete ────────────────────────────────────────────
+        yield ScanProgressEvent(
+            pct=100,
+            stage="complete",
+            message=f"Scan complete — {len(results):,} instruments evaluated",
+            results=results,
+            live_prices_available=live_prices_available,
+        )
 
     # ── DB: reference session ──────────────────────────────────────────────
 

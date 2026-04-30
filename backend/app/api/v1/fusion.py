@@ -1,152 +1,124 @@
 """
-Fusion API - Trading Signal Generation
+Fusion API — Trading Signal Generation and Retrieval
 
-Endpoints for signal assembly and fusion.
+Endpoints:
+  POST /signals/generate/{symbol}  — on-demand signal generation
+  GET  /signals                    — paginated signal list with full filtering
+  GET  /signals/by-id/{id}/audit   — per-signal audit trail
+  GET  /signals/{symbol}           — recent signals for a symbol (legacy)
 """
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from sqlalchemy import and_, desc, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.ai.fusion.serializers import serialise_signal
 from app.ai.fusion.signal_assembler import SignalAssembler
 from app.api.deps import get_db
 from app.core.auth import get_current_user, require_role
 from app.core.limiter import limiter
-from app.core.redis import PubSubClient
+from app.core.redis import get_pubsub_client, PubSubClient
 
 router = APIRouter()
 
 
-# ── JSONB normalisers ──────────────────────────────────────────────────────────
-# The DB stores contributing_events / ml_predictions / technical_indicators in
-# compact internal formats. These helpers translate them to the typed shapes the
-# frontend TradingSignal interface expects.
-
-def _normalise_events(raw) -> list[dict]:
-    if not raw or not isinstance(raw, list):
-        return []
-    result = []
-    for i, e in enumerate(raw):
-        if not isinstance(e, dict):
-            continue
-        result.append({
-            "event_id": str(e.get("id", i)),
-            "event_type": e.get("type", "unknown"),
-            "impact_score": round(float(e.get("impact", 0)) / 100, 4),
-            "summary": e.get("summary") or e.get("type") or "—",
-        })
-    return result
-
-
-def _normalise_ml_predictions(raw) -> list[dict]:
-    if not raw or not isinstance(raw, dict):
-        return []
-    confidence = float(raw.get("confidence", 0))
-    score = float(raw.get("score", 0))
-    model = raw.get("model") or "ensemble"
-    if confidence == 0.0 and score == 0.0:
-        return []
-    return [{
-        "model_id": str(model),
-        "model_name": str(model).capitalize(),
-        "prediction": "bullish" if score > 0.5 else "bearish",
-        "confidence": confidence,
-    }]
-
-
-def _normalise_technical(raw) -> list[dict]:
-    if not raw or not isinstance(raw, dict):
-        return []
-    indicators = raw.get("indicators")
-    if not indicators or not isinstance(indicators, dict):
-        return []
-    return [
-        {
-            "indicator": k,
-            "value": float(v) if isinstance(v, (int, float)) else 0.0,
-            "signal": "neutral",
-        }
-        for k, v in indicators.items()
-    ]
-
+# ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @router.post("/signals/generate/{symbol}")
-@limiter.limit("10000/minute")  # Increased for load testing
+@limiter.limit("60/minute")
 async def generate_signal(
     request: Request,
     symbol: str,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(require_role("trader")),
+    pubsub: PubSubClient = Depends(get_pubsub_client),
+    current_user=Depends(require_role("trader")),
 ):
-    """Generate trading signal for a symbol."""
-    assembler = SignalAssembler()
-    pubsub = PubSubClient()
-    
+    """On-demand signal generation for a symbol."""
+    from app.core.redis import get_redis
+    from app.ml.inference.feature_loader import FeatureLoader
+
+    ml_predictor = getattr(request.app.state, "ml_predictor", None)
+
+    feature_loader = (
+        FeatureLoader(db=db, redis=get_redis()) if ml_predictor else None
+    )
+
+    assembler = SignalAssembler(
+        ensemble_predictor=ml_predictor,
+        feature_loader=feature_loader,
+    )
+
     try:
         signal = await assembler.assemble_signal(db, pubsub, symbol)
-        return {
-            "signal_id": signal.id,
-            "symbol": signal.symbol,
-            "action": signal.action,
-            "confidence": float(signal.confidence_score),
-            "timestamp": signal.signal_timestamp.isoformat(),
-        }
-    except Exception as e:
+        return serialise_signal(signal)
+    except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Signal generation failed: {str(e)}"
-        )
+            detail=f"Signal generation failed: {exc}",
+        ) from exc
 
 
 @router.get("/signals")
 async def get_all_signals(
     page: int = 1,
     limit: int = 20,
-    symbol: str | None = None,
+    symbol: Optional[str] = None,
+    signal_type: Optional[str] = None,
+    time_horizon: Optional[str] = None,
+    min_confidence: Optional[float] = None,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user=Depends(get_current_user),
 ):
-    """Get recent signals with pagination."""
-    from sqlalchemy import select, desc, func
+    """
+    Paginated signal list with filtering.
+
+    Default window: active signals + signals that expired within the last 24 hours.
+    This matches professional terminal behaviour — same-day context is always visible.
+
+    Filters:
+      symbol         — exact NSE trading symbol (case-sensitive)
+      signal_type    — buy / sell / hold
+      time_horizon   — intraday / swing / positional
+      min_confidence — 0.0–1.0 inclusive threshold on calibrated_confidence
+    """
     from app.ai.fusion.models import AITradingSignal
-    
-    stmt = select(AITradingSignal).order_by(desc(AITradingSignal.signal_timestamp))
-    
+
+    predicates = [
+        or_(
+            AITradingSignal.expires_at.is_(None),
+            AITradingSignal.expires_at > text("NOW() - INTERVAL '24 hours'"),
+        )
+    ]
+
     if symbol:
-        stmt = stmt.where(AITradingSignal.symbol == symbol)
-    
-    # Get total count
-    count_stmt = select(func.count()).select_from(AITradingSignal)
-    if symbol:
-        count_stmt = count_stmt.where(AITradingSignal.symbol == symbol)
-    total = await db.scalar(count_stmt) or 0
-    
-    # Apply pagination
+        predicates.append(AITradingSignal.symbol == symbol)
+    if signal_type:
+        predicates.append(AITradingSignal.action == signal_type.upper())
+    if time_horizon:
+        predicates.append(AITradingSignal.time_horizon == time_horizon)
+    if min_confidence is not None:
+        predicates.append(AITradingSignal.confidence_score >= min_confidence)
+
+    where_clause = and_(*predicates)
+
+    total = await db.scalar(
+        select(func.count()).select_from(AITradingSignal).where(where_clause)
+    ) or 0
+
     offset = (page - 1) * limit
-    stmt = stmt.offset(offset).limit(limit)
-    
-    result = await db.execute(stmt)
-    signals = result.scalars().all()
-    
+    rows = (
+        await db.execute(
+            select(AITradingSignal)
+            .where(where_clause)
+            .order_by(desc(AITradingSignal.signal_timestamp))
+            .offset(offset)
+            .limit(limit)
+        )
+    ).scalars().all()
+
     return {
-        "signals": [
-            {
-                "signal_id": str(s.id),
-                "symbol": s.symbol,
-                "signal_type": s.action.lower(),  # Map action to signal_type
-                "confidence": float(s.confidence_score),
-                "calibrated_confidence": float(s.confidence_score),
-                "time_horizon": "intraday",  # Default, should be in DB
-                "reasoning": s.reasoning or "",
-                "contributing_factors": {
-                    "events": _normalise_events(s.contributing_events),
-                    "ml_predictions": _normalise_ml_predictions(s.ml_predictions),
-                    "technical": _normalise_technical(s.technical_indicators),
-                },
-                "regime_type": s.regime_type,
-                "generated_at": s.signal_timestamp.isoformat(),
-                "expires_at": s.signal_timestamp.isoformat(),  # Should calculate expiry
-            }
-            for s in signals
-        ],
+        "signals": [serialise_signal(s) for s in rows],
         "total": total,
         "page": page,
         "limit": limit,
@@ -157,10 +129,9 @@ async def get_all_signals(
 async def get_signal_audit(
     signal_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user=Depends(get_current_user),
 ):
-    """Return audit trail entries for a specific signal ID."""
-    from sqlalchemy import select
+    """Return the audit trail entry for a specific signal ID."""
     from app.ai.fusion.models import AITradingSignal
 
     try:
@@ -168,23 +139,29 @@ async def get_signal_audit(
     except (ValueError, TypeError):
         return {"audit_log": [], "total": 0}
 
-    stmt = select(AITradingSignal).where(AITradingSignal.id == signal_id_int)
-    result = await db.execute(stmt)
-    signal = result.scalar_one_or_none()
+    signal = (
+        await db.execute(
+            select(AITradingSignal).where(AITradingSignal.id == signal_id_int)
+        )
+    ).scalar_one_or_none()
 
     if not signal:
         return {"audit_log": [], "total": 0}
 
-    entry = {
-        "audit_id": signal.id,
-        "signal_id": str(signal.id),
-        "symbol": signal.symbol,
-        "signal_type": signal.action.lower(),
-        "confidence": float(signal.confidence_score),
-        "generated_at": signal.signal_timestamp.isoformat(),
-        "outcome": None,
+    return {
+        "audit_log": [
+            {
+                "audit_id": signal.id,
+                "signal_id": str(signal.id),
+                "symbol": signal.symbol,
+                "signal_type": signal.action.lower(),
+                "confidence": float(signal.confidence_score),
+                "generated_at": signal.signal_timestamp.isoformat(),
+                "outcome": None,
+            }
+        ],
+        "total": 1,
     }
-    return {"audit_log": [entry], "total": 1}
 
 
 @router.get("/signals/{symbol}")
@@ -192,29 +169,18 @@ async def get_signals(
     symbol: str,
     limit: int = 10,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user=Depends(get_current_user),
 ):
-    """Get recent signals for a symbol."""
-    from sqlalchemy import select, desc
+    """Recent signals for a symbol (lightweight — no pagination or filters)."""
     from app.ai.fusion.models import AITradingSignal
-    
-    stmt = (
-        select(AITradingSignal)
-        .where(AITradingSignal.symbol == symbol)
-        .order_by(desc(AITradingSignal.signal_timestamp))
-        .limit(limit)
-    )
-    
-    result = await db.execute(stmt)
-    signals = result.scalars().all()
-    
-    return [
-        {
-            "signal_id": s.id,
-            "symbol": s.symbol,
-            "action": s.action,
-            "confidence": float(s.confidence_score),
-            "timestamp": s.signal_timestamp.isoformat(),
-        }
-        for s in signals
-    ]
+
+    rows = (
+        await db.execute(
+            select(AITradingSignal)
+            .where(AITradingSignal.symbol == symbol)
+            .order_by(desc(AITradingSignal.signal_timestamp))
+            .limit(limit)
+        )
+    ).scalars().all()
+
+    return [serialise_signal(s) for s in rows]

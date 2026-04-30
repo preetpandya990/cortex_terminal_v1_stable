@@ -2,10 +2,20 @@ import { NextRequest, NextResponse } from 'next/server';
 
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8000';
 
-/**
- * Logout endpoint
- * POST /api/auth/logout
- */
+// Cookie attributes must exactly match those used when the cookie was set —
+// the path in particular must align or the browser will not overwrite/expire it.
+const REFRESH_COOKIE_PATH = '/api/auth';
+
+function clearRefreshTokenCookie(response: NextResponse): void {
+  response.cookies.set('refresh_token', '', {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'strict',
+    path: REFRESH_COOKIE_PATH,
+    maxAge: 0,
+  });
+}
+
 export async function POST(request: NextRequest) {
   try {
     // Get tokens from request
@@ -22,18 +32,13 @@ export async function POST(request: NextRequest) {
       },
     });
 
-    // Create response
     const nextResponse = NextResponse.json({ status: 'logged_out' });
-
-    // Clear refresh token cookie
-    nextResponse.cookies.delete('refresh_token');
-
+    clearRefreshTokenCookie(nextResponse);
     return nextResponse;
   } catch (error) {
     console.error('[API] Logout error:', error);
-    // Even if backend fails, clear local cookies
     const nextResponse = NextResponse.json({ status: 'logged_out' });
-    nextResponse.cookies.delete('refresh_token');
+    clearRefreshTokenCookie(nextResponse);
     return nextResponse;
   }
 }

@@ -15,7 +15,7 @@
 
 ---
 
-## 🏗️ Architecture (4 files)
+## 🏗️ Architecture (5 files)
 
 | Document | Description |
 |----------|-------------|
@@ -23,15 +23,17 @@
 | [ARCHITECTURE_SUMMARY.md](documentation/architecture/ARCHITECTURE_SUMMARY.md) | Quick reference guide |
 | [ARCHITECTURE_DIAGRAMS.md](documentation/architecture/ARCHITECTURE_DIAGRAMS.md) | Visual architecture diagrams |
 | [MERGE_PLAN.md](documentation/architecture/MERGE_PLAN.md) | Original ML + AI merge plan |
+| [MARKET_FEED_ARCHITECTURE.md](documentation/architecture/MARKET_FEED_ARCHITECTURE.md) | Unified real-time market feed architecture, design decisions, before/after |
 
 ---
 
-## 📡 API Documentation (2 files)
+## 📡 API Documentation (3 files)
 
 | Document | Description |
 |----------|-------------|
 | [API_ENDPOINTS_DOCUMENTATION.md](documentation/api/API_ENDPOINTS_DOCUMENTATION.md) | Complete API reference (50+ endpoints) |
 | [CURL_COMMANDS.md](documentation/api/CURL_COMMANDS.md) | Example CURL commands for testing |
+| [MARKET_FEED_WEBSOCKET_API.md](documentation/api/MARKET_FEED_WEBSOCKET_API.md) | Market feed WS protocol — connection, auth, all message types, error codes |
 
 ---
 
@@ -57,7 +59,7 @@
 
 ---
 
-## 🔧 Implementation (7 files)
+## 🔧 Implementation (8 files)
 
 | Document | Description |
 |----------|-------------|
@@ -68,6 +70,7 @@
 | [SCANNER_FIX_PRODUCTION_GRADE.md](documentation/implementation/SCANNER_FIX_PRODUCTION_GRADE.md) | Scanner production fixes |
 | [FRONTEND_COMPONENTS_SCAN.md](documentation/implementation/FRONTEND_COMPONENTS_SCAN.md) | Frontend component inventory |
 | [POST_MERGE_CLEANUP_CHECKLIST.md](documentation/implementation/POST_MERGE_CLEANUP_CHECKLIST.md) | Post-merge cleanup tasks |
+| [MARKET_FEED_IMPLEMENTATION.md](documentation/implementation/MARKET_FEED_IMPLEMENTATION.md) | **Unified real-time market feed** — problem analysis, solution, all file changes, throttle strategy, monitoring |
 
 ---
 
@@ -93,7 +96,7 @@
 
 ---
 
-## 📋 Tasks (8 files)
+## 📋 Tasks (9 files)
 
 | Document | Description |
 |----------|-------------|
@@ -105,16 +108,18 @@
 | [TASK_39_FINAL_RESULTS.md](documentation/tasks/TASK_39_FINAL_RESULTS.md) | Task 39 results |
 | [TASK_43_TRAINING_GUIDES_SUMMARY.md](documentation/tasks/TASK_43_TRAINING_GUIDES_SUMMARY.md) | Training guides summary |
 | [TASK_44_FINAL_SYSTEM_VALIDATION.md](documentation/tasks/TASK_44_FINAL_SYSTEM_VALIDATION.md) | Final validation |
+| [MARKET_FEED_CHANGE_LOG.md](documentation/tasks/hawk-eye/market-feed/MARKET_FEED_CHANGE_LOG.md) | File-by-file change log for the unified market feed implementation |
 
 ---
 
-## 🧪 Testing (3 files)
+## 🧪 Testing (4 files)
 
 | Document | Description |
 |----------|-------------|
 | [INTEGRATION_TESTS_SUMMARY.md](documentation/testing/INTEGRATION_TESTS_SUMMARY.md) | Integration test results |
 | [PERFORMANCE_TESTS_SUMMARY.md](documentation/testing/PERFORMANCE_TESTS_SUMMARY.md) | Performance test results |
 | [ML_SYSTEM_VERIFICATION_REPORT.md](documentation/testing/ML_SYSTEM_VERIFICATION_REPORT.md) | ML system verification |
+| [MARKET_FEED_TESTING_GUIDE.md](documentation/testing/MARKET_FEED_TESTING_GUIDE.md) | Market feed verification — mock mode, wscat tests, regression checklist, perf validation |
 
 ---
 
@@ -141,13 +146,14 @@
 
 ## 📊 Documentation Statistics
 
-- **Total Files**: 55 markdown documents
-- **Total Directories**: 10 organized categories
-- **Architecture Docs**: 4 files (including 2,499-line main doc)
+- **Total Files**: 60 markdown documents
+- **Total Directories**: 11 organized categories
+- **Architecture Docs**: 5 files (including 2,499-line main doc)
 - **Phase Reports**: 15 completion reports
 - **User Guides**: 6 comprehensive guides
-- **API Documentation**: 2 files (50+ endpoints)
-- **Test Reports**: 3 comprehensive reports
+- **API Documentation**: 3 files (50+ endpoints + market feed WS)
+- **Implementation Docs**: 8 files
+- **Test Reports**: 4 comprehensive reports
 
 ---
 
@@ -194,6 +200,6 @@
 
 ---
 
-**Last Updated**: April 16, 2026  
-**Documentation Version**: 1.0  
+**Last Updated**: April 28, 2026  
+**Documentation Version**: 1.1  
 **Project Status**: Production Ready

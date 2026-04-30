@@ -1,9 +1,9 @@
 /**
- * Signals Panel Component
- * Displays real-time trading signals with filtering capabilities
+ * Signals Panel — real-time trading signal list with filtering and pagination.
+ * Uses useSignalsRealtime for WebSocket-injected live updates + 30s poll fallback.
  */
 import * as React from "react";
-import { format } from "date-fns";
+import { format, differenceInHours, isPast } from "date-fns";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -15,9 +15,15 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { useSignals } from "@/hooks/useSignals";
+import { useSignalsRealtime } from "@/hooks/useSignalsRealtime";
 import { SignalDetailModal } from "@/components/ai/SignalDetailModal";
-import { SignalType, TimeHorizon, type SignalFilters, type TradingSignal } from "@/types/signals";
+import {
+  SignalType,
+  TimeHorizon,
+  type SignalFilters,
+  type TradingSignal,
+} from "@/types/signals";
+import type { ConnectionStatus } from "@/hooks/useCAIWebSocket";
 import {
   TrendingUp,
   TrendingDown,
@@ -26,10 +32,12 @@ import {
   RefreshCw,
   ChevronLeft,
   ChevronRight,
+  Clock,
 } from "lucide-react";
 
 interface SignalsPanelProps {
   className?: string;
+  onWsStatusChange?: (status: ConnectionStatus) => void;
 }
 
 function safeFormatDate(value: string | null | undefined, fmt: string): string {
@@ -39,7 +47,17 @@ function safeFormatDate(value: string | null | undefined, fmt: string): string {
   return format(d, fmt);
 }
 
-export function SignalsPanel({ className }: SignalsPanelProps) {
+/** Returns the expiry visual state for a signal. */
+function getExpiryState(expiresAt: string | null | undefined): "active" | "soon" | "expired" {
+  if (!expiresAt) return "active";
+  const d = new Date(expiresAt);
+  if (isNaN(d.getTime())) return "active";
+  if (isPast(d)) return "expired";
+  if (differenceInHours(d, new Date()) <= 2) return "soon";
+  return "active";
+}
+
+export function SignalsPanel({ className, onWsStatusChange }: SignalsPanelProps) {
   const [filters, setFilters] = React.useState<SignalFilters>({
     page: 1,
     limit: 10,
@@ -47,27 +65,26 @@ export function SignalsPanel({ className }: SignalsPanelProps) {
   const [selectedSignal, setSelectedSignal] = React.useState<TradingSignal | null>(null);
   const [showFilters, setShowFilters] = React.useState(false);
 
-  const { data, isLoading, refetch, isRefetching } = useSignals(filters);
+  const { data, isLoading, refetch, isRefetching, wsStatus } = useSignalsRealtime(filters);
+
+  // Lift WebSocket status to parent (page-level ConnectionStatusIndicator).
+  React.useEffect(() => {
+    onWsStatusChange?.(wsStatus);
+  }, [wsStatus, onWsStatusChange]);
 
   const getSignalIcon = (type: SignalType) => {
     switch (type) {
-      case SignalType.BUY:
-        return <TrendingUp className="size-4" />;
-      case SignalType.SELL:
-        return <TrendingDown className="size-4" />;
-      case SignalType.HOLD:
-        return <Minus className="size-4" />;
+      case SignalType.BUY:  return <TrendingUp className="size-4" />;
+      case SignalType.SELL: return <TrendingDown className="size-4" />;
+      case SignalType.HOLD: return <Minus className="size-4" />;
     }
   };
 
   const getSignalColor = (type: SignalType) => {
     switch (type) {
-      case SignalType.BUY:
-        return "bg-green-500/10 text-green-700 dark:text-green-400 border-green-500/20";
-      case SignalType.SELL:
-        return "bg-red-500/10 text-red-700 dark:text-red-400 border-red-500/20";
-      case SignalType.HOLD:
-        return "bg-yellow-500/10 text-yellow-700 dark:text-yellow-400 border-yellow-500/20";
+      case SignalType.BUY:  return "bg-green-500/10 text-green-700 dark:text-green-400 border-green-500/20";
+      case SignalType.SELL: return "bg-red-500/10 text-red-700 dark:text-red-400 border-red-500/20";
+      case SignalType.HOLD: return "bg-yellow-500/10 text-yellow-700 dark:text-yellow-400 border-yellow-500/20";
     }
   };
 
@@ -77,17 +94,15 @@ export function SignalsPanel({ className }: SignalsPanelProps) {
     return "text-red-600 dark:text-red-400";
   };
 
-  const handleFilterChange = (key: keyof SignalFilters, value: any) => {
+  const handleFilterChange = (key: keyof SignalFilters, value: unknown) => {
     setFilters((prev) => ({
       ...prev,
       [key]: value,
-      page: key === "page" ? value : 1, // Reset to page 1 when changing filters
+      page: key === "page" ? (value as number) : 1,
     }));
   };
 
-  const clearFilters = () => {
-    setFilters({ page: 1, limit: 10 });
-  };
+  const clearFilters = () => setFilters({ page: 1, limit: 10 });
 
   const totalPages = data ? Math.ceil(data.total / (filters.limit || 10)) : 0;
 
@@ -112,9 +127,7 @@ export function SignalsPanel({ className }: SignalsPanelProps) {
                 onClick={() => refetch()}
                 disabled={isRefetching}
               >
-                <RefreshCw
-                  className={`size-4 ${isRefetching ? "animate-spin" : ""}`}
-                />
+                <RefreshCw className={`size-4 ${isRefetching ? "animate-spin" : ""}`} />
                 Refresh
               </Button>
             </div>
@@ -122,7 +135,7 @@ export function SignalsPanel({ className }: SignalsPanelProps) {
         </CardHeader>
 
         <CardContent className="space-y-4">
-          {/* Filters Section */}
+          {/* Filters */}
           {showFilters && (
             <div className="rounded-lg border p-4">
               <div className="mb-3 flex items-center justify-between">
@@ -132,7 +145,6 @@ export function SignalsPanel({ className }: SignalsPanelProps) {
                 </Button>
               </div>
               <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
-                {/* Symbol Filter */}
                 <div>
                   <label className="text-sm font-medium">Symbol</label>
                   <input
@@ -145,17 +157,12 @@ export function SignalsPanel({ className }: SignalsPanelProps) {
                     className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
                   />
                 </div>
-
-                {/* Signal Type Filter */}
                 <div>
                   <label className="text-sm font-medium">Signal Type</label>
                   <select
                     value={filters.signal_type || ""}
                     onChange={(e) =>
-                      handleFilterChange(
-                        "signal_type",
-                        e.target.value || undefined
-                      )
+                      handleFilterChange("signal_type", e.target.value || undefined)
                     }
                     className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
                   >
@@ -165,17 +172,12 @@ export function SignalsPanel({ className }: SignalsPanelProps) {
                     <option value={SignalType.HOLD}>Hold</option>
                   </select>
                 </div>
-
-                {/* Time Horizon Filter */}
                 <div>
                   <label className="text-sm font-medium">Time Horizon</label>
                   <select
                     value={filters.time_horizon || ""}
                     onChange={(e) =>
-                      handleFilterChange(
-                        "time_horizon",
-                        e.target.value || undefined
-                      )
+                      handleFilterChange("time_horizon", e.target.value || undefined)
                     }
                     className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
                   >
@@ -185,18 +187,14 @@ export function SignalsPanel({ className }: SignalsPanelProps) {
                     <option value={TimeHorizon.POSITIONAL}>Positional</option>
                   </select>
                 </div>
-
-                {/* Confidence Threshold Filter */}
                 <div>
-                  <label className="text-sm font-medium">
-                    Min Confidence (%)
-                  </label>
+                  <label className="text-sm font-medium">Min Confidence (%)</label>
                   <input
                     type="number"
                     min="0"
                     max="100"
                     step="5"
-                    placeholder="0-100"
+                    placeholder="0–100"
                     value={
                       filters.min_confidence !== undefined
                         ? filters.min_confidence * 100
@@ -215,10 +213,10 @@ export function SignalsPanel({ className }: SignalsPanelProps) {
             </div>
           )}
 
-          {/* Signals Table */}
+          {/* Table */}
           {isLoading ? (
             <div className="py-8 text-center text-muted-foreground">
-              Loading signals...
+              Loading signals…
             </div>
           ) : data && data.signals.length > 0 ? (
             <>
@@ -229,55 +227,66 @@ export function SignalsPanel({ className }: SignalsPanelProps) {
                       <TableHead>Symbol</TableHead>
                       <TableHead>Direction</TableHead>
                       <TableHead>Confidence</TableHead>
-                      <TableHead>Time Horizon</TableHead>
+                      <TableHead>Horizon</TableHead>
                       <TableHead>Reasoning</TableHead>
                       <TableHead>Generated</TableHead>
+                      <TableHead>Expires</TableHead>
                       <TableHead className="text-right">Actions</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {data.signals.map((signal) => (
-                      <TableRow key={signal.signal_id}>
-                        <TableCell className="font-medium">
-                          {signal.symbol}
-                        </TableCell>
-                        <TableCell>
-                          <Badge className={getSignalColor(signal.signal_type)}>
-                            {getSignalIcon(signal.signal_type)}
-                            {signal.signal_type?.toUpperCase() || 'UNKNOWN'}
-                          </Badge>
-                        </TableCell>
-                        <TableCell>
-                          <span
-                            className={`font-semibold ${getConfidenceColor(
-                              signal.calibrated_confidence
-                            )}`}
-                          >
-                            {(signal.calibrated_confidence * 100).toFixed(1)}%
-                          </span>
-                        </TableCell>
-                        <TableCell>
-                          <Badge variant="outline">
-                            {signal.time_horizon}
-                          </Badge>
-                        </TableCell>
-                        <TableCell className="max-w-xs truncate">
-                          {signal.reasoning}
-                        </TableCell>
-                        <TableCell className="text-muted-foreground text-sm">
-                          {safeFormatDate(signal.generated_at, "MMM d, HH:mm")}
-                        </TableCell>
-                        <TableCell className="text-right">
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => setSelectedSignal(signal)}
-                          >
-                            View Details
-                          </Button>
-                        </TableCell>
-                      </TableRow>
-                    ))}
+                    {data.signals.map((signal) => {
+                      const expiryState = getExpiryState(signal.expires_at);
+                      const rowClass =
+                        expiryState === "expired" ? "opacity-60" : "";
+
+                      return (
+                        <TableRow key={signal.signal_id} className={rowClass}>
+                          <TableCell className="font-medium">
+                            {signal.symbol}
+                          </TableCell>
+                          <TableCell>
+                            <Badge className={getSignalColor(signal.signal_type)}>
+                              {getSignalIcon(signal.signal_type)}
+                              {signal.signal_type?.toUpperCase() ?? "UNKNOWN"}
+                            </Badge>
+                          </TableCell>
+                          <TableCell>
+                            <span
+                              className={`font-semibold ${getConfidenceColor(
+                                signal.calibrated_confidence
+                              )}`}
+                            >
+                              {(signal.calibrated_confidence * 100).toFixed(1)}%
+                            </span>
+                          </TableCell>
+                          <TableCell>
+                            <Badge variant="outline">{signal.time_horizon}</Badge>
+                          </TableCell>
+                          <TableCell className="max-w-xs truncate">
+                            {signal.reasoning}
+                          </TableCell>
+                          <TableCell className="text-muted-foreground text-sm">
+                            {safeFormatDate(signal.generated_at, "MMM d, HH:mm")}
+                          </TableCell>
+                          <TableCell className="text-sm">
+                            <ExpiryCell
+                              expiresAt={signal.expires_at}
+                              state={expiryState}
+                            />
+                          </TableCell>
+                          <TableCell className="text-right">
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => setSelectedSignal(signal)}
+                            >
+                              View Details
+                            </Button>
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
                   </TableBody>
                 </Table>
               </div>
@@ -326,12 +335,49 @@ export function SignalsPanel({ className }: SignalsPanelProps) {
         </CardContent>
       </Card>
 
-      {/* Signal Detail Modal */}
       <SignalDetailModal
         signal={selectedSignal}
         open={!!selectedSignal}
         onOpenChange={(open) => !open && setSelectedSignal(null)}
       />
     </>
+  );
+}
+
+// ── Expiry cell ────────────────────────────────────────────────────────────────
+
+interface ExpiryCellProps {
+  expiresAt: string | null | undefined;
+  state: "active" | "soon" | "expired";
+}
+
+function ExpiryCell({ expiresAt, state }: ExpiryCellProps) {
+  const formatted = expiresAt
+    ? safeFormatDate(expiresAt, "MMM d, HH:mm")
+    : "—";
+
+  if (state === "expired") {
+    return (
+      <span className="inline-flex items-center gap-1 text-red-600 dark:text-red-400">
+        <Clock className="size-3" />
+        <Badge variant="outline" className="border-red-400 text-red-600 dark:text-red-400 text-xs py-0">
+          EXPIRED
+        </Badge>
+        <span className="text-muted-foreground">{formatted}</span>
+      </span>
+    );
+  }
+
+  if (state === "soon") {
+    return (
+      <span className="inline-flex items-center gap-1 text-amber-600 dark:text-amber-400">
+        <Clock className="size-3" />
+        {formatted}
+      </span>
+    );
+  }
+
+  return (
+    <span className="text-muted-foreground">{formatted}</span>
   );
 }

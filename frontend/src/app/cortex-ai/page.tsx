@@ -1,15 +1,6 @@
 'use client';
 
-/**
- * Cortex AI Page
- * 
- * Integrated dashboard for CORTEX AI microservice featuring:
- * - Real-time Trading Signals
- * - Market Regime Detection
- * - High-Impact Events Monitoring
- * - ML Model Governance
- */
-import React, { useState } from 'react';
+import React, { useState, useCallback } from 'react';
 import { SignalsPanel } from '@/components/ai/SignalsPanel';
 import { RegimePanel } from '@/components/ai/RegimePanel';
 import { EventsPanel } from '@/components/ai/EventsPanel';
@@ -18,10 +9,16 @@ import { DeprecatedModelsPanel } from '@/components/ai/DeprecatedModelsPanel';
 import { ConnectionStatusIndicator } from '@/components/ai/ConnectionStatus';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { useAuth } from '@/contexts/AuthContext';
+import type { ConnectionStatus } from '@/hooks/useCAIWebSocket';
 
 export default function CortexAIPage() {
   const { isAuthenticated, isAuthReady } = useAuth();
   const [activeTab, setActiveTab] = useState('signals');
+  const [wsStatus, setWsStatus] = useState<ConnectionStatus>('disconnected');
+
+  const handleWsStatusChange = useCallback((status: ConnectionStatus) => {
+    setWsStatus(status);
+  }, []);
 
   if (!isAuthReady || !isAuthenticated) return null;
 
@@ -35,10 +32,10 @@ export default function CortexAIPage() {
             Real-time intelligence and market analysis powered by AI
           </p>
         </div>
-        <ConnectionStatusIndicator status="connected" />
+        <ConnectionStatusIndicator status={wsStatus} />
       </div>
 
-      {/* Main Content - Tabbed Interface */}
+      {/* Main Content */}
       <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
         <TabsList className="grid w-full grid-cols-4">
           <TabsTrigger value="signals">Trading Signals</TabsTrigger>
@@ -48,7 +45,7 @@ export default function CortexAIPage() {
         </TabsList>
 
         <TabsContent value="signals" className="mt-6">
-          <SignalsPanel />
+          <SignalsPanel onWsStatusChange={handleWsStatusChange} />
         </TabsContent>
 
         <TabsContent value="regime" className="mt-6">

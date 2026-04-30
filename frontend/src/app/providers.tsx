@@ -12,6 +12,7 @@ import { useState, useEffect } from 'react';
 import { HealthCheckWrapper } from '@/components/HealthCheckWrapper';
 import { AuthProvider, useAuth } from '@/contexts/AuthContext';
 import { ChartPreferencesProvider } from '@/contexts/ChartPreferencesContext';
+import { WatchlistProvider } from '@/contexts/WatchlistContext';
 import { ToastProvider } from '@/components/ui/toast';
 import { ErrorBoundary } from '@/components/ui/error-boundary';
 import { setAccessToken } from '@/lib/api-client';
@@ -60,6 +61,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
     >
       <QueryClientProvider client={queryClient}>
         <AuthProvider>
+          <WatchlistProvider>
           <ChartPreferencesProvider>
             <ToastProvider>
               <AuthSync>
@@ -67,6 +69,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
               </AuthSync>
             </ToastProvider>
           </ChartPreferencesProvider>
+          </WatchlistProvider>
         </AuthProvider>
       </QueryClientProvider>
     </ErrorBoundary>

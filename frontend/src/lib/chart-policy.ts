@@ -208,6 +208,35 @@ export function getMinAvailableDateForUnit(unit: CandleUnit): string {
   return unit === "minutes" || unit === "hours" ? "2022-01-01" : "2000-01-01";
 }
 
+/**
+ * Returns the optimal calendar-day chunk size for a single load-more request,
+ * sized to the active timeframe. Larger chunks mean fewer API calls for the
+ * same depth of history, keeping request counts well inside Upstox rate limits.
+ *
+ * All values stay within Upstox V3 per-request caps:
+ *   minutes ≤15 → 31 day max  |  minutes >15 → 92 day max
+ *   hours        → 92 day max  |  days/weeks/months → no hard cap
+ */
+export function getLoadMoreChunkDays(unit: CandleUnit, interval: number): number {
+  switch (unit) {
+    case "minutes":
+      if (interval <= 5)  return 15;  // 1m–5m:   ~10 trading days per fetch
+      if (interval <= 15) return 21;  // 10m–15m: ~15 trading days per fetch
+      if (interval <= 30) return 30;  // 30m:     ~21 trading days per fetch
+      return 45;                       // 45m–240m: ~30 trading days per fetch
+    case "hours":
+      return 60;                       // 1H–4H:   ~42 trading days per fetch
+    case "days":
+      return 180;                      // daily:   6 months per fetch
+    case "weeks":
+      return 365;                      // weekly:  1 year per fetch
+    case "months":
+      return 730;                      // monthly: 2 years per fetch
+    default:
+      return 30;
+  }
+}
+
 export function clampRange(
   unit: CandleUnit,
   interval: number,

@@ -92,7 +92,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     initAuth();
 
+    // api-client.ts dispatches this when a 401 occurs and silent refresh fails.
+    // Clear the in-memory token so the UI immediately reflects the deauth.
+    const handleAuthRequired = () => {
+      setAccessToken(null);
+      setAPIAccessToken(null);
+    };
+    window.addEventListener('auth:required', handleAuthRequired);
+
     return () => {
+      window.removeEventListener('auth:required', handleAuthRequired);
       if (refreshTimeoutRef.current) {
         clearTimeout(refreshTimeoutRef.current);
       }

@@ -132,26 +132,32 @@ export function SignalDetailModal({
                       {signal.time_horizon}
                     </div>
                   </div>
-                  {signal.target_price && (
+                  {signal.target_price != null && (
                     <div>
                       <div className="text-muted-foreground text-sm">
                         Target Price
                       </div>
-                      <div className="text-lg font-semibold">
-                        ₹{signal.target_price.toFixed(2)}
+                      <div className="text-lg font-semibold text-green-600 dark:text-green-400">
+                        ₹{signal.target_price.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                       </div>
                     </div>
                   )}
-                  {signal.stop_loss && (
+                  {signal.stop_loss != null && (
                     <div>
                       <div className="text-muted-foreground text-sm">
                         Stop Loss
                       </div>
-                      <div className="text-lg font-semibold">
-                        ₹{signal.stop_loss.toFixed(2)}
+                      <div className="text-lg font-semibold text-red-600 dark:text-red-400">
+                        ₹{signal.stop_loss.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                       </div>
                     </div>
                   )}
+                  <div>
+                    <div className="text-muted-foreground text-sm">Expires</div>
+                    <div className="text-sm font-medium">
+                      {safeFormat(signal.expires_at, "PPp")}
+                    </div>
+                  </div>
                 </div>
               </CardContent>
             </Card>
@@ -176,24 +182,49 @@ export function SignalDetailModal({
                   <div>
                     <h4 className="mb-2 font-semibold">Events</h4>
                     <div className="space-y-2">
-                      {signal.contributing_factors.events.map((event, idx) => (
-                        <div
-                          key={event.event_id ?? `event-${idx}`}
-                          className="rounded-lg border p-3"
-                        >
-                          <div className="flex items-center justify-between">
-                            <span className="text-sm font-medium">
-                              {event.event_type}
-                            </span>
-                            <Badge variant="outline">
-                              Impact: {(event.impact_score * 100).toFixed(0)}%
-                            </Badge>
+                      {signal.contributing_factors.events.map((event, idx) => {
+                        const displayTitle = event.article_title || event.event_type;
+                        const meta = [
+                          event.source_name,
+                          event.article_title ? event.event_type : event.summary,
+                        ]
+                          .filter(Boolean)
+                          .join(" · ");
+
+                        return (
+                          <div
+                            key={event.event_id ?? `event-${idx}`}
+                            className="rounded-lg border p-3"
+                          >
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="flex-1 min-w-0">
+                                <p className="text-sm font-medium leading-snug">
+                                  {event.source_url ? (
+                                    <a
+                                      href={event.source_url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="text-blue-600 hover:underline dark:text-blue-400"
+                                    >
+                                      {displayTitle}
+                                    </a>
+                                  ) : (
+                                    displayTitle
+                                  )}
+                                </p>
+                                {meta && (
+                                  <p className="text-muted-foreground mt-0.5 text-xs">
+                                    {meta}
+                                  </p>
+                                )}
+                              </div>
+                              <Badge variant="outline" className="shrink-0">
+                                {(event.impact_score * 100).toFixed(0)}%
+                              </Badge>
+                            </div>
                           </div>
-                          <p className="text-muted-foreground mt-1 text-sm">
-                            {event.summary}
-                          </p>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </div>
                 )}

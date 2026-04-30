@@ -1,12 +1,12 @@
 """
 Cortex AI — Base WebSocket Service
 ====================================
-Eliminates the maintenance fork between TickStreamService and
-UpstoxStreamIngestionService by extracting the shared WebSocket lifecycle
-into a proper abstract base class with hook methods for subclass behaviour.
+Abstract base providing connect/reconnect/send/disconnect lifecycle for
+services that maintain a persistent upstream WebSocket connection.
 
-Supports dynamic WebSocket URLs for services requiring fresh authorization
-(e.g., Upstox API v3 one-time-use URLs).
+Subclasses implement on_message() and optionally on_connected().
+Supports dynamic WebSocket URLs via _get_websocket_url() hook for services
+that require fresh authorization URLs (e.g., Upstox v3 one-time-use URLs).
 """
 from __future__ import annotations
 

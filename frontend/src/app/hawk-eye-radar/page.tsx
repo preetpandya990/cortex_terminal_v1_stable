@@ -256,8 +256,6 @@ export default function HawkEyeRadarPage() {
                 <WatchlistCard
                   key={item.id}
                   item={item}
-                  ltp={item.ltp}
-                  prevClose={item.prevClose}
                   onRemove={handleRemoveFromWatchlist}
                   onViewDetails={handleWatchlistItemClick}
                   isDragging={draggingId === item.id}

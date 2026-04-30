@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useMemo, useCallback } from "react";
+import { useEffect, useRef, useMemo, useCallback, useState } from "react";
 import {
   createChart,
   IChartApi,
@@ -33,7 +33,7 @@ import {
 } from "@/lib/indicators";
 import type { UpstoxCandle, UpstoxLtpTick } from "@/types/upstox";
 import type { CandleUnit } from "@/lib/chart-policy";
-import { Loader2 } from "lucide-react";
+import { ChevronsRight, Loader2 } from "lucide-react";
 
 // ─── Props ────────────────────────────────────────────────────────────────────
 
@@ -52,7 +52,53 @@ export interface CandlestickChartProps {
   onLoadMoreHistory?: () => Promise<void>;
   /** Ordered list of active indicator IDs from ChartPreferencesContext. */
   activeIndicators?: IndicatorId[];
+  /**
+   * When true the market is live — the Jump-to-Latest button shows a pulsing
+   * green dot and is labelled "Live".  When false it shows "Latest".
+   */
+  isLive?: boolean;
   className?: string;
+}
+
+// ─── OHLCV legend ─────────────────────────────────────────────────────────────
+
+interface OhlcvLegend {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+const PRICE_FMT = new Intl.NumberFormat("en-IN", {
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
+
+function fmtVol(v: number): string {
+  if (v >= 1_000_000_000) return `${(v / 1_000_000_000).toFixed(2)}B`;
+  if (v >= 1_000_000)     return `${(v / 1_000_000).toFixed(2)}M`;
+  if (v >= 1_000)         return `${(v / 1_000).toFixed(1)}K`;
+  return v.toLocaleString("en-IN");
+}
+
+function fmtLegendTime(ts: number, unit: CandleUnit): string {
+  const d = new Date(ts * 1000);
+  const datePart = new Intl.DateTimeFormat("en-IN", {
+    timeZone: "Asia/Kolkata",
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  }).format(d);
+  if (unit === "days" || unit === "weeks" || unit === "months") return datePart;
+  const timePart = new Intl.DateTimeFormat("en-IN", {
+    timeZone: "Asia/Kolkata",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).format(d);
+  return `${datePart} · ${timePart}`;
 }
 
 // ─── Colour palette ───────────────────────────────────────────────────────────
@@ -79,14 +125,26 @@ export function CandlestickChart({
   isLoadingMoreHistory = false,
   onLoadMoreHistory,
   activeIndicators = [],
+  isLive = false,
   className = "",
 }: CandlestickChartProps) {
   const containerRef    = useRef<HTMLDivElement>(null);
   const chartRef        = useRef<IChartApi | null>(null);
   const seriesRef       = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<"Histogram">  | null>(null);
-  const lastCandleCountRef = useRef(0);
-  const isLoadingMoreRef   = useRef(false);
+  const lastCandleCountRef  = useRef(0);
+  const isLoadingMoreRef    = useRef(false);
+  // Minimum gap between consecutive load-more triggers (ms).
+  // Prevents burst-firing while the chart is still rendering newly fetched data.
+  const lastTriggerAtRef    = useRef(0);
+
+  // OHLCV legend — crosshair-driven, falls back to the latest candle.
+  const [ohlcvLegend, setOhlcvLegend] = useState<OhlcvLegend | null>(null);
+  const latestOhlcvRef = useRef<OhlcvLegend | null>(null);
+  const isHoveringRef  = useRef(false);
+
+  // Jump-to-Latest — shown whenever the user has scrolled away from the right edge.
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
 
   // Per-indicator series map: each entry is an ordered array of series (some
   // indicators — BB, MACD, STOCH — need more than one series).
@@ -210,6 +268,46 @@ export function CandlestickChart({
     });
     volumeSeriesRef.current = volumeSeries;
 
+    // ── Crosshair OHLCV legend ──────────────────────────────────────────────
+    // Reads from refs so the handler is never stale across data updates.
+
+    chart.subscribeCrosshairMove((param) => {
+      const cs = seriesRef.current;
+      const vs = volumeSeriesRef.current;
+
+      if (!param.time || !cs) {
+        // Crosshair left the chart — snap back to the latest candle.
+        isHoveringRef.current = false;
+        if (latestOhlcvRef.current) setOhlcvLegend(latestOhlcvRef.current);
+        return;
+      }
+
+      isHoveringRef.current = true;
+
+      const cd = param.seriesData.get(cs);
+      const vd = vs ? param.seriesData.get(vs) : undefined;
+
+      if (cd && "open" in cd) {
+        setOhlcvLegend({
+          time:   param.time as number,
+          open:   cd.open,
+          high:   cd.high,
+          low:    cd.low,
+          close:  cd.close,
+          volume: vd && "value" in vd ? (vd as { value: number }).value : 0,
+        });
+      }
+    });
+
+    // Jump-to-Latest: show the button whenever the right edge scrolls away from
+    // the last bar.  Tolerance of 1.5 bars avoids false positives from partial
+    // right-side padding.  Reads lastCandleCountRef so it never goes stale.
+    const handleJumpDetect = () => {
+      const range = chart.timeScale().getVisibleLogicalRange();
+      setShowJumpToLatest(!!range && range.to < lastCandleCountRef.current - 1.5);
+    };
+    chart.timeScale().subscribeVisibleLogicalRangeChange(handleJumpDetect);
+
     const resizeObserver = new ResizeObserver((entries) => {
       const entry = entries[0];
       if (!entry || !chartRef.current) return;
@@ -222,12 +320,15 @@ export function CandlestickChart({
 
     return () => {
       resizeObserver.disconnect();
-      chartRef.current?.remove();
+      chartRef.current?.remove(); // also unsubscribes all crosshairMove listeners
       chartRef.current        = null;
       seriesRef.current       = null;
       volumeSeriesRef.current = null;
       indicatorSeriesMapRef.current.clear();
       lastCandleCountRef.current = 0;
+      isHoveringRef.current      = false;
+      latestOhlcvRef.current     = null;
+      setShowJumpToLatest(false);
     };
   }, [height]);
 
@@ -238,6 +339,23 @@ export function CandlestickChart({
 
     const currentCount  = chartDataWithLiveTick.length;
     const previousCount = lastCandleCountRef.current;
+
+    // Helper: sync the legend ref and state from the last candle + volume bar.
+    const syncLegendToLatest = () => {
+      const lastCandle = chartDataWithLiveTick[chartDataWithLiveTick.length - 1];
+      const lastVol    = volumeData[volumeData.length - 1];
+      if (!lastCandle) return;
+      const latest: OhlcvLegend = {
+        time:   lastCandle.time as number,
+        open:   lastCandle.open,
+        high:   lastCandle.high,
+        low:    lastCandle.low,
+        close:  lastCandle.close,
+        volume: lastVol?.value ?? 0,
+      };
+      latestOhlcvRef.current = latest;
+      if (!isHoveringRef.current) setOhlcvLegend(latest);
+    };
 
     if (Math.abs(currentCount - previousCount) > 1) {
       try {
@@ -252,6 +370,8 @@ export function CandlestickChart({
         if (volumeSeriesRef.current && volumeData.length) {
           volumeSeriesRef.current.setData(volumeData);
         }
+
+        syncLegendToLatest();
 
         if (savedRange && chartRef.current && currentCount > previousCount) {
           const candlesAdded = currentCount - previousCount;
@@ -276,6 +396,7 @@ export function CandlestickChart({
         } catch (error) {
           console.error("[CandlestickChart] update failed:", error);
         }
+        syncLegendToLatest();
       }
     }
 
@@ -330,7 +451,14 @@ export function CandlestickChart({
     const logicalRange = chartRef.current.timeScale().getVisibleLogicalRange();
     if (!logicalRange) return;
 
-    if (logicalRange.from < 5) {
+    // Trigger when 10 bars remain on the left — earlier than the previous threshold
+    // of 5, so data is ready before the user reaches the left edge (TradingView standard).
+    if (logicalRange.from < 10) {
+      const now = Date.now();
+      // 800 ms cooldown prevents burst-triggering during fast panning even after
+      // a fetch completes (isLoadingMoreRef resets in .finally()).
+      if (now - lastTriggerAtRef.current < 800) return;
+      lastTriggerAtRef.current = now;
       isLoadingMoreRef.current = true;
       onLoadMoreHistoryRef.current().finally(() => { isLoadingMoreRef.current = false; });
     }
@@ -345,14 +473,90 @@ export function CandlestickChart({
 
   // ── Render ──────────────────────────────────────────────────────────────────
 
+  const isBullish = ohlcvLegend ? ohlcvLegend.close >= ohlcvLegend.open : true;
+
   return (
     <div className={`relative h-full w-full ${className}`}>
+      {/* ── OHLCV crosshair legend ─────────────────────────────────────────── */}
+      {ohlcvLegend && (
+        <div
+          className={`pointer-events-none absolute left-3 top-3 z-10 select-none overflow-hidden rounded-xl border ${
+            isBullish ? "border-emerald-500/25" : "border-red-500/25"
+          }`}
+          aria-live="polite"
+          aria-label="OHLCV data for hovered candle"
+        >
+          {/* Accent bar */}
+          <div className={`h-0.5 w-full ${isBullish ? "bg-emerald-500" : "bg-red-500"}`} />
+
+          <div className="bg-transparent px-4 py-3">
+            {/* Date / time */}
+            <p className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-slate-300">
+              {fmtLegendTime(ohlcvLegend.time, candleUnit)}
+            </p>
+
+            {/* O H L C — stacked label + value columns */}
+            <div className="flex gap-5">
+              {(
+                [
+                  { label: "O", value: ohlcvLegend.open,  color: "text-white" },
+                  { label: "H", value: ohlcvLegend.high,  color: "text-emerald-300" },
+                  { label: "L", value: ohlcvLegend.low,   color: "text-red-300" },
+                  { label: "C", value: ohlcvLegend.close, color: isBullish ? "text-emerald-300" : "text-red-300" },
+                ] as const
+              ).map(({ label, value, color }) => (
+                <div key={label} className="flex flex-col gap-1">
+                  <span className="text-[9px] font-bold uppercase tracking-widest text-slate-400">
+                    {label}
+                  </span>
+                  <span className={`font-mono text-sm font-bold tabular-nums ${color}`}>
+                    {PRICE_FMT.format(value)}
+                  </span>
+                </div>
+              ))}
+            </div>
+
+            {/* Volume */}
+            {ohlcvLegend.volume > 0 && (
+              <div className="mt-2.5 flex items-center gap-2 border-t border-white/10 pt-2.5">
+                <span className="text-[9px] font-bold uppercase tracking-widest text-slate-400">
+                  Vol
+                </span>
+                <span className="font-mono text-xs font-semibold tabular-nums text-slate-200">
+                  {fmtVol(ohlcvLegend.volume)}
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── Loading more indicator — top-right to avoid legend overlap ─────── */}
       {isLoadingMoreHistory && (
-        <div className="absolute left-4 top-4 z-10 flex items-center gap-2 rounded-lg bg-slate-900/90 px-3 py-2 text-xs text-slate-300 backdrop-blur-sm">
+        <div className="absolute right-4 top-3 z-10 flex items-center gap-2 rounded-lg bg-slate-900/90 px-3 py-2 text-xs text-slate-300 backdrop-blur-sm">
           <Loader2 className="h-3 w-3 animate-spin" />
           <span>Loading historical data…</span>
         </div>
       )}
+
+      {/* ── Jump to Latest / Live button — bottom-right, industry-standard position */}
+      {showJumpToLatest && (
+        <button
+          onClick={() => chartRef.current?.timeScale().scrollToRealTime()}
+          className="absolute bottom-4 right-4 z-10 flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900/90 px-3 py-1.5 text-xs font-medium text-slate-200 backdrop-blur-sm transition-colors hover:border-slate-600 hover:bg-slate-800 hover:text-white"
+          aria-label={isLive ? "Jump to live price" : "Jump to latest candle"}
+        >
+          {isLive && (
+            <span className="relative flex h-2 w-2 shrink-0">
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+              <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
+            </span>
+          )}
+          <ChevronsRight className="h-3.5 w-3.5 shrink-0" />
+          {isLive ? "Live" : "Latest"}
+        </button>
+      )}
+
       <div
         ref={containerRef}
         style={{ width: "100%", height: height ?? "100%" }}

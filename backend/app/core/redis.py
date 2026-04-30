@@ -125,6 +125,24 @@ class RedisChannels:
         }
     """
     
+    # ── Market Feed ────────────────────────────────────────────────────────────
+    MARKET_FEED_LTPC = "cai:market-feed:ltpc"
+    """
+    Real-time ltpc ticks from Upstox Market Data Feed V3.
+
+    Published by MarketFeedService after per-instrument throttling (250 ms).
+    Subscribed by /upstox/market-feed/ws handlers to fan out to frontend clients.
+
+    Payload:
+        {
+            "type": "ltpc",
+            "instrument_key": "NSE_EQ|INE002A01018",
+            "ltp": 2851.50,
+            "cp": 2840.00,
+            "ts": 1704067200500
+        }
+    """
+
     # ── Correlation Events ─────────────────────────────────────────────────────
     CORRELATIONS_COMPLETED = "cai:correlations:completed"
     """

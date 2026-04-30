@@ -420,6 +420,7 @@ async def correlation_loop(
     try:
         # Initialize services
         from app.ai.fusion.signal_assembler import SignalAssembler
+        from app.services.market_calendar import nse_calendar
         from app.services.market_scanner import MarketScannerService
         
         scanner_svc = MarketScannerService(cache=redis_client)
@@ -434,59 +435,77 @@ async def correlation_loop(
         )
         
         logger.info("Correlation engine initialized successfully")
-        
+
         loop_iteration = 0
-        
+
         while not shutdown_event.is_set():
             loop_iteration += 1
             cycle_start = datetime.now(timezone.utc)
-            
+
+            # Determine market state once per cycle — drives pathway guard and sleep cadence.
+            try:
+                await asyncio.wait_for(nse_calendar.refresh_if_needed(), timeout=1.0)
+            except Exception:
+                pass
+            market = nse_calendar.get_session(cycle_start)
+
             try:
                 async with session_factory() as session:
-                    # ── Pathway 1: Scanner Anomalies ──────────────────────
-                    try:
-                        scan_results = await scanner_svc.scan_all(
-                            session,
-                            upstox_client,
-                            timeframe="1d",
-                            force_refresh=True,
-                        )
-                        
-                        # Filter high-conviction anomalies
-                        anomalies = [
-                            r for r in scan_results
-                            if abs(r.score) >= 5.0 and (r.volume_ratio or 0.0) >= 2.0
-                        ]
-                        
-                        if anomalies:
-                            logger.info(
-                                f"[Correlation #{loop_iteration}] "
-                                f"Processing {len(anomalies)} scanner anomalies"
+                    # ── Pathway 1: Scanner Anomalies (market-hours only) ──────
+                    if market.is_open_now:
+                        try:
+                            scan_results, live_prices_available = await scanner_svc.scan_all(
+                                session,
+                                upstox_client,
+                                timeframe="1d",
+                                force_refresh=True,
                             )
-                            
-                            for result in anomalies:
-                                try:
-                                    suggestion = await engine.on_scanner_anomaly(session, result.model_dump(mode="json"))
-                                    if suggestion:
-                                        logger.info(
+
+                            logger.debug(
+                                "[Correlation #%d] Scan complete: %d instruments | live_prices=%s",
+                                loop_iteration, len(scan_results), live_prices_available,
+                            )
+
+                            # Filter high-conviction anomalies
+                            anomalies = [
+                                r for r in scan_results
+                                if abs(r.score) >= 5.0 and (r.volume_ratio or 0.0) >= 2.0
+                            ]
+
+                            if anomalies:
+                                logger.info(
+                                    f"[Correlation #{loop_iteration}] "
+                                    f"Processing {len(anomalies)} scanner anomalies"
+                                )
+
+                                for result in anomalies:
+                                    try:
+                                        suggestion = await engine.on_scanner_anomaly(session, result.model_dump(mode="json"))
+                                        if suggestion:
+                                            logger.info(
+                                                f"[Correlation #{loop_iteration}] "
+                                                f"Generated {suggestion.confidence_level} "
+                                                f"{suggestion.signal_direction} suggestion for "
+                                                f"{suggestion.symbol}"
+                                            )
+                                    except Exception as e:
+                                        logger.error(
                                             f"[Correlation #{loop_iteration}] "
-                                            f"Generated {suggestion.confidence_level} "
-                                            f"{suggestion.signal_direction} suggestion for "
-                                            f"{suggestion.symbol}"
+                                            f"Error processing anomaly {result.instrument_key}: {e}",
+                                            exc_info=True
                                         )
-                                except Exception as e:
-                                    logger.error(
-                                        f"[Correlation #{loop_iteration}] "
-                                        f"Error processing anomaly {result.instrument_key}: {e}",
-                                        exc_info=True
-                                    )
-                                    continue
-                    
-                    except Exception as e:
-                        logger.error(
-                            f"[Correlation #{loop_iteration}] "
-                            f"Pathway 1 error: {e}",
-                            exc_info=True
+                                        continue
+
+                        except Exception as e:
+                            logger.error(
+                                f"[Correlation #{loop_iteration}] "
+                                f"Pathway 1 error: {e}",
+                                exc_info=True
+                            )
+                    else:
+                        logger.debug(
+                            "[Correlation #%d] Market closed — skipping scanner pathway",
+                            loop_iteration,
                         )
                     
                     # ── Pathway 2: High-Impact News Events ───────────────
@@ -538,11 +557,12 @@ async def correlation_loop(
                     f"Cycle completed in {cycle_duration:.2f}s"
                 )
                 
-                # Sleep 30s or until shutdown
+                # Sleep 30 s (market open) or 5 min (market closed) before next cycle.
+                sleep_secs = 30.0 if market.is_open_now else 300.0
                 try:
                     await asyncio.wait_for(
                         shutdown_event.wait(),
-                        timeout=30.0
+                        timeout=sleep_secs
                     )
                 except asyncio.TimeoutError:
                     continue

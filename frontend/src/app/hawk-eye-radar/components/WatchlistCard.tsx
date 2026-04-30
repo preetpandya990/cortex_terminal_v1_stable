@@ -5,6 +5,7 @@ import { TrendingUp, TrendingDown, Minus, X, GripVertical } from "lucide-react";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { useLtp } from "@/hooks/useLtp";
 import type { WatchlistItem } from "@/lib/api";
 
 interface GripHandlers {
@@ -13,8 +14,6 @@ interface GripHandlers {
 
 interface WatchlistCardProps {
   item: WatchlistItem;
-  ltp: number | null;
-  prevClose: number | null;
   onRemove?: (itemId: number) => void;
   onViewDetails?: (instrumentKey: string) => void;
   className?: string;
@@ -28,8 +27,6 @@ interface WatchlistCardProps {
 
 function WatchlistCardComponent({
   item,
-  ltp,
-  prevClose,
   onRemove,
   onViewDetails,
   className,
@@ -37,6 +34,10 @@ function WatchlistCardComponent({
   isOver = false,
   gripHandlers,
 }: WatchlistCardProps) {
+  const snapshot   = useLtp(item.instrument_key);
+  const ltp        = snapshot?.ltp ?? null;
+  const prevClose  = snapshot?.cp ?? null;
+
   const { percentChange, isPositive, isNeutral } = useMemo(() => {
     if (!ltp || !prevClose || prevClose === 0) {
       return { percentChange: 0, isPositive: false, isNeutral: true };

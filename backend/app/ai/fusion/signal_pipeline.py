@@ -64,17 +64,34 @@ class CircuitBreaker:
         return True  # half_open
 
 
-class SignalPipeline:
-    """End-to-end signal generation pipeline with resilience."""
+_HIGH_IMPACT_THRESHOLD = 0.70  # impact_score ≥ this → event-driven on-demand trigger
 
-    def __init__(self, max_retries: int = 3, retry_delay: float = 1.0):
+
+class SignalPipeline:
+    """
+    End-to-end signal generation pipeline with resilience.
+
+    Optional scheduler injection enables the event-driven on-demand trigger:
+    for high-impact events (classification.impact_score ≥ 0.70), affected symbols
+    are immediately queued via scheduler.generate_on_demand() as a fire-and-forget
+    task alongside the synchronous fusion layer.  This ensures stale signals are
+    never served to users monitoring high-impact news even if the scheduled cycle
+    has not yet run.
+    """
+
+    def __init__(
+        self,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
+        scheduler=None,  # Optional[SignalScheduler] — avoids circular import
+    ):
         self.signal_assembler = SignalAssembler()
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self._scheduler = scheduler
         self.circuit_breakers = {
             "intelligence": CircuitBreaker(),
             "fusion": CircuitBreaker(),
-            "distribution": CircuitBreaker(),
         }
 
     async def _execute_with_circuit_breaker(
@@ -145,28 +162,6 @@ class SignalPipeline:
                 logger.error(f"Fusion failed for {symbol}: {e}")
         return signals
 
-    async def distribute_signals(
-        self,
-        pubsub: PubSubClient,
-        signals: list[AITradingSignal],
-    ) -> None:
-        """Distribute signals to Redis pub/sub channels."""
-        for signal in signals:
-            try:
-                await self._execute_with_circuit_breaker(
-                    "distribution",
-                    pubsub.publish_json,
-                    RedisChannels.signals_for_symbol(signal.symbol),
-                    {
-                        "signal_id": signal.id,
-                        "symbol": signal.symbol,
-                        "action": signal.action,
-                        "confidence": float(signal.confidence_score),
-                        "timestamp": signal.signal_timestamp.isoformat(),
-                    },
-                )
-            except Exception as e:
-                logger.error(f"Distribution failed for signal {signal.id}: {e}")
 
     async def process_event_end_to_end(
         self,
@@ -189,22 +184,38 @@ class SignalPipeline:
             raw_event_id,
         )
 
-        # Get affected symbols (placeholder)
-        symbols = ["RELIANCE", "TCS"]  # Will be extracted from classification
+        # Resolve affected symbols and event impact score from the classification chain.
+        symbols, impact_score = await self._resolve_affected_symbols(db, raw_event_id)
+        if not symbols:
+            logger.info("No affected symbols found for raw_event_id=%d — skipping fusion", raw_event_id)
+            return {"status": "skipped", "reason": "no_affected_symbols", "raw_event_id": raw_event_id}
 
-        # Fusion layer
+        # Event-driven on-demand trigger: for high-impact events, immediately queue
+        # signal generation for each affected symbol via the scheduler's on-demand
+        # path.  This is fire-and-forget — it never blocks the pipeline.
+        # The scheduler's generate_on_demand() checks the on-demand Redis cache;
+        # assemble_signal() primes that cache after every assembly, so if the fusion
+        # layer below has already generated a fresh signal, the task is a no-op.
+        if impact_score >= _HIGH_IMPACT_THRESHOLD and self._scheduler is not None:
+            for sym in symbols:
+                asyncio.create_task(
+                    self._scheduler.generate_on_demand(sym),
+                    name=f"event_trigger_{sym}_{raw_event_id}",
+                )
+            logger.info(
+                "Event-driven trigger fired for %d symbol(s) (impact=%.2f, raw_event_id=%d)",
+                len(symbols),
+                impact_score,
+                raw_event_id,
+            )
+
+        # Fusion layer — assemble_signal inside publishes to SIGNALS_ALL
+        # and the per-symbol channel; no separate distribution step needed.
         signals = await self._retry_with_backoff(
             self.process_fusion_layer,
             db,
             pubsub,
             symbols,
-        )
-
-        # Distribution layer
-        await self._retry_with_backoff(
-            self.distribute_signals,
-            pubsub,
-            signals,
         )
 
         return {
@@ -242,6 +253,52 @@ class SignalPipeline:
             "errors": error_count,
             "results": [r for r in results if not isinstance(r, Exception)],
         }
+
+    async def _resolve_affected_symbols(
+        self,
+        db: AsyncSession,
+        raw_event_id: int,
+    ) -> tuple[list[str], float]:
+        """
+        Resolve affected symbols and event impact score by traversing the
+        classification chain: raw_event → processed_event → nlp_result → classification.
+
+        Returns:
+            (symbols, impact_score) — symbols is deduplicated and order-preserving;
+            impact_score is 0.0 when the chain is incomplete or classification missing.
+        """
+        processed = (
+            await db.execute(
+                select(AIProcessedEvent).where(AIProcessedEvent.raw_event_id == raw_event_id)
+            )
+        ).scalar_one_or_none()
+
+        if not processed:
+            return [], 0.0
+
+        nlp = (
+            await db.execute(
+                select(AINLPResult).where(AINLPResult.processed_event_id == processed.id)
+            )
+        ).scalar_one_or_none()
+
+        if not nlp:
+            return [], 0.0
+
+        classification = (
+            await db.execute(
+                select(AIEventClassification).where(
+                    AIEventClassification.nlp_result_id == nlp.id
+                )
+            )
+        ).scalar_one_or_none()
+
+        if not classification or not classification.affected_symbols:
+            return [], 0.0
+
+        symbols = list(dict.fromkeys(classification.affected_symbols))  # deduplicate, preserve order
+        impact_score = float(classification.impact_score)
+        return symbols, impact_score
 
     def get_circuit_breaker_status(self) -> dict[str, dict[str, Any]]:
         """Get status of all circuit breakers."""

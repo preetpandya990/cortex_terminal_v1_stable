@@ -35,7 +35,11 @@ export interface WatchlistReorderRequest {
   new_position: number;
 }
 
-export const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
+// Normalise the API base URL so it always ends with /api/v1.
+// NEXT_PUBLIC_API_URL may be set as either the bare origin ("http://localhost:8000")
+// or the full prefixed URL ("http://localhost:8000/api/v1") — both work correctly.
+const _apiOrigin = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000').replace(/\/$/, '');
+export const API_BASE_URL = _apiOrigin.endsWith('/api/v1') ? _apiOrigin : `${_apiOrigin}/api/v1`;
 export const WS_BASE_URL = API_BASE_URL.replace(/^http/i, 'ws');
 
 export const api = axios.create({
@@ -89,13 +93,12 @@ api.interceptors.response.use(
 
     if (!isSuppressed) {
       const payload = error.response?.data as { detail?: string; message?: string } | undefined;
-      const detail = payload?.detail ?? payload?.message;
-      console.error('[API Error]', {
-        method: error.config?.method?.toUpperCase(),
-        url: error.config?.url,
-        status,
-        ...(detail ? { detail } : { message: error.message }),
-      });
+      const detail = payload?.detail ?? payload?.message ?? error.message ?? 'unknown error';
+      // Use a flat string — object args are dropped as {} in the Next.js error overlay
+      // when any property is undefined (JSON.stringify omits undefined values).
+      console.error(
+        `[API Error] ${error.config?.method?.toUpperCase() ?? '?'} ${error.config?.url ?? '?'} → HTTP ${status ?? '?'} | ${detail}`,
+      );
     }
 
     return Promise.reject(error);
@@ -117,6 +120,30 @@ export class APIRequestError extends Error {
     this.statusCode = options?.statusCode;
     this.errorCode = options?.errorCode;
   }
+}
+
+/**
+ * Returns true when `error` is an HTTP 429 Too Many Requests response.
+ * Covers both AxiosError instances and plain error objects with a response shape.
+ */
+export function isRateLimitError(error: unknown): boolean {
+  if (error instanceof AxiosError) return error.response?.status === 429;
+  return (error as { response?: { status?: number } } | null)?.response?.status === 429;
+}
+
+/**
+ * Extracts the Retry-After delay from a 429 error response header.
+ * Falls back to `defaultMs` when the header is absent or non-numeric.
+ */
+export function getRetryAfterMs(error: unknown, defaultMs = 2_000): number {
+  const header =
+    error instanceof AxiosError
+      ? error.response?.headers?.['retry-after']
+      : (error as { response?: { headers?: Record<string, string> } } | null)
+          ?.response?.headers?.['retry-after'];
+  if (!header) return defaultMs;
+  const seconds = parseInt(String(header), 10);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1_000 : defaultMs;
 }
 
 /**

@@ -16,35 +16,36 @@ export function useSignalsRealtime(filters: SignalFilters = {}) {
 
   // Handle incoming signal updates from WebSocket
   const handleSignalUpdate = useCallback((signal: TradingSignal) => {
-    // Update the signals query cache with new signal
+    // Normalise signal_id to string — the backend guarantees a string, but guard
+    // against any future stub payloads that send a raw integer.
+    const incomingId = String(signal.signal_id);
+
     queryClient.setQueryData(
       ["signals", filters],
       (oldData: any) => {
         if (!oldData) return oldData;
 
-        // Check if signal matches current filters
-        if (filters.symbol && signal.symbol !== filters.symbol) {
-          return oldData;
-        }
-        if (filters.signal_type && signal.signal_type !== filters.signal_type) {
-          return oldData;
-        }
-        if (filters.min_confidence && signal.confidence < filters.min_confidence) {
+        // Filter: skip if signal doesn't match active filters
+        if (filters.symbol && signal.symbol !== filters.symbol) return oldData;
+        if (filters.signal_type && signal.signal_type !== filters.signal_type) return oldData;
+        if (filters.min_confidence !== undefined && signal.calibrated_confidence < filters.min_confidence) return oldData;
+
+        const existing: TradingSignal[] = oldData.signals || [];
+
+        // Deduplicate: skip if this signal_id is already in the cache.
+        // Guards against double-publish from any server-side code path.
+        if (existing.some((s) => String(s.signal_id) === incomingId)) {
           return oldData;
         }
 
-        // Add new signal to the beginning of the list
-        const updatedSignals = [signal, ...(oldData.signals || [])];
-        
-        // Limit to reasonable cache size
-        const maxCacheSize = filters.limit || 50;
-        if (updatedSignals.length > maxCacheSize) {
-          updatedSignals.pop();
+        const updated = [signal, ...existing];
+        if (updated.length > (filters.limit || 50)) {
+          updated.pop();
         }
 
         return {
           ...oldData,
-          signals: updatedSignals,
+          signals: updated,
           total: oldData.total + 1,
         };
       }

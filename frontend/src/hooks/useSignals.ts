@@ -22,6 +22,7 @@ export function useSignals(filters: SignalFilters = {}) {
       const params = new URLSearchParams();
       if (filters.symbol) params.append("symbol", filters.symbol);
       if (filters.signal_type) params.append("signal_type", filters.signal_type);
+      if (filters.time_horizon) params.append("time_horizon", filters.time_horizon);
       if (filters.min_confidence !== undefined) {
         params.append("min_confidence", filters.min_confidence.toString());
       }

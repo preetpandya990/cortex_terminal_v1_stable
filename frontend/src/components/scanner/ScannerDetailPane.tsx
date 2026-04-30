@@ -22,9 +22,11 @@ import { useAuth } from "@/contexts/AuthContext";
 import { useChartPreferences, TIMEFRAME_OPTIONS, type TimeframeOption } from "@/contexts/ChartPreferencesContext";
 import type { IndicatorId } from "@/lib/indicators";
 import { upstoxAPI, WS_BASE_URL, isNetworkError } from "@/lib/api";
+import { LivePriceBadge } from "@/components/shared/LivePriceBadge";
 import { mergeCandles } from "@/lib/candle-transforms";
 import {
   getISTTodayYMD,
+  getISTMarketSession,
   includesTodayOrYesterday,
   resolveCandleSourceMode,
   diffDaysInclusive,
@@ -93,10 +95,6 @@ function buildTickStreamUrl(instrumentKey: string): string {
 
 function getReconnectDelay(attempt: number): number {
   return Math.min(TICK_STREAM_BASE_DELAY_MS * Math.pow(2, attempt), TICK_STREAM_MAX_DELAY_MS);
-}
-
-function isIntradayTimeframe(tf: TimeframeOption): boolean {
-  return tf.unit === "minutes" || tf.unit === "hours";
 }
 
 // Derive exchange label from NSE_EQ|... instrument key
@@ -340,7 +338,6 @@ export function ScannerDetailPane({ stock, listType, open, onClose }: ScannerDet
   const { unit: candleUnit, interval: candleInterval, fromDate, toDate } = historicalState;
   const selectedRangeDays = diffDaysInclusive(fromDate, toDate);
   const candleSourceMode = resolveCandleSourceMode(selectedRangeDays, candleUnit, fromDate, toDate);
-  const liveMergeEnabled = includesTodayOrYesterday(fromDate, toDate);
 
   // ── Candle fetch ───────────────────────────────────────────────────────────
 
@@ -579,9 +576,12 @@ export function ScannerDetailPane({ stock, listType, open, onClose }: ScannerDet
   );
 
   // ── Tick stream WebSocket ──────────────────────────────────────────────────
+  //
+  // Always connect regardless of timeframe so the header price badge receives
+  // live ticks even when viewing a daily chart.
 
   useEffect(() => {
-    if (!isAuthenticated || !stock || !isIntradayTimeframe(currentTimeframe)) {
+    if (!isAuthenticated || !stock) {
       setTickStreamStatus("idle");
       return;
     }
@@ -642,7 +642,7 @@ export function ScannerDetailPane({ stock, listType, open, onClose }: ScannerDet
         tickSocketRef.current = null;
       }
     };
-  }, [stock?.symbol, currentTimeframe.id, isAuthenticated]);
+  }, [stock?.symbol, isAuthenticated]);
 
   // ── Watchlist toggle ───────────────────────────────────────────────────────
 
@@ -708,7 +708,7 @@ export function ScannerDetailPane({ stock, listType, open, onClose }: ScannerDet
           listType={listType}
           currentTimeframe={currentTimeframe}
           candles={candles}
-          liveTick={liveMergeEnabled ? liveTick : null}
+          liveTick={liveTick}
           tickStreamStatus={tickStreamStatus}
           candleUnit={candleUnit}
           candleInterval={candleInterval}
@@ -769,6 +769,7 @@ function PaneContent({
   currentTimeframe,
   candles,
   liveTick,
+  tickStreamStatus,
   candleUnit,
   candleInterval,
   isFetchingCandles,
@@ -790,12 +791,24 @@ function PaneContent({
 }: PaneContentProps) {
   const exchange = exchangeFromKey(stock.symbol);
 
+  // Apply live-merge condition here so the header badge always sees raw ticks.
+  const liveMergeEnabled = includesTodayOrYesterday(fromDate, toDate);
+
+  // Live price: WS tick wins; fall back to scanner snapshot when WS hasn't fired.
+  const displayPrice = liveTick?.last_price ?? stock.current_price;
+
+  const isLive =
+    tickStreamStatus === "live" && getISTMarketSession() === "open";
+  const isConnecting =
+    (tickStreamStatus === "connecting" || tickStreamStatus === "reconnecting") &&
+    getISTMarketSession() === "open";
+
   return (
     <div className="flex h-full flex-col overflow-hidden">
       {/* ── Header ──────────────────────────────────────────────────────────── */}
       <div className="flex shrink-0 items-start justify-between gap-4 border-b border-slate-100 px-8 py-6">
         <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
             <h2 className="truncate text-lg font-bold leading-tight text-slate-900">
               {stock.name ?? stock.trading_symbol ?? stock.symbol}
             </h2>
@@ -804,6 +817,12 @@ function PaneContent({
                 {stock.sector}
               </Badge>
             )}
+            <LivePriceBadge
+              price={displayPrice}
+              prevClose={stock.previous_close}
+              isLive={isLive}
+              isConnecting={isConnecting}
+            />
           </div>
           <div className="mt-0.5 flex items-center gap-2">
             <span className="font-mono text-sm font-medium text-slate-500">
@@ -897,7 +916,7 @@ function PaneContent({
                 <div className="flex-1" style={{ minHeight: 460 }}>
                   <CandlestickChart
                     candles={candles.data.candles}
-                    liveTick={liveTick}
+                    liveTick={liveMergeEnabled ? liveTick : null}
                     candleUnit={candleUnit}
                     candleInterval={candleInterval}
                     canLoadMoreHistory={hasMoreHistory}

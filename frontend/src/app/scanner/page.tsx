@@ -1,16 +1,18 @@
 'use client';
 
 import { useCallback, useMemo, useState } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api-client';
 import { useAuth } from '@/contexts/AuthContext';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { RefreshCw, AlertTriangle, Clock3, ChartColumnBig, DatabaseZap } from 'lucide-react';
-import { RunScanResponse, ScanResultsData, ScanType, ScannerContext, StockAnalysis } from '@/types/market';
+import { RunScanResponse, ScanResultsData, ScannerContext, StockAnalysis } from '@/types/market';
 import { ScanResults, type ScannerTab } from '@/components/scanner/ScanResults';
 import { ScannerDetailPane } from '@/components/scanner/ScannerDetailPane';
+import { ScanCountdownBar, ScanProgressBar } from '@/components/scanner/ScanProgressBars';
+import { useScanStream } from '@/hooks/useScanStream';
 
 const emptyResults: ScanResultsData = {
   top_gainers: [],
@@ -37,23 +39,18 @@ export default function ScannerPage() {
     setSelectedStock(null);
   }, []);
 
-  const {
-    data: scanData,
-    error: latestScanError,
-    isError: isLatestScanError,
-    isLoading,
-    isFetching,
-    refetch,
-  } = useQuery({
-    queryKey: ['scanner', 'latest'],
-    queryFn: async () => {
-      const response = await api.get('/scanner/latest');
-      return response.data;
+  // Invalidate the latest-scan cache when a stream completes so the countdown
+  // timer resets and the GET /latest result stays in sync with the new data.
+  const handleStreamComplete = useCallback(
+    (_result: RunScanResponse) => {
+      queryClient.invalidateQueries({ queryKey: ['scanner', 'latest'] });
     },
-    enabled: isAuthenticated,
-    refetchInterval: 60_000,
-  });
+    [queryClient],
+  );
 
+  const scanStream = useScanStream(handleStreamComplete);
+
+  // Context query first — its result drives the polling cadence for the scan data query.
   const {
     data: scannerContext,
     isLoading: isContextLoading,
@@ -63,46 +60,59 @@ export default function ScannerPage() {
     queryKey: ['scanner', 'context'],
     queryFn: async () => {
       const response = await api.get('/scanner/context');
+      return response.data as ScannerContext;
+    },
+    enabled: isAuthenticated,
+    // Function form: self-referential — reads the query's own cached data so the
+    // interval tightens to 60 s during market hours and relaxes to 5 min off-hours.
+    refetchInterval: (query) => {
+      const ctx = query.state.data as ScannerContext | undefined;
+      return ctx?.is_market_open ? 60_000 : 300_000;
+    },
+  });
+
+  // 30 s while market is open (prices tick), 5 min while closed (data is static).
+  // Falls back to 5 min until context loads — first fetch fires immediately on mount.
+  const latestRefetchMs = scannerContext?.is_market_open ? 30_000 : 300_000;
+
+  const {
+    data: scanData,
+    error: latestScanError,
+    isError: isLatestScanError,
+    isLoading,
+    isFetching,
+    dataUpdatedAt,
+    refetch,
+  } = useQuery({
+    queryKey: ['scanner', 'latest'],
+    queryFn: async () => {
+      const response = await api.get('/scanner/latest');
       return response.data;
     },
     enabled: isAuthenticated,
-    refetchInterval: 60_000,
-  });
-
-  const runScanMutation = useMutation({
-    mutationFn: async ({ selectedType }: { selectedType: ScanType }) => {
-      const response = await api.post('/scanner/run', { scan_type: selectedType });
-      return response.data as RunScanResponse;
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['scanner', 'latest'] });
-    },
+    refetchInterval: latestRefetchMs,
   });
 
   const latestScanTimestamp = scanData?.timestamp
     ? new Date(scanData.timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
     : null;
 
-  // Prefer fresh mutation results — POST /scanner/run returns the full results
-  // in its body. Using them directly avoids a stale-cache race on the GET /latest refetch.
+  // Prefer the fresh SSE result — it arrives before the invalidated GET /latest
+  // refetch completes, avoiding a stale-cache race on the visible data.
   const resultSet = useMemo(() => {
-    if (runScanMutation.isSuccess && runScanMutation.data?.results) {
-      return runScanMutation.data.results;
-    }
+    if (scanStream.result?.results) return scanStream.result.results;
     return scanData?.results ?? emptyResults;
-  }, [scanData?.results, runScanMutation.isSuccess, runScanMutation.data?.results]);
+  }, [scanStream.result, scanData?.results]);
+
   const totalScanned: number = useMemo(() => {
     const raw = resultSet.metadata?.quote_analyses;
-    return typeof raw === 'number' && Number.isFinite(raw)
-      ? raw
-      : (scanData?.total_scanned ?? resultSet.total_scanned);
-  }, [resultSet, scanData?.total_scanned]);
+    if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+    return scanStream.result?.total_scanned ?? scanData?.total_scanned ?? resultSet.total_scanned;
+  }, [resultSet, scanStream.result?.total_scanned, scanData?.total_scanned]);
 
-  const isRunDisabled = runScanMutation.isPending || isFetching || isContextLoading;
+  const isRunDisabled = scanStream.isStreaming || isFetching || isContextLoading;
 
-  const runScan = () => {
-    runScanMutation.mutate({ selectedType: 'market_close' });
-  };
+  const runScan = () => scanStream.trigger('market_close');
 
   if (!isAuthReady || !isAuthenticated) return null;
 
@@ -182,11 +192,27 @@ export default function ScannerPage() {
         {/* ── Controls ── */}
         <Button onClick={runScan} disabled={isRunDisabled}>
           <RefreshCw
-            className={`mr-2 h-4 w-4 ${runScanMutation.isPending ? 'animate-spin' : ''}`}
+            className={`mr-2 h-4 w-4 ${scanStream.isStreaming ? 'animate-spin' : ''}`}
           />
-          {runScanMutation.isPending ? 'Scanning...' : 'Run Scan'}
+          {scanStream.isStreaming ? 'Scanning...' : 'Run Scan'}
         </Button>
       </div>
+
+      {/* ── Progress bars ── */}
+      <ScanProgressBar
+        isStreaming={scanStream.isStreaming}
+        isFetching={isFetching}
+        pct={scanStream.pct}
+        message={scanStream.message}
+        stage={scanStream.stage}
+        error={scanStream.error}
+      />
+      <ScanCountdownBar
+        dataUpdatedAt={dataUpdatedAt}
+        isFetching={isFetching}
+        isStreaming={scanStream.isStreaming}
+        refetchMs={latestRefetchMs}
+      />
 
       {/* ── Banners ── */}
       {isLatestScanError ? (
@@ -204,12 +230,12 @@ export default function ScannerPage() {
         />
       ) : null}
 
-      {runScanMutation.isError ? (
-        <ErrorCard title="Scan failed" message={getErrorLabel(runScanMutation.error)} />
+      {scanStream.error && !scanStream.isStreaming ? (
+        <ErrorCard title="Scan failed" message={scanStream.error} />
       ) : null}
 
-      {runScanMutation.isSuccess ? (
-        <ScanSuccessBanner payload={runScanMutation.data} />
+      {scanStream.result && !scanStream.isStreaming ? (
+        <ScanSuccessBanner payload={scanStream.result} />
       ) : null}
 
       {scanData && scanData.live_prices_available === false ? (
@@ -235,7 +261,7 @@ export default function ScannerPage() {
       ) : null}
 
       {/* ── Results ── */}
-      {!scanData ? (
+      {!scanData && !scanStream.result ? (
         <Card className="border-dashed">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
@@ -249,7 +275,7 @@ export default function ScannerPage() {
           <CardContent>
             <Button onClick={runScan} disabled={isRunDisabled}>
               <RefreshCw
-                className={`mr-2 h-4 w-4 ${runScanMutation.isPending ? 'animate-spin' : ''}`}
+                className={`mr-2 h-4 w-4 ${scanStream.isStreaming ? 'animate-spin' : ''}`}
               />
               Run First Scan
             </Button>

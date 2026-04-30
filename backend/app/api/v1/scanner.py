@@ -16,12 +16,15 @@ Scan flow (delegated to MarketScannerService):
   4. Rank: gainers/losers by % change, volume spikes by volume_ratio
 """
 import asyncio
+import json
 import logging
+from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from time import perf_counter
 from typing import Literal
 
 from fastapi import APIRouter, Body, Depends, Query, Request
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -33,6 +36,7 @@ from app.schemas.scanner import (
     LatestScanResponse,
     RunScanRequest,
     RunScanResponse,
+    ScanProgressEvent,
     ScanResult,
     ScanResultsData,
     ScannerContextResponse,
@@ -192,6 +196,107 @@ async def run_scan(
         stale_instrument_count=stale_count,
         live_prices_available=live_prices_available,
         results=payload,
+    )
+
+
+@router.post("/run/stream")
+@limiter.limit("5/minute")
+async def run_scan_stream(
+    request: Request,
+    body: RunScanRequest = Body(default_factory=RunScanRequest),
+    user_id: str = Depends(get_current_user_id),
+    session: AsyncSession = Depends(get_db),
+    cache: CacheService = Depends(get_cache_service),
+    upstox_client: UpstoxClient = Depends(get_upstox_client),
+) -> StreamingResponse:
+    """
+    POST /scanner/run/stream — Server-Sent Events scan endpoint.
+
+    Streams ScanProgressEvent updates as text/event-stream.  The terminal
+    'complete' event carries the full RunScanResponse payload so the client
+    has results without a follow-up GET /latest round-trip.
+
+    SSE event types:
+      progress  →  { pct, stage, message }
+      complete  →  { pct, stage, message, response: RunScanResponse }
+      error     →  { message, stage }
+
+    Rate limit: 5/minute — same budget as POST /run.
+    """
+    timeframe = "1h" if body.scan_type == "intraday" else "1d"
+    cache_key = f"scanner:results:v2:{timeframe}"
+
+    async def _sse_generator() -> AsyncGenerator[str, None]:
+        scanner = MarketScannerService(cache=cache)
+        try:
+            async for event in scanner.scan_all_stream(session, upstox_client, timeframe):
+                if await request.is_disconnected():
+                    logger.debug("SSE scanner: client disconnected mid-stream")
+                    return
+
+                if event.results is not None:
+                    # Terminal event — build full response, update cache, send
+                    stale_count = sum(1 for r in event.results if r.warnings)
+                    payload = _build_scan_results(event.results)
+
+                    _ttl = (
+                        settings.CACHE_TTL_SCANNER_OPEN
+                        if nse_calendar.get_session(datetime.now(timezone.utc)).is_open_now
+                        else settings.CACHE_TTL_SCANNER_CLOSED
+                    )
+                    await cache.set(
+                        cache_key,
+                        {
+                            "results": [r.model_dump(mode="json") for r in event.results],
+                            "live_prices_available": event.live_prices_available,
+                        },
+                        ttl=_ttl,
+                    )
+
+                    run_response = RunScanResponse(
+                        status="success",
+                        message=event.message,
+                        scan_type=body.scan_type,
+                        total_scanned=payload.total_scanned,
+                        error_count=0,
+                        primary_error_code=None,
+                        stale_instrument_count=stale_count,
+                        live_prices_available=event.live_prices_available,
+                        results=payload,
+                    )
+                    data = json.dumps({
+                        "pct": 100,
+                        "stage": "complete",
+                        "message": event.message,
+                        "response": run_response.model_dump(mode="json"),
+                    }, default=str)
+                    yield f"event: complete\ndata: {data}\n\n"
+
+                elif event.stage == "error":
+                    data = json.dumps({"message": event.message, "stage": event.stage})
+                    yield f"event: error\ndata: {data}\n\n"
+
+                else:
+                    data = json.dumps({
+                        "pct": event.pct,
+                        "stage": event.stage,
+                        "message": event.message,
+                    })
+                    yield f"event: progress\ndata: {data}\n\n"
+
+        except Exception as exc:
+            logger.warning("SSE scanner stream failed: %s", exc)
+            data = json.dumps({"message": str(exc), "stage": "error", "code": type(exc).__name__})
+            yield f"event: error\ndata: {data}\n\n"
+
+    return StreamingResponse(
+        _sse_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
     )
 
 

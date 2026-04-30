@@ -10,7 +10,9 @@ Single shared httpx.AsyncClient with:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
 from typing import Any
 from fastapi import Request as FastAPIRequest
 
@@ -25,6 +27,11 @@ settings = get_settings()
 
 # Retry-after and other sensitive headers to strip from logged errors
 _SENSITIVE_HEADERS = {"authorization", "x-api-key"}
+
+# Upstox 429 back-off: up to 2 retries with exponential delay + jitter.
+# Total worst-case added latency: ~1s + ~2s = ~3s — acceptable for chart loads.
+_MAX_RETRIES  = 2
+_RETRY_BASE_S = 1.0
 
 
 class UpstoxClient:
@@ -233,54 +240,74 @@ class UpstoxClient:
         headers: dict,
         **kwargs: Any,
     ) -> Any:
-        """Shared HTTP execution logic used by both request variants."""
-        try:
-            response = await self._client.request(
-                method,
-                encoded_path,
-                headers=headers,
-                **kwargs,
-            )
-            response.raise_for_status()
-            return response.json()
+        """
+        Shared HTTP execution logic for both circuit-broken and ingestion paths.
 
-        except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code
+        Upstox 429 responses are retried up to _MAX_RETRIES times with
+        exponential back-off + jitter before surfacing as UpstoxRateLimitError.
+        All other errors surface immediately without retry.
+        """
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                response = await self._client.request(
+                    method,
+                    encoded_path,
+                    headers=headers,
+                    **kwargs,
+                )
+                response.raise_for_status()
+                return response.json()
 
-            # 401 in development — return mock data instead of failing
-            if status == 401 and settings.ENVIRONMENT == "development":
-                logger.warning("Upstox 401 - returning mock data for %s %s", method, encoded_path)
-                return self._get_mock_response(encoded_path)
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
 
-            body = exc.response.text[:300] if hasattr(exc.response, "text") else ""
-            logger.error(
-                "Upstox API error: %s %s → %d | Response: %s",
-                method, encoded_path, status, body,
-            )
+                # 401 in development — return mock data instead of failing
+                if status == 401 and settings.ENVIRONMENT == "development":
+                    logger.warning("Upstox 401 - returning mock data for %s %s", method, encoded_path)
+                    return self._get_mock_response(encoded_path)
 
-            # 429 = rate limited — excluded from both circuit breakers
-            if status == 429:
-                raise UpstoxRateLimitError(upstream_status=429)
+                # 429 — rate-limited; back off and retry before giving up.
+                # Excluded from circuit-breaker failure counting.
+                if status == 429 and attempt < _MAX_RETRIES:
+                    delay = _RETRY_BASE_S * (2 ** attempt) + random.uniform(0.0, 0.25)
+                    logger.warning(
+                        "Upstox 429 on %s %s — retry %d/%d in %.2fs",
+                        method, encoded_path, attempt + 1, _MAX_RETRIES, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
 
-            # 400 = invalid instrument key — excluded from both circuit breakers
-            if status == 400:
-                raise UpstoxInvalidInstrumentError(
-                    "Invalid instrument key rejected by Upstox (UDAPI100011)",
-                    upstream_status=400,
+                body = exc.response.text[:300] if hasattr(exc.response, "text") else ""
+                logger.error(
+                    "Upstox API error: %s %s → %d | Response: %s",
+                    method, encoded_path, status, body,
                 )
 
-            raise UpstoxAPIError(
-                f"Upstream API returned {status}",
-                upstream_status=status,
-            )
+                # 429 exhausted all retries — excluded from both circuit breakers
+                if status == 429:
+                    raise UpstoxRateLimitError(upstream_status=429)
 
-        except httpx.TimeoutException:
-            logger.error("Upstox API timeout: %s %s", method, encoded_path)
-            raise UpstoxConnectionError("Request to market data API timed out")
+                # 400 = invalid instrument key — excluded from both circuit breakers
+                if status == 400:
+                    raise UpstoxInvalidInstrumentError(
+                        "Invalid instrument key rejected by Upstox (UDAPI100011)",
+                        upstream_status=400,
+                    )
 
-        except httpx.ConnectError:
-            logger.error("Upstox connection error: %s %s", method, encoded_path)
-            raise UpstoxConnectionError("Cannot reach market data API")
+                raise UpstoxAPIError(
+                    f"Upstream API returned {status}",
+                    upstream_status=status,
+                )
+
+            except httpx.TimeoutException:
+                logger.error("Upstox API timeout: %s %s", method, encoded_path)
+                raise UpstoxConnectionError("Request to market data API timed out")
+
+            except httpx.ConnectError:
+                logger.error("Upstox connection error: %s %s", method, encoded_path)
+                raise UpstoxConnectionError("Cannot reach market data API")
+
+        raise UpstoxConnectionError("Request failed after all retry attempts")  # pragma: no cover
     
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         """

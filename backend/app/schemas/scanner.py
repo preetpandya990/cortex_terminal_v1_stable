@@ -109,3 +109,15 @@ class RunScanResponse(BaseModel):
     stale_instrument_count: int = 0
     live_prices_available: bool = True
     results: ScanResultsData
+
+
+class ScanProgressEvent(BaseModel):
+    """
+    Yielded by MarketScannerService.scan_all_stream() at each pipeline stage.
+    The terminal event has results populated; all prior events are progress-only.
+    """
+    pct: int = Field(ge=0, le=100)
+    stage: str
+    message: str
+    results: list[ScanResult] | None = None
+    live_prices_available: bool = False

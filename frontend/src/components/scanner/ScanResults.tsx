@@ -2,7 +2,6 @@
 
 import { useMemo, useState } from 'react';
 import { TrendingUp, TrendingDown, Volume2, AlertTriangle } from 'lucide-react';
-import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { StockAnalysis } from '@/types/market';
@@ -35,10 +34,51 @@ const volumeFormatter = new Intl.NumberFormat('en-IN', {
   maximumFractionDigits: 2,
 });
 
-const TABS: { id: ScannerTab; label: string; icon: typeof TrendingUp }[] = [
-  { id: 'gainers', label: 'Gainers', icon: TrendingUp },
-  { id: 'losers', label: 'Losers', icon: TrendingDown },
-  { id: 'volume', label: 'Volume Spikes', icon: Volume2 },
+type TabTheme = {
+  label: string;
+  icon: typeof TrendingUp;
+  active:       string;
+  inactive:     string;
+  iconActive:   string;
+  iconInactive: string;
+  countActive:  string;
+  countInactive: string;
+};
+
+const TABS: Array<{ id: ScannerTab } & TabTheme> = [
+  {
+    id:           'gainers',
+    label:        'Gainers',
+    icon:         TrendingUp,
+    active:       'border-emerald-500 bg-gradient-to-br from-emerald-500 to-emerald-600 text-white shadow-md shadow-emerald-200',
+    inactive:     'border-slate-200 bg-white text-slate-600 hover:border-emerald-300 hover:bg-emerald-50/60 hover:text-emerald-700',
+    iconActive:   'text-emerald-100',
+    iconInactive: 'text-emerald-500',
+    countActive:  'bg-white/20 text-white',
+    countInactive: 'bg-emerald-50 text-emerald-600 border border-emerald-200',
+  },
+  {
+    id:           'losers',
+    label:        'Losers',
+    icon:         TrendingDown,
+    active:       'border-red-500 bg-gradient-to-br from-red-500 to-red-600 text-white shadow-md shadow-red-200',
+    inactive:     'border-slate-200 bg-white text-slate-600 hover:border-red-300 hover:bg-red-50/60 hover:text-red-700',
+    iconActive:   'text-red-100',
+    iconInactive: 'text-red-500',
+    countActive:  'bg-white/20 text-white',
+    countInactive: 'bg-red-50 text-red-600 border border-red-200',
+  },
+  {
+    id:           'volume',
+    label:        'Volume Spikes',
+    icon:         Volume2,
+    active:       'border-amber-500 bg-gradient-to-br from-amber-500 to-orange-500 text-white shadow-md shadow-amber-200',
+    inactive:     'border-slate-200 bg-white text-slate-600 hover:border-amber-300 hover:bg-amber-50/60 hover:text-amber-700',
+    iconActive:   'text-amber-100',
+    iconInactive: 'text-amber-500',
+    countActive:  'bg-white/20 text-white',
+    countInactive: 'bg-amber-50 text-amber-600 border border-amber-200',
+  },
 ];
 
 function getSectors(stocks: StockAnalysis[]): string[] {
@@ -52,6 +92,12 @@ function getSectors(stocks: StockAnalysis[]): string[] {
 export function ScanResults({ topGainers, topLosers, volumeSpikes, onStockSelect }: ScanResultsProps) {
   const [activeTab, setActiveTab] = useState<ScannerTab>('gainers');
   const [selectedSector, setSelectedSector] = useState<string | null>(null);
+
+  const counts: Record<ScannerTab, number> = {
+    gainers: topGainers.length,
+    losers:  topLosers.length,
+    volume:  volumeSpikes.length,
+  };
 
   const rawStocks = useMemo(() => {
     if (activeTab === 'gainers') return topGainers;
@@ -77,16 +123,26 @@ export function ScanResults({ topGainers, topLosers, volumeSpikes, onStockSelect
     <div className="space-y-4">
       {/* Tab switcher */}
       <div className="flex flex-wrap gap-2">
-        {TABS.map(({ id, label, icon: Icon }) => (
-          <Button
-            key={id}
-            variant={activeTab === id ? 'default' : 'outline'}
-            onClick={() => handleTabChange(id)}
-          >
-            <Icon className="mr-2 h-4 w-4" />
-            {label}
-          </Button>
-        ))}
+        {TABS.map(({ id, label, icon: Icon, active, inactive, iconActive, iconInactive, countActive, countInactive }) => {
+          const isActive = activeTab === id;
+          return (
+            <button
+              key={id}
+              onClick={() => handleTabChange(id)}
+              className={`inline-flex items-center gap-2 rounded-xl border px-4 py-2.5 text-sm font-semibold transition-all duration-200 ${
+                isActive ? active : inactive
+              }`}
+            >
+              <Icon className={`h-4 w-4 ${isActive ? iconActive : iconInactive}`} />
+              {label}
+              <span className={`rounded-md px-1.5 py-0.5 tabular-nums text-xs font-bold ${
+                isActive ? countActive : countInactive
+              }`}>
+                {counts[id]}
+              </span>
+            </button>
+          );
+        })}
       </div>
 
       {/* Sector filter chips */}

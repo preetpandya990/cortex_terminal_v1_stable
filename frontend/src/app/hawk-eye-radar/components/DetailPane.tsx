@@ -1,12 +1,14 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { X, Loader2, Plus, Check } from "lucide-react";
-import { WS_BASE_URL, upstoxAPI, isNetworkError } from "@/lib/api";
+import { upstoxAPI, isNetworkError, isRateLimitError, getRetryAfterMs } from "@/lib/api";
 import { mergeCandles } from "@/lib/candle-transforms";
+import { useLtp } from "@/hooks/useLtp";
 import {
   getISTTodayYMD,
+  getISTMarketSession,
   includesTodayOrYesterday,
   resolveCandleSourceMode,
   diffDaysInclusive,
@@ -14,6 +16,7 @@ import {
   adjustDateRangeForTimeframe,
   getNoDataMessage,
   getMinAvailableDateForUnit,
+  getLoadMoreChunkDays,
   type CandleUnit,
   type CandleSourceMode,
   type HistoricalState,
@@ -27,19 +30,12 @@ import { AnalysisCardsSection } from "@/components/AnalysisCardsSection";
 import { useWatchlist } from "@/hooks/useWatchlist";
 import { useAuth } from "@/contexts/AuthContext";
 import { useChartPreferences, type TimeframeOption } from "@/contexts/ChartPreferencesContext";
+import { LivePriceBadge } from "@/components/shared/LivePriceBadge";
 import type {
   UpstoxCandlesResponse,
   UpstoxInstrument,
   UpstoxLtpTick,
-  UpstoxTickStreamMessage,
 } from "@/types/upstox";
-
-// ─── Constants ───────────────────────────────────────────────────────────────
-
-const TICK_STREAM_INTERVAL_MS = 500;
-const TICK_STREAM_MAX_RECONNECTS = 10;
-const TICK_STREAM_BASE_DELAY_MS = 1_000;
-const TICK_STREAM_MAX_DELAY_MS = 30_000;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -55,24 +51,6 @@ type FetchCandlesParams = {
   toDate: string;
   mode: CandleSourceMode;
 };
-
-type TickStreamStatus = "idle" | "connecting" | "live" | "reconnecting" | "error";
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function buildTickStreamUrl(instrumentKey: string): string {
-  const wsBase = WS_BASE_URL.replace(/\/$/, "");
-  const hasApiV1Prefix = /\/api\/v1$/i.test(wsBase);
-  const path = hasApiV1Prefix ? "/upstox/ticks/ws" : "/api/v1/upstox/ticks/ws";
-  const url = new URL(`${wsBase}${path}`);
-  url.searchParams.set("instrument_key", instrumentKey);
-  url.searchParams.set("interval_ms", String(TICK_STREAM_INTERVAL_MS));
-  return url.toString();
-}
-
-function getReconnectDelay(attempt: number): number {
-  return Math.min(TICK_STREAM_BASE_DELAY_MS * Math.pow(2, attempt), TICK_STREAM_MAX_DELAY_MS);
-}
 
 /** Extract YYYY-MM-DD from a candle timestamp (string ISO or Unix seconds). */
 function candleTimestampToDate(ts: string | number): string {
@@ -94,10 +72,17 @@ export function DetailPane({ instrument, onClose, showAnalysis = true }: DetailP
   const { isAuthenticated } = useAuth();
   const { defaultTimeframe, activeIndicators } = useChartPreferences();
 
-  // Use full watchlist items so we can derive watchlist status from the
-  // already-cached data instead of making a separate checkInWatchlist API call.
-  const { items: watchlistItems, addToWatchlist, removeFromWatchlist, isAdding, isRemoving } =
-    useWatchlist();
+  // Consume from the singleton context — no duplicate hook instance.
+  const {
+    items: watchlistItems,
+    addToWatchlist,
+    removeFromWatchlist,
+    isAdding,
+    isRemoving,
+    subscribeInstrument,
+    unsubscribeInstrument,
+    isMarketFeedConnected,
+  } = useWatchlist();
 
   // ── Derived watchlist state — zero extra API calls ──────────────────────────
   const watchlistEntry = watchlistItems.find(
@@ -105,6 +90,17 @@ export function DetailPane({ instrument, onClose, showAnalysis = true }: DetailP
   );
   const inWatchlist = !!watchlistEntry;
   const watchlistItemId = watchlistEntry?.id ?? null;
+
+  // ── Live price from market feed ─────────────────────────────────────────────
+  const priceSnapshot = useLtp(instrument.instrument_key);
+  const displayPrice  = priceSnapshot?.ltp ?? null;
+
+  // Subscribe this instrument to the market feed while DetailPane is mounted.
+  // This handles instruments not in the watchlist (e.g. opened from search).
+  useEffect(() => {
+    subscribeInstrument(instrument.instrument_key);
+    return () => unsubscribeInstrument(instrument.instrument_key);
+  }, [instrument.instrument_key, subscribeInstrument, unsubscribeInstrument]);
 
   // ── Chart / data state ──────────────────────────────────────────────────────
   const [currentTimeframe, setCurrentTimeframe] = useState<TimeframeOption>(defaultTimeframe);
@@ -122,16 +118,12 @@ export function DetailPane({ instrument, onClose, showAnalysis = true }: DetailP
   });
 
   const [candles, setCandles] = useState<UpstoxCandlesResponse | null>(null);
-  const [liveTick, setLiveTick] = useState<UpstoxLtpTick | null>(null);
-  const [tickStreamStatus, setTickStreamStatus] = useState<TickStreamStatus>("idle");
 
   // Infinite-scroll state
   const [earliestLoadedDate, setEarliestLoadedDate] = useState<string | null>(null);
   const [isLoadingMoreHistory, setIsLoadingMoreHistory] = useState(false);
   const [hasMoreHistory, setHasMoreHistory] = useState(true);
   const [timeframeSwitchMessage, setTimeframeSwitchMessage] = useState<string | null>(null);
-
-  const tickSocketRef = useRef<WebSocket | null>(null);
 
   // Signals that the initial candle fetch returned empty data and we should
   // attempt an automatic load-more once earliestLoadedDate is set.
@@ -258,6 +250,7 @@ export function DetailPane({ instrument, onClose, showAnalysis = true }: DetailP
     [],
   );
 
+
   // ── Instrument-change effect ────────────────────────────────────────────────
 
   useEffect(() => {
@@ -266,7 +259,6 @@ export function DetailPane({ instrument, onClose, showAnalysis = true }: DetailP
     setCandles(null);
     setEarliestLoadedDate(null);
     setHasMoreHistory(true);
-    setLiveTick(null);
     setTimeframeSwitchMessage(null);
 
     fetchCandles({
@@ -289,28 +281,48 @@ export function DetailPane({ instrument, onClose, showAnalysis = true }: DetailP
     setIsLoadingMoreHistory(true);
     setTimeframeSwitchMessage(null);
 
-    try {
-      const daysToLoad = candleUnit === "minutes" && candleInterval <= 15 ? 2 : 5;
-      const newFromDate = addDays(earliestLoadedDate, -daysToLoad);
-      const newToDate = addDays(earliestLoadedDate, -1);
-      const minDate = getMinAvailableDateForUnit(candleUnit);
+    const daysToLoad  = getLoadMoreChunkDays(candleUnit, candleInterval);
+    const newFromDate = addDays(earliestLoadedDate, -daysToLoad);
+    const newToDate   = addDays(earliestLoadedDate, -1);
+    const minDate     = getMinAvailableDateForUnit(candleUnit);
 
-      if (newFromDate < minDate && candleUnit === "minutes") {
-        setTimeframeSwitchMessage("Reached the oldest available data for this timeframe.");
-        setHasMoreHistory(false);
-        return;
-      }
+    if (newFromDate < minDate && candleUnit === "minutes") {
+      setTimeframeSwitchMessage("Reached the oldest available data for this timeframe.");
+      setHasMoreHistory(false);
+      return; // finally handles setIsLoadingMoreHistory(false)
+    }
 
-      const result = await upstoxAPI.getHistoricalCandles(instrument.instrument_key, {
+    // Inline fetch — extracted so it can be called twice (initial + one retry).
+    const fetchChunk = () =>
+      upstoxAPI.getHistoricalCandles(instrument.instrument_key, {
         unit: candleUnit,
         interval: candleInterval,
         to_date: newToDate,
         from_date: newFromDate,
       });
 
+    // Single-retry wrapper: if the backend propagates a 429, honour the
+    // Retry-After header, surface a brief message, then make one more attempt.
+    const fetchWithRetry = async () => {
+      try {
+        return await fetchChunk();
+      } catch (err) {
+        if (!isRateLimitError(err)) throw err;
+        const waitMs = getRetryAfterMs(err);
+        setTimeframeSwitchMessage(
+          `Rate limit reached — retrying in ${Math.ceil(waitMs / 1_000)}s…`,
+        );
+        await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
+        setTimeframeSwitchMessage(null);
+        return fetchChunk(); // second attempt; errors propagate to outer catch
+      }
+    };
+
+    try {
+      const result = await fetchWithRetry();
+
       if ((result?.data?.candles?.length ?? 0) > 0) {
-        // Merge using the functional updater — safe from stale closures even
-        // when called from an async context after a re-render.
+        // Functional updater avoids stale closure on candles after async gap.
         setCandles((prev) => {
           if (!prev) return null;
           const merged = mergeCandles(result.data.candles, prev.data.candles ?? []);
@@ -321,12 +333,21 @@ export function DetailPane({ instrument, onClose, showAnalysis = true }: DetailP
         setEarliestLoadedDate(firstTs);
         setHasMoreHistory(new Date(firstTs) > new Date(minDate));
       } else {
-        // Empty (weekend / holiday) — step the cursor back to keep searching.
+        // Empty window (holiday / weekend) — step the cursor back so the
+        // next trigger searches a fresh range without re-requesting this one.
         setEarliestLoadedDate(newFromDate);
       }
     } catch (error) {
-      console.error("[DetailPane] Failed to load historical data:", error);
-      setHasMoreHistory(false);
+      if (isRateLimitError(error)) {
+        // Both attempts exhausted — leave hasMoreHistory true so the user can
+        // scroll to retry once the rate-limit window resets.
+        setTimeframeSwitchMessage("Rate limit reached — scroll left to retry.");
+      } else {
+        if (!isNetworkError(error)) {
+          console.error("[DetailPane] Failed to load historical data:", error);
+        }
+        setHasMoreHistory(false);
+      }
     } finally {
       setIsLoadingMoreHistory(false);
     }
@@ -444,101 +465,74 @@ export function DetailPane({ instrument, onClose, showAnalysis = true }: DetailP
     instrument,
   ]);
 
-  // ── Tick stream WebSocket ───────────────────────────────────────────────────
-  //
-  // Production-grade: exponential-backoff reconnection on unexpected close,
-  // intentional close on unmount or auth loss (code 1000 → no reconnect).
 
-  useEffect(() => {
-    if (!isAuthenticated) {
-      setTickStreamStatus("idle");
-      return;
-    }
+  // ── Live price derivations ─────────────────────────────────────────────────
 
-    let reconnectAttempts = 0;
-    let reconnectTimeoutId: ReturnType<typeof setTimeout> | null = null;
-    let isCancelled = false;
+  // liveTick adapts the PriceFeed snapshot into the shape CandlestickChart
+  // expects for live candle merge. Null when no tick has arrived yet.
+  const liveTick: UpstoxLtpTick | null = priceSnapshot?.ltp != null
+    ? { instrument_key: instrument.instrument_key, last_price: priceSnapshot.ltp, server_timestamp: String(priceSnapshot.ts) }
+    : null;
 
-    const connect = () => {
-      if (isCancelled) return;
-      setTickStreamStatus("connecting");
-
-      const socket = new WebSocket(buildTickStreamUrl(instrument.instrument_key));
-      tickSocketRef.current = socket;
-
-      socket.onopen = () => {
-        if (isCancelled) return;
-        reconnectAttempts = 0;
-        setTickStreamStatus("live");
-      };
-
-      socket.onmessage = (event) => {
-        if (isCancelled) return;
-        try {
-          const payload = JSON.parse(event.data) as UpstoxTickStreamMessage;
-          if (payload.type === "tick") {
-            setLiveTick(payload.data);
-          }
-        } catch {
-          // Malformed message — log but don't disrupt the stream.
-        }
-      };
-
-      socket.onerror = () => {
-        if (isCancelled) return;
-        // onclose fires after onerror; let it handle reconnection.
-        setTickStreamStatus("error");
-      };
-
-      socket.onclose = (event) => {
-        if (isCancelled) return;
-        tickSocketRef.current = null;
-
-        const isIntentional = event.code === 1000 || event.code === 1001;
-        if (isIntentional) {
-          setTickStreamStatus("idle");
-          return;
-        }
-
-        if (reconnectAttempts < TICK_STREAM_MAX_RECONNECTS) {
-          setTickStreamStatus("reconnecting");
-          const delay = getReconnectDelay(reconnectAttempts);
-          reconnectAttempts++;
-          reconnectTimeoutId = setTimeout(connect, delay);
-        } else {
-          console.error("[DetailPane] Tick stream max reconnects reached for:", instrument.instrument_key);
-          setTickStreamStatus("error");
-        }
-      };
-    };
-
-    connect();
-
-    return () => {
-      isCancelled = true;
-      if (reconnectTimeoutId !== null) clearTimeout(reconnectTimeoutId);
-      if (tickSocketRef.current) {
-        tickSocketRef.current.close(1000, "Component unmounted");
-        tickSocketRef.current = null;
+  // Previous session close — derived from the most recent pre-today daily+
+  // candle. Only meaningful for daily/weekly/monthly candle units; intraday
+  // candles don't carry a reliable daily baseline.
+  const prevClose = useMemo(() => {
+    if (!candles?.data?.candles?.length) return null;
+    if (candleUnit !== "days" && candleUnit !== "weeks" && candleUnit !== "months") return null;
+    const today = getISTTodayYMD();
+    const arr = candles.data.candles;
+    // Candles are ascending — walk from the end to find the latest pre-today candle.
+    for (let i = arr.length - 1; i >= 0; i--) {
+      if (candleTimestampToDate(arr[i][0]) < today) {
+        return arr[i][4] as number;
       }
-    };
-  }, [instrument.instrument_key, isAuthenticated]);
+    }
+    return null;
+  }, [candles, candleUnit]);
+
+  const isLive       = isMarketFeedConnected && getISTMarketSession() === "open";
+  const isConnecting = !isMarketFeedConnected && getISTMarketSession() === "open";
 
   // ── Render ──────────────────────────────────────────────────────────────────
 
   return (
     <div className="fixed inset-0 z-50 bg-slate-950/40 backdrop-blur-sm">
       <div className="absolute inset-0 overflow-y-auto">
-        <div className="flex h-full flex-col p-6">
+        <div className="flex h-full flex-col">
           <div className="flex flex-1 flex-col w-full">
-            <Card className="flex flex-1 flex-col rounded-2xl border-slate-200 bg-white shadow-2xl">
+            <Card className="flex flex-1 flex-col rounded-none border-0 border-slate-200 bg-white shadow-2xl">
               {/* ── Header ─────────────────────────────────────────────────── */}
-              <CardHeader className="flex flex-row items-center justify-between shrink-0">
-                <div>
-                  <CardTitle className="text-2xl">{instrument.name || "—"}</CardTitle>
-                  <p className="text-sm text-slate-500">{instrument.trading_symbol}</p>
+              <CardHeader className="flex flex-row items-center justify-between gap-6 shrink-0">
+                {/* Identity + live price */}
+                <div className="min-w-0 flex-1 flex items-center gap-4">
+                  <div className="min-w-0">
+                    <CardTitle className="text-xl font-bold leading-tight text-slate-900">
+                      {instrument.name || "—"}
+                    </CardTitle>
+                    <div className="mt-1 flex items-center gap-2">
+                      <span className="font-mono text-sm font-medium text-slate-500">
+                        {instrument.trading_symbol}
+                      </span>
+                      {instrument.exchange && (
+                        <span className="rounded bg-slate-100 px-1.5 py-0.5 text-xs font-medium text-slate-500">
+                          {instrument.exchange}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <LivePriceBadge
+                    price={displayPrice ?? null}
+                    prevClose={prevClose}
+                    isLive={isLive}
+                    isConnecting={isConnecting}
+                    className="mt-3"
+                    align="start"
+                  />
                 </div>
-                <div className="flex items-center gap-2">
+
+                <div className="flex shrink-0 items-center gap-2">
                   {isAuthenticated && !showAnalysis && (
                     <Button
                       variant={inWatchlist ? "outline" : "default"}
@@ -608,6 +602,7 @@ export function DetailPane({ instrument, onClose, showAnalysis = true }: DetailP
                           isLoadingMoreHistory={isLoadingMoreHistory}
                           onLoadMoreHistory={stableHandleLoadMoreHistory}
                           activeIndicators={activeIndicators}
+                          isLive={isLive}
                         />
                       </div>
                     </div>

@@ -111,23 +111,11 @@ class EventProcessor:
                         
                         if signal:
                             signals.append(signal)
-                            
-                            # Publish signal to Redis
-                            import json
-                            await self.pubsub.publish(
-                                RedisChannels.SIGNALS_ALL,
-                                json.dumps({
-                                    "symbol": symbol,
-                                    "signal_id": signal.id,
-                                    "action": signal.action,
-                                    "confidence": float(signal.confidence_score),
-                                    "timestamp": signal.signal_timestamp.isoformat(),
-                                })
-                            )
-                            
+                            # assemble_signal already published the canonical payload
+                            # to SIGNALS_ALL and the per-symbol channel — no re-publish here.
                             logger.info(
-                                f"Generated signal for {symbol}: {signal.action}, "
-                                f"confidence={signal.confidence_score:.2f}"
+                                "Generated signal for %s: %s confidence=%.2f",
+                                symbol, signal.action, float(signal.confidence_score),
                             )
                     except Exception as e:
                         logger.error(f"Failed to generate signal for {symbol}: {e}", exc_info=True)
