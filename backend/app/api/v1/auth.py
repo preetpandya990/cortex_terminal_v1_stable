@@ -247,20 +247,25 @@ async def dev_login(
             detail="Endpoint not available in production"
         )
     
-    # Get or create trader user
+    # Get or create dev admin user
     user = await get_user_by_username(db, "trader")
-    
+
     if not user:
-        # Create trader user if doesn't exist
         user = User(
             username="trader",
             email="trader@cortex.local",
             hashed_password=hash_password("trader123"),
-            full_name="Trader User",
-            role="trader",
+            full_name="Dev Admin",
+            role="admin",
             is_active=True,
         )
         db.add(user)
+        await db.commit()
+        await db.refresh(user)
+    elif user.role != "admin":
+        # Upgrade existing dev user to admin on next login
+        stmt = update(User).where(User.id == user.id).values(role="admin")
+        await db.execute(stmt)
         await db.commit()
         await db.refresh(user)
     

@@ -89,6 +89,27 @@ class TradeSuggestion(Base):
         back_populates="suggestion",
         cascade="all, delete-orphan"
     )
+    paper_orders: Mapped[list["PaperOrder"]] = relationship(  # type: ignore[name-defined]
+        "PaperOrder",
+        back_populates="suggestion",
+        cascade="save-update, merge",
+        passive_deletes=True,
+        lazy="select",
+    )
+    paper_positions: Mapped[list["PaperPosition"]] = relationship(  # type: ignore[name-defined]
+        "PaperPosition",
+        back_populates="suggestion",
+        cascade="save-update, merge",
+        passive_deletes=True,
+        lazy="select",
+    )
+    paper_outcomes: Mapped[list["PaperTradeOutcome"]] = relationship(  # type: ignore[name-defined]
+        "PaperTradeOutcome",
+        back_populates="suggestion",
+        cascade="save-update, merge",
+        passive_deletes=True,
+        lazy="select",
+    )
     
     # Table constraints (defined in migration, documented here)
     __table_args__ = (

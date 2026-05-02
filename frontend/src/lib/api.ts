@@ -10,6 +10,26 @@ import type {
 } from '@/types/ml';
 import type { UpstoxCandlesResponse } from '@/types/upstox';
 import type { SuggestionsListResponse, SuggestionFilters } from '@/types/trade_suggestions';
+import type {
+  CreatePortfolioRequest,
+  UpdatePortfolioSettingsRequest,
+  PlaceOrderRequest,
+  ClosePositionRequest,
+  Portfolio,
+  PortfolioSummary,
+  PaperOrder,
+  PaperPositionDetail,
+  OrdersListResponse,
+  PositionsListResponse,
+  OutcomesListResponse,
+  OutcomeStatsResponse,
+  PnlSnapshotsListResponse,
+  QtySuggestionResponse,
+  OrdersQueryParams,
+  PositionsQueryParams,
+  OutcomesQueryParams,
+  PnlSnapshotsQueryParams,
+} from '@/types/paper_trading';
 
 // Watchlist types
 export interface WatchlistItem {
@@ -89,7 +109,9 @@ api.interceptors.response.use(
       error.code === 'ERR_NETWORK' ||
       error.message === 'Network Error' ||
       // Auth errors: handled by the token-refresh flow in AuthContext.
-      status === 401;
+      status === 401 ||
+      // Not Found: valid domain response (e.g. no portfolio yet) — callers handle via error state.
+      status === 404;
 
     if (!isSuppressed) {
       const payload = error.response?.data as { detail?: string; message?: string } | undefined;
@@ -601,6 +623,102 @@ export const caiAPI = {
 };
 
 // Watchlist API
+// Paper Trading API
+export const paperTradingAPI = {
+  getMyPortfolio: async (): Promise<PortfolioSummary> => {
+    return requestData(
+      api.get<PortfolioSummary>('/paper-trading/portfolios/me'),
+      'Failed to fetch portfolio'
+    );
+  },
+
+  createPortfolio: async (payload: CreatePortfolioRequest): Promise<Portfolio> => {
+    return requestData(
+      api.post<Portfolio>('/paper-trading/portfolios', payload),
+      'Failed to create portfolio'
+    );
+  },
+
+  updatePortfolioSettings: async (payload: UpdatePortfolioSettingsRequest): Promise<Portfolio> => {
+    return requestData(
+      api.patch<Portfolio>('/paper-trading/portfolios/me', payload),
+      'Failed to update portfolio settings'
+    );
+  },
+
+  placeOrder: async (payload: PlaceOrderRequest): Promise<PaperOrder> => {
+    return requestData(
+      api.post<PaperOrder>('/paper-trading/orders', payload),
+      'Failed to place order'
+    );
+  },
+
+  getOrders: async (params?: OrdersQueryParams): Promise<OrdersListResponse> => {
+    return requestData(
+      api.get<OrdersListResponse>('/paper-trading/orders', { params }),
+      'Failed to fetch orders'
+    );
+  },
+
+  cancelOrder: async (orderId: string): Promise<void> => {
+    return requestData(
+      api.delete(`/paper-trading/orders/${orderId}`),
+      'Failed to cancel order'
+    );
+  },
+
+  getPositions: async (params?: PositionsQueryParams): Promise<PositionsListResponse> => {
+    return requestData(
+      api.get<PositionsListResponse>('/paper-trading/positions', { params }),
+      'Failed to fetch positions'
+    );
+  },
+
+  getPositionDetail: async (positionId: string): Promise<PaperPositionDetail> => {
+    return requestData(
+      api.get<PaperPositionDetail>(`/paper-trading/positions/${positionId}`),
+      'Failed to fetch position detail'
+    );
+  },
+
+  closePosition: async (positionId: string, payload: ClosePositionRequest): Promise<PaperOrder> => {
+    return requestData(
+      api.post<PaperOrder>(`/paper-trading/positions/${positionId}/close`, payload),
+      'Failed to close position'
+    );
+  },
+
+  getQtySuggestion: async (suggestionId: string): Promise<QtySuggestionResponse> => {
+    return requestData(
+      api.get<QtySuggestionResponse>('/paper-trading/qty-suggestion', {
+        params: { suggestion_id: suggestionId },
+      }),
+      'Failed to fetch quantity suggestion'
+    );
+  },
+
+  getOutcomes: async (params?: OutcomesQueryParams): Promise<OutcomesListResponse> => {
+    return requestData(
+      api.get<OutcomesListResponse>('/paper-trading/outcomes', { params }),
+      'Failed to fetch outcomes'
+    );
+  },
+
+  getOutcomeStats: async (): Promise<OutcomeStatsResponse> => {
+    return requestData(
+      api.get<OutcomeStatsResponse>('/paper-trading/outcomes/stats'),
+      'Failed to fetch outcome stats'
+    );
+  },
+
+  getPnlSnapshots: async (params?: PnlSnapshotsQueryParams): Promise<PnlSnapshotsListResponse> => {
+    return requestData(
+      api.get<PnlSnapshotsListResponse>('/paper-trading/pnl/snapshots', { params }),
+      'Failed to fetch P&L snapshots'
+    );
+  },
+};
+
 export const watchlistAPI = {
   getWatchlist: async (): Promise<WatchlistItem[]> => {
     return requestData(

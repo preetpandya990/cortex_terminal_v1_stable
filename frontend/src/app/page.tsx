@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { useAuth } from '@/contexts/AuthContext';
-import { OpenPositionsPlaceholder } from "@/components/dashboard/OpenPositionsPlaceholder";
+import { OpenPositionsTable } from "@/components/paper-trading/OpenPositionsTable";
 import { InstrumentSearchCombobox } from "@/components/market/InstrumentSearchCombobox";
 import { DetailPane } from "@/app/hawk-eye-radar/components/DetailPane";
 import type { UpstoxInstrument } from "@/types/upstox";
@@ -21,9 +21,7 @@ export default function Home() {
 
   return (
     <div className="space-y-6">
-      {/* Search Bar — only rendered once auth state is known and user is logged in.
-          During the initial refresh window (isAuthReady=false) nothing renders here,
-          preventing instrument-search and LTP requests from firing unauthenticated. */}
+      {/* Search Bar — only rendered once auth state is known and user is logged in. */}
       {isAuthReady && isAuthenticated && (
         <InstrumentSearchCombobox
           onSelect={handleInstrumentSelect}
@@ -33,8 +31,8 @@ export default function Home() {
         />
       )}
 
-      {/* Open Positions */}
-      {/* {isAuthenticated && <OpenPositionsPlaceholder />} */}
+      {/* Paper Trading — Open Positions with live P&L stream */}
+      {isAuthReady && isAuthenticated && <OpenPositionsTable />}
 
       {/* Detail Pane Overlay */}
       {selectedInstrument && (

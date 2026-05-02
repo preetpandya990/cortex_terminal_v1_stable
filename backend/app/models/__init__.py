@@ -1,9 +1,14 @@
 """
 Database models.
 
-Import order matters — User must be registered with SQLAlchemy's mapper
-before WatchlistItem, because WatchlistItem.user is a forward-reference
-relationship("User", ...) that is resolved at mapper initialisation time.
+Import order matters — relationships with forward-references are resolved at
+mapper initialisation time, so dependent models must be imported after their
+targets:
+  User            → must precede WatchlistItem, Portfolio, PaperTradeOutcome
+  TradeSuggestion → must precede PaperOrder, PaperPosition, PaperTradeOutcome
+  Portfolio       → must precede PaperOrder, PaperPosition, PaperTradeOutcome,
+                    PaperPnlSnapshot
+  PaperPosition   → must precede PaperTradeOutcome
 """
 
 from app.models.ml_data import (
@@ -13,22 +18,38 @@ from app.models.ml_data import (
     MLAuditLog,
     Base,
 )
-from app.models.user import User, RefreshToken          # must precede WatchlistItem
-from app.models.trade_suggestions import (
-    TradeSuggestion,
-    EventCorrelation,
-)
+from app.models.user import User, RefreshToken
+from app.models.trade_suggestions import TradeSuggestion, EventCorrelation
 from app.models.watchlist import WatchlistItem
+from app.models.paper_trading import (
+    Portfolio,
+    PaperOrder,
+    PaperFill,
+    PaperPosition,
+    PaperTradeOutcome,
+    PaperPnlSnapshot,
+)
 
 __all__ = [
     "Base",
+    # Auth
     "User",
     "RefreshToken",
+    # ML
     "MLDriftMetric",
     "MLPrediction",
     "MLModelMetadata",
     "MLAuditLog",
+    # Signals
     "TradeSuggestion",
     "EventCorrelation",
+    # Watchlist
     "WatchlistItem",
+    # Paper Trading
+    "Portfolio",
+    "PaperOrder",
+    "PaperFill",
+    "PaperPosition",
+    "PaperTradeOutcome",
+    "PaperPnlSnapshot",
 ]

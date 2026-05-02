@@ -21,7 +21,8 @@ from slowapi.middleware import SlowAPIMiddleware
 
 from app.api.v1 import (
     auth, cai, fusion, governance, hawk_eye, ingestion, intelligence,
-    market_data, ml_drift, ml_predictions, safety, scanner, strategy, trade_suggestions, upstox, health, watchlist
+    market_data, ml_drift, ml_predictions, paper_trading, safety, scanner,
+    strategy, trade_suggestions, upstox, health, watchlist
 )
 from app.core.config import get_settings
 from app.core.database import engine, worker_engine
@@ -135,6 +136,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.cai_listener_task = cai_listener_task
     logger.info("CAI Redis listener started")
 
+    # Start Paper Trading P&L recompute worker
+    from app.services.paper_trading.pnl_worker import run_pnl_worker
+    pnl_worker_task = asyncio.create_task(
+        run_pnl_worker(get_redis()), name="paper_trading_pnl_worker"
+    )
+    app.state.pnl_worker_task = pnl_worker_task
+    logger.info("Paper Trading P&L worker started")
+
     logger.info("All services initialized — ready")
     yield
 
@@ -155,6 +164,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.cai_listener_task.cancel()
         try:
             await asyncio.wait_for(app.state.cai_listener_task, timeout=5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
+    # Cancel P&L worker
+    if hasattr(app.state, "pnl_worker_task") and app.state.pnl_worker_task:
+        app.state.pnl_worker_task.cancel()
+        try:
+            await asyncio.wait_for(app.state.pnl_worker_task, timeout=5.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
 
@@ -217,6 +234,8 @@ def create_app() -> FastAPI:
     app.include_router(trade_suggestions.ws_router, prefix=f"{settings.API_V1_PREFIX}/trade-suggestions", tags=["Trade Suggestions WebSocket"])
     app.include_router(ml_predictions.router, prefix=f"{settings.API_V1_PREFIX}/ml", tags=["ML Predictions"])
     app.include_router(ml_drift.router, prefix=settings.API_V1_PREFIX, tags=["ML Drift"])
+    app.include_router(paper_trading.router, prefix=f"{settings.API_V1_PREFIX}/paper-trading", tags=["Paper Trading"])
+    app.include_router(paper_trading.ws_router, prefix=settings.API_V1_PREFIX, tags=["Paper Trading WebSocket"])
     
     # API routes - AI
     app.include_router(ingestion.router, prefix=f"{settings.API_V1_PREFIX}/ingestion", tags=["AI Ingestion"])

@@ -112,3 +112,56 @@ class CacheError(CortexBaseError):
 class DatabaseError(CortexBaseError):
     default_message = "Database operation failed"
     status_code = 500
+
+
+# ── Paper Trading ───────────────────────────────────────────────────────────────
+
+class InsufficientFundsError(CortexBaseError):
+    """Raised when portfolio cash is insufficient to cover an order."""
+    default_message = "Insufficient portfolio cash to place this order"
+    status_code = 422
+
+
+class PositionLimitExceededError(CortexBaseError):
+    """Raised when placing an order would breach max_open_positions."""
+    default_message = "Maximum open positions limit reached for this portfolio"
+    status_code = 422
+
+
+class InvalidOrderError(CortexBaseError):
+    """Raised when an order is rejected for a business-rule violation."""
+    default_message = "Order is invalid"
+    status_code = 422
+
+
+class PortfolioNotFoundError(DataNotFoundError):
+    """Raised when the authenticated user has no active portfolio."""
+    default_message = "No active portfolio found for this user"
+
+
+class PositionNotFoundError(DataNotFoundError):
+    """Raised when a position does not exist or does not belong to the user."""
+    default_message = "Position not found"
+
+
+class OrderNotFoundError(DataNotFoundError):
+    """Raised when an order does not exist or does not belong to the user."""
+    default_message = "Order not found"
+
+
+class SettlementPendingError(CortexBaseError):
+    """
+    Raised when a SELL order is placed for shares purchased on the same day
+    under CNC product type.  T+1 settlement means those shares are not yet
+    available in the demat account.
+    """
+    default_message = (
+        "Shares purchased today under CNC are subject to T+1 settlement "
+        "and cannot be sold until the next trading day"
+    )
+    status_code = 422
+
+
+class DuplicatePortfolioError(DuplicateResourceError):
+    """Raised when a user attempts to create a second active portfolio."""
+    default_message = "An active portfolio already exists for this user"

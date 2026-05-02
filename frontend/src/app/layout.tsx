@@ -5,6 +5,7 @@ import { Providers } from "./providers";
 import Link from "next/link";
 import { AuthStatus } from "@/components/auth/AuthStatus";
 import { DevLoginButton } from "@/components/auth/DevLoginButton";
+import { AdminNavLink } from "@/components/admin/AdminNavLink";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -51,10 +52,11 @@ export default function RootLayout({
                   <Link href="/cortex-ai" className="transition-colors hover:text-slate-900">
                     Cortex AI
                   </Link>
+                  <AdminNavLink />
                 </nav>
                 <div className="flex items-center gap-4">
                   <AuthStatus />
-                  <DevLoginButton />
+                  {process.env.NODE_ENV === 'development' && <DevLoginButton />}
                 </div>
               </div>
             </header>

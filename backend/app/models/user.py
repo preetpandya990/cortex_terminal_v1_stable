@@ -28,6 +28,8 @@ class User(Base):
     # Relationships
     refresh_tokens: Mapped[list["RefreshToken"]] = relationship("RefreshToken", back_populates="user", cascade="all, delete-orphan")
     watchlist_items: Mapped[list["WatchlistItem"]] = relationship("WatchlistItem", back_populates="user", cascade="all, delete-orphan", order_by="WatchlistItem.position")
+    portfolios: Mapped[list["Portfolio"]] = relationship("Portfolio", back_populates="user", cascade="all, delete-orphan", lazy="select")  # type: ignore[name-defined]
+    paper_trade_outcomes: Mapped[list["PaperTradeOutcome"]] = relationship("PaperTradeOutcome", back_populates="user", cascade="all, delete-orphan", lazy="select")  # type: ignore[name-defined]
 
 
 class RefreshToken(Base):
