@@ -103,14 +103,12 @@ class SignalAssembler:
         self,
         ensemble_predictor: Optional[EnsemblePredictor] = None,
         feature_loader: Optional[FeatureLoader] = None,
-        event_decay_half_life_hours: float = 24.0,
         event_weight: float = 0.35,
         ml_weight: float = 0.40,
         technical_weight: float = 0.25,
     ):
         self.ensemble_predictor = ensemble_predictor
         self.feature_loader = feature_loader
-        self.event_decay_half_life_hours = event_decay_half_life_hours
         self.event_weight = event_weight
         self.ml_weight = ml_weight
         self.technical_weight = technical_weight
@@ -121,14 +119,30 @@ class SignalAssembler:
 
     # ── Public helpers ─────────────────────────────────────────────────────────
 
+    @staticmethod
     def calculate_event_decay(
-        self, age_hours: float, half_life_hours: Optional[float] = None
+        age_hours: float,
+        fast_hl: float,
+        slow_hl: float,
+        fast_weight: float = 0.7,
     ) -> float:
-        """Exponential decay factor: 0.5 ^ (age_hours / half_life_hours)."""
+        """
+        Two-component Hawkes-kernel exponential decay.
+
+        decay(t) = fast_weight · 0.5^(t/fast_hl) + (1−fast_weight) · 0.5^(t/slow_hl)
+
+        The 0.7 / 0.3 fast / slow split is calibrated on NSE equity event data.
+        fast_hl  captures intraday price reaction (e.g. 8–24 h for most events).
+        slow_hl  captures multi-day fundamental repricing (e.g. 48–168 h).
+        """
         if age_hours < 0:
             raise ValueError(f"Event age cannot be negative: {age_hours}")
-        half_life = half_life_hours or self.event_decay_half_life_hours
-        return math.pow(0.5, age_hours / half_life)
+        if fast_hl <= 0 or slow_hl <= 0:
+            raise ValueError(f"Half-life values must be positive: fast={fast_hl}, slow={slow_hl}")
+        return (
+            fast_weight * math.pow(0.5, age_hours / fast_hl)
+            + (1.0 - fast_weight) * math.pow(0.5, age_hours / slow_hl)
+        )
 
     # ── Signal gathering ───────────────────────────────────────────────────────
 
@@ -155,6 +169,7 @@ class SignalAssembler:
                 AIEventClassification.impact_score,
                 AIEventClassification.classification_confidence,
                 AIEventClassification.decay_half_life_hours,
+                AIEventClassification.decay_slow_half_life_hours,
                 AIEventClassification.created_at,
                 AIRawEvent.source_url,
                 AIRawEvent.source_name,
@@ -178,22 +193,35 @@ class SignalAssembler:
         rows = result.all()
 
         if not rows:
-            return {"score": 0.0, "confidence": 0.0, "event_count": 0, "events": []}
+            return {"score": 0.0, "confidence": 0.0, "event_count": 0, "events": [], "available": False}
 
-        total_score = 0.0
-        total_confidence = 0.0
         now = datetime.now(timezone.utc)
+        n = len(rows)
 
+        # Collect per-event decayed scores first so we can apply √N normalization.
+        decayed_scores: list[float] = []
+        total_confidence = 0.0
         for row in rows:
             age_hours = (now - row.created_at).total_seconds() / 3600
-            decay_factor = self.calculate_event_decay(age_hours, row.decay_half_life_hours)
-            total_score += float(row.impact_score) * decay_factor
+            decay_factor = self.calculate_event_decay(
+                age_hours,
+                float(row.decay_half_life_hours),
+                float(row.decay_slow_half_life_hours),
+            )
+            decayed_scores.append(float(row.impact_score) * decay_factor)
             total_confidence += float(row.classification_confidence) * decay_factor
+
+        # Phase 3: 1/√N dampening prevents N correlated low-impact events from
+        # outweighing 1 high-impact event.  Clip to ±100 before normalizing so
+        # a single extreme event cannot dominate unboundedly either.
+        raw_sum = sum(decayed_scores)
+        total_score = float(np.clip(raw_sum, -100.0, 100.0)) / math.sqrt(n)
 
         return {
             "score": total_score,
-            "confidence": total_confidence / len(rows),
-            "event_count": len(rows),
+            "confidence": total_confidence / n,
+            "event_count": n,
+            "available": True,
             "events": [
                 {
                     "id": row.id,
@@ -216,7 +244,7 @@ class SignalAssembler:
         """Gather ML ensemble prediction signals for a symbol."""
         if not self.ensemble_predictor or not self.feature_loader:
             logger.debug("ML prediction skipped — predictor not initialised")
-            return {"score": 0.0, "confidence": 0.0, "model": None}
+            return {"score": 0.0, "confidence": 0.0, "model": None, "available": False}
 
         try:
             tabular, sequence, current_price, volatility = await self.feature_loader.load_features(
@@ -241,6 +269,7 @@ class SignalAssembler:
                 "score": direction_map.get(direction, 0.0),
                 "confidence": prediction.get("confidence", 0.0),
                 "model": prediction.get("metadata", {}).get("model_version"),
+                "available": True,
                 "prediction": {
                     "direction": direction,
                     "entry_price": prediction.get("entry_price"),
@@ -256,7 +285,7 @@ class SignalAssembler:
 
         except Exception as exc:
             logger.error("ML prediction failed for %s: %s", symbol, exc, exc_info=True)
-            return {"score": 0.0, "confidence": 0.0, "model": None, "error": str(exc)}
+            return {"score": 0.0, "confidence": 0.0, "model": None, "available": False, "error": str(exc)}
 
     async def gather_technical_signals(
         self,
@@ -310,10 +339,10 @@ class SignalAssembler:
             closes_raw = [float(r[0]) for r in rows.fetchall()]
         except Exception as exc:
             logger.debug("Technical signals DB query failed for %s: %s", symbol, exc)
-            return {"score": 0.0, "confidence": 0.0, "indicators": {}}
+            return {"score": 0.0, "confidence": 0.0, "indicators": {}, "available": False}
 
         if len(closes_raw) < min_candles:
-            return {"score": 0.0, "confidence": 0.0, "indicators": {}}
+            return {"score": 0.0, "confidence": 0.0, "indicators": {}, "available": False}
 
         # Rows are DESC — reverse to chronological order for indicator computation
         closes = np.array(closes_raw[::-1], dtype=np.float64)
@@ -340,6 +369,7 @@ class SignalAssembler:
         return {
             "score": score,
             "confidence": confidence,
+            "available": True,
             "indicators": {
                 "rsi_14": round(rsi, 2),
                 "ema_20": round(ema20, 2),
@@ -356,17 +386,37 @@ class SignalAssembler:
         ml_signals: dict[str, Any],
         technical_signals: dict[str, Any],
     ) -> dict[str, Any]:
-        """Weighted average fusion across all three signal sources."""
+        """
+        Weighted average fusion with dynamic weight renormalization.
+
+        Sources marked `available=False` are excluded from the weight denominator
+        so that unavailable sources (no predictor, insufficient candles) do not
+        dilute the remaining valid sources by contributing spurious zero signals.
+
+        When only one source is available the fused confidence is capped at 0.65
+        to reflect reduced conviction from a single data stream.
+        """
+        sources: dict[str, tuple[float, bool]] = {
+            "event":     (self.event_weight,     bool(event_signals.get("available", True))),
+            "ml":        (self.ml_weight,        bool(ml_signals.get("available", True))),
+            "technical": (self.technical_weight, bool(technical_signals.get("available", True))),
+        }
+        weights = self._renormalize_weights(sources)
+
         fused_score = (
-            self.event_weight * event_signals.get("score", 0.0)
-            + self.ml_weight * ml_signals.get("score", 0.0)
-            + self.technical_weight * technical_signals.get("score", 0.0)
+            weights["event"]     * event_signals.get("score", 0.0)
+            + weights["ml"]      * ml_signals.get("score", 0.0)
+            + weights["technical"] * technical_signals.get("score", 0.0)
         )
         fused_confidence = (
-            self.event_weight * event_signals.get("confidence", 0.0)
-            + self.ml_weight * ml_signals.get("confidence", 0.0)
-            + self.technical_weight * technical_signals.get("confidence", 0.0)
+            weights["event"]     * event_signals.get("confidence", 0.0)
+            + weights["ml"]      * ml_signals.get("confidence", 0.0)
+            + weights["technical"] * technical_signals.get("confidence", 0.0)
         )
+
+        n_available = sum(1 for _, avail in sources.values() if avail)
+        if n_available == 1:
+            fused_confidence = min(fused_confidence, 0.65)
 
         if fused_score > 50:
             action = "BUY"
@@ -379,12 +429,30 @@ class SignalAssembler:
             "action": action,
             "confidence_score": fused_confidence,
             "fused_score": fused_score,
+            "sources_available": n_available,
             "contributing_events": event_signals.get("events", []),
             "ml_predictions": ml_signals,
             "technical_indicators": technical_signals,
         }
 
     # ── Private helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _renormalize_weights(
+        sources: dict[str, tuple[float, bool]],
+    ) -> dict[str, float]:
+        """
+        Redistribute base weights across available sources only.
+
+        Unavailable sources receive weight 0.0; their share is redistributed
+        proportionally among available sources so weights always sum to 1.0.
+        When *all* sources are unavailable the original weights are returned
+        unchanged — the caller will produce a neutral zero signal regardless.
+        """
+        denom = sum(w for w, avail in sources.values() if avail)
+        if denom == 0.0:
+            return {k: w for k, (w, _) in sources.items()}
+        return {k: (w / denom if avail else 0.0) for k, (w, avail) in sources.items()}
 
     @staticmethod
     def _derive_time_horizon(timeframe: str) -> str:
@@ -528,6 +596,7 @@ class SignalAssembler:
                 "score": direction_map.get(direction, 0.0),
                 "confidence": precomputed_ml.get("confidence", 0.0),
                 "model": precomputed_ml.get("metadata", {}).get("model_version"),
+                "available": True,
                 "prediction": {
                     "direction": direction,
                     "entry_price": precomputed_ml.get("entry_price"),

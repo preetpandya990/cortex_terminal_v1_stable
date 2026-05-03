@@ -5,12 +5,13 @@ from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 import bcrypt
 
 from app.api.deps import get_db
+from app.core.config import get_settings
 from app.core.redis import get_redis
 from app.core.security import (
     create_token_pair,
@@ -25,6 +26,19 @@ from app.models.user import User, RefreshToken
 
 router = APIRouter()
 
+# ── Security constants ─────────────────────────────────────────────────────────
+_settings = get_settings()
+
+# OWASP recommended: 12 rounds (~250 ms). Development uses 10 (~100 ms) so
+# test suites stay responsive while still exercising the real bcrypt path.
+_BCRYPT_ROUNDS: int = 10 if _settings.ENVIRONMENT == "development" else 12
+
+# Pre-computed at startup for constant-time login (prevents username enumeration
+# via response-time differences when the account does not exist).
+_DUMMY_HASH: str = bcrypt.hashpw(
+    b"cortex-timing-sentinel", bcrypt.gensalt(_BCRYPT_ROUNDS)
+).decode()
+
 
 # ── Request/Response Models ────────────────────────────────────────────────────
 class UserRegister(BaseModel):
@@ -35,8 +49,9 @@ class UserRegister(BaseModel):
 
 
 class UserLogin(BaseModel):
-    username: str
-    password: str
+    # Accepts a username OR an email address in a single field.
+    identifier: str = Field(..., min_length=1, max_length=254)
+    password: str = Field(..., min_length=1, max_length=100)
 
 
 class TokenResponse(BaseModel):
@@ -51,6 +66,8 @@ class RefreshRequest(BaseModel):
 
 
 class UserResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     username: str
     email: str
@@ -63,36 +80,38 @@ class UserResponse(BaseModel):
 
 # ── Helper Functions ───────────────────────────────────────────────────────────
 def hash_password(password: str) -> str:
-    """Hash password using bcrypt with optimized rounds for testing."""
-    # Use 4 rounds for testing (fast), 12 for production (secure)
-    rounds = 4  # ~10ms vs 12 rounds ~1000ms
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt(rounds=rounds)).decode('utf-8')
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(_BCRYPT_ROUNDS)).decode("utf-8")
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify password against hash."""
-    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+    return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
 
 
 
 async def get_user_by_username(db: AsyncSession, username: str) -> User | None:
-    """Get user by username."""
-    stmt = select(User).where(User.username == username)
-    result = await db.execute(stmt)
+    result = await db.execute(select(User).where(User.username == username))
     return result.scalar_one_or_none()
 
 
 async def get_user_by_email(db: AsyncSession, email: str) -> User | None:
-    """Get user by email."""
-    stmt = select(User).where(User.email == email)
-    result = await db.execute(stmt)
+    result = await db.execute(select(User).where(User.email == email))
     return result.scalar_one_or_none()
 
 
+async def get_user_by_identifier(db: AsyncSession, identifier: str) -> User | None:
+    """Resolve a username-or-email identifier to a User row.
+
+    Tries username first (exact match), then falls back to email so that users
+    with an '@' in their username are still found correctly.
+    """
+    user = await get_user_by_username(db, identifier)
+    if user is None:
+        user = await get_user_by_email(db, identifier)
+    return user
+
+
 async def get_user_by_id(db: AsyncSession, user_id: int) -> User | None:
-    """Get user by ID."""
-    stmt = select(User).where(User.id == user_id)
-    result = await db.execute(stmt)
+    result = await db.execute(select(User).where(User.id == user_id))
     return result.scalar_one_or_none()
 
 
@@ -160,36 +179,29 @@ async def login(
     response: Response,
     db: AsyncSession = Depends(get_db),
 ):
-    """Login and receive access + refresh tokens."""
-    # Get user
-    user = await get_user_by_username(db, credentials.username)
-    if not user:
+    """Authenticate with username or email and return a token pair."""
+    user = await get_user_by_identifier(db, credentials.identifier)
+
+    # Always run bcrypt regardless of whether the account exists.
+    # This equalises response time and prevents username enumeration via timing.
+    candidate_hash = user.hashed_password if user is not None else _DUMMY_HASH
+    password_ok = verify_password(credentials.password, candidate_hash)
+
+    if user is None or not password_ok:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password"
+            detail="Incorrect credentials",
         )
-    
-    # Verify password
-    if not verify_password(credentials.password, user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password"
-        )
-    
-    # Check if user is active
+
     if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="User account is disabled"
+            detail="Account disabled",
         )
-    
-    # Create token pair
+
     token_pair = create_token_pair(subject=str(user.id), role=user.role)
-    
-    # Decode refresh token to get jti and family
     refresh_payload = decode_token(token_pair.refresh_token, expected_type="refresh")
-    
-    # Store refresh token in database
+
     await store_refresh_token(
         db,
         user_id=user.id,
@@ -197,19 +209,15 @@ async def login(
         jti=refresh_payload.jti,
         expires_at=datetime.fromtimestamp(refresh_payload.exp, tz=timezone.utc),
     )
-    
-    # Update last login
-    stmt = (
+
+    await db.execute(
         update(User)
         .where(User.id == user.id)
         .values(last_login=datetime.now(timezone.utc))
     )
-    await db.execute(stmt)
     await db.commit()
-    
-    # Set refresh token in HTTPOnly cookie
+
     set_refresh_token_cookie(response, token_pair.refresh_token)
-    
     return token_pair
 
 

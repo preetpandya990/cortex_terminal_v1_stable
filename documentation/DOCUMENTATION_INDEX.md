@@ -59,10 +59,11 @@
 
 ---
 
-## 🔧 Implementation (8 files)
+## 🔧 Implementation (9 files)
 
 | Document | Description |
 |----------|-------------|
+| [AUTH_LOGIN_AND_ADMIN_USERS.md](documentation/implementation/AUTH_LOGIN_AND_ADMIN_USERS.md) | **Login UI & Admin User Management** — branded login page, auth middleware, BFF routes, CRUD user management, safety guards, session revocation |
 | [CORTEX_AI_UNIFIED_MERGE_COMPLETE.md](documentation/implementation/CORTEX_AI_UNIFIED_MERGE_COMPLETE.md) | Merge completion report |
 | [IMPLEMENTATION_COMPLETE.md](documentation/implementation/IMPLEMENTATION_COMPLETE.md) | Implementation summary |
 | [DRIFT_DETECTION_IMPLEMENTATION.md](documentation/implementation/DRIFT_DETECTION_IMPLEMENTATION.md) | ML drift detection details |
@@ -133,10 +134,11 @@
 
 ---
 
-## 🚨 Troubleshooting (4 files)
+## 🚨 Troubleshooting (5 files)
 
 | Document | Description |
 |----------|-------------|
+| [AUTH_LOGIN_BUGS.md](documentation/troubleshooting/AUTH_LOGIN_BUGS.md) | **Auth & Login bugs** — FastAPI 204 assertion, Pydantic ORM mode 500, role lost on token refresh (root cause + fix for each) |
 | [KNOWN_ISSUES_AND_REMEDIATION.md](documentation/troubleshooting/KNOWN_ISSUES_AND_REMEDIATION.md) | Known issues & fixes |
 | [AUTH_FIX_SUMMARY.md](documentation/troubleshooting/AUTH_FIX_SUMMARY.md) | Authentication fixes |
 | [UPSTOX_FIX_SUMMARY.md](documentation/troubleshooting/UPSTOX_FIX_SUMMARY.md) | Upstox integration fixes |
@@ -146,13 +148,14 @@
 
 ## 📊 Documentation Statistics
 
-- **Total Files**: 60 markdown documents
+- **Total Files**: 62 markdown documents
 - **Total Directories**: 11 organized categories
 - **Architecture Docs**: 5 files (including 2,499-line main doc)
 - **Phase Reports**: 15 completion reports
 - **User Guides**: 6 comprehensive guides
 - **API Documentation**: 3 files (50+ endpoints + market feed WS)
-- **Implementation Docs**: 8 files
+- **Implementation Docs**: 9 files
+- **Troubleshooting Docs**: 5 files
 - **Test Reports**: 4 comprehensive reports
 
 ---

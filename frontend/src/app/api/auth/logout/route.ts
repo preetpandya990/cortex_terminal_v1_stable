@@ -4,7 +4,7 @@ const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8000';
 
 // Cookie attributes must exactly match those used when the cookie was set —
 // the path in particular must align or the browser will not overwrite/expire it.
-const REFRESH_COOKIE_PATH = '/api/auth';
+const REFRESH_COOKIE_PATH = '/';
 
 function clearRefreshTokenCookie(response: NextResponse): void {
   response.cookies.set('refresh_token', '', {

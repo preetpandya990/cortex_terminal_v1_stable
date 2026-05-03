@@ -3,7 +3,7 @@
 import { useEffect } from "react";
 import { useRouter, usePathname } from "next/navigation";
 import Link from "next/link";
-import { BarChart3, Brain, ShieldAlert } from "lucide-react";
+import { BarChart3, Brain, Users, ShieldAlert } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 
 const NAV_ITEMS = [
@@ -19,6 +19,12 @@ const NAV_ITEMS = [
     icon: Brain,
     description: "Model registry & deployment",
   },
+  {
+    href: "/admin/users",
+    label: "User Management",
+    icon: Users,
+    description: "Create, manage roles & access",
+  },
 ];
 
 export default function AdminLayout({ children }: { children: React.ReactNode }) {
@@ -33,14 +39,13 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
     }
   }, [isAuthReady, isAuthenticated, isAdmin, router]);
 
-  // Render nothing until auth is resolved to prevent flash
   if (!isAuthReady || !isAuthenticated || !isAdmin) return null;
 
   return (
-    <div className="flex min-h-[calc(100vh-73px)] gap-6">
+    <div className="flex min-h-[calc(100vh-57px)] gap-6">
       {/* Sidebar */}
       <aside className="w-56 flex-shrink-0">
-        <div className="sticky top-6 rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
+        <div className="sticky top-[73px] rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
           <div className="mb-3 flex items-center gap-2 px-2 py-1">
             <ShieldAlert className="h-4 w-4 text-rose-500" />
             <span className="text-xs font-bold uppercase tracking-widest text-slate-500">

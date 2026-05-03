@@ -4,20 +4,24 @@ import React, { createContext, useContext, useState, useEffect, useCallback, use
 import { setAccessToken as setAPIAccessToken } from '@/lib/api-client';
 import { decodeRole, hasMinimumRole, type UserRole } from '@/lib/jwt';
 
-// sessionStorage key written on explicit logout to prevent silent re-auth
-// within the same browser tab session. Cleared on the next successful login.
 const SESSION_ENDED_KEY = 'auth:session_ended';
+
+export interface UserProfile {
+  id: number;
+  username: string;
+  email: string;
+  full_name: string | null;
+  role: UserRole;
+  is_active: boolean;
+}
 
 interface AuthContextType {
   accessToken: string | null;
+  user: UserProfile | null;
   isAuthenticated: boolean;
-  /** True once the initial token-refresh attempt has completed (regardless of outcome).
-   *  Use this alongside isAuthenticated to prevent queries firing during the boot window. */
   isAuthReady: boolean;
   isLoading: boolean;
-  /** Role decoded from the JWT access token payload. Defaults to "viewer" when unauthenticated. */
   role: UserRole;
-  /** Convenience: true when role === "admin". */
   isAdmin: boolean;
   login: (token: string) => void;
   logout: () => Promise<void>;
@@ -28,12 +32,24 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [accessToken, setAccessToken] = useState<string | null>(null);
+  const [user, setUser] = useState<UserProfile | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const refreshTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  // Deduplicates concurrent refresh calls (React 18 Strict Mode double-invoke,
-  // parallel RSC requests). Set synchronously before the first await so that
-  // any second caller immediately receives the same in-flight promise.
   const refreshInFlightRef = useRef<Promise<boolean> | null>(null);
+
+  const fetchUserProfile = useCallback(async (token: string) => {
+    try {
+      const response = await fetch('/api/auth/me', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (response.ok) {
+        const profile: UserProfile = await response.json();
+        setUser(profile);
+      }
+    } catch {
+      // Non-critical — auth still functions without the profile
+    }
+  }, []);
 
   const refreshToken = useCallback(async (): Promise<boolean> => {
     if (refreshInFlightRef.current) {
@@ -58,9 +74,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setAPIAccessToken(data.access_token);
 
         const refreshIn = (data.expires_in - 60) * 1000;
-        if (refreshTimeoutRef.current) {
-          clearTimeout(refreshTimeoutRef.current);
-        }
+        if (refreshTimeoutRef.current) clearTimeout(refreshTimeoutRef.current);
         refreshTimeoutRef.current = setTimeout(() => refreshToken(), refreshIn);
 
         return true;
@@ -73,18 +87,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
     })();
 
-    // Assigned synchronously — before the first await inside the async IIFE —
-    // so any concurrent caller sees a non-null ref and joins the same promise.
     refreshInFlightRef.current = promise;
     return promise;
   }, []);
 
-  const login = useCallback((token: string) => {
-    // Clear any logout signal so a re-login in the same tab session works normally.
-    try { sessionStorage.removeItem(SESSION_ENDED_KEY); } catch { /* SSR / private browsing */ }
-    setAccessToken(token);
-    setAPIAccessToken(token);
-  }, []);
+  const login = useCallback(
+    (token: string) => {
+      try { sessionStorage.removeItem(SESSION_ENDED_KEY); } catch { /* SSR / private browsing */ }
+      setAccessToken(token);
+      setAPIAccessToken(token);
+    },
+    [],
+  );
 
   const logout = useCallback(async () => {
     if (refreshTimeoutRef.current) {
@@ -92,9 +106,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       refreshTimeoutRef.current = null;
     }
 
-    // Signal this tab that the user explicitly ended their session.
-    // AuthProvider reads this on its next mount and skips silent refresh,
-    // keeping the user on the login screen rather than re-authenticating.
     try { sessionStorage.setItem(SESSION_ENDED_KEY, '1'); } catch { /* SSR / private browsing */ }
 
     try {
@@ -104,17 +115,23 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
       });
     } finally {
-      // Always clear in-memory state regardless of network outcome.
       setAccessToken(null);
       setAPIAccessToken(null);
+      setUser(null);
     }
   }, [accessToken]);
 
+  // Fetch user profile whenever we acquire (or lose) an access token
+  useEffect(() => {
+    if (accessToken) {
+      fetchUserProfile(accessToken);
+    } else {
+      setUser(null);
+    }
+  }, [accessToken, fetchUserProfile]);
+
   useEffect(() => {
     const initAuth = async () => {
-      // Honour an explicit logout that happened earlier in this tab session.
-      // The flag is written by logout() and cleared here so the next
-      // user-initiated login (same tab) works without interference.
       let skipSilentRefresh = false;
       try {
         if (sessionStorage.getItem(SESSION_ENDED_KEY)) {
@@ -132,19 +149,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     initAuth();
 
-    // api-client.ts dispatches this when a 401 occurs and silent refresh fails.
-    // Clear the in-memory token so the UI immediately reflects the deauth.
     const handleAuthRequired = () => {
       setAccessToken(null);
       setAPIAccessToken(null);
+      setUser(null);
     };
     window.addEventListener('auth:required', handleAuthRequired);
 
     return () => {
       window.removeEventListener('auth:required', handleAuthRequired);
-      if (refreshTimeoutRef.current) {
-        clearTimeout(refreshTimeoutRef.current);
-      }
+      if (refreshTimeoutRef.current) clearTimeout(refreshTimeoutRef.current);
     };
   }, [refreshToken]);
 
@@ -152,6 +166,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const value: AuthContextType = {
     accessToken,
+    user,
     isAuthenticated: !!accessToken,
     isAuthReady: !isLoading,
     isLoading,

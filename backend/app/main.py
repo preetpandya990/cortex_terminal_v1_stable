@@ -20,7 +20,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from app.api.v1 import (
-    auth, cai, fusion, governance, hawk_eye, ingestion, intelligence,
+    admin_users, auth, cai, fusion, governance, hawk_eye, ingestion, intelligence,
     market_data, ml_drift, ml_predictions, paper_trading, safety, scanner,
     strategy, trade_suggestions, upstox, health, watchlist
 )
@@ -224,6 +224,7 @@ def create_app() -> FastAPI:
 
     # API routes - ML
     app.include_router(auth.router, prefix=f"{settings.API_V1_PREFIX}/auth", tags=["Authentication"])
+    app.include_router(admin_users.router, prefix=f"{settings.API_V1_PREFIX}/admin", tags=["Admin — User Management"])
     app.include_router(watchlist.router, prefix=f"{settings.API_V1_PREFIX}/watchlist", tags=["Watchlist"])
     app.include_router(market_data.router, prefix=f"{settings.API_V1_PREFIX}/market-data", tags=["Market Data"])
     app.include_router(scanner.router, prefix=f"{settings.API_V1_PREFIX}/scanner", tags=["Scanner"])

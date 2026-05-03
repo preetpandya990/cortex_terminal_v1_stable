@@ -70,6 +70,7 @@ def suggest_quantity(
     risk_per_trade_pct: Decimal,
     entry_price: Decimal,
     stop_loss: Decimal | None,
+    conviction_scale: float = 1.0,
 ) -> QtySuggestionResponse:
     """
     Compute the system-suggested quantity for a paper order.
@@ -81,22 +82,26 @@ def suggest_quantity(
     entry_price        : Suggested entry price from TradeSuggestion (must be > 0)
     stop_loss          : Suggested stop-loss price from TradeSuggestion
                          (None triggers the conservative fallback)
+    conviction_scale   : ML signal conviction in [0.0, 1.0] from EnsemblePredictor.
+                         0.0 = signal confidence exactly at the regime threshold;
+                         1.0 = maximum confidence (full Kelly sizing, default).
+                         Scales raw_qty before the affordability clamp, converting
+                         the binary BUY/HOLD gate into graduated position sizing.
 
     Returns
     -------
     QtySuggestionResponse
         Full breakdown including suggested_qty, max_affordable_qty,
         capital_at_risk, risk_pct_of_cash, stop_distance, and a note
-        if the fallback stop was used.
+        if the fallback stop or conviction scaling was applied.
 
     Raises
     ------
     ValidationError
         If entry_price ≤ 0, current_cash ≤ 0, risk_per_trade_pct is out of
-        range, or stop_loss ≥ entry_price (invalid — stop must be below entry
-        for a long position suggestion).
+        range, conviction_scale is out of range, or stop_loss ≥ entry_price.
     """
-    _validate_inputs(current_cash, risk_per_trade_pct, entry_price, stop_loss)
+    _validate_inputs(current_cash, risk_per_trade_pct, entry_price, stop_loss, conviction_scale)
 
     note: str | None = None
 
@@ -130,20 +135,42 @@ def suggest_quantity(
 
     # ── Step 3: Raw quantity from risk formula ─────────────────────────────────
     raw_qty = capital_at_risk / stop_distance
+
+    # ── Step 4: Apply conviction scaling ──────────────────────────────────────
+    # Converts the binary BUY/HOLD confidence gate into graduated position
+    # sizing.  A signal at exactly the regime threshold (conviction_scale=0.0)
+    # results in the minimum 1-share position; a high-conviction signal
+    # (conviction_scale=1.0) receives the full Kelly-computed quantity.
+    # Scaling happens before the affordability clamp so the cap logic remains
+    # independent of conviction.
+    if conviction_scale < 1.0:
+        raw_qty = raw_qty * Decimal(str(round(conviction_scale, 6)))
+        if note is None:
+            note = (
+                f"Conviction scale of {conviction_scale:.2f} applied — position sized "
+                f"to {conviction_scale * 100:.0f}% of the full Kelly recommendation "
+                f"based on signal confidence relative to the volatility-regime threshold."
+            )
+        logger.info(
+            "Conviction scaling applied: scale=%.4f raw_qty_before_scale=%.4f",
+            conviction_scale,
+            float(capital_at_risk / stop_distance),
+        )
+
     raw_qty_floored = int(raw_qty.to_integral_value(rounding="ROUND_FLOOR"))
 
-    # ── Step 4: Maximum affordable quantity ───────────────────────────────────
+    # ── Step 5: Maximum affordable quantity ───────────────────────────────────
     # Hard upper bound: you can't buy more than cash allows.
     max_affordable_qty = int(
         (current_cash / entry_price).to_integral_value(rounding="ROUND_FLOOR")
     )
     max_affordable_qty = max(_MIN_QTY, max_affordable_qty)
 
-    # ── Step 5: Final suggested quantity ──────────────────────────────────────
+    # ── Step 6: Final suggested quantity ──────────────────────────────────────
     # Clamped between 1 and max_affordable_qty.
     suggested_qty = max(_MIN_QTY, min(raw_qty_floored, max_affordable_qty))
 
-    # ── Step 6: Derive actual risk metrics for the suggested quantity ──────────
+    # ── Step 7: Derive actual risk metrics for the suggested quantity ──────────
     actual_capital_at_risk = stop_distance * Decimal(suggested_qty)
     risk_pct_of_cash = (
         (actual_capital_at_risk / current_cash * Decimal("100"))
@@ -151,7 +178,7 @@ def suggest_quantity(
         else Decimal("0")
     )
 
-    # Flag if the suggestion was capped by affordability
+    # Flag if the suggestion was capped by affordability (only when no prior note)
     if raw_qty_floored > max_affordable_qty and note is None:
         note = (
             f"Suggested quantity was capped at {max_affordable_qty} shares "
@@ -190,6 +217,7 @@ def _validate_inputs(
     risk_per_trade_pct: Decimal,
     entry_price: Decimal,
     stop_loss: Decimal | None,
+    conviction_scale: float = 1.0,
 ) -> None:
     """Raise ValidationError on any invalid input combination."""
     if current_cash <= Decimal("0"):
@@ -203,6 +231,10 @@ def _validate_inputs(
     if entry_price <= Decimal("0"):
         raise ValidationError(
             f"entry_price must be positive, got {entry_price}."
+        )
+    if not (0.0 <= conviction_scale <= 1.0):
+        raise ValidationError(
+            f"conviction_scale must be in [0.0, 1.0], got {conviction_scale}."
         )
     if stop_loss is not None:
         if stop_loss <= Decimal("0"):

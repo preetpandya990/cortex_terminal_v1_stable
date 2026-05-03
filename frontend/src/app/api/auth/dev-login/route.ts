@@ -41,7 +41,7 @@ export async function POST(_request: NextRequest) {
         httpOnly: true,
         secure: false, // localhost has no TLS in dev
         sameSite: 'strict',
-        path: '/api/auth',
+        path: '/',
       });
     }
 

@@ -67,6 +67,7 @@ class AIEventClassification(Base):
     classification_confidence: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)
     reasoning: Mapped[str | None] = mapped_column(Text)
     decay_half_life_hours: Mapped[int] = mapped_column(Integer, server_default="24")
+    decay_slow_half_life_hours: Mapped[int] = mapped_column(Integer, server_default="72")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("NOW()"))
 
 

@@ -81,10 +81,11 @@ def create_access_token(subject: str, extra_claims: dict | None = None) -> str:
 def create_refresh_token(subject: str, family_id: str, role: str = "viewer") -> str:
     """Create a longer-lived refresh JWT with family tracking."""
     return _create_token(
-        subject, 
-        "refresh", 
+        subject,
+        "refresh",
         settings.REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60,
-        family_id=family_id
+        family_id=family_id,
+        extra_claims={"role": role},
     )
 
 
@@ -177,7 +178,7 @@ async def rotate_refresh_token(
         if revoked:
             raise CortexInvalidTokenError("Token family has been revoked")
     
-    role = getattr(payload, "role", "viewer")
+    role = payload.role or "viewer"
     return create_token_pair(payload.sub, family_id=payload.family, role=role)
 
 
