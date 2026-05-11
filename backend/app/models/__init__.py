@@ -4,11 +4,11 @@ Database models.
 Import order matters — relationships with forward-references are resolved at
 mapper initialisation time, so dependent models must be imported after their
 targets:
-  User            → must precede WatchlistItem, Portfolio, PaperTradeOutcome
-  TradeSuggestion → must precede PaperOrder, PaperPosition, PaperTradeOutcome
-  Portfolio       → must precede PaperOrder, PaperPosition, PaperTradeOutcome,
-                    PaperPnlSnapshot
-  PaperPosition   → must precede PaperTradeOutcome
+  User                     → must precede all models that back-reference it
+  TradeSuggestion          → must precede PaperOrder, PaperPosition, PaperTradeOutcome
+  Portfolio / PaperOrder   → must precede StrategyActivation (entry/exit order FKs)
+  Strategy                 → must precede UserStrategySubscription, StrategyActivation
+  StrategyActivation       → must precede StrategyTrade
 """
 
 from app.models.ml_data import (
@@ -28,6 +28,15 @@ from app.models.paper_trading import (
     PaperPosition,
     PaperTradeOutcome,
     PaperPnlSnapshot,
+)
+from app.models.strategies import (
+    UserPreferences,
+    Strategy,
+    UserStrategySubscription,
+    StrategyActivation,
+    StrategyTrade,
+    StrategyBacktestRun,
+    StrategyAuditLog,
 )
 
 __all__ = [
@@ -52,4 +61,12 @@ __all__ = [
     "PaperPosition",
     "PaperTradeOutcome",
     "PaperPnlSnapshot",
+    # Trading Strategies
+    "UserPreferences",
+    "Strategy",
+    "UserStrategySubscription",
+    "StrategyActivation",
+    "StrategyTrade",
+    "StrategyBacktestRun",
+    "StrategyAuditLog",
 ]

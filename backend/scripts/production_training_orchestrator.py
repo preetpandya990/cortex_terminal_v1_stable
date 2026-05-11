@@ -56,12 +56,17 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text
 
 from app.core.config import get_settings
-from app.ml.features.symbol_selector import get_top_liquid_symbols, analyze_symbol_data_quality
+from app.ml.features.symbol_selector import (
+    get_top_liquid_symbols,
+    analyze_symbol_data_quality,
+    MIN_BARS_FOR_TRAINING,
+    MIN_RELATIVE_COMPLETENESS_PCT,
+)
 from app.ml.features.feature_pipeline import prepare_training_data  # noqa: F401
 from app.ml.features.target_generator import create_targets_batch, get_class_weights
 from app.ml.training.walk_forward import WalkForwardSplitter, Split
 from app.ml.training.xgboost_trainer import XGBoostTrainer
-from app.ml.training.gru_trainer import GRUTrainer, CrossSectionalSequenceGenerator
+from app.ml.training.gru_trainer import GRUTrainer, CrossSectionalSequenceGenerator, configure_gpu
 from app.ml.training.ensemble_trainer import EnsembleTrainer
 from app.ml.training.evaluator import ModelEvaluator, EvaluationResults
 from app.ml.training.checkpoint_manager import CheckpointManager, find_checkpoint
@@ -85,9 +90,9 @@ logger = logging.getLogger(__name__)
 class TrainingConfig:
     """Production training configuration."""
     n_symbols: int = 2551
-    lookback_years: int = 3
+    lookback_years: int = 10
     sequence_length: int = 60
-    n_features: int = 47  # 42 technical + 5 sentiment
+    n_features: int = 49  # 44 technical + 5 sentiment
 
     # Walk-forward validation
     initial_train_days: int = 730  # 2 years
@@ -243,8 +248,9 @@ class ProductionTrainingOrchestrator:
         self.ensemble_trainer: Optional[EnsembleTrainer] = None
 
         # GRU evaluation subset (kept after step 6 for steps 7-8)
-        self.gru_eval_X: Optional[np.ndarray] = None
-        self.gru_eval_y: Optional[np.ndarray] = None
+        self.gru_eval_X:       Optional[np.ndarray] = None
+        self.gru_eval_y:       Optional[np.ndarray] = None
+        self.gru_eval_returns: Optional[np.ndarray] = None  # h-bar forward returns
 
         self.results: Optional[TrainingResults] = None
 
@@ -406,15 +412,16 @@ class ProductionTrainingOrchestrator:
             logger.info("=" * 100)
 
             if cp.is_done("step_6_gru"):
-                gru_model, best_params, eval_X, eval_y = cp.load_gru()
+                gru_model, best_params, eval_X, eval_y, eval_r = cp.load_gru()
                 self.gru_trainer = GRUTrainer(
                     input_shape=(self.config.sequence_length, self.config.n_features),
                     num_classes=2,
                     random_state=42,
                 )
                 self.gru_trainer.model = gru_model
-                self.gru_eval_X = eval_X
-                self.gru_eval_y = eval_y
+                self.gru_eval_X       = eval_X
+                self.gru_eval_y       = eval_y
+                self.gru_eval_returns = eval_r
                 gru_results = {
                     'model':              gru_model,
                     'best_params':        best_params,
@@ -510,7 +517,7 @@ class ProductionTrainingOrchestrator:
                 logger.info("→ Resuming: step_10 skipped  (models already registered)")
             else:
                 t0 = time.monotonic()
-                model_paths = await self._register_models_in_registry(evaluation_results)
+                model_paths = await self._register_models_in_registry(evaluation_results, onnx_paths)
                 cp.mark_done("step_10_registry", time.monotonic() - t0)
 
             # ── Finalise ──────────────────────────────────────────────────────
@@ -553,24 +560,35 @@ class ProductionTrainingOrchestrator:
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _select_symbols_and_assess_quality(self) -> None:
-        logger.info(f"Selecting top {self.config.n_symbols} liquid symbols...")
+        logger.info(
+            "Selecting top %d liquid symbols  "
+            "(min_bars=%d  min_relative_completeness=%.0f%%)",
+            self.config.n_symbols,
+            MIN_BARS_FOR_TRAINING,
+            MIN_RELATIVE_COMPLETENESS_PCT,
+        )
 
+        # DB-level pre-filter: only symbols with ≥ MIN_BARS_FOR_TRAINING candles
+        # in the lookback window are returned.
         self.symbols = await get_top_liquid_symbols(
             db=self.db,
             n=self.config.n_symbols,
             timeframe='1D',
             lookback_days=self.config.lookback_years * 365,
+            min_data_points=MIN_BARS_FOR_TRAINING,
         )
 
         if not self.symbols:
             raise ValueError("No symbols selected. Check database data availability.")
 
-        logger.info("✓ Selected %d symbols  top_10=%s", len(self.symbols), self.symbols[:10])
+        logger.info("✓ Pre-selected %d symbols  top_10=%s", len(self.symbols), self.symbols[:10])
 
-        logger.info("Assessing data quality for all selected symbols...")
-        quality_reports = []
+        # Per-symbol quality audit: relative completeness + data-integrity gates
+        logger.info("Auditing data quality for %d symbols...", len(self.symbols))
+        quality_reports: list[dict] = []
+        analysis_failed: list[str] = []
 
-        for i, symbol in enumerate(self.symbols[:]):  # iterate copy so removal is safe
+        for symbol in list(self.symbols):  # iterate a copy so we can mutate self.symbols
             try:
                 report = await analyze_symbol_data_quality(
                     symbol=symbol,
@@ -579,23 +597,52 @@ class ProductionTrainingOrchestrator:
                     db=self.db,
                 )
                 quality_reports.append(report)
-            except Exception as e:
-                logger.warning("  Failed to analyze %s: %s", symbol, e)
+            except Exception as exc:
+                logger.warning("  Quality audit failed for %s: %s", symbol, exc)
+                analysis_failed.append(symbol)
                 self.symbols.remove(symbol)
 
+        if analysis_failed:
+            logger.warning(
+                "  Removed %d symbol(s) due to audit errors: %s",
+                len(analysis_failed), analysis_failed[:20],
+            )
+
         if len(self.symbols) < 10:
-            raise ValueError(f"Insufficient symbols after quality check: {len(self.symbols)}")
+            raise ValueError(f"Insufficient symbols after quality audit: {len(self.symbols)}")
 
+        # Apply quality gates using the is_qualified flag (combines all sub-gates)
         if quality_reports:
-            avg_completeness = np.mean([r['completeness_pct'] for r in quality_reports])
-            min_completeness = min(r['completeness_pct'] for r in quality_reports)
-            logger.info("✓ Data quality — avg=%.1f%%  min=%.1f%%", avg_completeness, min_completeness)
+            qualified_pairs  = [(s, r) for s, r in zip(self.symbols, quality_reports) if r["is_qualified"]]
+            disqualified     = [(s, r) for s, r in zip(self.symbols, quality_reports) if not r["is_qualified"]]
 
-            min_required = 90.0
-            self.symbols = [
-                sym for sym, rep in zip(self.symbols, quality_reports)
-                if rep['completeness_pct'] >= min_required
-            ][:self.config.n_symbols]
+            if disqualified:
+                logger.warning(
+                    "  Disqualified %d symbol(s)  (first 20 shown):",
+                    len(disqualified),
+                )
+                for sym, rep in disqualified[:20]:
+                    logger.warning(
+                        "    ✗ %s — %s  (bars=%d  completeness=%.1f%%)",
+                        sym,
+                        rep.get("disqualification_reason", "unknown"),
+                        rep.get("actual_bars", 0),
+                        rep.get("completeness_pct", 0.0),
+                    )
+
+            completeness_vals = [r["completeness_pct"] for _, r in qualified_pairs]
+            logger.info(
+                "✓ Quality gate passed  qualified=%d  disqualified=%d  "
+                "avg_completeness=%.1f%%  min_completeness=%.1f%%  "
+                "method=%s",
+                len(qualified_pairs),
+                len(disqualified),
+                float(np.mean(completeness_vals)) if completeness_vals else 0.0,
+                float(np.min(completeness_vals))  if completeness_vals else 0.0,
+                quality_reports[0].get("completeness_method", "relative_to_own_listing_period"),
+            )
+
+            self.symbols = [s for s, _ in qualified_pairs][: self.config.n_symbols]
 
         logger.info("✓ Final symbol count: %d", len(self.symbols))
 
@@ -667,13 +714,15 @@ class ProductionTrainingOrchestrator:
         )
 
         for symbol, df in self.targets_data.items():
-            if 'target' in df.columns:
-                self.targets_data[symbol] = {
-                    'target':      df['target'].astype(int).values,
-                    'features_df': df,
-                }
-            else:
+            if 'target' not in df.columns:
                 raise ValueError(f"No target column found for {symbol}")
+            if 'forward_return' not in df.columns:
+                raise ValueError(f"No forward_return column found for {symbol}")
+            self.targets_data[symbol] = {
+                'target':         df['target'].astype(int).values,
+                'forward_return':  df['forward_return'].astype(np.float32).values,
+                'features_df':    df.drop(columns=['forward_return']),
+            }
 
         self._validate_targets_data()
 
@@ -836,6 +885,12 @@ class ProductionTrainingOrchestrator:
         the rebuild takes ~15 min from disk-loaded parquets.
         """
         import tensorflow as tf
+
+        # Hard VRAM cap must be set before the first GPU kernel.  configure_gpu()
+        # is idempotent — this is a no-op if called earlier in the process, and
+        # the authoritative call-site if no earlier caller exists.
+        configure_gpu()
+
         from app.ml.features.feature_pipeline import (
             normalize_features, create_sequences, get_all_feature_names,
         )
@@ -851,7 +906,7 @@ class ProductionTrainingOrchestrator:
         # ── Sub-A: eval arrays ────────────────────────────────────────────────
         if cp.gru_has_eval_arrays():
             # Skip sequence building — load eval arrays from checkpoint.
-            X_val, y_val, eval_meta = cp.load_gru_eval_arrays()
+            X_val, y_val, r_val, eval_meta = cp.load_gru_eval_arrays()
             split_idx = eval_meta["split_idx"]
             n_total   = eval_meta["n_total"]
             # Reconstruct gru_plan from saved meta so we can rebuild X_train only.
@@ -898,44 +953,60 @@ class ProductionTrainingOrchestrator:
                 len(gru_plan), n_total, seq_len, n_feat,
             )
 
-            # ── Pre-allocate & fill X_all, y_all ─────────────────────────────
-            X_all = np.empty((n_total, seq_len, n_feat), dtype=np.float32)
+            # ── Pre-allocate & fill X_all, y_all, r_all ──────────────────────
+            # float16 halves RAM (1.5 GB vs 3 GB); cast to float32 in tf.data pipeline.
+            X_all = np.empty((n_total, seq_len, n_feat), dtype=np.float16)
             y_all = np.empty(n_total, dtype=np.int32)
+            r_all = np.empty(n_total, dtype=np.float32)  # h-bar forward returns
 
             cursor = 0
             for symbol, y_start, n in gru_plan:
                 df_raw = self.targets_data[symbol]['features_df']
                 y_sym  = self.targets_data[symbol]['target']
+                r_sym  = self.targets_data[symbol]['forward_return']
                 norm_df = normalize_features(
                     df_raw, method='rolling', window=seq_len, feature_cols=feature_names
                 )
                 X_seq, _, _ = create_sequences(norm_df, seq_len, feature_names)
-                X_all[cursor:cursor + n] = X_seq[:n]
-                y_all[cursor:cursor + n] = y_sym[y_start:y_start + n]
-                cursor += n
+                take = min(len(X_seq), n, n_total - cursor)
+                if take <= 0:
+                    break
+                X_all[cursor:cursor + take] = X_seq[:take]
+                y_all[cursor:cursor + take] = y_sym[y_start:y_start + take]
+                r_all[cursor:cursor + take] = r_sym[y_start:y_start + take]
+                cursor += take
 
+            # Trim to actual filled rows
+            X_all = X_all[:cursor]
+            y_all = y_all[:cursor]
+            r_all = r_all[:cursor]
             logger.info("✓ GRU sequences written: %d samples across %d symbols", cursor, len(gru_plan))
 
             # ── Split train / val ─────────────────────────────────────────────
             split_idx = int(n_total * TRAIN_FRAC)
             X_val_view = X_all[split_idx:]
             y_val_view = y_all[split_idx:]
+            r_val_view = r_all[split_idx:]
             if len(X_val_view) > VAL_CAP:
-                idx   = np.random.choice(len(X_val_view), VAL_CAP, replace=False)
-                X_val = X_val_view[idx].copy()
-                y_val = y_val_view[idx].copy()
+                val_idx = np.random.choice(len(X_val_view), VAL_CAP, replace=False)
+                X_val = X_val_view[val_idx].copy()
+                y_val = y_val_view[val_idx].copy()
+                r_val = r_val_view[val_idx].copy()
             else:
+                val_idx = None
                 X_val = X_val_view.copy()
                 y_val = y_val_view.copy()
-            del X_val_view, y_val_view
+                r_val = r_val_view.copy()
+            del X_val_view, y_val_view, r_val_view
 
             # Save sub-A before releasing X_all / targets_data
             cp.save_gru_eval_arrays(
-                X_val, y_val,
+                X_val, y_val, r_val,
                 class_weights=self.class_weights or {},
                 gru_plan=gru_plan,
                 n_total=n_total,
                 split_idx=split_idx,
+                val_idx=val_idx,
             )
 
             del X_all, y_all
@@ -948,16 +1019,17 @@ class ProductionTrainingOrchestrator:
             logger.info("✓ targets_data released after GRU sequence build")
 
         # Store eval arrays for steps 7-8
-        self.gru_eval_X = X_val
-        self.gru_eval_y = y_val
+        self.gru_eval_X       = X_val
+        self.gru_eval_y       = y_val
+        self.gru_eval_returns = r_val
 
         # ── Build X_train (always rebuilt — too large to persist) ─────────────
         # Load targets_data if not already freed (sub-A path freed it above)
         # On the sub-A resume path we need to reload targets_data to rebuild X_train.
         n_train = split_idx
         logger.info(
-            "Building X_train from targets_data  n_train=%d  (%.2f GB)...",
-            n_train, n_train * seq_len * n_feat * 4 / 1e9,
+            "Building X_train from targets_data  n_train=%d  (%.2f GB float16)...",
+            n_train, n_train * seq_len * n_feat * 2 / 1e9,
         )
 
         # Reload targets_data for the training sequence rebuild
@@ -965,7 +1037,8 @@ class ProductionTrainingOrchestrator:
             logger.info("  Loading targets_data from checkpoint for X_train rebuild...")
             self.targets_data, _ = self.cp.load_targets()
 
-        X_train = np.empty((n_train, seq_len, n_feat), dtype=np.float32)
+        # float16 halves RAM footprint; cast to float32 in tf.data pipeline below.
+        X_train = np.empty((n_train, seq_len, n_feat), dtype=np.float16)
         y_train = np.empty(n_train, dtype=np.int32)
         cursor  = 0
         for symbol, y_start, n in gru_plan:
@@ -977,17 +1050,23 @@ class ProductionTrainingOrchestrator:
                 df_raw, method='rolling', window=seq_len, feature_cols=feature_names
             )
             X_seq, _, _ = create_sequences(norm_df, seq_len, feature_names)
-            take = min(n, n_train - cursor)
+            # Cap by actual sequences produced — NaN-dropping in normalize_features
+            # can yield fewer rows than the count recorded in gru_plan during pass 1.
+            take = min(len(X_seq), n, n_train - cursor)
             if take <= 0:
                 break
             X_train[cursor:cursor + take] = X_seq[:take]
             y_train[cursor:cursor + take] = y_sym[y_start:y_start + take]
             cursor += take
 
+        # Trim to actual filled rows (gru_plan counts may exceed actual after NaN drops)
+        X_train = X_train[:cursor]
+        y_train = y_train[:cursor]
+
         # Free targets_data again (done with it)
         del self.targets_data
         gc.collect()
-        logger.info("✓ X_train built  shape=%s", X_train.shape)
+        logger.info("✓ X_train built  shape=%s  (planned=%d  actual=%d)", X_train.shape, n_train, cursor)
 
         logger.info(
             "GRU data summary:  train=%d  (%.2f GB)  val=%d  class_dist(val)=%s",
@@ -1002,16 +1081,21 @@ class ProductionTrainingOrchestrator:
         y_train_int = y_train.astype(np.int32)
         n_train_samples = len(X_train)
 
-        # Pin source tensors to CPU so from_tensor_slices never attempts to copy
-        # the entire 2.97 GB array to GPU VRAM (which only has 1.55 GiB free).
-        # TF will transfer one batch at a time (~2.9 MB) during training instead.
+        # Pin source tensors to CPU — TF transfers one batch at a time to GPU.
+        # Cast float16→float32 per batch (cheap op; fixed parallelism=2 prevents
+        # unbounded float32 materialization that exhausted RAM with AUTOTUNE).
+        # Prefetch capped at 2 for same reason — AUTOTUNE grew the buffer each epoch.
         with tf.device('/CPU:0'):
             train_ds = (
                 tf.data.Dataset
                 .from_tensor_slices((X_train, y_train_int))
-                .shuffle(buffer_size=20_000, reshuffle_each_iteration=True)
+                .shuffle(buffer_size=5_000, reshuffle_each_iteration=True)
                 .batch(self.config.batch_size)
-                .prefetch(tf.data.AUTOTUNE)
+                .map(
+                    lambda x, y: (tf.cast(x, tf.float32), y),
+                    num_parallel_calls=2,
+                )
+                .prefetch(2)
             )
 
         # Free numpy arrays — TF dataset retains its own reference on CPU.
@@ -1110,19 +1194,105 @@ class ProductionTrainingOrchestrator:
         initial_epoch: int,
         epoch_cb: Any,
     ) -> None:
-        """Run model.fit() — extracted so it can be called via asyncio.to_thread."""
+        """
+        Run model.fit() with OOM recovery — extracted so it can run via asyncio.to_thread.
+
+        OOM recovery strategy
+        ---------------------
+        If TF raises ``ResourceExhaustedError`` (GPU VRAM exhausted), this method:
+
+        1. Clears the Keras session to release all GPU-resident model weights and
+           optimizer states.
+        2. Rebatches the existing ``tf.data`` pipeline to half the current batch
+           size — no raw arrays needed since ``train_ds`` is backed by pinned CPU
+           tensors and is re-iterable.
+        3. Resets the GRU trainer's model to ``None`` so ``train()`` rebuilds it
+           with fresh weights at the smaller batch.
+        4. Repeats up to ``_MAX_OOM_RETRIES`` times, halving batch size each time.
+
+        The minimum batch floor is 32 to avoid degenerate single-sample training.
+        If all retries are exhausted, a ``RuntimeError`` is raised with actionable
+        guidance (reduce ``gru_n_symbols`` or ``n_features``, or increase
+        ``_GPU_VRAM_LIMIT_MB`` in ``gru_trainer.py``).
+        """
         import tensorflow as tf
+        import gc
+
+        # XLA kernel fusion: ~20 % throughput improvement on Ampere GPUs.
+        # Set here (not in configure_gpu) so it applies only when model.fit()
+        # is active, not during HPO tuner search or evaluation passes.
         tf.config.optimizer.set_jit(True)
 
-        self.gru_trainer.train(
-            params=best_params,
-            epochs=self.config.max_epochs,
-            class_weight=self.class_weights,
-            train_generator=train_ds,
-            val_data=(X_val, y_val),
-            initial_epoch=initial_epoch,
-            extra_callbacks=[epoch_cb],
-        )
+        _MAX_OOM_RETRIES: int = 2
+        current_ds   = train_ds
+        batch_size   = self.config.batch_size   # tracked for logging only
+        cur_epoch    = initial_epoch
+
+        for attempt in range(_MAX_OOM_RETRIES + 1):
+            try:
+                self.gru_trainer.train(
+                    params=best_params,
+                    epochs=self.config.max_epochs,
+                    class_weight=self.class_weights,
+                    train_generator=current_ds,
+                    val_data=(X_val, y_val),
+                    initial_epoch=cur_epoch,
+                    extra_callbacks=[epoch_cb],
+                )
+                return  # success — exit retry loop
+
+            except tf.errors.ResourceExhaustedError as oom:
+                if attempt >= _MAX_OOM_RETRIES:
+                    logger.error(
+                        "GRU training exhausted GPU memory after %d attempt(s) "
+                        "(last batch_size=%d).  "
+                        "Remediation: reduce gru_n_symbols / n_features, "
+                        "or increase _GPU_VRAM_LIMIT_MB in gru_trainer.py.",
+                        attempt + 1,
+                        batch_size,
+                    )
+                    raise RuntimeError(
+                        f"GRU OOM — all {_MAX_OOM_RETRIES + 1} attempts failed. "
+                        f"Last batch_size: {batch_size}.  See logs for remediation."
+                    ) from oom
+
+                new_batch = max(batch_size // 2, 32)
+                logger.warning(
+                    "GRU training OOM at batch_size=%d (attempt %d/%d) — "
+                    "clearing Keras session and rebatching to %d.",
+                    batch_size,
+                    attempt + 1,
+                    _MAX_OOM_RETRIES + 1,
+                    new_batch,
+                )
+
+                # ── Recovery step 1: free GPU memory ─────────────────────────
+                # clear_session() destroys all Keras models, layers, and
+                # optimizer states, returning their VRAM to TF's allocator.
+                tf.keras.backend.clear_session()
+                gc.collect()
+
+                # ── Recovery step 2: rebatch existing dataset ─────────────────
+                # train_ds is backed by pinned CPU tensors (from_tensor_slices)
+                # and is re-iterable.  unbatch() peels the current batch dim;
+                # batch(new_batch) regroups at the smaller size.  The shuffle
+                # and cast-to-float32 steps are preserved in the parent pipeline.
+                current_ds = current_ds.unbatch().batch(new_batch).prefetch(2)
+                batch_size = new_batch
+
+                # ── Recovery step 3: reset model state ───────────────────────
+                # train() rebuilds the model graph from scratch.  We restart
+                # from epoch 0 — no valid checkpoint exists for the OOM'd run.
+                self.gru_trainer.model = None
+                cur_epoch = 0
+
+                logger.warning(
+                    "OOM recovery: retrying GRU training at batch_size=%d "
+                    "(attempt %d/%d)...",
+                    new_batch,
+                    attempt + 2,
+                    _MAX_OOM_RETRIES + 1,
+                )
 
     async def _create_and_optimize_ensemble(self, splits: List[Split]) -> Dict[str, Any]:
         logger.info("Optimizing ensemble weights on %d validation samples...", len(self.gru_eval_y))
@@ -1140,10 +1310,19 @@ class ProductionTrainingOrchestrator:
         X_val_tab = self.gru_eval_X[:, -1, :]
         y_val     = self.gru_eval_y
 
+        eff_metric = self.config.ensemble_optimization_metric
+        if self.gru_eval_returns is None and eff_metric == 'sharpe_ratio':
+            logger.warning(
+                "Forward returns unavailable (old checkpoint) — "
+                "falling back to accuracy for ensemble optimisation."
+            )
+            eff_metric = 'accuracy'
+
         optimized_weights = await asyncio.to_thread(
             self.ensemble_trainer.optimize_weights,
             X_val_tab, X_val_seq, y_val,
-            metric=self.config.ensemble_optimization_metric,
+            returns=self.gru_eval_returns,
+            metric=eff_metric,
         )
         self.ensemble_trainer.weights = optimized_weights
 
@@ -1157,9 +1336,10 @@ class ProductionTrainingOrchestrator:
     async def _evaluate_all_models(self, splits: List[Split]) -> Dict[str, EvaluationResults]:
         import xgboost as xgb
 
-        X_test_seq = self.gru_eval_X
-        X_test_tab = self.gru_eval_X[:, -1, :]
-        y_test     = self.gru_eval_y
+        X_test_seq   = self.gru_eval_X
+        X_test_tab   = self.gru_eval_X[:, -1, :]
+        y_test       = self.gru_eval_y
+        test_returns = self.gru_eval_returns
 
         logger.info("Evaluating on %d test samples...", len(y_test))
         evaluation_results = {}
@@ -1172,22 +1352,22 @@ class ProductionTrainingOrchestrator:
         else:
             xgb_proba = xgb_raw
         xgb_pred = np.argmax(xgb_proba, axis=1)
-        xgb_res  = self.model_evaluator.evaluate(y_true=y_test, y_pred=xgb_pred, y_proba=xgb_proba)
+        xgb_res  = self.model_evaluator.evaluate(y_true=y_test, y_pred=xgb_pred, y_proba=xgb_proba, returns=test_returns)
         evaluation_results['xgboost'] = xgb_res
-        logger.info("  XGBoost  acc=%.4f  F1(up)=%.4f  F1(down)=%.4f", xgb_res.accuracy, xgb_res.f1_score.get('up', 0), xgb_res.f1_score.get('down', 0))
+        logger.info("  XGBoost  acc=%.4f  F1(up)=%.4f  F1(down)=%.4f  Sharpe=%.4f", xgb_res.accuracy, xgb_res.f1_score.get('up', 0), xgb_res.f1_score.get('down', 0), xgb_res.sharpe_ratio)
 
         # GRU
         gru_proba = self.gru_trainer.model.predict(X_test_seq, verbose=0)
         gru_pred  = np.argmax(gru_proba, axis=1)
-        gru_res   = self.model_evaluator.evaluate(y_true=y_test, y_pred=gru_pred, y_proba=gru_proba)
+        gru_res   = self.model_evaluator.evaluate(y_true=y_test, y_pred=gru_pred, y_proba=gru_proba, returns=test_returns)
         evaluation_results['gru'] = gru_res
-        logger.info("  GRU      acc=%.4f  F1(up)=%.4f  F1(down)=%.4f", gru_res.accuracy, gru_res.f1_score.get('up', 0), gru_res.f1_score.get('down', 0))
+        logger.info("  GRU      acc=%.4f  F1(up)=%.4f  F1(down)=%.4f  Sharpe=%.4f", gru_res.accuracy, gru_res.f1_score.get('up', 0), gru_res.f1_score.get('down', 0), gru_res.sharpe_ratio)
 
         # Ensemble
         ens_pred, ens_proba = self.ensemble_trainer.predict(
             X_test_tab, X_test_seq, apply_confidence_threshold=False
         )
-        ens_res = self.model_evaluator.evaluate(y_true=y_test, y_pred=ens_pred, y_proba=ens_proba)
+        ens_res = self.model_evaluator.evaluate(y_true=y_test, y_pred=ens_pred, y_proba=ens_proba, returns=test_returns)
         evaluation_results['ensemble'] = ens_res
         logger.info(
             "  Ensemble acc=%.4f  F1(up)=%.4f  F1(down)=%.4f  Sharpe=%.4f",
@@ -1217,6 +1397,12 @@ class ProductionTrainingOrchestrator:
 
     async def _export_models_to_onnx(self) -> Dict[str, str]:
         onnx_paths: Dict[str, str] = {}
+
+        # Save XGBoost training artifact now so Treelite can load it.
+        # (Step 10 also saves it, but Step 9 runs first and needs the file on disk.)
+        xgb_json_early = self.models_dir / "xgboost_model.json"
+        self.xgboost_trainer.model.save_model(str(xgb_json_early))
+        logger.info("  ✓ XGBoost JSON pre-saved for Treelite: %s", xgb_json_early)
 
         # XGBoost → Treelite (5-10x faster than ONNX)
         logger.info("Compiling XGBoost to Treelite...")
@@ -1270,17 +1456,46 @@ class ProductionTrainingOrchestrator:
         return onnx_paths
 
     def _discover_onnx_paths(self) -> Dict[str, str]:
-        """Reconstruct onnx_paths dict from files already on disk."""
+        """Reconstruct inference artifact paths from files already on disk.
+
+        Called when Step 9 is skipped due to a checkpoint resume.  Returns the
+        same structure as ``_export_models_to_onnx()`` so Step 10 always
+        receives a consistent dict regardless of the resume path.
+        """
         paths: Dict[str, str] = {}
-        for p in self.onnx_dir.glob("*.onnx"):
-            key = p.stem  # e.g. xgboost_model → use as-is
-            paths[key] = str(p)
+
+        # XGBoost → Treelite .so
+        treelite_dir = self.output_dir / "treelite"
+        xgb_so = treelite_dir / "xgboost_model.so"
+        if xgb_so.exists():
+            paths["xgboost"] = str(xgb_so)
+        else:
+            logger.warning("_discover_onnx_paths: Treelite .so not found at %s", xgb_so)
+
+        # GRU → optimized ONNX (prefer *_optimized.onnx, fall back to plain)
+        gru_opt = self.onnx_dir / "gru_optimized.onnx"
+        gru_plain = self.onnx_dir / "gru_model.onnx"
+        if gru_opt.exists():
+            paths["gru"] = str(gru_opt)
+        elif gru_plain.exists():
+            paths["gru"] = str(gru_plain)
+        else:
+            logger.warning("_discover_onnx_paths: GRU ONNX not found in %s", self.onnx_dir)
+
         return paths
 
     async def _register_models_in_registry(
         self,
         evaluation_results: Dict[str, Any],
+        onnx_paths: Dict[str, str],
     ) -> Dict[str, str]:
+        """Register trained models in the registry.
+
+        Stores the native training artifacts (model_path) and the
+        inference-ready artifacts (onnx_path) separately so that
+        RegistryModelLoader can load the correct format (.so / .onnx)
+        without extension-check failures.
+        """
         import os
         from cryptography.fernet import Fernet
 
@@ -1297,61 +1512,93 @@ class ProductionTrainingOrchestrator:
 
         model_paths: Dict[str, str] = {}
 
-        # Save XGBoost
+        # Save native training artifacts to disk
         xgb_path = self.models_dir / "xgboost_model.json"
         self.xgboost_trainer.model.save_model(str(xgb_path))
-        model_paths['xgboost'] = str(xgb_path)
-        logger.info("  ✓ XGBoost → %s", xgb_path)
+        model_paths["xgboost"] = str(xgb_path)
+        logger.info("  ✓ XGBoost training artifact → %s", xgb_path)
 
-        # Save GRU
         gru_path = self.models_dir / "gru_model.keras"
         self.gru_trainer.model.save(str(gru_path))
-        model_paths['gru'] = str(gru_path)
-        logger.info("  ✓ GRU → %s", gru_path)
+        model_paths["gru"] = str(gru_path)
+        logger.info("  ✓ GRU training artifact → %s", gru_path)
 
-        # Register with evaluation metrics
+        xgb_inference = onnx_paths.get("xgboost")
+        gru_inference  = onnx_paths.get("gru")
+
+        if not xgb_inference:
+            logger.warning(
+                "No XGBoost inference artifact in onnx_paths — "
+                "RegistryModelLoader will reject this record at startup. "
+                "Ensure Step 9 (Treelite compilation) succeeded."
+            )
+        if not gru_inference:
+            logger.warning(
+                "No GRU inference artifact in onnx_paths — "
+                "RegistryModelLoader will reject this record at startup. "
+                "Ensure Step 9 (ONNX export) succeeded."
+            )
+
         try:
-            # Extract ensemble weights from ensemble trainer
-            xgb_weight = self.ensemble_trainer.weights.get('xgboost', 0.75)
-            gru_weight = self.ensemble_trainer.weights.get('gru', 0.25)
-            
-            # Prepare XGBoost metrics
-            xgb_metrics = asdict(evaluation_results['xgboost'])
-            xgb_metrics['ensemble_weight'] = xgb_weight
-            
-            xgb_meta = await registry.register_model(
-                version=f"{self.config.model_version}_xgboost",
-                model_type="xgboost",
-                artifact_path=model_paths['xgboost'],
-                metrics=xgb_metrics,
-                metadata={
-                    'n_symbols': len(self.symbols),
-                    'n_features': self.config.n_features,
-                    'training_samples': self._calculate_total_samples(),
-                },
-                feature_version="1.0.0",
-                status="development",
-            )
-            logger.info("  ✓ XGBoost registered  id=%s", xgb_meta.id)
+            xgb_weight = self.ensemble_trainer.weights.get("xgboost", 0.75)
+            gru_weight  = self.ensemble_trainer.weights.get("gru", 0.25)
 
-            # Prepare GRU metrics
-            gru_metrics = asdict(evaluation_results['gru'])
-            gru_metrics['ensemble_weight'] = gru_weight
-            
-            gru_meta = await registry.register_model(
-                version=f"{self.config.model_version}_gru",
-                model_type="gru",
-                artifact_path=model_paths['gru'],
-                metrics=gru_metrics,
-                metadata={
-                    'n_symbols': len(self.symbols),
-                    'n_features': self.config.n_features,
-                    'training_samples': self._calculate_total_samples(),
+            xgb_metrics = asdict(evaluation_results["xgboost"])
+            xgb_metrics["ensemble_weight"] = xgb_weight
+
+            # The feature manifest is the ordered list of feature names used
+            # during training.  Storing it in training_features makes every
+            # model self-describing: FeatureLoader reads the manifest from the
+            # active production record and computes exactly those features,
+            # so n_features changing between runs never requires code changes.
+            from app.ml.features.feature_pipeline import get_all_feature_names
+            include_sentiment = getattr(self.config, "include_sentiment", True)
+            feature_names = get_all_feature_names(include_sentiment=include_sentiment)
+            logger.info("  Feature manifest: %d features (sentiment=%s)", len(feature_names), include_sentiment)
+
+            xgb_meta = await registry.register_model(
+                version                 = f"{self.config.model_version}_xgboost",
+                model_type              = "xgboost",
+                artifact_path           = model_paths["xgboost"],
+                inference_artifact_path = xgb_inference,
+                metrics                 = xgb_metrics,
+                metadata                = {
+                    "features":         feature_names,   # → training_features column
+                    "n_symbols":        len(self.symbols),
+                    "n_features":       len(feature_names),
+                    "training_samples": self._calculate_total_samples(),
                 },
-                feature_version="1.0.0",
-                status="development",
+                feature_version = "1.0.0",
+                status          = "development",
+                overwrite       = True,
             )
-            logger.info("  ✓ GRU registered  id=%s", gru_meta.id)
+            logger.info("  ✓ XGBoost registered  id=%s  inference=%s  n_features=%d",
+                        xgb_meta.id, Path(xgb_inference).suffix if xgb_inference else "none",
+                        len(feature_names))
+
+            gru_metrics = asdict(evaluation_results["gru"])
+            gru_metrics["ensemble_weight"] = gru_weight
+
+            gru_meta = await registry.register_model(
+                version                 = f"{self.config.model_version}_gru",
+                model_type              = "gru",
+                artifact_path           = model_paths["gru"],
+                inference_artifact_path = gru_inference,
+                metrics                 = gru_metrics,
+                metadata                = {
+                    "features":         feature_names,   # → training_features column
+                    "n_symbols":        len(self.symbols),
+                    "n_features":       len(feature_names),
+                    "training_samples": self._calculate_total_samples(),
+                },
+                feature_version = "1.0.0",
+                status          = "development",
+                overwrite       = True,
+            )
+            logger.info("  ✓ GRU registered  id=%s  inference=%s  n_features=%d",
+                        gru_meta.id, Path(gru_inference).suffix if gru_inference else "none",
+                        len(feature_names))
+
         except Exception as e:
             logger.error("Model registry registration failed: %s", e)
             raise

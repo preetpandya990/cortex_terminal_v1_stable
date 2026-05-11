@@ -27,6 +27,7 @@ T+1 settlement (CNC only):
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID
@@ -79,6 +80,56 @@ _ZERO = Decimal("0")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Trade context — unified carrier for signal-backed and manual orders
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class _TradeContext:
+    """
+    Carries the instrument and signal metadata needed throughout the order
+    placement pipeline.  Built from either a TradeSuggestion (signal-backed)
+    or directly from PlaceOrderRequest fields (manual trade).
+    """
+    suggestion_id: UUID | None
+    symbol: str
+    instrument_key: str
+    entry_price: Decimal | None
+    stop_loss: Decimal | None
+    take_profit_1: Decimal | None
+    take_profit_2: Decimal | None
+    take_profit_3: Decimal | None
+
+
+def _ctx_from_suggestion(suggestion: TradeSuggestion) -> _TradeContext:
+    def _dec(v: object) -> Decimal | None:
+        return Decimal(str(v)) if v is not None else None
+
+    return _TradeContext(
+        suggestion_id=suggestion.suggestion_id,
+        symbol=suggestion.symbol,
+        instrument_key=suggestion.instrument_key or suggestion.symbol,
+        entry_price=_dec(suggestion.entry_price),
+        stop_loss=_dec(suggestion.stop_loss),
+        take_profit_1=_dec(suggestion.take_profit_1),
+        take_profit_2=_dec(suggestion.take_profit_2),
+        take_profit_3=_dec(suggestion.take_profit_3),
+    )
+
+
+def _ctx_from_payload(payload: PlaceOrderRequest) -> _TradeContext:
+    return _TradeContext(
+        suggestion_id=None,
+        symbol=(payload.symbol or "").upper(),
+        instrument_key=payload.instrument_key or "",
+        entry_price=Decimal(str(payload.entry_price)) if payload.entry_price else None,
+        stop_loss=None,
+        take_profit_1=None,
+        take_profit_2=None,
+        take_profit_3=None,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Public API — Place order
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -89,7 +140,12 @@ async def place_order(
     payload: PlaceOrderRequest,
 ) -> tuple[PaperOrder, PaperFill | None]:
     """
-    Place a paper order derived from a TradeSuggestion.
+    Place a paper order.  Supports two modes:
+
+    Signal-backed: payload.suggestion_id is set — fetches TradeSuggestion and
+                   derives instrument metadata from it.
+    Manual:        payload.suggestion_id is None — uses symbol/instrument_key/
+                   entry_price supplied directly in the payload.
 
     Returns
     -------
@@ -98,24 +154,24 @@ async def place_order(
 
     Raises
     ------
-    DataNotFoundError       If the referenced TradeSuggestion is not found.
-    PositionLimitExceededError  If max_open_positions would be breached.
-    InsufficientFundsError  If cash is insufficient to cover a BUY order.
-    SettlementPendingError  If a CNC SELL is attempted on same-day shares.
-    InvalidOrderError       For other business-rule violations.
+    DataNotFoundError          If suggestion_id provided but suggestion not found.
+    PositionLimitExceededError If max_open_positions would be breached.
+    InsufficientFundsError     If cash is insufficient to cover a BUY order.
+    SettlementPendingError     If a CNC SELL is attempted on same-day shares.
+    InvalidOrderError          For other business-rule violations.
     """
     portfolio = await get_active_portfolio(session, user_id)
 
-    suggestion = await _fetch_suggestion(session, payload.suggestion_id)
+    if payload.suggestion_id is not None:
+        suggestion = await _fetch_suggestion(session, payload.suggestion_id)
+        ctx = _ctx_from_suggestion(suggestion)
+    else:
+        ctx = _ctx_from_payload(payload)
 
     if payload.transaction_type.value == "BUY":
-        order, fill = await _place_buy_order(
-            session, redis, portfolio, suggestion, payload
-        )
+        order, fill = await _place_buy_order(session, redis, portfolio, ctx, payload)
     else:
-        order, fill = await _place_sell_order(
-            session, redis, portfolio, suggestion, payload
-        )
+        order, fill = await _place_sell_order(session, redis, portfolio, ctx, payload)
 
     return order, fill
 
@@ -174,7 +230,7 @@ async def _place_buy_order(
     session: AsyncSession,
     redis: Redis,
     portfolio: Portfolio,
-    suggestion: TradeSuggestion,
+    ctx: _TradeContext,
     payload: PlaceOrderRequest,
 ) -> tuple[PaperOrder, PaperFill | None]:
     """Validate and execute a BUY order."""
@@ -186,8 +242,8 @@ async def _place_buy_order(
             "Close an existing position before opening a new one."
         )
 
-    # ── Funds pre-flight (use suggested entry price as cost estimate) ─────────
-    ref_price = Decimal(str(suggestion.entry_price or 0)) if suggestion.entry_price else _ZERO
+    # ── Funds pre-flight ──────────────────────────────────────────────────────
+    ref_price = ctx.entry_price or _ZERO
     if ref_price <= _ZERO:
         ref_price = Decimal(str(payload.price)) if payload.price else _ZERO
     estimated_cost = ref_price * Decimal(payload.quantity)
@@ -197,15 +253,13 @@ async def _place_buy_order(
             f"available cash ₹{float(portfolio.current_cash):,.2f}."
         )
 
-    order = _build_order(portfolio.id, suggestion, payload)
+    order = _build_order(portfolio.id, ctx, payload)
     session.add(order)
     await session.flush()
 
     fill: PaperFill | None = None
     if payload.order_type.value == "MARKET":
-        fill = await _execute_fill(
-            session, redis, portfolio, order, suggestion, payload.quantity
-        )
+        fill = await _execute_fill(session, redis, portfolio, order, ctx, payload.quantity)
         order.status = "COMPLETE"
     else:
         order.status = "OPEN"
@@ -224,7 +278,7 @@ async def _place_sell_order(
     session: AsyncSession,
     redis: Redis,
     portfolio: Portfolio,
-    suggestion: TradeSuggestion,
+    ctx: _TradeContext,
     payload: PlaceOrderRequest,
 ) -> tuple[PaperOrder, PaperFill | None]:
     """
@@ -235,30 +289,30 @@ async def _place_sell_order(
     flow (e.g., a counter-trade on the same symbol).
     """
     # ── Open position check ───────────────────────────────────────────────────
-    open_pos = await _find_open_position(session, portfolio.id, suggestion.symbol)
+    open_pos = await _find_open_position(session, portfolio.id, ctx.symbol)
     if open_pos is None:
         raise InvalidOrderError(
-            f"No open position found for {suggestion.symbol}. "
+            f"No open position found for {ctx.symbol}. "
             "Cannot place a SELL order without an open position."
         )
     if payload.quantity > open_pos.quantity:
         raise InvalidOrderError(
             f"SELL quantity {payload.quantity} exceeds open position "
-            f"quantity {open_pos.quantity} for {suggestion.symbol}."
+            f"quantity {open_pos.quantity} for {ctx.symbol}."
         )
 
     # ── T+1 settlement check (CNC only) ───────────────────────────────────────
     if payload.product_type.value == "CNC":
-        await _assert_t1_settlement(session, portfolio.id, suggestion.symbol)
+        await _assert_t1_settlement(session, portfolio.id, ctx.symbol)
 
-    order = _build_order(portfolio.id, suggestion, payload)
+    order = _build_order(portfolio.id, ctx, payload)
     session.add(order)
     await session.flush()
 
     fill: PaperFill | None = None
     if payload.order_type.value == "MARKET":
         fill = await _execute_fill(
-            session, redis, portfolio, order, suggestion, payload.quantity,
+            session, redis, portfolio, order, ctx, payload.quantity,
             close_position=open_pos,
         )
         order.status = "COMPLETE"
@@ -280,7 +334,7 @@ async def _execute_fill(
     redis: Redis,
     portfolio: Portfolio,
     order: PaperOrder,
-    suggestion: TradeSuggestion,
+    ctx: _TradeContext,
     fill_quantity: int,
     close_position: PaperPosition | None = None,
 ) -> PaperFill:
@@ -295,10 +349,8 @@ async def _execute_fill(
     ltp = await _get_ltp(redis, order.instrument_key)
     fallback_used = ltp is None
     if fallback_used:
-        # No tick available: use suggestion entry_price as fill price.
-        # This happens in mock/dev environments or when the symbol isn't subscribed.
-        fallback_ref = suggestion.entry_price
-        ltp = Decimal(str(fallback_ref)) if fallback_ref else _ZERO
+        # No tick: fall back to known entry price (suggestion or manual), then limit price.
+        ltp = ctx.entry_price or _ZERO
         if ltp <= _ZERO:
             ltp = Decimal(str(order.price or "0"))
         logger.warning(
@@ -372,7 +424,7 @@ async def _execute_fill(
             portfolio=portfolio,
             order=order,
             fill=fill,
-            suggestion=suggestion,
+            ctx=ctx,
         )
     else:
         if close_position is None:
@@ -405,14 +457,14 @@ async def _execute_fill(
 
 def _build_order(
     portfolio_id: UUID,
-    suggestion: TradeSuggestion,
+    ctx: _TradeContext,
     payload: PlaceOrderRequest,
 ) -> PaperOrder:
     return PaperOrder(
         portfolio_id=portfolio_id,
-        suggestion_id=suggestion.suggestion_id,
-        symbol=suggestion.symbol,
-        instrument_key=suggestion.instrument_key or suggestion.symbol,
+        suggestion_id=ctx.suggestion_id,
+        symbol=ctx.symbol,
+        instrument_key=ctx.instrument_key,
         transaction_type=payload.transaction_type.value,
         product_type=payload.product_type.value,
         order_type=payload.order_type.value,
@@ -572,17 +624,20 @@ async def execute_pending_order_fill(
             f"Portfolio {order.portfolio_id} not found while filling order {order.id}."
         )
 
-    suggestion_stmt = select(TradeSuggestion).where(
-        TradeSuggestion.suggestion_id == order.suggestion_id
+    # Build a _TradeContext from the order record.  For LIMIT/SL fills the
+    # suggestion may have already expired; we only need symbol/instrument_key
+    # and fill price here — SL/TP targets were written to PaperPosition at
+    # order placement time so they don't need to be re-derived.
+    ctx = _TradeContext(
+        suggestion_id=order.suggestion_id,
+        symbol=order.symbol,
+        instrument_key=order.instrument_key,
+        entry_price=fill_price,  # the confirmed fill price is the reference
+        stop_loss=None,
+        take_profit_1=None,
+        take_profit_2=None,
+        take_profit_3=None,
     )
-    suggestion = (await session.execute(suggestion_stmt)).scalar_one_or_none()
-    if suggestion is None:
-        # Suggestion expired — fill at provided price, no suggestion context
-        from app.models.trade_suggestions import TradeSuggestion as TS
-        suggestion = TS(
-            symbol=order.symbol,
-            instrument_key=order.instrument_key,
-        )
 
     # Temporarily override the fill price (bypass LTP lookup)
     charges = calculate_charges(
@@ -639,7 +694,7 @@ async def execute_pending_order_fill(
             portfolio=portfolio,
             order=order,
             fill=fill,
-            suggestion=suggestion,
+            ctx=ctx,
         )
     else:
         close_position = await _find_open_position(

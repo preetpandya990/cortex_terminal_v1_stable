@@ -7,7 +7,7 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Integer, Numeric, String, text
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Integer, Numeric, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -83,6 +83,23 @@ class TradeSuggestion(Base):
         server_default=text("NOW()")
     )
     
+    # Strategy linkage (Phase 2 — Rule Engine)
+    strategy_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("strategies.id", ondelete="SET NULL"),
+        nullable=True,
+        index=False,  # partial index created in migration
+    )
+    strategy_activation_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("strategy_activations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=False,
+    )
+    strategy_match_result: Mapped[dict | None] = mapped_column(
+        JSONB(astext_type=Text()), nullable=True
+    )
+
     # Relationships
     correlations: Mapped[list["EventCorrelation"]] = relationship(
         "EventCorrelation",

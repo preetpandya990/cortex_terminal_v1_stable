@@ -184,6 +184,7 @@ export function CandlestickChart({
       layout: {
         background: { type: ColorType.Solid, color: "transparent" },
         textColor: "#9ca3af",
+        attributionLogo: false,
       },
       grid: {
         vertLines: { color: "#1f2937" },
@@ -239,7 +240,6 @@ export function CandlestickChart({
         },
       },
       rightPriceScale: { borderColor: "#374151" },
-      watermark:       { visible: false },
       width:  containerRef.current.clientWidth,
       height: height ?? (containerRef.current.clientHeight || 400),
     });
@@ -621,7 +621,7 @@ function createIndicatorSeries(
       s.priceScale().applyOptions({
         scaleMargins:     { top: 0.1, bottom: 0.1 },
         borderVisible:    false,
-        drawTicks:        false,
+        ticksVisible:     false,
         entireTextOnly:   true,
       });
       // Overbought / oversold reference lines
@@ -657,7 +657,7 @@ function createIndicatorSeries(
       macdLine.priceScale().applyOptions({
         scaleMargins:   { top: 0.1, bottom: 0.1 },
         borderVisible:  false,
-        drawTicks:      false,
+        ticksVisible:   false,
         entireTextOnly: true,
       });
       return [macdLine, signalLine, histogram];
@@ -684,7 +684,7 @@ function createIndicatorSeries(
       kLine.priceScale().applyOptions({
         scaleMargins:   { top: 0.1, bottom: 0.1 },
         borderVisible:  false,
-        drawTicks:      false,
+        ticksVisible:   false,
         entireTextOnly: true,
       });
       kLine.createPriceLine({ price: 80, color: COLORS.STOCH_OB, lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false });

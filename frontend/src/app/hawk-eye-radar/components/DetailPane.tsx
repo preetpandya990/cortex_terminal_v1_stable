@@ -27,6 +27,7 @@ import { CandlestickChart } from "@/components/charts/CandlestickChart";
 import { TimeframeSelector } from "@/components/charts/TimeframeSelector";
 import { IndicatorSelector } from "@/components/charts/IndicatorSelector";
 import { AnalysisCardsSection } from "@/components/AnalysisCardsSection";
+import { OpenTradeModal } from "@/components/paper-trading/OpenTradeModal";
 import { useWatchlist } from "@/hooks/useWatchlist";
 import { useAuth } from "@/contexts/AuthContext";
 import { useChartPreferences, type TimeframeOption } from "@/contexts/ChartPreferencesContext";
@@ -36,6 +37,7 @@ import type {
   UpstoxInstrument,
   UpstoxLtpTick,
 } from "@/types/upstox";
+import type { TradeSuggestion } from "@/types/trade_suggestions";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -64,13 +66,16 @@ interface DetailPaneProps {
   instrument: UpstoxInstrument;
   onClose: () => void;
   showAnalysis?: boolean;
+  suggestion?: TradeSuggestion;
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
-export function DetailPane({ instrument, onClose, showAnalysis = true }: DetailPaneProps) {
+export function DetailPane({ instrument, onClose, showAnalysis = true, suggestion }: DetailPaneProps) {
   const { isAuthenticated } = useAuth();
   const { defaultTimeframe, activeIndicators } = useChartPreferences();
+
+  const [tradeModalOpen, setTradeModalOpen] = useState(false);
 
   // Consume from the singleton context — no duplicate hook instance.
   const {
@@ -551,6 +556,19 @@ export function DetailPane({ instrument, onClose, showAnalysis = true }: DetailP
                       {inWatchlist ? "In Watchlist" : "Add to Watchlist"}
                     </Button>
                   )}
+
+                  {/* Paper trade entry */}
+                  {isAuthenticated && (
+                    <button
+                      type="button"
+                      onClick={() => setTradeModalOpen(true)}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 shadow-sm hover:bg-slate-50 transition-colors"
+                    >
+                      <span className="h-2 w-2 rounded-full bg-emerald-500" />
+                      Trade
+                    </button>
+                  )}
+
                   <Button variant="ghost" size="icon" onClick={onClose}>
                     <X className="h-5 w-5" />
                   </Button>
@@ -647,6 +665,20 @@ export function DetailPane({ instrument, onClose, showAnalysis = true }: DetailP
           </div>
         </div>
       </div>
+
+      {tradeModalOpen && (
+        <OpenTradeModal
+          instrument={{
+            name: instrument.name || instrument.trading_symbol,
+            trading_symbol: instrument.trading_symbol,
+            exchange: instrument.exchange,
+            instrument_key: instrument.instrument_key,
+          }}
+          suggestion={suggestion}
+          livePrice={displayPrice}
+          onClose={() => setTradeModalOpen(false)}
+        />
+      )}
     </div>
   );
 }

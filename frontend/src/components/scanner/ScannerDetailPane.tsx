@@ -23,6 +23,7 @@ import { useChartPreferences, TIMEFRAME_OPTIONS, type TimeframeOption } from "@/
 import type { IndicatorId } from "@/lib/indicators";
 import { upstoxAPI, WS_BASE_URL, isNetworkError } from "@/lib/api";
 import { LivePriceBadge } from "@/components/shared/LivePriceBadge";
+import { OpenTradeModal } from "@/components/paper-trading/OpenTradeModal";
 import { mergeCandles } from "@/lib/candle-transforms";
 import {
   getISTTodayYMD,
@@ -296,6 +297,8 @@ export function ScannerDetailPane({ stock, listType, open, onClose }: ScannerDet
   const { isAuthenticated } = useAuth();
   const { activeIndicators: activeIndicatorsReadonly } = useChartPreferences();
   const activeIndicators = activeIndicatorsReadonly as IndicatorId[];
+
+  const [tradeModalOpen, setTradeModalOpen] = useState(false);
 
   // ── Watchlist ──────────────────────────────────────────────────────────────
   const { items: watchlistItems, addToWatchlist, removeFromWatchlist, isAdding, isRemoving } =
@@ -728,7 +731,20 @@ export function ScannerDetailPane({ stock, listType, open, onClose }: ScannerDet
           onTimeframeChange={handleTimeframeChange}
           onToggleWatchlist={handleToggleWatchlist}
           onLoadMoreHistory={stableHandleLoadMoreHistory}
+          onTradeClick={() => setTradeModalOpen(true)}
         /> : null}
+
+        {stock && tradeModalOpen && (
+          <OpenTradeModal
+            instrument={{
+              name: stock.name ?? stock.trading_symbol ?? stock.symbol,
+              trading_symbol: stock.trading_symbol ?? stock.symbol,
+              instrument_key: stock.symbol,
+            }}
+            livePrice={liveTick?.last_price ?? stock.current_price}
+            onClose={() => setTradeModalOpen(false)}
+          />
+        )}
       </div>
     </>
   );
@@ -761,6 +777,7 @@ interface PaneContentProps {
   onTimeframeChange: (tf: TimeframeOption) => void;
   onToggleWatchlist: () => void;
   onLoadMoreHistory: () => Promise<void>;
+  onTradeClick: () => void;
 }
 
 function PaneContent({
@@ -788,6 +805,7 @@ function PaneContent({
   onTimeframeChange,
   onToggleWatchlist,
   onLoadMoreHistory,
+  onTradeClick,
 }: PaneContentProps) {
   const exchange = exchangeFromKey(stock.symbol);
 
@@ -853,6 +871,19 @@ function PaneContent({
               {inWatchlist ? "Watchlisted" : "Watchlist"}
             </Button>
           )}
+
+          {/* Paper trade entry */}
+          {isAuthenticated && (
+            <button
+              type="button"
+              onClick={onTradeClick}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 shadow-sm hover:bg-slate-50 transition-colors"
+            >
+              <span className="h-2 w-2 rounded-full bg-emerald-500" />
+              Trade
+            </button>
+          )}
+
           <Button variant="ghost" size="icon" onClick={onClose} aria-label="Close detail pane">
             <X className="h-4 w-4" />
           </Button>

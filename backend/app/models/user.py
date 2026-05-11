@@ -31,6 +31,14 @@ class User(Base):
     portfolios: Mapped[list["Portfolio"]] = relationship("Portfolio", back_populates="user", cascade="all, delete-orphan", lazy="select")  # type: ignore[name-defined]
     paper_trade_outcomes: Mapped[list["PaperTradeOutcome"]] = relationship("PaperTradeOutcome", back_populates="user", cascade="all, delete-orphan", lazy="select")  # type: ignore[name-defined]
 
+    # Trading Strategies back-references
+    preferences: Mapped["UserPreferences | None"] = relationship("UserPreferences", back_populates="user", uselist=False, cascade="all, delete-orphan", lazy="select")  # type: ignore[name-defined]
+    strategies: Mapped[list["Strategy"]] = relationship("Strategy", back_populates="creator", foreign_keys="Strategy.created_by", cascade="all, delete-orphan", lazy="select")  # type: ignore[name-defined]
+    strategy_subscriptions: Mapped[list["UserStrategySubscription"]] = relationship("UserStrategySubscription", back_populates="user", cascade="all, delete-orphan", order_by="UserStrategySubscription.priority", lazy="select")  # type: ignore[name-defined]
+    strategy_activations: Mapped[list["StrategyActivation"]] = relationship("StrategyActivation", back_populates="user", cascade="all, delete-orphan", order_by="StrategyActivation.created_at.desc()", lazy="select")  # type: ignore[name-defined]
+    strategy_trades: Mapped[list["StrategyTrade"]] = relationship("StrategyTrade", back_populates="user", cascade="all, delete-orphan", order_by="StrategyTrade.entry_at.desc()", lazy="select")  # type: ignore[name-defined]
+    backtest_runs: Mapped[list["StrategyBacktestRun"]] = relationship("StrategyBacktestRun", back_populates="user", cascade="all, delete-orphan", order_by="StrategyBacktestRun.created_at.desc()", lazy="select")  # type: ignore[name-defined]
+
 
 class RefreshToken(Base):
     """Refresh token with family tracking for rotation."""

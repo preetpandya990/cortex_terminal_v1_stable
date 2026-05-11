@@ -109,7 +109,7 @@ async def test_xgboost_export():
         from sklearn.datasets import make_classification
         
         # Create dummy XGBoost model
-        X, y = make_classification(n_samples=1000, n_features=47, n_classes=3, n_informative=20)
+        X, y = make_classification(n_samples=1000, n_features=49, n_classes=3, n_informative=20)
         model = xgb.XGBClassifier(n_estimators=10, max_depth=3)
         model.fit(X, y)
         

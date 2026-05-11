@@ -3,7 +3,7 @@
 import { useEffect } from "react";
 import { useRouter, usePathname } from "next/navigation";
 import Link from "next/link";
-import { BarChart3, Brain, Users, ShieldAlert } from "lucide-react";
+import { BarChart3, Brain, Layers, Users, ShieldAlert } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 
 const NAV_ITEMS = [
@@ -18,6 +18,12 @@ const NAV_ITEMS = [
     label: "ML Governance",
     icon: Brain,
     description: "Model registry & deployment",
+  },
+  {
+    href: "/admin/strategies",
+    label: "Strategies",
+    icon: Layers,
+    description: "Promote, demote & audit library",
   },
   {
     href: "/admin/users",

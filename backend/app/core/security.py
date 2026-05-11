@@ -17,6 +17,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
+import bcrypt
 import jwt
 from fastapi import Depends, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -259,3 +260,19 @@ def get_refresh_token_from_cookie(request: Request) -> str:
 
 
 CurrentUserID = Annotated[str, Depends(get_current_user_id)]
+
+
+# ── Password hashing ───────────────────────────────────────────────────────────
+# OWASP recommended: 12 rounds in production (~250 ms), 10 in development
+# (~100 ms) so test suites stay responsive while still exercising real bcrypt.
+_BCRYPT_ROUNDS: int = 12
+
+
+def hash_password(password: str) -> str:
+    """Hash a plaintext password with bcrypt. Returns the utf-8 encoded hash."""
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(_BCRYPT_ROUNDS)).decode("utf-8")
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Constant-time bcrypt comparison — safe against timing attacks."""
+    return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))

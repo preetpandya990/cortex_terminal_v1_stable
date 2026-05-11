@@ -1,451 +1,345 @@
 """
 Populate Baseline Prediction Statistics for Drift Detection
 
-Generates predictions on recent historical data to establish baseline statistics
-for production drift monitoring. Computes mean, std, min, max for both raw and
-filtered (high-confidence) predictions.
+Generates ensemble predictions on a representative sample of recent historical
+symbols to establish the confidence-score distribution used as the drift baseline.
+
+The baseline is stored in MLModelMetadata.training_prediction_stats for every
+active production model.  The drift detector later compares live prediction
+distributions against this baseline using a z-score / KS test approach.
 
 Usage:
-    python scripts/populate_baseline_statistics.py --model-id xgboost_1.0.0_xgboost
-    python scripts/populate_baseline_statistics.py --all-production
+    python scripts/populate_baseline_statistics.py
+    python scripts/populate_baseline_statistics.py --sample-size 2000
+    python scripts/populate_baseline_statistics.py --dry-run
 """
+from __future__ import annotations
+
 import asyncio
 import argparse
 import logging
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Any, List
-import json
+from typing import Any
 
 import numpy as np
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.core.database import AsyncSessionLocal
 from app.core.redis import init_redis, close_redis, get_redis
 from app.models.ml_data import MLModelMetadata
-from app.ml.inference.registry_loader import RegistryModelLoader
+from app.ml.inference.registry_loader import RegistryModelLoader, LoadedEnsemble
 from app.ml.inference.ensemble_predictor import EnsemblePredictor
 from app.ml.inference.feature_loader import FeatureLoader
 from app.models.upstox_data import UpstoxOHLCV
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+# Minimum predictions needed to accept the baseline as valid
+_MIN_VALID_PREDICTIONS = 50
+# Calendar days to look back when selecting candidate symbols
+_SYMBOL_LOOKBACK_DAYS = 90
+# Minimum trading-day candles a symbol must have in that window to be eligible
+_MIN_CANDLES = 45
 
-class BaselineStatisticsComputer:
-    """Computes baseline prediction statistics for drift detection."""
-    
+
+class BaselineComputer:
+    """
+    Computes the baseline prediction-confidence distribution for drift monitoring.
+
+    Strategy
+    --------
+    1. Collect a representative sample of actively-traded symbols.
+    2. Run the production ensemble on each symbol's current features.
+    3. Record the confidence score (0–1) from each prediction.
+    4. Derive mean / std / percentiles from the collected scores.
+    5. Persist the statistics in MLModelMetadata.training_prediction_stats
+       for every active production model (all models share the same ensemble
+       confidence distribution as their baseline).
+
+    The stored format is intentionally flat so the drift detector can read it
+    with simple dict.get('mean') / dict.get('std') calls:
+
+        {
+            "mean":              float,
+            "std":               float,
+            "min":               float,
+            "max":               float,
+            "p25":               float,
+            "p50":               float,
+            "p75":               float,
+            "p90":               float,
+            "sample_size":       int,
+            "high_conf_mean":    float,   # mean of predictions >= confidence_threshold
+            "high_conf_std":     float,
+            "high_conf_count":   int,
+            "confidence_threshold": float,
+            "computed_at":       str,     # ISO-8601 UTC
+            "data_window_days":  int,
+        }
+    """
+
     def __init__(
         self,
         db: AsyncSession,
-        redis,
-        sample_size: int = 5000,
-        lookback_days: int = 60,
-        confidence_threshold: float = 0.6,
-    ):
+        redis: Any,
+        sample_size: int = 1000,
+        confidence_threshold: float = 0.60,
+        dry_run: bool = False,
+    ) -> None:
         self.db = db
         self.redis = redis
         self.sample_size = sample_size
-        self.lookback_days = lookback_days
         self.confidence_threshold = confidence_threshold
-        
-    async def get_training_symbols(self) -> List[str]:
-        """Get all symbols used in training from training results."""
-        training_results_path = Path(__file__).parent.parent / "models/production/training_results_20260420_114151.json"
-        
-        if not training_results_path.exists():
-            logger.warning("Training results not found, sampling from database")
-            return await self._sample_symbols_from_db()
-            
-        with open(training_results_path) as f:
-            results = json.load(f)
-            
-        symbols = results.get("symbols", [])
-        logger.info(f"Loaded {len(symbols)} training symbols")
-        return symbols
-    
-    async def _sample_symbols_from_db(self) -> List[str]:
-        """Fallback: sample symbols from database."""
-        stmt = select(UpstoxOHLCV.instrument_key).distinct().limit(1000)
-        result = await self.db.execute(stmt)
-        symbols = [row[0] for row in result.fetchall()]
-        logger.info(f"Sampled {len(symbols)} symbols from database")
-        return symbols
-    
-    async def sample_recent_data(self, symbols: List[str]) -> List[Dict[str, Any]]:
-        """Sample recent OHLCV data for baseline computation."""
-        cutoff = datetime.now(timezone.utc) - timedelta(days=self.lookback_days)
-        
-        # Get available data points per symbol
-        stmt = select(
-            UpstoxOHLCV.instrument_key,
-            func.count(UpstoxOHLCV.timestamp).label('count')
-        ).where(
-            UpstoxOHLCV.instrument_key.in_(symbols),
-            UpstoxOHLCV.timeframe == '1d',
-            UpstoxOHLCV.timestamp >= cutoff
-        ).group_by(UpstoxOHLCV.instrument_key).having(
-            func.count(UpstoxOHLCV.timestamp) >= 60  # Need 60 days for sequence
+        self.dry_run = dry_run
+
+    # ── public ────────────────────────────────────────────────────────────────
+
+    async def run(self) -> dict[str, Any]:
+        """Run the full baseline computation pipeline."""
+        logger.info(
+            "Baseline computation started  sample_size=%d  dry_run=%s",
+            self.sample_size, self.dry_run,
         )
-        
-        result = await self.db.execute(stmt)
-        symbol_counts = {row.instrument_key: row.count for row in result.fetchall()}
-        
-        if not symbol_counts:
-            raise ValueError(f"No symbols with sufficient data in last {self.lookback_days} days")
-        
-        logger.info(f"Found {len(symbol_counts)} symbols with sufficient data")
-        
-        # Calculate samples per symbol
-        total_available = sum(symbol_counts.values())
-        samples = []
-        
-        for symbol, count in symbol_counts.items():
-            # Proportional sampling
-            n_samples = max(1, int(self.sample_size * count / total_available))
-            
-            # Get random timestamps for this symbol
-            stmt = select(UpstoxOHLCV.timestamp).where(
-                UpstoxOHLCV.instrument_key == symbol,
-                UpstoxOHLCV.timeframe == '1d',
-                UpstoxOHLCV.timestamp >= cutoff
-            ).order_by(func.random()).limit(n_samples)
-            
-            result = await self.db.execute(stmt)
-            timestamps = [row[0] for row in result.fetchall()]
-            
-            for ts in timestamps:
-                samples.append({
-                    'symbol': symbol,
-                    'timestamp': ts,
-                    'timeframe': '1d'
-                })
-                
-            if len(samples) >= self.sample_size:
-                break
-        
-        logger.info(f"Sampled {len(samples)} data points across {len(set(s['symbol'] for s in samples))} symbols")
-        return samples[:self.sample_size]
-    
-    async def generate_predictions(
-        self,
-        samples: List[Dict[str, Any]],
-        predictor: EnsemblePredictor,
-        model_type: str,
-    ) -> np.ndarray:
-        """Generate predictions for sampled data."""
+
+        # 1. Load production ensemble (single load, reused for all symbols)
+        loader = RegistryModelLoader(session=self.db, num_threads=4, use_gpu=False)
+        ensemble: LoadedEnsemble = await loader.load_production_ensemble()
+        predictor = EnsemblePredictor.from_loaded_ensemble(ensemble)
         feature_loader = FeatureLoader(
             db=self.db,
             redis=self.redis,
-            sequence_length=60,
-            n_features=47,
+            sequence_length=ensemble.sequence_length,
+            n_features=ensemble.n_features,
+            feature_names=ensemble.feature_names,
         )
-        
-        predictions = []
-        failed = 0
-        
-        logger.info(f"Generating {len(samples)} predictions for {model_type}...")
-        
-        for i, sample in enumerate(samples):
-            try:
-                # Load features
-                tabular, sequence, price, vol = await feature_loader.load_features(
-                    symbol=sample['symbol'],
-                    timeframe=sample['timeframe'],
-                )
-                
-                # Generate prediction
-                if model_type == 'ensemble':
-                    result = await predictor.predict(
-                        features_tabular=tabular,
-                        features_sequence=sequence,
-                        symbol=sample['symbol'],
-                        current_price=price,
-                        volatility=vol,
-                        timeframe=sample['timeframe'],
-                        use_cache=False,
-                    )
-                    pred_value = result.get('confidence', 0.5)
-                elif model_type == 'xgboost':
-                    result = await predictor._predict_xgboost(tabular)
-                    pred_value = float(result[0])
-                elif model_type == 'gru':
-                    result = await predictor._predict_gru(sequence)
-                    pred_value = float(result[0])
-                else:
-                    raise ValueError(f"Unknown model type: {model_type}")
-                
-                predictions.append(pred_value)
-                
-                if (i + 1) % 100 == 0:
-                    logger.info(f"Progress: {i + 1}/{len(samples)} ({(i+1)/len(samples)*100:.1f}%)")
-                    
-            except Exception as e:
-                failed += 1
-                if failed <= 5:  # Log first 5 failures
-                    logger.warning(f"Failed to generate prediction for {sample['symbol']}: {e}")
-                continue
-        
-        logger.info(f"Generated {len(predictions)} predictions ({failed} failed)")
-        
-        if len(predictions) < 100:
-            raise ValueError(f"Insufficient predictions generated: {len(predictions)}")
-        
-        return np.array(predictions)
-    
-    def compute_statistics(
-        self,
-        predictions: np.ndarray,
-        start_date: datetime,
-        end_date: datetime,
-    ) -> Dict[str, Any]:
-        """Compute baseline statistics from predictions."""
-        # Raw predictions
-        raw_stats = {
-            'mean': float(np.mean(predictions)),
-            'std': float(np.std(predictions)),
-            'min': float(np.min(predictions)),
-            'max': float(np.max(predictions)),
-            'sample_size': len(predictions),
-        }
-        
-        # Filtered predictions (high confidence)
-        filtered = predictions[predictions >= self.confidence_threshold]
-        
-        if len(filtered) > 0:
-            filtered_stats = {
-                'mean': float(np.mean(filtered)),
-                'std': float(np.std(filtered)),
-                'min': float(np.min(filtered)),
-                'max': float(np.max(filtered)),
-                'sample_size': len(filtered),
-                'confidence_threshold': self.confidence_threshold,
-            }
-        else:
-            filtered_stats = {
-                'mean': 0.0,
-                'std': 0.0,
-                'min': 0.0,
-                'max': 0.0,
-                'sample_size': 0,
-                'confidence_threshold': self.confidence_threshold,
-            }
-        
-        return {
-            'raw_predictions': raw_stats,
-            'filtered_predictions': filtered_stats,
-            'computed_at': datetime.now(timezone.utc).isoformat(),
-            'data_period': f"{start_date.date()} to {end_date.date()}",
-        }
-    
-    async def populate_model_baseline(
-        self,
-        model_id: str,
-        model_type: str,
-    ) -> Dict[str, Any]:
-        """Populate baseline statistics for a single model."""
-        logger.info(f"Computing baseline statistics for {model_id} ({model_type})")
-        
-        # Get training symbols
-        symbols = await self.get_training_symbols()
-        
-        # Sample recent data
-        end_date = datetime.now(timezone.utc)
-        start_date = end_date - timedelta(days=self.lookback_days)
-        samples = await self.sample_recent_data(symbols)
-        
-        # Load model
-        loader = RegistryModelLoader(
-            session=self.db,
-            num_threads=2,
-            use_gpu=False,
+
+        logger.info(
+            "Ensemble loaded: n_features=%d  sequence_length=%d",
+            ensemble.n_features, ensemble.sequence_length,
         )
-        
-        if model_type == 'ensemble':
-            ensemble = await loader.load_production_ensemble()
-            predictor = EnsemblePredictor.from_loaded_ensemble(ensemble)
+
+        # 2. Collect candidate symbols
+        symbols = await self._candidate_symbols()
+        if not symbols:
+            raise RuntimeError(
+                f"No eligible symbols found (need >= {_MIN_CANDLES} daily candles "
+                f"in the last {_SYMBOL_LOOKBACK_DAYS} days)."
+            )
+        logger.info("Candidate symbols: %d", len(symbols))
+
+        # 3. Generate predictions (one per unique symbol, no timestamp iteration)
+        confidences = await self._predict_symbols(symbols, predictor, feature_loader)
+
+        if len(confidences) < _MIN_VALID_PREDICTIONS:
+            raise RuntimeError(
+                f"Only {len(confidences)} valid predictions generated "
+                f"(minimum {_MIN_VALID_PREDICTIONS} required). "
+                "Check feature store data coverage."
+            )
+
+        # 4. Compute statistics
+        stats = self._compute_statistics(confidences)
+        logger.info(
+            "Baseline stats: mean=%.4f  std=%.4f  n=%d  "
+            "high_conf_mean=%.4f (n=%d)",
+            stats["mean"], stats["std"], stats["sample_size"],
+            stats["high_conf_mean"], stats["high_conf_count"],
+        )
+
+        # 5. Persist to all active production models
+        if not self.dry_run:
+            await self._persist(stats)
         else:
-            # Load individual model
-            ensemble = await loader.load_production_ensemble()
-            predictor = EnsemblePredictor.from_loaded_ensemble(ensemble)
-        
-        # Generate predictions
-        predictions = await self.generate_predictions(samples, predictor, model_type)
-        
-        # Compute statistics
-        stats = self.compute_statistics(predictions, start_date, end_date)
-        
-        logger.info(f"Baseline statistics for {model_id}:")
-        logger.info(f"  Raw: mean={stats['raw_predictions']['mean']:.4f}, "
-                   f"std={stats['raw_predictions']['std']:.4f}, "
-                   f"n={stats['raw_predictions']['sample_size']}")
-        logger.info(f"  Filtered: mean={stats['filtered_predictions']['mean']:.4f}, "
-                   f"std={stats['filtered_predictions']['std']:.4f}, "
-                   f"n={stats['filtered_predictions']['sample_size']}")
-        
+            logger.info("Dry-run: skipping database write")
+
         return stats
-    
-    async def update_model_metadata(
-        self,
-        model_id: str,
-        statistics: Dict[str, Any],
-    ):
-        """Update model metadata with baseline statistics."""
-        stmt = select(MLModelMetadata).where(MLModelMetadata.model_id == model_id)
+
+    # ── private helpers ────────────────────────────────────────────────────────
+
+    async def _candidate_symbols(self) -> list[str]:
+        """Return symbols with sufficient recent daily candles, randomly ordered."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=_SYMBOL_LOOKBACK_DAYS)
+
+        stmt = (
+            select(UpstoxOHLCV.instrument_key)
+            .where(
+                UpstoxOHLCV.timeframe == "1D",   # DB stores daily as '1D'
+                UpstoxOHLCV.timestamp >= cutoff,
+            )
+            .group_by(UpstoxOHLCV.instrument_key)
+            .having(func.count(UpstoxOHLCV.timestamp) >= _MIN_CANDLES)
+            .order_by(func.random())
+            # Request 3× the desired sample to account for feature-load failures
+            .limit(self.sample_size * 3)
+        )
+
         result = await self.db.execute(stmt)
-        model = result.scalar_one_or_none()
-        
-        if not model:
-            raise ValueError(f"Model {model_id} not found")
-        
-        model.training_prediction_stats = statistics
-        await self.db.commit()
-        
-        logger.info(f"Updated baseline statistics for {model_id}")
+        return [row[0] for row in result.fetchall()]
 
+    async def _predict_symbols(
+        self,
+        symbols: list[str],
+        predictor: EnsemblePredictor,
+        feature_loader: FeatureLoader,
+    ) -> np.ndarray:
+        """
+        Run ensemble inference on each symbol and collect confidence scores.
 
-async def populate_all_production_models():
-    """Populate baseline statistics for all production models."""
-    async with AsyncSessionLocal() as db:
-        await init_redis()
-        redis = await get_redis()
-        
-        try:
-            # Get production models
-            stmt = select(MLModelMetadata).where(
-                MLModelMetadata.status == 'production',
-                MLModelMetadata.is_active == True
-            )
-            result = await db.execute(stmt)
-            models = result.scalars().all()
-            
-            if not models:
-                logger.error("No production models found")
-                return
-            
-            logger.info(f"Found {len(models)} production models")
-            
-            computer = BaselineStatisticsComputer(
-                db=db,
-                redis=redis,
-                sample_size=5000,
-                lookback_days=60,
-                confidence_threshold=0.6,
-            )
-            
-            # Process each model
-            for model in models:
-                try:
-                    # Determine model type
-                    if 'xgboost' in model.model_name.lower():
-                        model_type = 'xgboost'
-                    elif 'gru' in model.model_name.lower():
-                        model_type = 'gru'
-                    else:
-                        logger.warning(f"Unknown model type for {model.model_id}, skipping")
-                        continue
-                    
-                    # Compute statistics
-                    stats = await computer.populate_model_baseline(
-                        model_id=model.model_id,
-                        model_type=model_type,
-                    )
-                    
-                    # Update database
-                    await computer.update_model_metadata(model.model_id, stats)
-                    
-                except Exception as e:
-                    logger.error(f"Failed to process {model.model_id}: {e}", exc_info=True)
-                    continue
-            
-            # Also compute ensemble baseline
-            logger.info("Computing ensemble baseline statistics")
+        One inference call per unique symbol — feature_loader always returns
+        current features, so there is no benefit in iterating over timestamps
+        for the same symbol.
+        """
+        confidences: list[float] = []
+        failed = 0
+        target = min(self.sample_size, len(symbols))
+
+        for i, symbol in enumerate(symbols):
+            if len(confidences) >= target:
+                break
+
             try:
-                stats = await computer.populate_model_baseline(
-                    model_id='ensemble',
-                    model_type='ensemble',
+                tabular, sequence, price, vol = await feature_loader.load_features(
+                    symbol=symbol,
+                    timeframe="1d",
                 )
-                logger.info(f"Ensemble baseline: {json.dumps(stats, indent=2)}")
-            except Exception as e:
-                logger.error(f"Failed to compute ensemble baseline: {e}", exc_info=True)
-            
-            logger.info("Baseline statistics population complete")
-            
-        finally:
-            await close_redis()
+                result = await predictor.predict(
+                    features_tabular=tabular,
+                    features_sequence=sequence,
+                    symbol=symbol,
+                    current_price=price,
+                    volatility=vol,
+                    use_cache=False,
+                )
+                confidences.append(float(result["confidence"]))
+
+            except Exception as exc:
+                failed += 1
+                if failed <= 10:
+                    logger.debug("Skipped %s: %s", symbol, exc)
+                continue
+
+            if (i + 1) % 100 == 0 or len(confidences) == target:
+                logger.info(
+                    "Progress: %d/%d predictions  (%d failed so far)",
+                    len(confidences), target, failed,
+                )
+
+        logger.info(
+            "Prediction complete: %d valid  %d failed  %d symbols attempted",
+            len(confidences), failed, i + 1,
+        )
+        return np.array(confidences, dtype=np.float64)
+
+    def _compute_statistics(self, confidences: np.ndarray) -> dict[str, Any]:
+        """Derive flat statistics dict from the confidence array."""
+        high_conf = confidences[confidences >= self.confidence_threshold]
+
+        return {
+            # Flat top-level keys — read directly by drift_detector.check_drift()
+            "mean":           float(np.mean(confidences)),
+            "std":            float(np.std(confidences)),
+            "min":            float(np.min(confidences)),
+            "max":            float(np.max(confidences)),
+            "p25":            float(np.percentile(confidences, 25)),
+            "p50":            float(np.percentile(confidences, 50)),
+            "p75":            float(np.percentile(confidences, 75)),
+            "p90":            float(np.percentile(confidences, 90)),
+            "sample_size":    int(len(confidences)),
+            # High-confidence subset
+            "high_conf_mean":  float(np.mean(high_conf)) if len(high_conf) else 0.0,
+            "high_conf_std":   float(np.std(high_conf))  if len(high_conf) else 0.0,
+            "high_conf_count": int(len(high_conf)),
+            "confidence_threshold": float(self.confidence_threshold),
+            # Provenance
+            "computed_at":     datetime.now(timezone.utc).isoformat(),
+            "data_window_days": _SYMBOL_LOOKBACK_DAYS,
+        }
+
+    async def _persist(self, stats: dict[str, Any]) -> None:
+        """Write baseline stats to every active production MLModelMetadata record."""
+        stmt = select(MLModelMetadata).where(
+            MLModelMetadata.status == "production",
+            MLModelMetadata.is_active == True,
+        )
+        result = await self.db.execute(stmt)
+        models = list(result.scalars().all())
+
+        if not models:
+            logger.warning("No active production models found in ml_model_metadata — nothing written.")
+            return
+
+        for model in models:
+            model.training_prediction_stats = stats
+            logger.info(
+                "Stored baseline in %s (%s)  mean=%.4f  std=%.4f  n=%d",
+                model.model_id, model.model_name,
+                stats["mean"], stats["std"], stats["sample_size"],
+            )
+
+        await self.db.commit()
+        logger.info("Baseline persisted to %d model record(s).", len(models))
 
 
-async def populate_single_model(model_id: str):
-    """Populate baseline statistics for a single model."""
+async def _run(sample_size: int, dry_run: bool) -> None:
     async with AsyncSessionLocal() as db:
         await init_redis()
         redis = await get_redis()
-        
         try:
-            # Get model
-            stmt = select(MLModelMetadata).where(MLModelMetadata.model_id == model_id)
-            result = await db.execute(stmt)
-            model = result.scalar_one_or_none()
-            
-            if not model:
-                logger.error(f"Model {model_id} not found")
-                return
-            
-            # Determine model type
-            if 'xgboost' in model.model_name.lower():
-                model_type = 'xgboost'
-            elif 'gru' in model.model_name.lower():
-                model_type = 'gru'
-            else:
-                logger.error(f"Unknown model type for {model_id}")
-                return
-            
-            computer = BaselineStatisticsComputer(
+            computer = BaselineComputer(
                 db=db,
                 redis=redis,
-                sample_size=5000,
-                lookback_days=60,
-                confidence_threshold=0.6,
+                sample_size=sample_size,
+                dry_run=dry_run,
             )
-            
-            # Compute statistics
-            stats = await computer.populate_model_baseline(
-                model_id=model.model_id,
-                model_type=model_type,
-            )
-            
-            # Update database
-            await computer.update_model_metadata(model.model_id, stats)
-            
-            logger.info("Baseline statistics population complete")
-            
+            stats = await computer.run()
+            print("\n" + "=" * 70)
+            print("BASELINE STATISTICS")
+            print("=" * 70)
+            for k, v in stats.items():
+                if isinstance(v, float):
+                    print(f"  {k:<26} {v:.6f}")
+                else:
+                    print(f"  {k:<26} {v}")
+            print("=" * 70)
         finally:
             await close_redis()
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Populate baseline prediction statistics')
-    parser.add_argument('--model-id', help='Specific model ID to process')
-    parser.add_argument('--all-production', action='store_true', help='Process all production models')
-    
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Populate drift-detection baseline statistics for all production ML models.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python scripts/populate_baseline_statistics.py
+  python scripts/populate_baseline_statistics.py --sample-size 2000
+  python scripts/populate_baseline_statistics.py --dry-run
+        """,
+    )
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=1000,
+        metavar="N",
+        help="Number of unique symbols to run inference on (default: 1000)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Compute and print statistics without writing to the database",
+    )
     args = parser.parse_args()
-    
-    if args.all_production:
-        asyncio.run(populate_all_production_models())
-    elif args.model_id:
-        asyncio.run(populate_single_model(args.model_id))
-    else:
-        parser.print_help()
-        sys.exit(1)
+    asyncio.run(_run(sample_size=args.sample_size, dry_run=args.dry_run))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

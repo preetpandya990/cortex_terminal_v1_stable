@@ -20,9 +20,10 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from app.api.v1 import (
-    admin_users, auth, cai, fusion, governance, hawk_eye, ingestion, intelligence,
-    market_data, ml_drift, ml_predictions, paper_trading, safety, scanner,
-    strategy, trade_suggestions, upstox, health, watchlist
+    admin_strategies, admin_users, auth, cai, fusion, governance, hawk_eye,
+    ingestion, intelligence, market_data, ml_drift, ml_predictions, paper_trading,
+    safety, scanner, strategies, strategy, trade_suggestions, upstox, health,
+    users, watchlist,
 )
 from app.core.config import get_settings
 from app.core.database import engine, worker_engine
@@ -81,15 +82,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.ml_ensemble  = None
     app.state.ml_predictor = None
     try:
-        from app.ml.inference.registry_loader import RegistryModelLoader
+        from app.ml.inference.registry_loader import RegistryModelLoader, bootstrap_production_models
         from app.ml.inference.ensemble_predictor import EnsemblePredictor
         from app.core.database import AsyncSessionLocal
         from app.core.redis import get_cache_service
 
-        # Session is only needed for the DB query inside load_production_ensemble.
-        # LoadedEnsemble stores plain scalars (no ORM objects), so it safely
-        # outlives this session.
+        # Session is only needed for DB queries; LoadedEnsemble stores plain
+        # scalars so it safely outlives this session.
         async with AsyncSessionLocal() as session:
+            await bootstrap_production_models(session)
             loader   = RegistryModelLoader(session=session, num_threads=4, use_gpu=False)
             ensemble = await loader.load_production_ensemble()
 
@@ -144,6 +145,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.pnl_worker_task = pnl_worker_task
     logger.info("Paper Trading P&L worker started")
 
+    # Start Strategy SL/TP monitoring worker
+    from app.services.strategy_engine.sl_tp_worker import run_sl_tp_worker
+    sl_tp_worker_task = asyncio.create_task(
+        run_sl_tp_worker(get_redis()), name="strategy_sl_tp_worker"
+    )
+    app.state.sl_tp_worker_task = sl_tp_worker_task
+    logger.info("Strategy SL/TP monitoring worker started")
+
     logger.info("All services initialized — ready")
     yield
 
@@ -172,6 +181,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.pnl_worker_task.cancel()
         try:
             await asyncio.wait_for(app.state.pnl_worker_task, timeout=5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
+    # Cancel Strategy SL/TP worker
+    if hasattr(app.state, "sl_tp_worker_task") and app.state.sl_tp_worker_task:
+        app.state.sl_tp_worker_task.cancel()
+        try:
+            await asyncio.wait_for(app.state.sl_tp_worker_task, timeout=5.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
 
@@ -225,6 +242,7 @@ def create_app() -> FastAPI:
     # API routes - ML
     app.include_router(auth.router, prefix=f"{settings.API_V1_PREFIX}/auth", tags=["Authentication"])
     app.include_router(admin_users.router, prefix=f"{settings.API_V1_PREFIX}/admin", tags=["Admin — User Management"])
+    app.include_router(admin_strategies.router, prefix=f"{settings.API_V1_PREFIX}/admin/strategies", tags=["Admin — Strategy Governance"])
     app.include_router(watchlist.router, prefix=f"{settings.API_V1_PREFIX}/watchlist", tags=["Watchlist"])
     app.include_router(market_data.router, prefix=f"{settings.API_V1_PREFIX}/market-data", tags=["Market Data"])
     app.include_router(scanner.router, prefix=f"{settings.API_V1_PREFIX}/scanner", tags=["Scanner"])
@@ -243,6 +261,8 @@ def create_app() -> FastAPI:
     app.include_router(intelligence.router, prefix=f"{settings.API_V1_PREFIX}/intelligence", tags=["AI Intelligence"])
     app.include_router(governance.router, prefix=f"{settings.API_V1_PREFIX}/governance", tags=["AI Governance"])
     app.include_router(strategy.router, prefix=f"{settings.API_V1_PREFIX}/strategy", tags=["AI Strategy"])
+    app.include_router(strategies.router, prefix=f"{settings.API_V1_PREFIX}/strategies", tags=["Trading Strategies"])
+    app.include_router(users.router, prefix=f"{settings.API_V1_PREFIX}/users", tags=["User Profile"])
     app.include_router(fusion.router, prefix=f"{settings.API_V1_PREFIX}/fusion", tags=["AI Fusion"])
     app.include_router(safety.router, prefix=f"{settings.API_V1_PREFIX}/safety", tags=["AI Safety"])
     app.include_router(cai.router, prefix=f"{settings.API_V1_PREFIX}/cai", tags=["Cortex AI"])

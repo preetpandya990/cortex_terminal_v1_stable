@@ -9,6 +9,7 @@ Assembles trading signals from multiple data sources:
 Weights (Phase 2–4): event=0.50, ml=0.50, technical=0.00
 Weights (Phase 5+):  event=0.35, ml=0.40, technical=0.25
 """
+import asyncio
 import logging
 import math
 from datetime import datetime, time, timedelta, timezone
@@ -668,13 +669,34 @@ class SignalAssembler:
         from app.core.config import get_settings as _get_settings
         try:
             _settings = _get_settings()
-            await get_redis().setex(
+            _redis = get_redis()
+            await _redis.setex(
                 f"cai:signals:on-demand:{symbol}",
                 _settings.SIGNAL_ON_DEMAND_CACHE_TTL,
                 "1",
             )
         except Exception:
+            _redis = None
             pass  # cache priming is best-effort; never fail assembly over it
+
+        # Fire strategy rule-engine dispatch as a non-blocking background task.
+        # The dispatcher creates its own DB session — completely decoupled from
+        # this session's lifecycle.  Any failure is logged; it never fails assembly.
+        from app.services.strategy_engine.dispatcher import strategy_dispatcher as _dispatcher
+        asyncio.create_task(
+            _dispatcher.dispatch_background(
+                signal_id=signal.id,
+                symbol=symbol,
+                action=signal.action,
+                confidence_score=float(signal.confidence_score),
+                regime_type=signal.regime_type or "unknown",
+                time_horizon=time_horizon,
+                technical_indicators=dict(signal.technical_indicators or {}),
+                ml_predictions=dict(signal.ml_predictions or {}),
+                redis=_redis,
+            ),
+            name=f"strategy_dispatch_{symbol}_{signal.id}",
+        )
 
         logger.info(
             "Signal assembled — symbol=%s action=%s confidence=%.2f horizon=%s expires=%s",

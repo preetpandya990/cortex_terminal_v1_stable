@@ -2,6 +2,7 @@
 
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import { setAccessToken as setAPIAccessToken } from '@/lib/api-client';
+import { setAuthToken } from '@/lib/api';
 import { decodeRole, hasMinimumRole, type UserRole } from '@/lib/jwt';
 
 const SESSION_ENDED_KEY = 'auth:session_ended';
@@ -66,12 +67,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         if (!response.ok) {
           setAccessToken(null);
           setAPIAccessToken(null);
+          setAuthToken(null);
           return false;
         }
 
         const data = await response.json();
-        setAccessToken(data.access_token);
+        // Sync both API clients synchronously before triggering React re-renders,
+        // so any effects that fire on the subsequent render already have the token.
         setAPIAccessToken(data.access_token);
+        setAuthToken(data.access_token);
+        setAccessToken(data.access_token);
 
         const refreshIn = (data.expires_in - 60) * 1000;
         if (refreshTimeoutRef.current) clearTimeout(refreshTimeoutRef.current);
@@ -81,6 +86,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       } catch {
         setAccessToken(null);
         setAPIAccessToken(null);
+        setAuthToken(null);
         return false;
       } finally {
         refreshInFlightRef.current = null;
@@ -94,8 +100,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const login = useCallback(
     (token: string) => {
       try { sessionStorage.removeItem(SESSION_ENDED_KEY); } catch { /* SSR / private browsing */ }
-      setAccessToken(token);
       setAPIAccessToken(token);
+      setAuthToken(token);
+      setAccessToken(token);
     },
     [],
   );
@@ -115,8 +122,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
       });
     } finally {
-      setAccessToken(null);
       setAPIAccessToken(null);
+      setAuthToken(null);
+      setAccessToken(null);
       setUser(null);
     }
   }, [accessToken]);
@@ -150,8 +158,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     initAuth();
 
     const handleAuthRequired = () => {
-      setAccessToken(null);
       setAPIAccessToken(null);
+      setAuthToken(null);
+      setAccessToken(null);
       setUser(null);
     };
     window.addEventListener('auth:required', handleAuthRequired);

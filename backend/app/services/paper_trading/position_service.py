@@ -21,7 +21,11 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
+from typing import TYPE_CHECKING
 from uuid import UUID
+
+if TYPE_CHECKING:
+    from app.services.paper_trading.order_service import _TradeContext
 
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -60,7 +64,7 @@ async def apply_buy_fill_to_position(
     portfolio: Portfolio,
     order: PaperOrder,
     fill: PaperFill,
-    suggestion: TradeSuggestion,
+    ctx: "_TradeContext",  # type: ignore[name-defined]  # forward ref from order_service
 ) -> PaperPosition:
     """
     Open a new position or add to an existing OPEN position (WAC).
@@ -73,7 +77,7 @@ async def apply_buy_fill_to_position(
     existing = await _find_open_position(session, portfolio.id, order.symbol)
 
     if existing is None:
-        position = _open_new_position(portfolio, order, fill, suggestion)
+        position = _open_new_position(portfolio, order, fill, ctx)
         session.add(position)
     else:
         # Add-to-position: recalculate WAC
@@ -371,11 +375,11 @@ def _open_new_position(
     portfolio: Portfolio,
     order: PaperOrder,
     fill: PaperFill,
-    suggestion: TradeSuggestion,
+    ctx: "_TradeContext",  # type: ignore[name-defined]
 ) -> PaperPosition:
     return PaperPosition(
         portfolio_id=portfolio.id,
-        suggestion_id=suggestion.suggestion_id if hasattr(suggestion, "suggestion_id") else None,
+        suggestion_id=ctx.suggestion_id,
         symbol=order.symbol,
         instrument_key=order.instrument_key,
         quantity=fill.fill_quantity,
@@ -385,10 +389,10 @@ def _open_new_position(
         realized_pnl=_ZERO,
         total_charges=fill.total_charges,
         side="LONG" if order.transaction_type == "BUY" else "SHORT",
-        target_price_1=getattr(suggestion, "take_profit_1", None),
-        target_price_2=getattr(suggestion, "take_profit_2", None),
-        target_price_3=getattr(suggestion, "take_profit_3", None),
-        stop_loss=getattr(suggestion, "stop_loss", None),
+        target_price_1=ctx.take_profit_1,
+        target_price_2=ctx.take_profit_2,
+        target_price_3=ctx.take_profit_3,
+        stop_loss=ctx.stop_loss,
         status="OPEN",
         opened_at=datetime.now(timezone.utc),
     )

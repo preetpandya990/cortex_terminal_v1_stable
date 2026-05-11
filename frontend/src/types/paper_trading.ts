@@ -37,7 +37,14 @@ export interface UpdatePortfolioSettingsRequest {
 }
 
 export interface PlaceOrderRequest {
-  suggestion_id: string;
+  /** Signal-backed trade — links to a TradeSuggestion for full audit trail. */
+  suggestion_id?: string;
+
+  /** Manual trade fields — required when suggestion_id is omitted. */
+  symbol?: string;
+  instrument_key?: string;
+  entry_price?: number;
+
   transaction_type: TransactionType;
   product_type: ProductType;
   order_type: OrderType;

@@ -1,8 +1,9 @@
 'use client';
 
 import Link from 'next/link';
+import { useEffect, useRef, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
-import { LogOut } from 'lucide-react';
+import { ChevronDown, LogOut, Settings, Workflow } from 'lucide-react';
 import { useAuth } from '@/contexts/AuthContext';
 import { AdminNavLink } from '@/components/admin/AdminNavLink';
 import { cn } from '@/lib/utils';
@@ -42,19 +43,56 @@ function CortexLogo() {
 function UserBadge() {
   const { user, role, isAdmin, logout } = useAuth();
   const router = useRouter();
+  const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
 
   const displayName = user?.username ?? role;
   const initial = (user?.username?.[0] ?? role[0]).toUpperCase();
 
+  // Close on outside click or Escape
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { setOpen(false); triggerRef.current?.focus(); } };
+    const onClick = (e: MouseEvent) => {
+      if (!menuRef.current?.contains(e.target as Node) && !triggerRef.current?.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    document.addEventListener('mousedown', onClick);
+    return () => { document.removeEventListener('keydown', onKey); document.removeEventListener('mousedown', onClick); };
+  }, [open]);
+
+  // Trap focus inside menu when open
+  const handleMenuKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (!open) return;
+    const items = menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]');
+    if (!items?.length) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (e.key === 'ArrowDown') { e.preventDefault(); (document.activeElement === last ? first : (document.activeElement as HTMLElement)?.nextElementSibling as HTMLElement ?? first)?.focus(); }
+    if (e.key === 'ArrowUp') { e.preventDefault(); (document.activeElement === first ? last : (document.activeElement as HTMLElement)?.previousElementSibling as HTMLElement ?? last)?.focus(); }
+    if (e.key === 'Tab') setOpen(false);
+  };
+
   const handleLogout = async () => {
+    setOpen(false);
     await logout();
     router.push('/login');
   };
 
   return (
-    <div className="flex items-center gap-2">
-      {/* Avatar + name */}
-      <div className="flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 pr-3">
+    <div className="relative">
+      {/* Avatar trigger button */}
+      <button
+        ref={triggerRef}
+        onClick={() => setOpen((v) => !v)}
+        aria-haspopup="true"
+        aria-expanded={open}
+        aria-label={`User menu for ${displayName}`}
+        className="flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 pr-2.5 transition-colors hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400 focus-visible:ring-offset-1"
+      >
         <span
           className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-slate-800 text-[10px] font-bold text-white"
           aria-hidden="true"
@@ -67,18 +105,62 @@ function UserBadge() {
             Admin
           </span>
         )}
-      </div>
-
-      {/* Sign out */}
-      <button
-        onClick={handleLogout}
-        className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400 focus-visible:ring-offset-1"
-        title="Sign out"
-        aria-label="Sign out"
-      >
-        <LogOut className="h-3.5 w-3.5" aria-hidden="true" />
-        <span className="hidden sm:inline">Sign out</span>
+        <ChevronDown
+          className={cn('h-3 w-3 text-slate-400 transition-transform duration-150', open && 'rotate-180')}
+          aria-hidden="true"
+        />
       </button>
+
+      {/* Dropdown menu */}
+      {open && (
+        <div
+          ref={menuRef}
+          role="menu"
+          aria-label="User menu"
+          onKeyDown={handleMenuKeyDown}
+          className={cn(
+            'absolute right-0 top-full z-50 mt-1.5 w-44 overflow-hidden',
+            'rounded-lg border border-slate-200 bg-white shadow-lg shadow-slate-200/60',
+            'animate-in fade-in-0 zoom-in-95 duration-100',
+          )}
+        >
+          <div className="py-1">
+            <Link
+              href="/settings"
+              role="menuitem"
+              tabIndex={0}
+              onClick={() => setOpen(false)}
+              className="flex items-center gap-2.5 px-3.5 py-2 text-sm text-slate-700 transition-colors hover:bg-slate-50 focus-visible:bg-slate-50 focus-visible:outline-none"
+            >
+              <Settings className="h-3.5 w-3.5 text-slate-400" aria-hidden="true" />
+              Profile &amp; Settings
+            </Link>
+            {!isAdmin && (
+              <Link
+                href="/strategies"
+                role="menuitem"
+                tabIndex={0}
+                onClick={() => setOpen(false)}
+                className="flex items-center gap-2.5 px-3.5 py-2 text-sm text-slate-700 transition-colors hover:bg-slate-50 focus-visible:bg-slate-50 focus-visible:outline-none"
+              >
+                <Workflow className="h-3.5 w-3.5 text-slate-400" aria-hidden="true" />
+                My Strategies
+              </Link>
+            )}
+          </div>
+          <div className="border-t border-slate-100 py-1">
+            <button
+              role="menuitem"
+              tabIndex={0}
+              onClick={handleLogout}
+              className="flex w-full items-center gap-2.5 px-3.5 py-2 text-sm text-rose-600 transition-colors hover:bg-rose-50 focus-visible:bg-rose-50 focus-visible:outline-none"
+            >
+              <LogOut className="h-3.5 w-3.5" aria-hidden="true" />
+              Sign out
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

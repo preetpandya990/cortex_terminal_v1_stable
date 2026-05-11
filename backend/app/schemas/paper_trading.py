@@ -230,34 +230,49 @@ class UpdatePortfolioSettingsRequest(BaseModel):
 
 class PlaceOrderRequest(BaseModel):
     """
-    Place a paper order derived from a TradeSuggestion.
+    Place a paper order.
 
-    The suggestion_id links the order back to the originating signal so
-    the audit trail remains complete from ML prediction → human decision →
-    simulated execution.
+    Two modes:
+      Signal-backed  — provide suggestion_id; symbol/instrument_key/entry_price
+                       are derived from the linked TradeSuggestion.
+      Manual         — omit suggestion_id; symbol, instrument_key, and
+                       entry_price are required instead.
 
     Validation rules:
-      - LIMIT and SL orders require price
-      - SL and SL-M orders require trigger_price
-      - price and trigger_price must be positive when provided
+      - Exactly one of (suggestion_id) or (symbol + instrument_key) must be set.
+      - LIMIT and SL orders require price.
+      - SL and SL-M orders require trigger_price.
     """
 
-    suggestion_id: UUID = Field(
-        ...,
-        description="ID of the TradeSuggestion this order originates from",
+    suggestion_id: UUID | None = Field(
+        default=None,
+        description="TradeSuggestion this order originates from (omit for manual trades)",
     )
-    transaction_type: TransactionType = Field(
-        ...,
-        description="BUY or SELL",
+
+    # ── Manual-trade fields — required when suggestion_id is None ─────────────
+    symbol: str | None = Field(
+        default=None,
+        max_length=50,
+        description="NSE trading symbol (required for manual orders)",
     )
+    instrument_key: str | None = Field(
+        default=None,
+        max_length=200,
+        description="Upstox instrument key (required for manual orders)",
+    )
+    entry_price: float | None = Field(
+        default=None,
+        gt=0,
+        description="Reference entry price for cost estimation (required for manual orders)",
+    )
+
+    # ── Common fields ──────────────────────────────────────────────────────────
+    transaction_type: TransactionType = Field(..., description="BUY or SELL")
     product_type: ProductType = Field(
         ...,
         description="CNC (delivery) | MIS (intraday) | NRML (F&O carry)",
     )
-    order_type: OrderType = Field(
-        ...,
-        description="MARKET | LIMIT | SL | SL-M",
-    )
+    order_type: OrderType = Field(..., description="MARKET | LIMIT | SL | SL-M")
     validity: OrderValidity = Field(
         default=OrderValidity.DAY,
         description="DAY (valid for the full session) | IOC (immediate or cancel)",
@@ -266,7 +281,7 @@ class PlaceOrderRequest(BaseModel):
         ...,
         gt=0,
         le=1_000_000,
-        description="Number of shares (user-confirmed, may differ from suggested qty)",
+        description="Number of shares",
     )
     price: float | None = Field(
         default=None,
@@ -280,15 +295,23 @@ class PlaceOrderRequest(BaseModel):
     )
 
     @model_validator(mode="after")
-    def validate_price_requirements(self) -> "PlaceOrderRequest":
+    def validate_all(self) -> "PlaceOrderRequest":
+        # Exactly one trade source must be provided
+        if self.suggestion_id is None:
+            missing = [
+                f for f in ("symbol", "instrument_key", "entry_price")
+                if getattr(self, f) is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"Manual orders require: {', '.join(missing)}. "
+                    "Provide suggestion_id for signal-backed orders."
+                )
+        # Order-type price requirements
         if self.order_type in (OrderType.LIMIT, OrderType.SL) and self.price is None:
-            raise ValueError(
-                f"{self.order_type.value} orders require a price."
-            )
+            raise ValueError(f"{self.order_type.value} orders require a price.")
         if self.order_type in (OrderType.SL, OrderType.SL_M) and self.trigger_price is None:
-            raise ValueError(
-                f"{self.order_type.value} orders require a trigger_price."
-            )
+            raise ValueError(f"{self.order_type.value} orders require a trigger_price.")
         return self
 
 

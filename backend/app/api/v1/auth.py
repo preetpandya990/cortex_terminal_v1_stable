@@ -8,17 +8,17 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-import bcrypt
-
 from app.api.deps import get_db
 from app.core.config import get_settings
 from app.core.redis import get_redis
 from app.core.security import (
     create_token_pair,
     decode_token,
+    hash_password,
     set_refresh_token_cookie,
     clear_refresh_token_cookie,
     get_current_user_id,
+    verify_password,
     CurrentUserID,
 )
 from app.exceptions import AuthError
@@ -26,18 +26,11 @@ from app.models.user import User, RefreshToken
 
 router = APIRouter()
 
-# ── Security constants ─────────────────────────────────────────────────────────
 _settings = get_settings()
-
-# OWASP recommended: 12 rounds (~250 ms). Development uses 10 (~100 ms) so
-# test suites stay responsive while still exercising the real bcrypt path.
-_BCRYPT_ROUNDS: int = 10 if _settings.ENVIRONMENT == "development" else 12
 
 # Pre-computed at startup for constant-time login (prevents username enumeration
 # via response-time differences when the account does not exist).
-_DUMMY_HASH: str = bcrypt.hashpw(
-    b"cortex-timing-sentinel", bcrypt.gensalt(_BCRYPT_ROUNDS)
-).decode()
+_DUMMY_HASH: str = hash_password("cortex-timing-sentinel")
 
 
 # ── Request/Response Models ────────────────────────────────────────────────────
@@ -79,15 +72,6 @@ class UserResponse(BaseModel):
 
 
 # ── Helper Functions ───────────────────────────────────────────────────────────
-def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(_BCRYPT_ROUNDS)).decode("utf-8")
-
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
-
-
-
 async def get_user_by_username(db: AsyncSession, username: str) -> User | None:
     result = await db.execute(select(User).where(User.username == username))
     return result.scalar_one_or_none()

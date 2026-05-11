@@ -365,6 +365,7 @@ export default function HawkEyeRadarPage() {
         <DetailPane
           instrument={detailInstrument}
           onClose={handleCloseDetail}
+          suggestion={detailSuggestion ?? undefined}
         />
       )}
     </div>

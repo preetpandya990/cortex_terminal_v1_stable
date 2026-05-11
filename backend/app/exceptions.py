@@ -165,3 +165,42 @@ class SettlementPendingError(CortexBaseError):
 class DuplicatePortfolioError(DuplicateResourceError):
     """Raised when a user attempts to create a second active portfolio."""
     default_message = "An active portfolio already exists for this user"
+
+
+# ── Trading Strategies ──────────────────────────────────────────────────────────
+
+class StrategyNotFoundError(DataNotFoundError):
+    """Raised when a strategy does not exist or is not accessible to the requester."""
+    default_message = "Strategy not found"
+
+
+class StrategyForbiddenError(ForbiddenError):
+    """Raised when a user attempts to mutate a strategy they do not own."""
+    default_message = "You do not have permission to modify this strategy"
+
+
+class StrategyConflictError(DuplicateResourceError):
+    """Raised on subscription priority collision or duplicate active subscription."""
+    default_message = "Strategy subscription conflict"
+
+
+class StrategyActivationNotFoundError(DataNotFoundError):
+    """Raised when a strategy activation does not exist or is not accessible."""
+    default_message = "Strategy activation not found"
+
+
+class InvalidStrategyStateError(CortexBaseError):
+    """Raised when a requested FSM transition is illegal for the current state."""
+    default_message = "Invalid strategy activation state transition"
+    status_code = 409
+
+
+class BacktestRunNotFoundError(DataNotFoundError):
+    """Raised when a backtest run does not exist or is not accessible."""
+    default_message = "Backtest run not found"
+
+
+class IncorrectPasswordError(CortexBaseError):
+    """Raised when the current_password provided for a profile update is wrong."""
+    default_message = "Current password is incorrect"
+    status_code = 422

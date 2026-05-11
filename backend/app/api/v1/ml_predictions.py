@@ -40,7 +40,13 @@ async def predict(
 
     try:
         redis = await get_redis()
-        feature_loader = FeatureLoader(db=db, redis=redis, sequence_length=60, n_features=47)
+        feature_loader = FeatureLoader(
+            db=db,
+            redis=redis,
+            sequence_length=predictor.sequence_length,
+            n_features=predictor.n_features,
+            feature_names=predictor.feature_names,
+        )
 
         try:
             tabular, sequence, current_price, volatility = await feature_loader.load_features(

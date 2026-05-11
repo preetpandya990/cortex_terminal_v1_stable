@@ -60,20 +60,39 @@ class DriftDetector:
             logger.error(f"AI Model {model_id} not found in database")
             raise ValueError(f"AI Model {model_id} not found")
 
-        # Find corresponding ML model by name mapping
-        stmt = select(MLModelMetadata).where(
-            MLModelMetadata.model_name == ai_model.model_name
+        # Find corresponding ML model.
+        # Governance names follow the pattern 'cortex_<type>_<timeframe>' (e.g. 'cortex_xgboost_1d')
+        # while ML registry names are short ('xgboost', 'gru').  Try exact match first; fall back
+        # to substring match so this bridge remains robust as naming conventions evolve.
+        stmt = (
+            select(MLModelMetadata)
+            .where(
+                MLModelMetadata.status == "production",
+                MLModelMetadata.is_active == True,
+            )
         )
         result = await db.execute(stmt)
-        ml_model = result.scalar_one_or_none()
-        
-        if not ml_model:
-            # No ML predictions to analyze - use simulated metrics
-            logger.warning(f"No ML model found for {ai_model.model_name}, using baseline check")
+        production_records: list[MLModelMetadata] = list(result.scalars().all())
+
+        ml_model: MLModelMetadata | None = None
+        # 1. Exact match
+        ml_model = next((m for m in production_records if m.model_name == ai_model.model_name), None)
+        # 2. Substring match: 'cortex_xgboost_1d' contains 'xgboost'
+        if ml_model is None:
+            ml_model = next(
+                (m for m in production_records if m.model_name in ai_model.model_name),
+                None,
+            )
+
+        if ml_model is None:
+            logger.warning(
+                "No production MLModelMetadata found for governance model '%s' — using baseline check",
+                ai_model.model_name,
+            )
             return await self._baseline_drift_check(db, pubsub, ai_model)
 
-        # Get recent ML predictions (timestamp column is WITHOUT TIME ZONE)
-        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=lookback_hours)
+        # Get recent ML predictions (TIMESTAMPTZ column — keep timezone-aware)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
         stmt = select(MLPrediction).where(
             MLPrediction.model_id == ml_model.model_id,
             MLPrediction.timestamp >= cutoff
@@ -95,10 +114,21 @@ class DriftDetector:
             current_mean = statistics.mean(predictions)
             current_std = statistics.stdev(predictions) if len(predictions) > 1 else 0
             
-            # Get baseline from ML model training stats
+            # Get baseline from ML model training stats.
+            # Flat format: {'mean': ..., 'std': ...}  (current)
+            # Legacy nested format: {'raw_predictions': {'mean': ..., 'std': ...}}
             baseline_stats = ml_model.training_prediction_stats or {}
-            baseline_mean = baseline_stats.get('mean', current_mean)
-            baseline_std = baseline_stats.get('std', 1.0)
+            raw = baseline_stats.get('raw_predictions', {})
+            baseline_mean = (
+                baseline_stats.get('mean')
+                or raw.get('mean')
+                or current_mean
+            )
+            baseline_std = (
+                baseline_stats.get('std')
+                or raw.get('std')
+                or 1.0
+            )
             
             # Calculate drift score using z-score approach
             if baseline_std > 0:

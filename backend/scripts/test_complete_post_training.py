@@ -35,7 +35,7 @@ async def test_complete_workflow():
     
     # Create dummy data
     n_samples = 1000
-    n_features = 47
+    n_features = 49
     sequence_length = 60
     
     X_tab = np.random.randn(n_samples, n_features).astype(np.float32)

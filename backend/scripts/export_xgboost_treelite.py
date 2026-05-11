@@ -41,7 +41,7 @@ TREELITE_MODEL_PATH = TREELITE_DIR / "xgboost_model.tl"
 TREELITE_LIB_PATH = TREELITE_DIR / "xgboost_model"  # Extension added by compiler
 
 # Model configuration
-N_FEATURES = 47
+N_FEATURES = 49
 N_CLASSES = 2  # Binary classification
 
 

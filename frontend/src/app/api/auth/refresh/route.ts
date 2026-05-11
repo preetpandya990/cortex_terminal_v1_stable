@@ -31,10 +31,16 @@ export async function POST(request: NextRequest) {
 
     if (!response.ok) {
       const error = await response.json();
-      return NextResponse.json(
+      const errorResponse = NextResponse.json(
         { error: error.detail || 'Token refresh failed' },
-        { status: response.status }
+        { status: response.status },
       );
+      // A 401 means the refresh token is revoked/expired — purge the stale cookie
+      // so the middleware stops blocking the /login page and the loop breaks.
+      if (response.status === 401) {
+        errorResponse.cookies.delete('refresh_token');
+      }
+      return errorResponse;
     }
 
     const data = await response.json();

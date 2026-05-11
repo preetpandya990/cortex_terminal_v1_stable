@@ -11,6 +11,27 @@ import type {
 import type { UpstoxCandlesResponse } from '@/types/upstox';
 import type { SuggestionsListResponse, SuggestionFilters } from '@/types/trade_suggestions';
 import type {
+  ActivationsListResponse,
+  BacktestRunsListResponse,
+  CreateStrategyRequest,
+  ReorderSubscriptionsRequest,
+  StrategiesListResponse,
+  Strategy,
+  StrategyActivation,
+  StrategyBacktestRun,
+  StrategyPerformance,
+  SubscribeStrategyRequest,
+  SubscriptionsListResponse,
+  TradesListResponse,
+  TriggerBacktestRequest,
+  UpdateStrategyRequest,
+  UpdateUserPreferencesRequest,
+  UpdateUserProfileRequest,
+  UserPreferences,
+  UserProfile,
+  UserStrategySubscription,
+} from '@/types/strategies';
+import type {
   CreatePortfolioRequest,
   UpdatePortfolioSettingsRequest,
   PlaceOrderRequest,
@@ -719,6 +740,201 @@ export const paperTradingAPI = {
   },
 };
 
+// User Profile & Preferences API
+export const userAPI = {
+  getProfile: async (): Promise<UserProfile> => {
+    return requestData(
+      api.get<UserProfile>('/users/me/profile'),
+      'Failed to fetch user profile'
+    );
+  },
+
+  updateProfile: async (payload: UpdateUserProfileRequest): Promise<UserProfile> => {
+    return requestData(
+      api.put<UserProfile>('/users/me/profile', payload),
+      'Failed to update profile'
+    );
+  },
+
+  getPreferences: async (): Promise<UserPreferences> => {
+    return requestData(
+      api.get<UserPreferences>('/users/me/preferences'),
+      'Failed to fetch preferences'
+    );
+  },
+
+  updatePreferences: async (payload: UpdateUserPreferencesRequest): Promise<UserPreferences> => {
+    return requestData(
+      api.put<UserPreferences>('/users/me/preferences', payload),
+      'Failed to update preferences'
+    );
+  },
+};
+
+// Trading Strategies API
+export const strategiesAPI = {
+  // Strategy CRUD
+  create: async (payload: CreateStrategyRequest): Promise<Strategy> => {
+    return requestData(
+      api.post<Strategy>('/strategies/', payload),
+      'Failed to create strategy'
+    );
+  },
+
+  list: async (params?: { status?: string; tags?: string[]; page?: number; page_size?: number }): Promise<StrategiesListResponse> => {
+    return requestData(
+      api.get<StrategiesListResponse>('/strategies/', { params }),
+      'Failed to fetch strategies'
+    );
+  },
+
+  listMine: async (params?: { status?: string; page?: number; page_size?: number }): Promise<StrategiesListResponse> => {
+    return requestData(
+      api.get<StrategiesListResponse>('/strategies/mine', { params }),
+      'Failed to fetch your strategies'
+    );
+  },
+
+  get: async (id: string): Promise<Strategy> => {
+    return requestData(
+      api.get<Strategy>(`/strategies/${id}`),
+      'Failed to fetch strategy'
+    );
+  },
+
+  update: async (id: string, payload: UpdateStrategyRequest): Promise<Strategy> => {
+    return requestData(
+      api.put<Strategy>(`/strategies/${id}`, payload),
+      'Failed to update strategy'
+    );
+  },
+
+  delete: async (id: string): Promise<void> => {
+    return requestData(
+      api.delete(`/strategies/${id}`),
+      'Failed to archive strategy'
+    );
+  },
+
+  duplicate: async (id: string): Promise<Strategy> => {
+    return requestData(
+      api.post<Strategy>(`/strategies/${id}/duplicate`),
+      'Failed to duplicate strategy'
+    );
+  },
+
+  // Subscriptions
+  getSubscriptions: async (): Promise<SubscriptionsListResponse> => {
+    return requestData(
+      api.get<SubscriptionsListResponse>('/strategies/subscriptions'),
+      'Failed to fetch subscriptions'
+    );
+  },
+
+  subscribe: async (strategyId: string, payload: SubscribeStrategyRequest): Promise<void> => {
+    return requestData(
+      api.post(`/strategies/${strategyId}/subscribe`, payload),
+      'Failed to subscribe to strategy'
+    );
+  },
+
+  setSubscriptionActive: async (strategyId: string, isActive: boolean): Promise<UserStrategySubscription> => {
+    return requestData(
+      api.patch<UserStrategySubscription>(`/strategies/${strategyId}/subscribe`, { is_active: isActive }),
+      isActive ? 'Failed to resume subscription' : 'Failed to pause subscription'
+    );
+  },
+
+  unsubscribe: async (strategyId: string): Promise<void> => {
+    return requestData(
+      api.delete(`/strategies/${strategyId}/subscribe`),
+      'Failed to unsubscribe from strategy'
+    );
+  },
+
+  reorderSubscriptions: async (payload: ReorderSubscriptionsRequest): Promise<SubscriptionsListResponse> => {
+    return requestData(
+      api.put<SubscriptionsListResponse>('/strategies/subscriptions/reorder', payload),
+      'Failed to reorder subscriptions'
+    );
+  },
+
+  // Activations
+  getActivations: async (params?: { symbol?: string; state?: string; strategy_id?: string; page?: number; page_size?: number }): Promise<ActivationsListResponse> => {
+    return requestData(
+      api.get<ActivationsListResponse>('/strategies/activations', { params }),
+      'Failed to fetch activations'
+    );
+  },
+
+  getActivation: async (activationId: string): Promise<StrategyActivation> => {
+    return requestData(
+      api.get<StrategyActivation>(`/strategies/activations/${activationId}`),
+      'Failed to fetch activation'
+    );
+  },
+
+  cancelActivation: async (activationId: string): Promise<StrategyActivation> => {
+    return requestData(
+      api.post<StrategyActivation>(`/strategies/activations/${activationId}/cancel`),
+      'Failed to cancel activation'
+    );
+  },
+
+  exitActivation: async (activationId: string, exitPrice?: number | null): Promise<StrategyActivation> => {
+    return requestData(
+      api.post<StrategyActivation>(`/strategies/activations/${activationId}/exit`, {
+        exit_price: exitPrice ?? null,
+      }),
+      'Failed to exit activation'
+    );
+  },
+
+  // Trades & Performance
+  getTrades: async (strategyId: string, params?: { page?: number; page_size?: number }): Promise<TradesListResponse> => {
+    return requestData(
+      api.get<TradesListResponse>(`/strategies/${strategyId}/trades`, { params }),
+      'Failed to fetch trades'
+    );
+  },
+
+  getPerformance: async (strategyId: string): Promise<StrategyPerformance> => {
+    return requestData(
+      api.get<StrategyPerformance>(`/strategies/${strategyId}/performance`),
+      'Failed to fetch performance'
+    );
+  },
+
+  // Backtests
+  triggerBacktest: async (strategyId: string, payload: TriggerBacktestRequest): Promise<StrategyBacktestRun> => {
+    return requestData(
+      api.post<StrategyBacktestRun>(`/strategies/${strategyId}/backtests`, payload),
+      'Failed to queue backtest'
+    );
+  },
+
+  listBacktests: async (strategyId: string): Promise<BacktestRunsListResponse> => {
+    return requestData(
+      api.get<BacktestRunsListResponse>(`/strategies/${strategyId}/backtests`),
+      'Failed to fetch backtest runs'
+    );
+  },
+
+  getBacktest: async (strategyId: string, runId: string): Promise<StrategyBacktestRun> => {
+    return requestData(
+      api.get<StrategyBacktestRun>(`/strategies/${strategyId}/backtests/${runId}`),
+      'Failed to fetch backtest run'
+    );
+  },
+
+  cancelBacktest: async (strategyId: string, runId: string): Promise<void> => {
+    return requestData(
+      api.delete(`/strategies/${strategyId}/backtests/${runId}`),
+      'Failed to cancel backtest'
+    );
+  },
+};
+
 export const watchlistAPI = {
   getWatchlist: async (): Promise<WatchlistItem[]> => {
     return requestData(
@@ -752,6 +968,109 @@ export const watchlistAPI = {
     return requestData(
       api.get(`/watchlist/check/${encodeURIComponent(instrumentKey)}`),
       'Failed to check watchlist status'
+    );
+  },
+};
+
+// ── Admin — Strategy Governance ───────────────────────────────────────────────
+
+export interface AdminStrategyItem {
+  id: string;
+  created_by: number;
+  creator_username: string | null;
+  name: string;
+  description: string | null;
+  tags: string[] | null;
+  scope: string;
+  status: string;
+  version: number;
+  total_subscribers: number;
+  avg_daily_return_pct: number | null;
+  win_rate_pct: number | null;
+  total_trades: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AdminStrategiesListResponse {
+  items: AdminStrategyItem[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface PromoteStrategyRequest {
+  reason: string;
+}
+
+export interface StrategyAuditLogEntry {
+  id: number;
+  strategy_id: string | null;
+  admin_user_id: number | null;
+  admin_username: string | null;
+  action: 'promote' | 'demote';
+  reason: string;
+  scope_before: string;
+  scope_after: string;
+  strategy_name: string;
+  created_at: string;
+}
+
+export interface StrategyAuditLogListResponse {
+  items: StrategyAuditLogEntry[];
+  total: number;
+}
+
+export const adminStrategiesAPI = {
+  createLibraryStrategy: async (payload: CreateStrategyRequest): Promise<AdminStrategyItem> =>
+    requestData(
+      api.post<AdminStrategyItem>('/admin/strategies', payload),
+      'Failed to create library strategy',
+    ),
+
+  list: async (params?: {
+    scope?: string;
+    status?: string;
+    search?: string;
+    page?: number;
+    page_size?: number;
+  }): Promise<AdminStrategiesListResponse> => {
+    const query = new URLSearchParams();
+    if (params?.scope) query.set('scope', params.scope);
+    if (params?.status) query.set('status', params.status);
+    if (params?.search) query.set('search', params.search);
+    if (params?.page) query.set('page', String(params.page));
+    if (params?.page_size) query.set('page_size', String(params.page_size));
+    const qs = query.toString();
+    return requestData(
+      api.get<AdminStrategiesListResponse>(`/admin/strategies${qs ? `?${qs}` : ''}`),
+      'Failed to fetch strategies',
+    );
+  },
+
+  promote: async (strategyId: string, body: PromoteStrategyRequest): Promise<AdminStrategyItem> =>
+    requestData(
+      api.post<AdminStrategyItem>(`/admin/strategies/${strategyId}/promote`, body),
+      'Failed to promote strategy',
+    ),
+
+  demote: async (strategyId: string, body: PromoteStrategyRequest): Promise<AdminStrategyItem> =>
+    requestData(
+      api.delete<AdminStrategyItem>(`/admin/strategies/${strategyId}/promote`, { data: body }),
+      'Failed to demote strategy',
+    ),
+
+  getAuditLog: async (
+    strategyId: string,
+    params?: { page?: number; page_size?: number },
+  ): Promise<StrategyAuditLogListResponse> => {
+    const query = new URLSearchParams();
+    if (params?.page) query.set('page', String(params.page));
+    if (params?.page_size) query.set('page_size', String(params.page_size));
+    const qs = query.toString();
+    return requestData(
+      api.get<StrategyAuditLogListResponse>(`/admin/strategies/${strategyId}/audit-log${qs ? `?${qs}` : ''}`),
+      'Failed to fetch audit log',
     );
   },
 };
