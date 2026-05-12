@@ -22,13 +22,21 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
-# Default RSS feeds for Indian financial markets
+# Default RSS/XML feeds for Indian financial markets.
+# Exchange feeds provide corporate announcements, board meetings, and results
+# with higher credibility than general financial news.
 DEFAULT_RSS_FEEDS = [
+    # ── Financial news sources ─────────────────────────────────────────────────
     ("Economic Times Markets", "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"),
     ("Moneycontrol", "https://www.moneycontrol.com/rss/latestnews.xml"),
     ("Business Standard", "https://www.business-standard.com/rss/markets-106.rss"),
     ("LiveMint Markets", "https://www.livemint.com/rss/markets"),
     ("Reuters India Business", "https://feeds.reuters.com/reuters/INbusinessNews"),
+    # ── Official exchange feeds ────────────────────────────────────────────────
+    # NSE corporate filings: board meetings, results, insider trading disclosures
+    ("NSE Corporate Filings", "https://www.nseindia.com/static/rss-feed"),
+    # BSE corporate announcements and circulars
+    ("BSE Corporate Notices", "https://www.bseindia.com/data/xml/notices.xml"),
 ]
 
 

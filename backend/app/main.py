@@ -21,9 +21,9 @@ from slowapi.middleware import SlowAPIMiddleware
 
 from app.api.v1 import (
     admin_strategies, admin_users, auth, cai, fusion, governance, hawk_eye,
-    ingestion, intelligence, market_data, ml_drift, ml_predictions, paper_trading,
+    ingestion, intelligence, market_data, ml_drift, ml_patterns, ml_predictions, paper_trading,
     safety, scanner, strategies, strategy, trade_suggestions, upstox, health,
-    users, watchlist,
+    users, watchlist, ai_sentiment, ai_stream,
 )
 from app.core.config import get_settings
 from app.core.database import engine, worker_engine
@@ -58,6 +58,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Prometheus metrics initialized")
 
     await init_redis()
+
+    # Initialize FinBERT NLP engine (ONNX GPU) — runs model loading in thread pool
+    try:
+        from app.ai.intelligence.nlp_engine import NLPEngine
+        await NLPEngine.initialize()
+        logger.info("FinBERT NLP engine initialized")
+    except Exception as exc:
+        logger.warning("FinBERT initialization failed (sentiment analysis degraded): %s", exc)
 
     upstox_client = UpstoxClient()
     await upstox_client.start()
@@ -252,10 +260,15 @@ def create_app() -> FastAPI:
     app.include_router(trade_suggestions.router, prefix=f"{settings.API_V1_PREFIX}/trade-suggestions", tags=["Trade Suggestions"])
     app.include_router(trade_suggestions.ws_router, prefix=f"{settings.API_V1_PREFIX}/trade-suggestions", tags=["Trade Suggestions WebSocket"])
     app.include_router(ml_predictions.router, prefix=f"{settings.API_V1_PREFIX}/ml", tags=["ML Predictions"])
+    app.include_router(ml_patterns.router, prefix=settings.API_V1_PREFIX, tags=["ML Pattern Analysis"])
     app.include_router(ml_drift.router, prefix=settings.API_V1_PREFIX, tags=["ML Drift"])
     app.include_router(paper_trading.router, prefix=f"{settings.API_V1_PREFIX}/paper-trading", tags=["Paper Trading"])
     app.include_router(paper_trading.ws_router, prefix=settings.API_V1_PREFIX, tags=["Paper Trading WebSocket"])
     
+    # API routes - AI Analysis Cards
+    app.include_router(ai_sentiment.router, prefix=settings.API_V1_PREFIX, tags=["AI Sentiment Analysis"])
+    app.include_router(ai_stream.router, prefix=settings.API_V1_PREFIX, tags=["AI Analysis Stream"])
+
     # API routes - AI
     app.include_router(ingestion.router, prefix=f"{settings.API_V1_PREFIX}/ingestion", tags=["AI Ingestion"])
     app.include_router(intelligence.router, prefix=f"{settings.API_V1_PREFIX}/intelligence", tags=["AI Intelligence"])

@@ -83,6 +83,8 @@ export function WatchlistProvider({ children }: { children: React.ReactNode }) {
   const reconnectTimeout = useRef<ReturnType<typeof setTimeout> | null>(null)
   const reconnectAttempt = useRef(0)
   const shouldConnectRef = useRef(false)
+  // Always points to the latest connectWs — prevents stale closures in onclose callbacks
+  const connectWsRef     = useRef<() => void>(() => {})
   const [isMarketFeedConnected, setIsMarketFeedConnected] = useState(false)
 
   // ── Watchlist fetch ──────────────────────────────────────────────────────
@@ -239,6 +241,10 @@ export function WatchlistProvider({ children }: { children: React.ReactNode }) {
     }
 
     ws.onclose = () => {
+      // If a new connection was already established (e.g. token refresh re-ran
+      // the effect before this onclose fired), don't touch wsRef or reconnect.
+      if (wsRef.current !== ws) return
+
       wsRef.current = null
       setIsMarketFeedConnected(false)
 
@@ -249,9 +255,12 @@ export function WatchlistProvider({ children }: { children: React.ReactNode }) {
       reconnectAttempt.current = attempt + 1
       const base  = Math.min(1000 * Math.pow(2, attempt), 30_000)
       const jitter = base * 0.25 * (Math.random() * 2 - 1)
-      reconnectTimeout.current = setTimeout(connectWs, base + jitter)
+      // Use ref so we always call the latest connectWs (avoids stale token in URL)
+      reconnectTimeout.current = setTimeout(() => connectWsRef.current(), base + jitter)
     }
   }, [buildWsUrl])
+  // Keep ref in sync — runs synchronously during render, before any effect fires
+  connectWsRef.current = connectWs
 
   useEffect(() => {
     if (!isAuthenticated || !isAuthReady || !accessToken) {

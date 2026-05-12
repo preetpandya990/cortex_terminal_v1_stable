@@ -658,7 +658,10 @@ export function DetailPane({ instrument, onClose, showAnalysis = true, suggestio
 
                 {/* Analysis section */}
                 {showAnalysis && (
-                  <AnalysisCardsSection instrumentKey={instrument.instrument_key} />
+                  <AnalysisCardsSection
+                    instrumentKey={instrument.instrument_key}
+                    symbol={instrument.trading_symbol ?? undefined}
+                  />
                 )}
               </CardContent>
             </Card>

@@ -164,6 +164,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
     if (!enabled) return;
 
     shouldReconnectRef.current = true;
+    reconnectAttemptsCountRef.current = 0;
     let ws: WebSocket | null = null;
     let reconnectTimeout: NodeJS.Timeout | null = null;
     let heartbeatIntervalId: NodeJS.Timeout | null = null;

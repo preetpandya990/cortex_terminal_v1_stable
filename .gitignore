@@ -411,10 +411,14 @@ backend/models/cache/
 # ============================================
 !.gitignore
 !.gitkeep
-!README.md
-!requirements.txt
-!package.json
-!package-lock.json
+!/README.md
+!/requirements.txt
+!/package.json
+!/package-lock.json
+
+# Graphify generated cache
+graphify-out/cache/
+/node_modules/
 
 # ============================================
 # Working Files / Conversation History

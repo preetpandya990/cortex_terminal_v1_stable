@@ -32,6 +32,7 @@ ijson==3.3.0                    # Streaming JSON parser
 # ── WebSocket ──────────────────────────────────────────────────────────────────
 websockets==13.1                # WebSocket support
 protobuf>=4.25,<7                # Upstox market data feed — protobuf binary decode
+sse-starlette==1.8.2            # Production-grade SSE (Server-Sent Events) for FastAPI
 
 # ── Security ───────────────────────────────────────────────────────────────────
 PyJWT==2.10.0                   # JWT encode/decode
@@ -40,6 +41,7 @@ cryptography==42.0.5            # Fernet encryption for model artifacts
 # ── Rate Limiting ──────────────────────────────────────────────────────────────
 slowapi==0.1.9                  # Rate limiting with Redis backend
 tenacity==8.2.3                 # Retry logic with exponential backoff
+cachetools==7.1.1               # In-memory caching (LRU cache for pattern detection)
 
 # ── ML & AI ────────────────────────────────────────────────────────────────────
 # TensorFlow with bundled CUDA/cuDNN (WSL2/Linux only — installs nvidia-*-cu12 packages)
@@ -52,15 +54,24 @@ keras-tuner==1.4.7              # Hyperparameter optimization (keras-tuner >= 1.
 # MUST be installed separately BEFORE this file to get the CPU wheel:
 #   pip install torch==2.5.1+cpu --index-url https://download.pytorch.org/whl/cpu
 torch==2.5.1                    # CPU-only — see install note above
-transformers==4.36.2            # Hugging Face transformers (FinBERT)
+transformers==4.46.3            # Hugging Face transformers (FinBERT) — 4.46.3 is the resolved version; 4.41+ requires tf-keras for Keras 3 compat
+tf-keras>=2.16.0                # Keras 2 compatibility shim required by transformers 4.41+ when Keras 3 is installed (via tensorflow)
 sentencepiece==0.1.99           # Tokenizer for transformers
-onnxruntime==1.19.2             # ONNX CPU inference — updated for numpy 2.x + ONNX opset 20
+onnxruntime-gpu==1.19.2         # ONNX GPU inference via CUDAExecutionProvider — do NOT also install onnxruntime (CPU); both write to the same onnxruntime/ namespace and the CPU uninstall removes shared __init__.py
+onnx==1.16.1                    # Pinned: >=1.16 required by onnxruntime-gpu 1.19.2 (TensorProto.INT4); <=1.16.1 required by hummingbird-ml 0.4.12
 evidently==0.4.33               # ML monitoring and drift detection
 
 # XGBoost — CPU only to avoid CUDA version conflicts with tensorflow[and-cuda].
 # The RTX 3050 (4GB) GPU budget is allocated exclusively to TF/GRU training.
 # XGBoost on CPU with tree_method='hist' is fast enough for 4M tabular samples.
 xgboost==2.0.3                  # Gradient boosting (CPU); GPU requires matching CUDA build
+
+# FinBERT ONNX export & optimization (GPU inference via onnxruntime-gpu)
+# optimum converts HF models to ONNX and loads them with ORTModel classes.
+# Install note: onnxruntime-gpu must be installed before optimum[onnxruntime] to
+# avoid pip silently downgrading to onnxruntime (CPU build).
+optimum[onnxruntime]==1.23.3    # HuggingFace Optimum — ONNX export + ORTModel inference
+onnxscript>=0.1.0               # Required by optimum for PyTorch → ONNX export at first model load
 
 # ONNX conversion libraries
 onnxmltools==1.12.0             # XGBoost to ONNX converter
@@ -80,6 +91,11 @@ openai==1.10.0                  # OpenAI client (optional fallback)
 # ── NLP ────────────────────────────────────────────────────────────────────────
 spacy==3.7.2                    # NLP pipeline
 # Run after install: python -m spacy download en_core_web_sm
+
+# TA-Lib candlestick pattern detection (requires system lib first)
+# Ubuntu/Debian: sudo apt-get install libta-lib-dev
+# macOS: brew install ta-lib
+TA-Lib>=0.4.28                  # 61 candlestick patterns via C library
 
 # ── Data Processing ────────────────────────────────────────────────────────────
 numpy==2.1.3                    # Numerical computing (2.x — scikit-learn >= 1.5.0 required)

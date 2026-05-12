@@ -2,264 +2,196 @@
 
 /**
  * Analysis Cards Section
- * Displays ML predictions, trend analysis, and volatility metrics
+ * ======================
+ * World-class financial intelligence dashboard displaying three cards:
+ *  1. ML Pattern Analysis  — auto-detected candlestick pattern (TA-Lib, 61 patterns)
+ *  2. AI Sentiment         — FinBERT ONNX news sentiment from RSS + NSE/BSE feeds
+ *  3. Prediction Summary   — client-side synthesis → BUY / SELL / HOLD
+ *
+ * Real-time updates via Server-Sent Events (SSE).
+ * Falls back to parallel React Query polling if SSE is unavailable.
  */
 
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { TrendingUp, Activity, BarChart3, TrendingDown, Minus, Loader2 } from "lucide-react";
-import { useQuery } from "@tanstack/react-query";
-import { api } from "@/lib/api";
-import { useAuth } from "@/contexts/AuthContext";
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { api } from '@/lib/api';
+import { useAuth } from '@/contexts/AuthContext';
+import { MLPatternCard } from './MLPatternCard';
+import { AISentimentCard } from './AISentimentCard';
+import { PredictionSummaryCard } from './PredictionSummaryCard';
+import type {
+  AnalysisStreamEvent,
+  PatternAnalysisCard,
+  SentimentAnalysisCard,
+} from '@/types/analysis';
 
 interface AnalysisCardsSectionProps {
   instrumentKey: string | null;
+  symbol?: string | null;  // Optional NSE ticker for news filtering (e.g. "RELIANCE")
   className?: string;
 }
 
-interface MLPrediction {
-  symbol: string;
-  available: boolean;
-  unavailable_reason?: string | null;
-  direction?: string | null;
-  confidence?: number | null;
-  entry_price?: number | null;
-  stop_loss?: number | null;
-  take_profit_1?: number | null;
-  take_profit_2?: number | null;
-  take_profit_3?: number | null;
-  volatility?: number | null;
-  probabilities?: { up: number; down: number; hold: number } | null;
-  model_version?: string | null;
-  predicted_at?: string | null;
+// ── SSE connection hook ────────────────────────────────────────────────────────
+
+const SSE_MAX_RETRIES = 3;
+const SSE_RETRY_DELAY_MS = 5_000;
+
+function useAnalysisStream(
+  instrumentKey: string | null,
+  symbol: string | null | undefined,
+  accessToken: string | null,
+  enabled: boolean,
+) {
+  const [patternData, setPatternData] = useState<PatternAnalysisCard | null>(null);
+  const [sentimentData, setSentimentData] = useState<SentimentAnalysisCard | null>(null);
+  const [isConnected, setIsConnected] = useState(false);
+  const [isInitialLoad, setIsInitialLoad] = useState(true);
+
+  const esRef = useRef<EventSource | null>(null);
+  const retryCountRef = useRef(0);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const connect = useCallback(() => {
+    if (!enabled || !instrumentKey || !accessToken) return;
+
+    esRef.current?.close();
+
+    const url = new URL('/api/v1/ai/stream', window.location.origin);
+    url.searchParams.set('instrument_key', instrumentKey);
+    url.searchParams.set('token', accessToken);
+    if (symbol) url.searchParams.set('symbol', symbol);
+
+    const es = new EventSource(url.toString());
+    esRef.current = es;
+
+    es.addEventListener('analysis_update', (e: MessageEvent) => {
+      try {
+        const payload: AnalysisStreamEvent = JSON.parse(e.data);
+        if (payload.pattern)   setPatternData(payload.pattern);
+        if (payload.sentiment) setSentimentData(payload.sentiment);
+        setIsInitialLoad(false);
+        setIsConnected(true);
+        retryCountRef.current = 0;
+      } catch {
+        // malformed payload — ignore
+      }
+    });
+
+    es.addEventListener('error', (e: MessageEvent) => {
+      // Non-fatal error from server — keep connection open
+      // (distinct from es.onerror which fires on connection loss)
+    });
+
+    es.onerror = () => {
+      setIsConnected(false);
+      es.close();
+
+      if (retryCountRef.current < SSE_MAX_RETRIES) {
+        retryCountRef.current += 1;
+        retryTimerRef.current = setTimeout(connect, SSE_RETRY_DELAY_MS);
+      }
+      // After max retries, fall back to React Query polling (queries are always enabled)
+    };
+  }, [enabled, instrumentKey, symbol, accessToken]);
+
+  // Connect / reconnect when key deps change
+  useEffect(() => {
+    if (!enabled) return;
+    setIsInitialLoad(true);
+    setPatternData(null);
+    setSentimentData(null);
+    retryCountRef.current = 0;
+    connect();
+
+    return () => {
+      esRef.current?.close();
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+    };
+  }, [connect, enabled, instrumentKey]);
+
+  return { patternData, sentimentData, isConnected, isInitialLoad };
 }
 
-interface HawkEyeAnalysis {
-  instrument_key: string;
-  timeframe: string;
-  indicators: {
-    rsi: number;
-    macd: { value: number; signal: number; histogram: number };
-    moving_averages: { sma_20: number; sma_50: number; ema_20: number };
-    bollinger_bands: { upper: number; middle: number; lower: number };
-  };
-  signals: {
-    trend: string;
-    strength: string;
-    recommendation: string;
-  };
-}
+// ── Main component ─────────────────────────────────────────────────────────────
 
-export function AnalysisCardsSection({ instrumentKey, className }: AnalysisCardsSectionProps) {
-  const { isAuthenticated, isAuthReady } = useAuth();
+export function AnalysisCardsSection({
+  instrumentKey,
+  symbol,
+  className,
+}: AnalysisCardsSectionProps) {
+  const { isAuthenticated, isAuthReady, accessToken } = useAuth();
   const canQuery = isAuthReady && isAuthenticated && !!instrumentKey;
 
-  // Fetch ML prediction
-  const mlQuery = useQuery({
-    queryKey: ["ml-prediction", instrumentKey],
+  // ── SSE real-time stream ───────────────────────────────────────────────────
+  const {
+    patternData: ssePattern,
+    sentimentData: sseSentiment,
+    isConnected: sseConnected,
+    isInitialLoad: sseLoading,
+  } = useAnalysisStream(instrumentKey, symbol, accessToken, canQuery);
+
+  // ── Polling fallback (React Query) ─────────────────────────────────────────
+  // Always active — provides data when SSE hasn't fired yet or after max retries.
+  const patternQuery = useQuery({
+    queryKey: ['ml-pattern-strongest', instrumentKey],
     queryFn: async () => {
-      const response = await api.post(`/ml/predict`, {
-        symbol: instrumentKey,
-        timeframe: "1d",
+      const res = await api.get('/ml/pattern-analysis', {
+        params: { instrument_key: instrumentKey, auto_detect: true },
       });
-      return response.data as MLPrediction;
+      return res.data as PatternAnalysisCard;
     },
     enabled: canQuery,
-    staleTime: 60_000, // 1 minute
+    staleTime: 300_000,   // 5 minutes
+    refetchInterval: sseConnected ? false : 300_000,  // poll only when SSE is down
   });
 
-  // Fetch Hawk-Eye analysis
-  const analysisQuery = useQuery({
-    queryKey: ["hawk-eye-analysis", instrumentKey],
+  const sentimentQuery = useQuery({
+    queryKey: ['ai-sentiment', instrumentKey, symbol],
     queryFn: async () => {
-      const response = await api.get(`/hawk-eye/analyze`, {
+      const res = await api.get('/ai/sentiment', {
         params: {
           instrument_key: instrumentKey,
-          timeframe: "1d",
+          ...(symbol ? { symbol } : {}),
+          lookback_hours: 24,
         },
       });
-      return response.data as HawkEyeAnalysis;
+      return res.data as SentimentAnalysisCard;
     },
     enabled: canQuery,
-    staleTime: 300_000, // 5 minutes
+    staleTime: 120_000,   // 2 minutes
+    refetchInterval: sseConnected ? false : 120_000,
   });
 
-  if (!instrumentKey) {
-    return null;
-  }
+  if (!instrumentKey) return null;
 
-  // Map backend direction to display format
-  const getDirectionColor = (direction: string | null | undefined) => {
-    const dir = direction?.toUpperCase();
-    if (dir === "BUY") return "text-emerald-600";
-    if (dir === "SELL") return "text-red-600";
-    return "text-slate-600";
-  };
+  // SSE data takes priority; fall back to React Query data
+  const patternData = ssePattern ?? patternQuery.data ?? null;
+  const sentimentData = sseSentiment ?? sentimentQuery.data ?? null;
 
-  const getDirectionBgColor = (direction: string | null | undefined) => {
-    const dir = direction?.toUpperCase();
-    if (dir === "BUY") return "bg-emerald-500";
-    if (dir === "SELL") return "bg-red-500";
-    return "bg-slate-400";
-  };
-
-  const getTrendIcon = (trend: string) => {
-    if (trend === "bullish") return <TrendingUp className="h-5 w-5 text-emerald-600" />;
-    if (trend === "bearish") return <TrendingDown className="h-5 w-5 text-red-600" />;
-    return <Minus className="h-5 w-5 text-slate-400" />;
-  };
-
-  const getTrendColor = (trend: string) => {
-    if (trend === "bullish") return "text-emerald-600";
-    if (trend === "bearish") return "text-red-600";
-    return "text-slate-600";
-  };
-
-  const getRecommendationColor = (rec: string) => {
-    if (rec === "buy" || rec === "strong_buy") return "bg-emerald-100 text-emerald-700";
-    if (rec === "sell" || rec === "strong_sell") return "bg-red-100 text-red-700";
-    return "bg-slate-100 text-slate-700";
-  };
+  const isPatternLoading = sseLoading && !patternData && patternQuery.isLoading;
+  const isSentimentLoading = sseLoading && !sentimentData && sentimentQuery.isLoading;
+  const isSummaryLoading = isPatternLoading && isSentimentLoading;
 
   return (
     <div className={className}>
       <div className="grid gap-4 md:grid-cols-3">
-        {/* Trend Analysis Card */}
-        <Card className="border-slate-200/80 bg-white/90">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-lg">
-              {analysisQuery.data ? getTrendIcon(analysisQuery.data.signals.trend) : <TrendingUp className="h-5 w-5 text-slate-400" />}
-              Trend Analysis
-            </CardTitle>
-            <CardDescription>AI-powered trend detection</CardDescription>
-          </CardHeader>
-          <CardContent>
-            {analysisQuery.isLoading ? (
-              <div className="flex items-center gap-2 text-sm text-slate-500">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                Loading analysis...
-              </div>
-            ) : analysisQuery.data ? (
-              <div className="space-y-3 text-sm">
-                <div>
-                  <span className="text-slate-600">Trend: </span>
-                  <span className={`font-semibold capitalize ${getTrendColor(analysisQuery.data.signals.trend)}`}>
-                    {analysisQuery.data.signals.trend}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-slate-600">Strength: </span>
-                  <span className="font-semibold capitalize">{analysisQuery.data.signals.strength}</span>
-                </div>
-                <div>
-                  <span className="text-slate-600">Recommendation: </span>
-                  <span className={`inline-block rounded px-2 py-1 text-xs font-semibold uppercase ${getRecommendationColor(analysisQuery.data.signals.recommendation)}`}>
-                    {analysisQuery.data.signals.recommendation}
-                  </span>
-                </div>
-              </div>
-            ) : (
-              <p className="text-sm text-slate-400">Unable to load analysis</p>
-            )}
-          </CardContent>
-        </Card>
+        <MLPatternCard
+          data={patternData}
+          isLoading={isPatternLoading}
+          error={!isPatternLoading && !patternData && !!patternQuery.error}
+        />
 
-        {/* Technical Indicators Card */}
-        <Card className="border-slate-200/80 bg-white/90">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-lg">
-              <Activity className="h-5 w-5 text-blue-600" />
-              Technical Indicators
-            </CardTitle>
-            <CardDescription>Key market indicators</CardDescription>
-          </CardHeader>
-          <CardContent>
-            {analysisQuery.isLoading ? (
-              <div className="flex items-center gap-2 text-sm text-slate-500">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                Loading indicators...
-              </div>
-            ) : analysisQuery.data ? (
-              <div className="space-y-2 text-sm">
-                <div className="flex justify-between">
-                  <span className="text-slate-600">RSI:</span>
-                  <span className="font-semibold">{analysisQuery.data.indicators.rsi.toFixed(2)}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-600">MACD:</span>
-                  <span className="font-semibold">{analysisQuery.data.indicators.macd.value.toFixed(2)}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-600">SMA 20:</span>
-                  <span className="font-semibold">₹{analysisQuery.data.indicators.moving_averages.sma_20.toFixed(2)}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-600">EMA 20:</span>
-                  <span className="font-semibold">₹{analysisQuery.data.indicators.moving_averages.ema_20.toFixed(2)}</span>
-                </div>
-              </div>
-            ) : (
-              <p className="text-sm text-slate-400">Unable to load indicators</p>
-            )}
-          </CardContent>
-        </Card>
+        <AISentimentCard
+          data={sentimentData}
+          isLoading={isSentimentLoading}
+          error={!isSentimentLoading && !sentimentData && !!sentimentQuery.error}
+        />
 
-        {/* ML Predictions Card */}
-        <Card className="border-slate-200/80 bg-white/90">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-lg">
-              <BarChart3 className="h-5 w-5 text-purple-600" />
-              ML Predictions
-            </CardTitle>
-            <CardDescription>Machine learning forecasts</CardDescription>
-          </CardHeader>
-          <CardContent>
-            {mlQuery.isLoading ? (
-              <div className="flex items-center gap-2 text-sm text-slate-500">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                Loading prediction...
-              </div>
-            ) : mlQuery.data && !mlQuery.data.available ? (
-              <div className="space-y-1">
-                <p className="text-sm text-slate-500">No historical data ingested yet.</p>
-                <p className="text-xs text-slate-400">
-                  Run the data ingestion pipeline to enable ML predictions for this symbol.
-                </p>
-              </div>
-            ) : mlQuery.data?.available && mlQuery.data.direction != null ? (
-              <div className="space-y-3 text-sm">
-                <div>
-                  <span className="text-slate-600">Direction: </span>
-                  <span className={`font-semibold capitalize ${getDirectionColor(mlQuery.data.direction)}`}>
-                    {mlQuery.data.direction}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-slate-600">Confidence: </span>
-                  <span className="font-semibold">{((mlQuery.data.confidence ?? 0) * 100).toFixed(1)}%</span>
-                </div>
-                <div className="pt-1">
-                  <div className="h-2 w-full rounded-full bg-slate-200">
-                    <div
-                      className={`h-2 rounded-full transition-all ${getDirectionBgColor(mlQuery.data.direction)}`}
-                      style={{ width: `${(mlQuery.data.confidence ?? 0) * 100}%` }}
-                    />
-                  </div>
-                </div>
-                {mlQuery.data.entry_price != null && mlQuery.data.stop_loss != null && (
-                  <div className="flex justify-between text-xs text-slate-500">
-                    <span>Entry ₹{mlQuery.data.entry_price.toFixed(2)}</span>
-                    <span>SL ₹{mlQuery.data.stop_loss.toFixed(2)}</span>
-                  </div>
-                )}
-                {mlQuery.data.model_version && (
-                  <div className="text-xs text-slate-400">{mlQuery.data.model_version}</div>
-                )}
-              </div>
-            ) : (
-              <p className="text-sm text-slate-400">No prediction available</p>
-            )}
-          </CardContent>
-        </Card>
+        <PredictionSummaryCard
+          patternData={patternData}
+          sentimentData={sentimentData}
+          isLoading={isSummaryLoading}
+        />
       </div>
     </div>
   );

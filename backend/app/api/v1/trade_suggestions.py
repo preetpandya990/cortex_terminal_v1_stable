@@ -649,26 +649,29 @@ async def websocket_endpoint(
     - CPU overhead: <1% per 100 connections
     """
     manager = get_websocket_manager()
-    
-    # Validate token if provided
+
+    # Validate token if provided (token is only present when passed as URL query param;
+    # the frontend sends it in-band after connect, so this branch is currently latent)
     user_id = None
     if token:
         try:
-            from app.core.security import verify_jwt
-            payload = verify_jwt(token)
-            user_id = payload.get("sub")
+            from app.core.security import decode_token
+            payload = decode_token(token)
+            user_id = payload.sub
             logger.info(f"WebSocket authenticated as user {user_id}")
         except Exception as e:
             logger.warning(f"WebSocket authentication failed: {e}")
+            # Accept first so the close frame is valid per RFC 6455
+            await websocket.accept()
             await websocket.close(code=1008, reason="Invalid token")
             return
-    
-    # Connect client
+
+    # Connect client (calls websocket.accept() internally)
     client_id = await manager.connect(websocket, user_id=user_id)
-    
+
     # Auto-subscribe to suggestions room
     await manager.subscribe_to_room(client_id, "suggestions")
-    
+
     # Start Redis listener (shared across all connections)
     listener_task = asyncio.create_task(redis_listener_task(redis))
     
