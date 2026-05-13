@@ -145,6 +145,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.cai_listener_task = cai_listener_task
     logger.info("CAI Redis listener started")
 
+    # Start Trade Suggestions WebSocket Redis listener — persistent singleton that
+    # bridges Redis pub/sub to connected suggestion WebSocket clients.
+    from app.api.v1.trade_suggestions import suggestions_redis_listener
+    suggestions_listener_task = asyncio.create_task(
+        suggestions_redis_listener(), name="suggestions_redis_listener"
+    )
+    app.state.suggestions_listener_task = suggestions_listener_task
+    logger.info("Trade Suggestions Redis listener started")
+
     # Start Paper Trading P&L recompute worker
     from app.services.paper_trading.pnl_worker import run_pnl_worker
     pnl_worker_task = asyncio.create_task(
@@ -181,6 +190,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.cai_listener_task.cancel()
         try:
             await asyncio.wait_for(app.state.cai_listener_task, timeout=5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
+    # Cancel Trade Suggestions Redis listener
+    if hasattr(app.state, "suggestions_listener_task") and app.state.suggestions_listener_task:
+        app.state.suggestions_listener_task.cancel()
+        try:
+            await asyncio.wait_for(app.state.suggestions_listener_task, timeout=5.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
 

@@ -55,6 +55,11 @@ export interface ContributingFactors {
 export interface TradingSignal {
   signal_id: string;
   symbol: string;
+  /** Official company name from instrument_master (e.g. "HDFC Bank Limited"). Null for legacy rows. */
+  company_name: string | null;
+  /** True when the symbol exists in instrument_master as an NSE EQ equity (tradeable).
+   *  False for companies referenced in news/RSS that are not listed on the platform. */
+  is_nse_eligible: boolean;
   signal_type: SignalType;
   confidence: number;
   calibrated_confidence: number;
@@ -95,6 +100,9 @@ export interface SignalFilters {
   signal_type?: SignalType;
   min_confidence?: number;
   time_horizon?: TimeHorizon;
+  /** When true, returns only NSE-eligible signals. When false, returns Non-NSE only.
+   *  Omit to return all signals (admin / bulk views). */
+  is_nse_eligible?: boolean;
   page?: number;
   limit?: number;
 }

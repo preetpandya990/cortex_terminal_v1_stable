@@ -197,6 +197,21 @@ export function WatchlistProvider({ children }: { children: React.ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [watchlistItems])
 
+  // ── Seed priceFeed from last daily close when market is closed / on page load
+  // Prevents watchlist cards from showing "—" until the first live tick arrives.
+  // Only seeds entries that have no live tick yet — live ticks always win.
+  useEffect(() => {
+    if (!watchlistItems.length) return
+    const now = Date.now()
+    watchlistItems.forEach((item) => {
+      if (item.last_close == null) return
+      const cp = item.prev_close ?? item.last_close
+      // priceFeed.update only overwrites if the incoming ts is newer than stored ts,
+      // so seeding with ts=0 means any real tick will supersede this immediately.
+      priceFeed.seed(item.instrument_key, item.last_close, cp)
+    })
+  }, [watchlistItems])
+
   // ── WebSocket connection ─────────────────────────────────────────────────
 
   const buildWsUrl = useCallback((): string | null => {

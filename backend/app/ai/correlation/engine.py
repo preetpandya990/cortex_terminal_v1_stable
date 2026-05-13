@@ -16,6 +16,7 @@ Author: Cortex AI Team
 Version: 1.0.0
 """
 import asyncio
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -24,6 +25,8 @@ from uuid import UUID, uuid4
 
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.redis import CacheService
 
 from app.ai.fusion.models import AIEventClassification
 from app.ai.fusion.signal_assembler import SignalAssembler
@@ -127,16 +130,21 @@ class EventCorrelationEngine:
         self,
         signal_assembler: SignalAssembler,
         redis: Redis,
+        scanner_cache: "CacheService | None" = None,
     ):
         """
         Initialize correlation engine.
-        
+
         Args:
             signal_assembler: Service for gathering AI/ML signals
-            redis: Redis client for pub/sub
+            redis:            Redis client for pub/sub
+            scanner_cache:    CacheService for reading cached scanner results
+                              in Pathway 2.  When None, Pathway 2 falls back
+                              to the event-impact-based synthetic signal.
         """
         self.assembler = signal_assembler
         self.redis = redis
+        self.scanner_cache = scanner_cache
 
         # Circuit breakers per agent
         self.circuit_breakers = {
@@ -171,17 +179,23 @@ class EventCorrelationEngine:
         symbol = scanner_signal.get("instrument_key")
 
         logger.info(
-            f"[{correlation_id}] Pathway 1: Scanner anomaly for {symbol}"
+            "Pipeline stage=trigger pathway=1 correlation_id=%s symbol=%s",
+            correlation_id, symbol,
+            extra={"pipeline_stage": "trigger", "correlation_id": str(correlation_id)},
         )
 
         # Gather signals with timeout
+        t_gather_start = datetime.now(timezone.utc)
         try:
             ai_signal, ml_signal, latencies = await asyncio.wait_for(
                 self._gather_signals_pathway1(db, scanner_signal),
                 timeout=5.0,
             )
         except asyncio.TimeoutError:
-            logger.warning(f"[{correlation_id}] Timeout gathering signals")
+            logger.warning(
+                "Pipeline stage=signal_gather status=timeout correlation_id=%s symbol=%s",
+                correlation_id, symbol,
+            )
             await self._record_correlation(
                 db, correlation_id, "SCANNER_ANOMALY", trigger_timestamp,
                 None, "TIMEOUT", None
@@ -189,14 +203,23 @@ class EventCorrelationEngine:
             return None
         except Exception as e:
             logger.error(
-                f"[{correlation_id}] Error gathering signals: {e}",
-                exc_info=True
+                "Pipeline stage=signal_gather status=error correlation_id=%s symbol=%s error=%s",
+                correlation_id, symbol, e, exc_info=True,
             )
             await self._record_correlation(
                 db, correlation_id, "SCANNER_ANOMALY", trigger_timestamp,
                 None, f"ERROR: {str(e)}", None
             )
             return None
+
+        t_gather_ms = int((datetime.now(timezone.utc) - t_gather_start).total_seconds() * 1000)
+        logger.debug(
+            "Pipeline stage=signal_gather status=ok correlation_id=%s symbol=%s "
+            "scanner_ms=%s ai_ms=%s ml_ms=%s gather_total_ms=%d",
+            correlation_id, symbol,
+            latencies.get("scanner_ms"), latencies.get("ai_ms"), latencies.get("ml_ms"),
+            t_gather_ms,
+        )
 
         # Compute consensus
         suggestion = await self._compute_consensus(
@@ -211,9 +234,22 @@ class EventCorrelationEngine:
         )
 
         if suggestion:
+            total_ms = int(
+                (datetime.now(timezone.utc) - trigger_timestamp).total_seconds() * 1000
+            )
             logger.info(
-                f"[{correlation_id}] {suggestion.confidence_level} confidence "
-                f"{suggestion.signal_direction} suggestion generated"
+                "Pipeline stage=suggestion_committed correlation_id=%s "
+                "suggestion_id=%s symbol=%s direction=%s confidence=%s "
+                "consensus_score=%.2f total_pipeline_ms=%d",
+                correlation_id, suggestion.suggestion_id, suggestion.symbol,
+                suggestion.signal_direction, suggestion.confidence_level,
+                float(suggestion.consensus_score), total_ms,
+                extra={
+                    "pipeline_stage": "suggestion_committed",
+                    "correlation_id": str(correlation_id),
+                    "suggestion_id": str(suggestion.suggestion_id),
+                    "total_pipeline_ms": total_ms,
+                },
             )
 
         return suggestion
@@ -339,31 +375,24 @@ class EventCorrelationEngine:
         event: AIEventClassification,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, int]]:
         """
-        Gather scanner and ML signals for news-triggered event.
-        
-        AI signal from event, query Scanner + ML in parallel.
-        
+        Gather scanner and ML signals for a news-triggered correlation.
+
+        Scanner signal is read from the live Redis scan cache so that Pathway 2
+        uses real technical state for the affected symbol rather than a synthetic
+        approximation.  Falls back to an event-derived signal when the symbol
+        has not yet been scanned (e.g. off-hours or first boot).
+
         Returns:
-            Tuple of (scanner_signal, ml_signal, latencies)
+            (scanner_signal, ml_signal, latencies)
         """
         start_time = datetime.now(timezone.utc)
 
-        # For Pathway 2, we need current scanner state
-        # Use gather_event_signals as proxy for scanner (simplified)
+        # ── Scanner signal (from Redis scan cache) ────────────────────────────
         scanner_start = datetime.now(timezone.utc)
-        # Placeholder: In production, query actual scanner service
-        scanner_signal = {
-            "direction": "buy" if event.impact_score > 0 else "sell",
-            "confidence": min(abs(float(event.impact_score)), 100.0),
-            "instrument_key": symbol,
-            "trading_symbol": None,
-            "price_change_pct": 0.0,
-            "volume_ratio": 1.0,
-            "signals": [],
-        }
+        scanner_signal = await self._resolve_scanner_signal_for_symbol(symbol, event)
         scanner_latency = (datetime.now(timezone.utc) - scanner_start).total_seconds() * 1000
 
-        # ML prediction
+        # ── ML prediction ─────────────────────────────────────────────────────
         ml_start = datetime.now(timezone.utc)
         ml_signal = await self.assembler.gather_ml_signals(db, symbol)
         ml_latency = (datetime.now(timezone.utc) - ml_start).total_seconds() * 1000
@@ -372,12 +401,94 @@ class EventCorrelationEngine:
 
         latencies = {
             "scanner_ms": int(scanner_latency),
-            "ai_ms": 0,  # Already available from event
-            "ml_ms": int(ml_latency),
-            "total_ms": int(total_latency),
+            "ai_ms":      0,               # AI signal comes from the event itself
+            "ml_ms":      int(ml_latency),
+            "total_ms":   int(total_latency),
         }
 
         return scanner_signal, ml_signal, latencies
+
+    async def _resolve_scanner_signal_for_symbol(
+        self,
+        symbol: str,
+        event: AIEventClassification,
+    ) -> dict[str, Any]:
+        """
+        Look up a symbol in the latest cached scanner results.
+
+        Returns the real scanner dict when found; otherwise falls back to an
+        event-impact-derived synthetic signal (available=False flagged) so the
+        consensus engine can still evaluate Pathway 2 with a weak scanner agent.
+        """
+        # Synthetic fallback used when scanner cache is absent or symbol not found.
+        # Confidence is intentionally capped at 50 so a synthetic-only Pathway 2
+        # signal can only reach consensus if the ML score is very high.
+        impact = float(event.impact_score)
+        fallback: dict[str, Any] = {
+            "direction":       "buy"  if impact > 0 else "sell",
+            "confidence":      50.0,   # capped — signal is inferred, not observed
+            "instrument_key":  symbol,
+            "trading_symbol":  symbol,
+            "price_change_pct": 0.0,
+            "volume_ratio":    1.0,
+            "signals":         [],
+            "available":       False,  # marks synthetic origin for audit trail
+        }
+
+        if self.scanner_cache is None:
+            logger.debug(
+                "Pathway 2 scanner: no cache service — using synthetic signal for %s", symbol
+            )
+            return fallback
+
+        try:
+            cached = await self.scanner_cache.get("scanner:results:v2:1d")
+            if not cached:
+                logger.debug(
+                    "Pathway 2 scanner: cache empty — using synthetic signal for %s", symbol
+                )
+                return fallback
+
+            raw_results: list[dict] = cached.get("results", [])
+            # Match on trading_symbol (affected_symbols contains NSE trading symbols)
+            match = next(
+                (r for r in raw_results if r.get("trading_symbol") == symbol), None
+            )
+
+            if match is None:
+                logger.debug(
+                    "Pathway 2 scanner: symbol %s not in cached results (%d entries) — using synthetic",
+                    symbol, len(raw_results),
+                )
+                return fallback
+
+            # Map ScanResult fields to the canonical scanner_signal shape used
+            # by _compute_consensus (mirrors Pathway 1 output).
+            scan_dir = match.get("signal", "neutral")
+            if scan_dir == "neutral":
+                # A neutral scanner reading won't reach consensus — return synthetic
+                # so the consensus engine explicitly rejects via DIRECTION_MISMATCH
+                # rather than treating neutral as implicit agreement.
+                return {**fallback, "direction": "neutral", "available": True}
+
+            return {
+                "direction":        scan_dir,          # "buy" | "sell"
+                "confidence":       min(abs(float(match.get("score", 0.0))) * 10, 100.0),
+                "instrument_key":   match.get("instrument_key", symbol),
+                "trading_symbol":   match.get("trading_symbol", symbol),
+                "price_change_pct": float(match.get("price_change_pct", 0.0)),
+                "volume_ratio":     float(match.get("volume_ratio", 1.0)),
+                "rsi":              match.get("rsi"),
+                "signals":          match.get("signals", []),
+                "available":        True,
+            }
+
+        except Exception as exc:
+            logger.warning(
+                "Pathway 2 scanner cache lookup failed for %s: %s — using synthetic",
+                symbol, exc,
+            )
+            return fallback
 
     async def _compute_consensus(
         self,
@@ -413,14 +524,27 @@ class EventCorrelationEngine:
             TradeSuggestion if consensus reached, None otherwise
         """
         # Map to unified direction
-        scanner_dir = "BUY" if scanner_signal.get("direction") in ["buy", "bullish"] else "SELL"
-        
+        # Scanner output uses "signal" key ("buy"/"sell"); "direction" is the
+        # legacy / Pathway-2-synthetic key.  Accept both.
+        _scanner_signal_raw = (
+            scanner_signal.get("signal") or scanner_signal.get("direction") or ""
+        ).lower()
+        scanner_dir = "BUY" if _scanner_signal_raw in ("buy", "bullish") else "SELL"
+
+        # Derive scanner confidence from the anomaly score (0–20 nominal range).
+        # score=5 → 25%, score=10 → 50%, score=20 → 100%; capped at 100.
+        # Falls back to the explicit "confidence" key when present (Pathway 2 synthetic).
+        _raw_score = abs(scanner_signal.get("score", 0.0))
+        scanner_conf = scanner_signal.get("confidence") or min(_raw_score / 20.0 * 100, 100.0)
+
         ai_score = ai_signal.get("score", 0.0)
-        ai_dir = "BUY" if ai_score > 0 else "SELL"
-        
+        # Neutral AI (no events, score=0) should not vote SELL — it is uninformative.
+        # Align with the scanner direction so it does not block a scanner+ML consensus.
+        ai_dir = "BUY" if ai_score > 0 else ("SELL" if ai_score < 0 else scanner_dir)
+
         ml_prediction = ml_signal.get("prediction", {})
         ml_dir = ml_prediction.get("direction", "HOLD")
-        
+
         # Reject ML HOLD signals
         if ml_dir == "HOLD":
             await self._record_correlation(
@@ -442,15 +566,38 @@ class EventCorrelationEngine:
             )
             return None
 
-        # Compute weighted consensus score
-        scanner_conf = scanner_signal.get("confidence", 0.0)
-        ai_conf = abs(ai_signal.get("confidence", 0.0)) * 100  # Normalize to 0-100
-        ml_conf = ml_signal.get("confidence", 0.0) * 100  # Normalize to 0-100
+        # Compute weighted consensus score (all values in 0–100 range).
+        # scanner_conf: score-based (0–100) blended with volume_ratio signal strength
+        # ai_conf: event classification confidence × 100 (raw is 0–1)
+        # ml_conf: ensemble prediction confidence × 100 (raw is 0–1)
+
+        # Blend score (70%) with volume_ratio signal (30%) for a richer scanner proxy.
+        # vol_ratio is capped at 10× for normalisation; above that it's noise.
+        _vol_ratio = min(scanner_signal.get("volume_ratio", 1.0), 10.0)
+        _vol_conf = _vol_ratio / 10.0 * 100.0
+        scanner_conf = min(scanner_conf * 0.70 + _vol_conf * 0.30, 100.0)
+
+        ai_conf = abs(ai_signal.get("confidence", 0.0)) * 100
+        ml_conf = ml_signal.get("confidence", 0.0) * 100
+
+        # Dynamic weight redistribution: when AI has no events its 40% weight is
+        # dead weight and makes consensus unreachable.  Redistribute proportionally
+        # to scanner and ML so strong technical + model agreement can produce a
+        # valid suggestion — mirrors SignalAssembler.fuse_signals() renormalization.
+        ai_available = bool(ai_signal.get("available")) and ai_signal.get("event_count", 0) > 0
+        if ai_available:
+            w_scanner, w_ai, w_ml = SCANNER_WEIGHT, AI_WEIGHT, ML_WEIGHT
+        else:
+            # Distribute AI_WEIGHT proportionally between scanner and ML
+            total_remaining = SCANNER_WEIGHT + ML_WEIGHT  # 0.60
+            w_scanner = SCANNER_WEIGHT / total_remaining  # 0.50
+            w_ai      = 0.0
+            w_ml      = ML_WEIGHT / total_remaining       # 0.50
 
         consensus_score = (
-            SCANNER_WEIGHT * scanner_conf +
-            AI_WEIGHT * ai_conf +
-            ML_WEIGHT * ml_conf
+            w_scanner * scanner_conf +
+            w_ai      * ai_conf +
+            w_ml      * ml_conf
         )
 
         # Determine confidence level
@@ -477,13 +624,44 @@ class EventCorrelationEngine:
             reward = abs(targets[0] - entry_price)
             risk_reward_ratio = reward / risk if risk > 0 else None
 
+        # Derive regime_type from signal direction (heuristic; refined when ML
+        # model outputs explicit regime classification in a future iteration).
+        regime_type = "bull_trending" if all_buy else "bear_trending"
+
+        # Derive time_horizon from trigger pathway:
+        # Scanner anomalies are intraday momentum events; news events typically
+        # resolve on a longer swing/multi-day horizon.
+        time_horizon = (
+            "intraday" if trigger_type == "SCANNER_ANOMALY" else "swing"
+        )
+
         # Create trade suggestion
         symbol = scanner_signal.get("instrument_key") or ml_signal.get("symbol", "UNKNOWN")
+        # trading_symbol is the human-readable NSE ticker (e.g. "RELIANCE").
+        # In Pathway 2 both fields equal the ticker; in Pathway 1 the scanner
+        # provides the real trading_symbol separately from the instrument_key.
+        trading_sym: str | None = scanner_signal.get("trading_symbol")
+
+        # Resolve company name before committing the suggestion so that the
+        # company_name column is populated in one shot — avoiding a later JOIN.
+        # This is a best-effort lookup; failures must never block suggestion creation.
+        company_name: str | None = None
+        try:
+            from app.services.symbol_validator import symbol_validator  # noqa: PLC0415
+            _lookup_sym = trading_sym or symbol
+            company_name = await symbol_validator.get_company_name(_lookup_sym, db)
+        except Exception as _cn_exc:
+            logger.debug(
+                "Company name lookup failed for '%s' (non-fatal): %s",
+                trading_sym or symbol, _cn_exc,
+            )
+
         suggestion = TradeSuggestion(
             suggestion_id=uuid4(),
             symbol=symbol,
             instrument_key=symbol,
-            trading_symbol=scanner_signal.get("trading_symbol"),
+            trading_symbol=trading_sym,
+            company_name=company_name,
             consensus_score=Decimal(str(round(consensus_score, 2))),
             confidence_level=confidence_level,
             signal_direction="BUY" if all_buy else "SELL",
@@ -500,11 +678,34 @@ class EventCorrelationEngine:
             generated_at=trigger_timestamp,
             expires_at=trigger_timestamp + timedelta(hours=SUGGESTION_EXPIRY_HOURS),
             status="active",
+            regime_type=regime_type,
+            time_horizon=time_horizon,
         )
 
         db.add(suggestion)
         await db.commit()
         await db.refresh(suggestion)
+
+        # Strategy compliance — evaluate against all subscribed users' active
+        # strategies and persist compliance rows in the same session.
+        # Failures are non-fatal: the suggestion is already committed.
+        try:
+            from app.services.suggestion_compliance import suggestion_compliance_service
+            n_rows = await suggestion_compliance_service.evaluate_and_persist(
+                db=db, suggestion=suggestion
+            )
+            if n_rows:
+                await db.commit()
+                logger.debug(
+                    "Compliance evaluated for suggestion %s: %d rows",
+                    suggestion.suggestion_id, n_rows,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Strategy compliance evaluation failed for suggestion %s "
+                "(non-fatal, suggestion already committed): %s",
+                suggestion.suggestion_id, exc,
+            )
 
         # Track metrics
         suggestions_generated_total.labels(
@@ -540,14 +741,45 @@ class EventCorrelationEngine:
             ml_output=ml_signal,
         )
 
-        # Publish to Redis for real-time updates
+        # Publish full suggestion payload so WebSocket clients can render
+        # immediately without a round-trip REST fetch.
         try:
-            await self.redis.publish(
-                RedisChannels.SUGGESTIONS_NEW,
-                str(suggestion.suggestion_id)
+            t_publish_start = datetime.now(timezone.utc)
+            payload = json.dumps({
+                "suggestion_id":     str(suggestion.suggestion_id),
+                "symbol":            suggestion.symbol,
+                "instrument_key":    suggestion.instrument_key,
+                "trading_symbol":    suggestion.trading_symbol,
+                "company_name":      suggestion.company_name,
+                "signal_direction":  suggestion.signal_direction,
+                "confidence_level":  suggestion.confidence_level,
+                "consensus_score":   float(suggestion.consensus_score),
+                "trigger_pathway":   suggestion.trigger_pathway,
+                "entry_price":       float(suggestion.entry_price)       if suggestion.entry_price       else None,
+                "stop_loss":         float(suggestion.stop_loss)         if suggestion.stop_loss         else None,
+                "take_profit_1":     float(suggestion.take_profit_1)     if suggestion.take_profit_1     else None,
+                "take_profit_2":     float(suggestion.take_profit_2)     if suggestion.take_profit_2     else None,
+                "take_profit_3":     float(suggestion.take_profit_3)     if suggestion.take_profit_3     else None,
+                "risk_reward_ratio": float(suggestion.risk_reward_ratio) if suggestion.risk_reward_ratio else None,
+                "generated_at":      suggestion.generated_at.isoformat(),
+                "expires_at":        suggestion.expires_at.isoformat(),
+                "status":            suggestion.status,
+            })
+            await self.redis.publish(RedisChannels.SUGGESTIONS_NEW, payload)
+            publish_ms = int(
+                (datetime.now(timezone.utc) - t_publish_start).total_seconds() * 1000
+            )
+            logger.debug(
+                "Pipeline stage=redis_published suggestion_id=%s publish_ms=%d",
+                suggestion.suggestion_id, publish_ms,
+                extra={
+                    "pipeline_stage": "redis_published",
+                    "suggestion_id": str(suggestion.suggestion_id),
+                    "publish_ms": publish_ms,
+                },
             )
         except Exception as e:
-            logger.error(f"Failed to publish to Redis: {e}")
+            logger.error("Failed to publish suggestion %s to Redis: %s", suggestion.suggestion_id, e)
 
         return suggestion
 

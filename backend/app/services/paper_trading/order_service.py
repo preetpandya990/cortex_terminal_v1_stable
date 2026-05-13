@@ -117,15 +117,18 @@ def _ctx_from_suggestion(suggestion: TradeSuggestion) -> _TradeContext:
 
 
 def _ctx_from_payload(payload: PlaceOrderRequest) -> _TradeContext:
+    def _dec(v: object) -> Decimal | None:
+        return Decimal(str(v)) if v is not None else None
+
     return _TradeContext(
         suggestion_id=None,
         symbol=(payload.symbol or "").upper(),
         instrument_key=payload.instrument_key or "",
-        entry_price=Decimal(str(payload.entry_price)) if payload.entry_price else None,
-        stop_loss=None,
-        take_profit_1=None,
-        take_profit_2=None,
-        take_profit_3=None,
+        entry_price=_dec(payload.entry_price),
+        stop_loss=_dec(payload.stop_loss),
+        take_profit_1=_dec(payload.take_profit_1),
+        take_profit_2=_dec(payload.take_profit_2),
+        take_profit_3=_dec(payload.take_profit_3),
     )
 
 

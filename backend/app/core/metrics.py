@@ -230,6 +230,45 @@ api_cache_invalidations_total = Counter(
 )
 
 
+# ── ML Feedback Metrics ────────────────────────────────────────────────────────
+ml_feedback_computations_total = Counter(
+    'ml_feedback_computations_total',
+    'Total ML feedback computations by final status',
+    ['status'],  # success | failure
+)
+
+ml_feedback_retry_attempts_total = Counter(
+    'ml_feedback_retry_attempts_total',
+    'Total ML feedback computation attempts (including retries)',
+    ['attempt'],  # 1 | 2 | 3
+)
+
+ml_feedback_computation_duration_seconds = Histogram(
+    'ml_feedback_computation_duration_seconds',
+    'End-to-end duration of a successful ML feedback computation (seconds)',
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0),
+)
+
+# ── Regime Detection Metrics ───────────────────────────────────────────────────
+regime_detection_runs_total = Counter(
+    'regime_detection_runs_total',
+    'Total daily regime detection batch runs by status',
+    ['status'],  # success | failure
+)
+
+regime_detection_duration_seconds = Histogram(
+    'regime_detection_duration_seconds',
+    'Duration of a full regime detection batch run (seconds)',
+    buckets=(1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0),
+)
+
+regime_detection_symbols_total = Counter(
+    'regime_detection_symbols_total',
+    'Total symbols processed during regime detection by outcome',
+    ['status'],  # detected | unchanged | skipped | failed
+)
+
+
 def init_metrics(app_version: str, environment: str):
     """Initialize application info metrics."""
     app_info.info({

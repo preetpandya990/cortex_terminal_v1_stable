@@ -8,13 +8,13 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useCallback } from "react";
 import { useEvents } from "./useEvents";
 import { useCAIWebSocket } from "./useCAIWebSocket";
-import type { EventFilters, EventDetail } from "@/types/events";
+import type { EventFilters, MarketEvent } from "@/types/events";
 
 export function useEventsRealtime(filters: EventFilters = {}) {
   const queryClient = useQueryClient();
   const eventsQuery = useEvents(filters);
 
-  const handleEventUpdate = useCallback((event: EventDetail) => {
+  const handleEventUpdate = useCallback((event: MarketEvent) => {
     queryClient.setQueryData(
       ["events", filters],
       (oldData: any) => {

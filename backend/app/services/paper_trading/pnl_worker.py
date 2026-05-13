@@ -440,7 +440,6 @@ async def _auto_close_position(
     )
 
     # Schedule ML feedback computation
-    from app.services.paper_trading.outcome_service import compute_ml_feedback
     from app.models.paper_trading import PaperTradeOutcome
     outcome_stmt = (
         select(PaperTradeOutcome)
@@ -449,20 +448,40 @@ async def _auto_close_position(
     outcome = (await session.execute(outcome_stmt)).scalar_one_or_none()
     if outcome:
         asyncio.create_task(
-            _compute_feedback_deferred(outcome.id),
+            _compute_feedback_deferred(
+                outcome.id,
+                outcome.symbol,
+                outcome.portfolio_id,
+                outcome.user_id,
+            ),
             name=f"ml_feedback_{outcome.id}",
         )
 
 
-async def _compute_feedback_deferred(outcome_id: UUID) -> None:
-    """Fire-and-forget: compute ML feedback in a separate DB session."""
-    try:
-        async with WorkerSessionLocal() as session:
-            from app.services.paper_trading.outcome_service import compute_ml_feedback
-            await compute_ml_feedback(session, outcome_id)
-            await session.commit()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Deferred ML feedback failed for outcome %s: %s", outcome_id, exc)
+async def _compute_feedback_deferred(
+    outcome_id: UUID,
+    symbol: str,
+    portfolio_id: UUID,
+    user_id: int,
+) -> None:
+    """
+    Fire-and-forget: compute ML feedback with exponential-backoff retry.
+
+    Delegates to compute_ml_feedback_with_retry() which handles:
+      - 3 attempts with exp backoff + jitter
+      - MLFeedbackError DB record on final failure
+      - Redis cai:ml:feedback_errors alert on final failure
+      - Prometheus instrumentation
+    """
+    from app.core.retry import compute_ml_feedback_with_retry
+
+    await compute_ml_feedback_with_retry(
+        outcome_id=outcome_id,
+        symbol=symbol,
+        portfolio_id=portfolio_id,
+        user_id=user_id,
+        session_factory=WorkerSessionLocal,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────

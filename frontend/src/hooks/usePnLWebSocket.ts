@@ -7,69 +7,94 @@
  *
  * Architecture:
  *  - Token passed as ?token= query param (backend WS endpoint requirement).
- *  - LivePnLUpdate frames are merged into a ref-backed position map.
- *  - Portfolio aggregate stats (unrealized P&L, portfolio value, return %) are
- *    exposed as stable state — one re-render per 500 ms frame maximum.
- *  - Exponential backoff reconnect with 30 s cap.
+ *  - LivePnLUpdate frames merged into a ref-backed position map (no re-render per tick).
+ *  - Portfolio aggregate stats exposed as stable state — one re-render per frame max.
+ *  - Exponential backoff reconnect (1 s → 30 s cap, ±20 % jitter), 10 attempts.
+ *  - Auth failures (4001 / 4004) abort reconnect immediately — stale token retries are futile.
+ *  - Server heartbeat pings ({type:"ping"}) answered with {type:"pong"} in-band.
+ *  - attempt counter reset on every effect re-run so URL/token changes start fresh.
  */
 
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { WS_BASE_URL } from '@/lib/api';
 import type { LivePnLUpdate, LivePositionPnL } from '@/types/paper_trading';
+
+// ── Close codes that must not trigger reconnect ───────────────────────────────
+const FATAL_CLOSE_CODES = new Set([
+  4001, // Invalid or expired token
+  4004, // No active portfolio
+]);
+
+// ── Reconnect strategy ────────────────────────────────────────────────────────
+const MAX_RECONNECT_ATTEMPTS = 10;
+const BASE_RECONNECT_MS      = 1_000;
+const MAX_RECONNECT_MS       = 30_000;
+
+// ── Client heartbeat (independent of server heartbeat) ───────────────────────
+const CLIENT_HEARTBEAT_MS = 25_000;
+
+// ── Public types ──────────────────────────────────────────────────────────────
 
 export type PnLConnectionState = 'connecting' | 'connected' | 'disconnected' | 'error';
 
 export interface PnLPortfolioStats {
   total_unrealized_pnl: number;
-  total_realized_pnl: number;
-  current_cash: number;
-  portfolio_value: number;
-  total_return_pct: number;
-  last_updated: string | null;
+  total_realized_pnl:   number;
+  current_cash:         number;
+  portfolio_value:      number;
+  total_return_pct:     number;
+  last_updated:         string | null;
 }
 
 export interface UsePnLWebSocketReturn {
   connectionState: PnLConnectionState;
-  isConnected: boolean;
-  /** Live P&L keyed by position_id — update without triggering parent re-renders */
+  isConnected:     boolean;
+  /** Live P&L keyed by position_id — read without triggering re-renders */
   positionPnLMap: React.MutableRefObject<Map<string, LivePositionPnL>>;
-  /** Portfolio-level aggregate stats — triggers re-render on each frame */
+  /** Portfolio aggregate stats — one re-render per ~500 ms frame */
   portfolioStats: PnLPortfolioStats;
+  /** Manually tear down the connection and suppress automatic reconnect */
   disconnect: () => void;
+  /** Reset attempt counter and immediately reconnect (e.g. after token refresh) */
+  reconnect: () => void;
 }
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 const INITIAL_STATS: PnLPortfolioStats = {
   total_unrealized_pnl: 0,
-  total_realized_pnl: 0,
-  current_cash: 0,
-  portfolio_value: 0,
-  total_return_pct: 0,
-  last_updated: null,
+  total_realized_pnl:   0,
+  current_cash:         0,
+  portfolio_value:      0,
+  total_return_pct:     0,
+  last_updated:         null,
 };
 
-const MAX_RECONNECT_ATTEMPTS = 10;
-const BASE_RECONNECT_MS = 1_000;
-const MAX_RECONNECT_MS = 30_000;
-const HEARTBEAT_MS = 30_000;
+function backoffDelay(attempt: number): number {
+  const base   = Math.min(BASE_RECONNECT_MS * 2 ** attempt, MAX_RECONNECT_MS);
+  const jitter = base * 0.2 * (Math.random() * 2 - 1);
+  return Math.round(base + jitter);
+}
+
+// ── Hook ──────────────────────────────────────────────────────────────────────
 
 export function usePnLWebSocket(
   portfolioId: string | null | undefined,
-  token: string | null | undefined,
-  enabled = true
+  token:       string | null | undefined,
+  enabled = true,
 ): UsePnLWebSocketReturn {
-  const [, forceUpdate] = useReducer((x: number) => x + 1, 0);
   const [connectionState, setConnectionState] = useState<PnLConnectionState>('disconnected');
-  const [portfolioStats, setPortfolioStats] = useState<PnLPortfolioStats>(INITIAL_STATS);
+  const [portfolioStats,  setPortfolioStats]  = useState<PnLPortfolioStats>(INITIAL_STATS);
 
-  // Ref-backed position map — updated every 500 ms frame without causing re-renders.
-  // Parent rows read this directly via ref to paint their own P&L cells.
   const positionPnLMap = useRef<Map<string, LivePositionPnL>>(new Map());
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const attemptsRef = useRef(0);
+  const wsRef          = useRef<WebSocket | null>(null);
+  const heartbeatRef   = useRef<ReturnType<typeof setInterval> | null>(null);
+  const reconnectRef   = useRef<ReturnType<typeof setTimeout>  | null>(null);
+  const attemptsRef    = useRef(0);
   const shouldReconnectRef = useRef(true);
+  // Stable ref so connect() inside useEffect always sees fresh values
+  const connectRef     = useRef<(() => void) | null>(null);
 
   const url = useMemo(() => {
     if (!portfolioId || !token) return null;
@@ -77,40 +102,15 @@ export function usePnLWebSocket(
   }, [portfolioId, token]);
 
   const clearTimers = useCallback(() => {
-    if (heartbeatRef.current) {
-      clearInterval(heartbeatRef.current);
-      heartbeatRef.current = null;
-    }
-    if (reconnectRef.current) {
-      clearTimeout(reconnectRef.current);
-      reconnectRef.current = null;
-    }
-  }, []);
-
-  const scheduleReconnect = useCallback((connectFn: () => void) => {
-    if (!shouldReconnectRef.current || attemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
-      if (attemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
-        console.error('[PnLWS] Max reconnection attempts reached');
-        setConnectionState('error');
-      }
-      return;
-    }
-
-    attemptsRef.current += 1;
-    const delay = Math.min(
-      BASE_RECONNECT_MS * Math.pow(2, attemptsRef.current),
-      MAX_RECONNECT_MS
-    );
-    const jitter = delay * 0.2 * (Math.random() * 2 - 1);
-    const finalDelay = Math.round(delay + jitter);
-
-    console.log(`[PnLWS] Reconnecting in ${finalDelay}ms (attempt ${attemptsRef.current}/${MAX_RECONNECT_ATTEMPTS})`);
-    reconnectRef.current = setTimeout(connectFn, finalDelay);
+    if (heartbeatRef.current) { clearInterval(heartbeatRef.current); heartbeatRef.current = null; }
+    if (reconnectRef.current)  { clearTimeout(reconnectRef.current);  reconnectRef.current  = null; }
   }, []);
 
   useEffect(() => {
     if (!enabled || !url) return;
 
+    // Reset state for this URL / token combination
+    attemptsRef.current       = 0;
     shouldReconnectRef.current = true;
 
     const connect = () => {
@@ -133,38 +133,53 @@ export function usePnLWebSocket(
         setConnectionState('connected');
         attemptsRef.current = 0;
 
+        // Periodic client→server ping so the backend knows the client is alive
         heartbeatRef.current = setInterval(() => {
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'ping' }));
           }
-        }, HEARTBEAT_MS);
+        }, CLIENT_HEARTBEAT_MS);
       };
 
       ws.onmessage = (event: MessageEvent) => {
+        let frame: Record<string, unknown>;
         try {
-          const frame: LivePnLUpdate = JSON.parse(event.data as string);
-
-          // Update per-position map (no re-render)
-          frame.positions.forEach((pos) => {
-            positionPnLMap.current.set(pos.position_id, pos);
-          });
-
-          // Update portfolio aggregate stats (triggers one re-render per frame)
-          setPortfolioStats({
-            total_unrealized_pnl: frame.total_unrealized_pnl,
-            total_realized_pnl: frame.total_realized_pnl,
-            current_cash: frame.current_cash,
-            portfolio_value: frame.portfolio_value,
-            total_return_pct: frame.total_return_pct,
-            last_updated: frame.ts,
-          });
-        } catch (err) {
-          // Silently ignore parse errors — the backend may send health pings
+          frame = JSON.parse(event.data as string) as Record<string, unknown>;
+        } catch {
+          return;
         }
+
+        // Server heartbeat — respond with pong, nothing else to do
+        if (frame.type === 'ping') {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'pong' }));
+          }
+          return;
+        }
+
+        // Ignore our own pong echoes or unknown frame types
+        if (frame.type === 'pong' || !Array.isArray(frame.positions)) return;
+
+        const update = frame as unknown as LivePnLUpdate;
+
+        // Update per-position map — no re-render
+        update.positions.forEach((pos) => {
+          positionPnLMap.current.set(pos.position_id, pos);
+        });
+
+        // Portfolio aggregate — one re-render per frame
+        setPortfolioStats({
+          total_unrealized_pnl: update.total_unrealized_pnl,
+          total_realized_pnl:   update.total_realized_pnl,
+          current_cash:         update.current_cash,
+          portfolio_value:      update.portfolio_value,
+          total_return_pct:     update.total_return_pct,
+          last_updated:         update.ts,
+        });
       };
 
       ws.onerror = () => {
-        setConnectionState('error');
+        // onclose fires right after; state set there
         clearTimers();
       };
 
@@ -172,37 +187,62 @@ export function usePnLWebSocket(
         wsRef.current = null;
         clearTimers();
 
+        // Auth / config errors — retrying with the same token is pointless
+        if (FATAL_CLOSE_CODES.has(event.code)) {
+          console.warn(`[PnLWS] Fatal close ${event.code}: ${event.reason} — reconnect suppressed`);
+          setConnectionState('error');
+          return;
+        }
+
+        // Clean disconnect or unmount
         if (event.code === 1000 || !shouldReconnectRef.current) {
           setConnectionState('disconnected');
           return;
         }
 
+        if (attemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
+          console.error('[PnLWS] Max reconnection attempts reached');
+          setConnectionState('error');
+          return;
+        }
+
+        attemptsRef.current += 1;
+        const delay = backoffDelay(attemptsRef.current);
+        console.log(`[PnLWS] Reconnecting in ${delay} ms (attempt ${attemptsRef.current}/${MAX_RECONNECT_ATTEMPTS})`);
         setConnectionState('disconnected');
-        scheduleReconnect(connect);
+        reconnectRef.current = setTimeout(connect, delay);
       };
     };
 
+    connectRef.current = connect;
     connect();
 
     return () => {
       shouldReconnectRef.current = false;
       clearTimers();
-      if (wsRef.current) {
-        wsRef.current.close(1000, 'Component unmount');
-        wsRef.current = null;
-      }
+      wsRef.current?.close(1000, 'Component unmount');
+      wsRef.current = null;
       setConnectionState('disconnected');
     };
-  }, [url, enabled, clearTimers, scheduleReconnect]);
+  }, [url, enabled, clearTimers]);
 
   const disconnect = useCallback(() => {
     shouldReconnectRef.current = false;
     clearTimers();
-    if (wsRef.current) {
-      wsRef.current.close(1000, 'Client disconnect');
-      wsRef.current = null;
-    }
+    wsRef.current?.close(1000, 'Client disconnect');
+    wsRef.current = null;
     setConnectionState('disconnected');
+  }, [clearTimers]);
+
+  const reconnect = useCallback(() => {
+    clearTimers();
+    wsRef.current?.close(1000, 'Manual reconnect');
+    wsRef.current = null;
+    attemptsRef.current       = 0;
+    shouldReconnectRef.current = true;
+    setConnectionState('disconnected');
+    // Trigger connect on next tick so state flushes first
+    setTimeout(() => connectRef.current?.(), 0);
   }, [clearTimers]);
 
   return {
@@ -211,5 +251,6 @@ export function usePnLWebSocket(
     positionPnLMap,
     portfolioStats,
     disconnect,
+    reconnect,
   };
 }

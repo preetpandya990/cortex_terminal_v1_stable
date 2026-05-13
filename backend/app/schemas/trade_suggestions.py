@@ -9,7 +9,7 @@ from enum import Enum
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # ============================================================================
@@ -47,6 +47,33 @@ class TriggerType(str, Enum):
     """Event correlation trigger type."""
     SCANNER_ANOMALY = "SCANNER_ANOMALY"
     NEWS_EVENT = "NEWS_EVENT"
+
+
+# ============================================================================
+# Strategy Compliance
+# ============================================================================
+
+class StrategyComplianceInfo(BaseModel):
+    """
+    Per-user strategy compliance summary attached to each suggestion response.
+
+    Populated when the requesting user has active strategy subscriptions.
+    At most one row is returned — the highest-priority strategy that was
+    evaluated (passed or not).  Full gate details are in pipeline_result.
+    """
+    model_config = ConfigDict(protected_namespaces=())
+
+    strategy_id: UUID = Field(description="Strategy that was evaluated")
+    strategy_name: str = Field(description="Human-readable strategy name")
+    passed: bool = Field(description="Whether the suggestion passes all gates")
+    blocked_at: str | None = Field(
+        None,
+        description="First gate that failed; None if all gates passed",
+    )
+    pipeline_result: dict[str, Any] | None = Field(
+        None,
+        description="Full gate-level audit trail from StrategyFilterPipeline",
+    )
 
 
 # ============================================================================
@@ -96,6 +123,7 @@ class TradeSuggestionResponse(BaseModel):
     symbol: str = Field(min_length=1, max_length=50)
     instrument_key: str = Field(min_length=1, max_length=100)
     trading_symbol: str | None = Field(None, max_length=50)
+    company_name: str | None = Field(None, description="Human-readable company name from instrument master")
     
     # Consensus metadata
     consensus_score: float = Field(ge=0.0, le=100.0, description="Weighted consensus score (0-100)")
@@ -116,13 +144,27 @@ class TradeSuggestionResponse(BaseModel):
     take_profit_2: float | None = Field(None, gt=0, description="Second take profit target")
     take_profit_3: float | None = Field(None, gt=0, description="Third take profit target")
     
+    # Market context (set at generation time; feeds strategy filter pipeline)
+    regime_type: str | None = Field(None, description="Market regime when suggestion was generated")
+    time_horizon: str | None = Field(None, description="Expected trade time horizon")
+
     # Temporal metadata
     generated_at: datetime = Field(description="When suggestion was generated")
     expires_at: datetime = Field(description="When suggestion expires")
     status: SuggestionStatus
     created_at: datetime
     updated_at: datetime
-    
+
+    # Per-user strategy compliance annotation (None when user has no subscriptions)
+    strategy_compliance: StrategyComplianceInfo | None = Field(
+        None,
+        description=(
+            "Strategy compliance result for the requesting user. "
+            "Populated when the user has active strategy subscriptions. "
+            "hard_gate users only see suggestions where passed=True."
+        ),
+    )
+
     @field_validator("consensus_score", mode="before")
     @classmethod
     def convert_decimal_to_float(cls, v: Any) -> float:

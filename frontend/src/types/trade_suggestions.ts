@@ -39,6 +39,21 @@ export type TriggerType = "SCANNER_ANOMALY" | "NEWS_EVENT";
 // ============================================================================
 
 /**
+ * Per-user strategy compliance evaluation result attached to each suggestion.
+ * Present when the user has active strategy subscriptions; null otherwise.
+ */
+export interface StrategyComplianceInfo {
+  strategy_id: string;
+  strategy_name: string;
+  /** True when the suggestion passes all strategy gates */
+  passed: boolean;
+  /** First gate that blocked the suggestion; null when passed=true */
+  blocked_at: string | null;
+  /** Full gate-level audit trail from StrategyFilterPipeline */
+  pipeline_result: Record<string, any> | null;
+}
+
+/**
  * Multi-agent validated trade suggestion
  */
 export interface TradeSuggestion {
@@ -46,6 +61,7 @@ export interface TradeSuggestion {
   symbol: string;
   instrument_key: string;
   trading_symbol: string | null;
+  company_name: string | null;
   consensus_score: number;
   confidence_level: ConfidenceLevel;
   signal_direction: SignalDirection;
@@ -59,11 +75,17 @@ export interface TradeSuggestion {
   take_profit_1: number | null;
   take_profit_2: number | null;
   take_profit_3: number | null;
+  /** Market regime when suggestion was generated (e.g. "bull_trending") */
+  regime_type: string | null;
+  /** Expected trade time horizon (e.g. "intraday", "swing") */
+  time_horizon: string | null;
   generated_at: string;
   expires_at: string;
   status: SuggestionStatus;
   created_at: string;
   updated_at: string;
+  /** Strategy compliance annotation — null when user has no active subscriptions */
+  strategy_compliance: StrategyComplianceInfo | null;
 }
 
 /**

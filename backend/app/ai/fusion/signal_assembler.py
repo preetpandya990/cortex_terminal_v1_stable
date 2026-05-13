@@ -10,6 +10,7 @@ Weights (Phase 2–4): event=0.50, ml=0.50, technical=0.00
 Weights (Phase 5+):  event=0.35, ml=0.40, technical=0.25
 """
 import asyncio
+import json
 import logging
 import math
 from datetime import datetime, time, timedelta, timezone
@@ -100,6 +101,9 @@ _CONFIDENCE_BAND: list[tuple[float, str]] = [
 class SignalAssembler:
     """Assembles and persists trading signals from multiple sources."""
 
+    # TTL for per-symbol ML prediction cache entries (seconds).
+    _ML_CACHE_TTL = 30
+
     def __init__(
         self,
         ensemble_predictor: Optional[EnsemblePredictor] = None,
@@ -107,12 +111,15 @@ class SignalAssembler:
         event_weight: float = 0.35,
         ml_weight: float = 0.40,
         technical_weight: float = 0.25,
+        redis: Optional[Any] = None,
     ):
         self.ensemble_predictor = ensemble_predictor
         self.feature_loader = feature_loader
         self.event_weight = event_weight
         self.ml_weight = ml_weight
         self.technical_weight = technical_weight
+        # raw redis.asyncio.Redis client; None disables caching transparently
+        self._ml_cache = redis
 
         total_weight = event_weight + ml_weight + technical_weight
         if not math.isclose(total_weight, 1.0, rel_tol=1e-5):
@@ -147,6 +154,32 @@ class SignalAssembler:
 
     # ── Signal gathering ───────────────────────────────────────────────────────
 
+    @staticmethod
+    def _build_event_dict(row: Any) -> dict[str, Any]:
+        """
+        Build the contributing-event dict stored in ai_trading_signals.contributing_events.
+
+        article_title comes from AIRawEvent.extra_data["title"] (populated for new events
+        after the rss_fetcher bug-fix).  For the large corpus of existing events where
+        extra_data was never written, we fall back to the first line of raw_content —
+        the RSS fetcher always constructs raw_content as "{title}\n\n{description}", so
+        line 0 is always the article headline.
+        """
+        raw = row.raw_content or ""
+        parts = raw.split("\n\n", 1)
+        title_from_content = parts[0].strip() or None
+        summary_from_content = parts[1].strip()[:300] if len(parts) > 1 else None
+
+        return {
+            "id": row.id,
+            "type": row.event_type,
+            "impact": float(row.impact_score),
+            "source_url": row.source_url or None,
+            "source_name": row.source_name or None,
+            "article_title": row.article_title or title_from_content or None,
+            "summary": summary_from_content or None,
+        }
+
     async def gather_event_signals(
         self,
         db: AsyncSession,
@@ -174,6 +207,7 @@ class SignalAssembler:
                 AIEventClassification.created_at,
                 AIRawEvent.source_url,
                 AIRawEvent.source_name,
+                AIRawEvent.raw_content,
                 func.jsonb_extract_path_text(
                     AIRawEvent.extra_data, "title"
                 ).label("article_title"),
@@ -224,14 +258,7 @@ class SignalAssembler:
             "event_count": n,
             "available": True,
             "events": [
-                {
-                    "id": row.id,
-                    "type": row.event_type,
-                    "impact": float(row.impact_score),
-                    "source_url": row.source_url or None,
-                    "source_name": row.source_name or None,
-                    "article_title": row.article_title or None,
-                }
+                self._build_event_dict(row)
                 for row in rows[:5]
             ],
         }
@@ -242,10 +269,29 @@ class SignalAssembler:
         symbol: str,
         timeframe: str = "1d",
     ) -> dict[str, Any]:
-        """Gather ML ensemble prediction signals for a symbol."""
+        """
+        Gather ML ensemble prediction signals for a symbol.
+
+        Results are cached in Redis for `_ML_CACHE_TTL` seconds (30 s) under
+        `cortex:ml:signal:{symbol}:{timeframe}`.  This prevents redundant
+        feature-loading DB queries + inference calls when the correlation loop
+        fires the same symbol multiple times within a single cycle.  Cache
+        failures are non-fatal — the full pipeline runs as a fallback.
+        """
         if not self.ensemble_predictor or not self.feature_loader:
             logger.debug("ML prediction skipped — predictor not initialised")
             return {"score": 0.0, "confidence": 0.0, "model": None, "available": False}
+
+        cache_key = f"cortex:ml:signal:{symbol}:{timeframe}"
+
+        if self._ml_cache is not None:
+            try:
+                cached = await self._ml_cache.get(cache_key)
+                if cached:
+                    logger.debug("ML signal cache hit — symbol=%s timeframe=%s", symbol, timeframe)
+                    return json.loads(cached)
+            except Exception as exc:
+                logger.debug("ML signal cache read failed (non-fatal): %s", exc)
 
         try:
             tabular, sequence, current_price, volatility = await self.feature_loader.load_features(
@@ -266,9 +312,9 @@ class SignalAssembler:
             direction_map = {"BUY": 100.0, "SELL": -100.0, "HOLD": 0.0}
             direction = prediction.get("direction_label", "HOLD")
 
-            return {
+            result: dict[str, Any] = {
                 "score": direction_map.get(direction, 0.0),
-                "confidence": prediction.get("confidence", 0.0),
+                "confidence": prediction.get("conviction_scale", 0.0),
                 "model": prediction.get("metadata", {}).get("model_version"),
                 "available": True,
                 "prediction": {
@@ -283,6 +329,18 @@ class SignalAssembler:
                     "probabilities": prediction.get("probabilities"),
                 },
             }
+
+            if self._ml_cache is not None:
+                try:
+                    await self._ml_cache.setex(cache_key, self._ML_CACHE_TTL, json.dumps(result))
+                    logger.debug(
+                        "ML signal cached — symbol=%s timeframe=%s ttl=%ds",
+                        symbol, timeframe, self._ML_CACHE_TTL,
+                    )
+                except Exception as exc:
+                    logger.debug("ML signal cache write failed (non-fatal): %s", exc)
+
+            return result
 
         except Exception as exc:
             logger.error("ML prediction failed for %s: %s", symbol, exc, exc_info=True)
@@ -583,6 +641,38 @@ class SignalAssembler:
         Returns:
             Persisted AITradingSignal ORM instance
         """
+        # ── Symbol eligibility check ───────────────────────────────────────────
+        # Determines whether this signal is actionable (NSE-listed equity present
+        # in instrument_master) or informational only (company referenced in news
+        # but not listed / tracked on the platform).
+        #
+        # Critically: the assembler NEVER raises here.  Raising was the old
+        # behaviour; it silently dropped Non-NSE signals from the pipeline.
+        # The caller (API endpoint) is responsible for enforcing hard rejection
+        # when an explicit user request targets an ineligible symbol — the
+        # internal pipeline (event processor, scheduler) simply stores the signal
+        # with is_nse_eligible=False so it surfaces in the Non-NSE tab.
+        #
+        # Controlled by ENABLE_SYMBOL_VALIDATION: when False (emergency / testing)
+        # all symbols are treated as eligible.
+        from app.core.config import get_settings as _get_settings  # noqa: PLC0415
+        from app.services.symbol_validator import symbol_validator  # noqa: PLC0415
+
+        _settings = _get_settings()
+        _is_nse_eligible: bool = True
+        if _settings.ENABLE_SYMBOL_VALIDATION:
+            _is_nse_eligible = await symbol_validator.validate_symbol(symbol, db)
+
+        # Resolve company name — the eligibility check above already warmed the
+        # Redis eligibility cache, so get_company_name() is a second cache read
+        # (separate key) with near-zero overhead for any previously seen symbol.
+        # Failures are non-fatal; company_name stays None rather than blocking assembly.
+        _company_name: str | None = None
+        try:
+            _company_name = await symbol_validator.get_company_name(symbol, db)
+        except Exception:
+            pass
+
         regime = await self.get_latest_regime(db)
         strategy_id = await self.get_active_strategy(db, regime) if regime else None
 
@@ -595,7 +685,7 @@ class SignalAssembler:
             direction = precomputed_ml.get("direction_label", "HOLD")
             ml_signals = {
                 "score": direction_map.get(direction, 0.0),
-                "confidence": precomputed_ml.get("confidence", 0.0),
+                "confidence": precomputed_ml.get("conviction_scale", 0.0),
                 "model": precomputed_ml.get("metadata", {}).get("model_version"),
                 "available": True,
                 "prediction": {
@@ -637,6 +727,8 @@ class SignalAssembler:
         signal = AITradingSignal(
             signal_timestamp=now_utc,
             symbol=symbol,
+            company_name=_company_name,
+            is_nse_eligible=_is_nse_eligible,
             action=fused["action"],
             confidence_score=Decimal(str(round(fused["confidence_score"], 2))),
             strategy_id=strategy_id or "default",

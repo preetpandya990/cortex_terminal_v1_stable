@@ -82,6 +82,7 @@ from app.schemas.strategies import (
     UserStrategySubscriptionResponse,
 )
 from app.services import strategy_service
+from app.services.suggestion_compliance import suggestion_compliance_service
 
 logger = logging.getLogger(__name__)
 
@@ -386,6 +387,10 @@ async def subscribe(
     db: AsyncSession = Depends(get_db),
 ) -> UserStrategySubscriptionResponse:
     sub = await strategy_service.subscribe(int(user_id), strategy_id, body, db)
+    await db.commit()
+    # Backfill compliance for all existing active suggestions so badges appear
+    # immediately without waiting for a new suggestion to be generated.
+    await suggestion_compliance_service.backfill_for_user(db, int(user_id), strategy_id)
     await db.commit()
     return UserStrategySubscriptionResponse.model_validate(sub)
 

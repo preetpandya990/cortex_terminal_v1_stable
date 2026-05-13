@@ -29,6 +29,8 @@ export function useSignalsRealtime(filters: SignalFilters = {}) {
         if (filters.symbol && signal.symbol !== filters.symbol) return oldData;
         if (filters.signal_type && signal.signal_type !== filters.signal_type) return oldData;
         if (filters.min_confidence !== undefined && signal.calibrated_confidence < filters.min_confidence) return oldData;
+        // Route to the correct tab cache: NSE signals go to the NSE query, Non-NSE to Non-NSE.
+        if (filters.is_nse_eligible !== undefined && signal.is_nse_eligible !== filters.is_nse_eligible) return oldData;
 
         const existing: TradingSignal[] = oldData.signals || [];
 

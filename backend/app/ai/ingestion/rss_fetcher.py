@@ -129,7 +129,7 @@ class RSSFetcher:
                 content_hash=content_hash,
                 raw_content=content,
                 language="en",
-                metadata=item["metadata"],
+                extra_data=item["metadata"],
             )
 
             db.add(event)

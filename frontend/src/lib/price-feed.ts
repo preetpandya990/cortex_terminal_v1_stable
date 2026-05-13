@@ -67,6 +67,18 @@ class PriceFeed {
   }
 
   /**
+   * Seed an instrument with its last known daily close price.
+   * Only writes if no live tick has arrived yet — live ticks always supersede seeds.
+   * Called after the watchlist REST response loads so cards show a price immediately
+   * on page load and when the market is closed (no live ticks flowing).
+   */
+  seed(instrumentKey: string, ltp: number, cp: number): void {
+    if (this.prices.has(instrumentKey)) return   // live data already present — don't overwrite
+    this.prices.set(instrumentKey, { ltp, cp, ts: 0 })
+    this.scheduleFlush()
+  }
+
+  /**
    * Remove all stored prices for an instrument.
    * Called when an instrument is fully unsubscribed from the market feed.
    */

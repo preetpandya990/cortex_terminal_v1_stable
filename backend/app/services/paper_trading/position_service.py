@@ -478,12 +478,59 @@ async def _write_outcome(
         )
         suggestion = (await session.execute(stmt)).scalar_one_or_none()
 
-    # Entry slippage: how far actual entry_price deviated from suggested
+    # For manually-opened positions with no linked TradeSuggestion, look for a
+    # matching AITradingSignal so we can capture confidence level and price targets.
+    from app.services.paper_trading.outcome_service import (
+        _derive_confidence_level,
+        _find_matching_ai_signal,
+    )
+
+    ai_signal = None
+    if suggestion is None:
+        signal_direction = "BUY" if position.side == "LONG" else "SELL"
+        ai_signal = await _find_matching_ai_signal(
+            session,
+            symbol=position.symbol,
+            direction=signal_direction,
+            opened_at=opened_at,
+            closed_at=closed_at,
+        )
+        if ai_signal:
+            logger.info(
+                "Manual trade %s/%s matched to AITradingSignal id=%s "
+                "(confidence=%.2f generated=%s)",
+                portfolio.id, position.symbol,
+                ai_signal.id, float(ai_signal.confidence_score),
+                ai_signal.signal_timestamp.isoformat(),
+            )
+
+    # Entry slippage against the best available reference price
     entry_slippage_pct: Decimal | None = None
-    if suggestion and suggestion.entry_price and suggestion.entry_price > _ZERO:
+    ref_entry = (suggestion.entry_price if suggestion else None) or (
+        ai_signal.target_price if ai_signal else None
+    )
+    if ref_entry and ref_entry > _ZERO:
         entry_slippage_pct = (
-            (entry_price - suggestion.entry_price) / suggestion.entry_price * Decimal("100")
+            (entry_price - ref_entry) / ref_entry * Decimal("100")
         ).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+
+    # Price target resolution — priority: suggestion → position snapshot → ai_signal
+    _sl = (suggestion.stop_loss if suggestion else None) or position.stop_loss or (
+        ai_signal.stop_loss if ai_signal else None
+    )
+    _tp1 = (suggestion.take_profit_1 if suggestion else None) or position.target_price_1 or (
+        ai_signal.target_price if ai_signal else None
+    )
+    _tp2 = (suggestion.take_profit_2 if suggestion else None) or position.target_price_2
+    _tp3 = (suggestion.take_profit_3 if suggestion else None) or position.target_price_3
+
+    # Confidence resolution — suggestion takes priority; fall back to ai_signal
+    _confidence_level = suggestion.confidence_level if suggestion else (
+        _derive_confidence_level(ai_signal.confidence_score) if ai_signal else None
+    )
+    _consensus_score = suggestion.consensus_score if suggestion else (
+        (ai_signal.confidence_score * Decimal("100")).quantize(Decimal("0.01")) if ai_signal else None
+    )
 
     outcome = PaperTradeOutcome(
         portfolio_id=portfolio.id,
@@ -501,14 +548,13 @@ async def _write_outcome(
         pnl_pct=pnl_pct,
         hold_duration_seconds=hold_duration_seconds,
         exit_reason=exit_reason,
-        # Suggestion snapshot (None if no suggestion attached)
         suggested_entry_price=suggestion.entry_price if suggestion else None,
-        suggested_stop_loss=suggestion.stop_loss if suggestion else None,
-        suggested_tp1=suggestion.take_profit_1 if suggestion else None,
-        suggested_tp2=suggestion.take_profit_2 if suggestion else None,
-        suggested_tp3=suggestion.take_profit_3 if suggestion else None,
-        suggestion_consensus_score=suggestion.consensus_score if suggestion else None,
-        suggestion_confidence_level=suggestion.confidence_level if suggestion else None,
+        suggested_stop_loss=_sl,
+        suggested_tp1=_tp1,
+        suggested_tp2=_tp2,
+        suggested_tp3=_tp3,
+        suggestion_consensus_score=_consensus_score,
+        suggestion_confidence_level=_confidence_level,
         entry_slippage_pct=entry_slippage_pct,
         # ML feedback fields — populated async by outcome_service
         ml_direction_correct=None,

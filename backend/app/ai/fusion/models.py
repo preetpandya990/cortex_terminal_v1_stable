@@ -174,6 +174,12 @@ class AITradingSignal(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     signal_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     symbol: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    # Denormalized from instrument_master.name — populated at assembly time to
+    # avoid a JOIN on every signal read and every serialization/WebSocket publish.
+    company_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # False when the symbol is not present in instrument_master as an NSE EQ equity.
+    # Such signals are informational only — no trade execution is possible.
+    is_nse_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
     action: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
     confidence_score: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)
     strategy_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)

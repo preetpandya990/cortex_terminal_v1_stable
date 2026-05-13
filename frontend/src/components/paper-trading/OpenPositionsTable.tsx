@@ -3,27 +3,26 @@
 /**
  * OpenPositionsTable
  * ====================
- * Real implementation replacing OpenPositionsPlaceholder.
+ * Positions panel with Open / Closed tabs.
  *
  * Architecture:
- *  - REST: usePortfolioSummary + usePositions (TanStack Query, 30 s stale)
- *  - Live P&L: usePnLWebSocket — 500 ms frames from the backend P&L worker.
- *    Each position row reads from the shared positionPnLMap ref so individual
- *    row re-renders are driven by a row-level useEffect, not parent state.
+ *  - Single `usePositions()` call (no status filter) — splits client-side.
+ *  - Live P&L: usePnLWebSocket (500 ms frames). Rows poll the shared ref;
+ *    closed positions have no live data.
+ *  - Row click opens PositionDetailModal (fills, SL/TP gauge, outcome, timeline).
+ *  - Close button on open rows triggers ClosePositionModal.
  *  - First visit (no portfolio): renders CreatePortfolioModal inline prompt.
- *  - Close: ClosePositionModal per row.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
   AlertCircle,
-  ChevronDown,
+  ChevronRight,
   Loader2,
   Plus,
   TrendingDown,
   TrendingUp,
-  X,
   Wifi,
   WifiOff,
 } from "lucide-react";
@@ -33,7 +32,10 @@ import { usePnLWebSocket } from "@/hooks/usePnLWebSocket";
 import { PortfolioSummaryCard } from "./PortfolioSummaryCard";
 import { CreatePortfolioModal } from "./CreatePortfolioModal";
 import { ClosePositionModal } from "./ClosePositionModal";
+import { PositionDetailModal } from "./PositionDetailModal";
 import type { LivePositionPnL, PaperPosition } from "@/types/paper_trading";
+
+// ── Formatters ────────────────────────────────────────────────────────────────
 
 const INR = new Intl.NumberFormat("en-IN", {
   style: "currency",
@@ -42,23 +44,37 @@ const INR = new Intl.NumberFormat("en-IN", {
   maximumFractionDigits: 2,
 });
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Live P&L Row
-// Each row subscribes to the shared positionPnLMap ref via a 500 ms interval
-// so only the changed cell re-renders, not the whole table.
-// ──────────────────────────────────────────────────────────────────────────────
+function fmtIST(iso: string): string {
+  return new Intl.DateTimeFormat("en-IN", {
+    timeZone: "Asia/Kolkata",
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
+  }).format(new Date(iso));
+}
 
-interface PositionRowProps {
+// ── Open position row ─────────────────────────────────────────────────────────
+// Polls the shared positionPnLMap ref at 500 ms — only this row re-renders on
+// each tick, never the parent table.
+
+interface OpenRowProps {
   position: PaperPosition;
   positionPnLMap: React.MutableRefObject<Map<string, LivePositionPnL>>;
   onClose: (position: PaperPosition, livePrice?: number) => void;
+  onDetail: (position: PaperPosition, livePrice?: number) => void;
 }
 
-function PositionRow({ position, positionPnLMap, onClose }: PositionRowProps) {
+function OpenPositionRow({
+  position,
+  positionPnLMap,
+  onClose,
+  onDetail,
+}: OpenRowProps) {
   const [livePnL, setLivePnL] = useState<LivePositionPnL | null>(null);
 
-  // Poll the shared ref at ~500 ms — matches the backend worker cadence.
-  // We avoid subscribing the parent to a state update for every tick.
   useEffect(() => {
     const id = window.setInterval(() => {
       const tick = positionPnLMap.current.get(position.id);
@@ -68,66 +84,73 @@ function PositionRow({ position, positionPnLMap, onClose }: PositionRowProps) {
   }, [position.id, positionPnLMap]);
 
   const displayPnl = livePnL?.unrealized_pnl ?? position.unrealized_pnl;
-  const displayPct = livePnL?.pnl_pct ?? null;
-  const lastPrice = livePnL?.last_price ?? position.last_price;
-  const isLong = position.side === "LONG";
+  const displayPct = livePnL?.pnl_pct        ?? position.pnl_pct;
+  const lastPrice  = livePnL?.last_price      ?? position.last_price;
+  const isLong     = position.side === "LONG";
   const isPositive = (displayPnl ?? 0) >= 0;
 
   return (
-    <tr className="border-t border-slate-100 transition-colors hover:bg-slate-50/50">
+    <tr
+      className="border-t border-slate-100 transition-colors hover:bg-blue-50/40 cursor-pointer"
+      onClick={() => onDetail(position, livePnL?.last_price)}
+    >
       {/* Symbol */}
-      <td className="px-3 py-2.5">
+      <td className="px-3 py-3">
         <div className="font-semibold text-slate-900">{position.symbol}</div>
-        <div className="text-[10px] text-slate-400 uppercase tracking-wide">
-          {position.status === "OPEN" ? "Open" : "Closed"}
+        <div className="text-[10px] text-slate-400 uppercase tracking-wide mt-0.5">
+          NSE · EQ
         </div>
       </td>
 
       {/* Side */}
-      <td className="px-3 py-2.5">
+      <td className="px-3 py-3">
         <span
           className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold ${
-            isLong ? "bg-emerald-100 text-emerald-700" : "bg-rose-100 text-rose-700"
+            isLong
+              ? "bg-emerald-100 text-emerald-700"
+              : "bg-rose-100 text-rose-700"
           }`}
         >
-          {isLong ? <TrendingUp className="h-3 w-3" /> : <TrendingDown className="h-3 w-3" />}
+          {isLong
+            ? <TrendingUp className="h-3 w-3" />
+            : <TrendingDown className="h-3 w-3" />}
           {isLong ? "Long" : "Short"}
         </span>
       </td>
 
       {/* Qty */}
-      <td className="px-3 py-2.5 text-right font-medium text-slate-700">
+      <td className="px-3 py-3 text-right font-medium text-slate-700 tabular-nums">
         {position.quantity.toLocaleString("en-IN")}
       </td>
 
       {/* Avg Cost */}
-      <td className="px-3 py-2.5 text-right text-slate-600">
+      <td className="px-3 py-3 text-right text-slate-600 tabular-nums text-sm">
         {INR.format(position.avg_cost_price)}
       </td>
 
       {/* Last Price */}
-      <td className="px-3 py-2.5 text-right font-medium text-slate-900">
+      <td className="px-3 py-3 text-right font-semibold text-slate-900 tabular-nums">
         {lastPrice != null ? INR.format(lastPrice) : "—"}
       </td>
 
       {/* Unrealized P&L */}
-      <td className={`px-3 py-2.5 text-right font-semibold ${isPositive ? "text-emerald-600" : "text-rose-600"}`}>
+      <td
+        className={`px-3 py-3 text-right tabular-nums ${
+          isPositive ? "text-emerald-600" : "text-rose-600"
+        }`}
+      >
         {displayPnl != null ? (
           <>
-            {isPositive ? "+" : ""}
-            {INR.format(displayPnl)}
-          </>
-        ) : (
-          "—"
-        )}
-      </td>
-
-      {/* P&L % */}
-      <td className={`px-3 py-2.5 text-right text-sm ${isPositive ? "text-emerald-600" : "text-rose-600"}`}>
-        {displayPct != null ? (
-          <>
-            {displayPct >= 0 ? "+" : ""}
-            {displayPct.toFixed(2)}%
+            <div className="font-semibold">
+              {isPositive ? "+" : ""}
+              {INR.format(displayPnl)}
+            </div>
+            {displayPct != null && (
+              <div className="text-[11px]">
+                {displayPct >= 0 ? "+" : ""}
+                {displayPct.toFixed(2)}%
+              </div>
+            )}
           </>
         ) : (
           "—"
@@ -135,17 +158,56 @@ function PositionRow({ position, positionPnLMap, onClose }: PositionRowProps) {
       </td>
 
       {/* Stop Loss */}
-      <td className="px-3 py-2.5 text-right text-slate-500 text-xs">
-        {position.stop_loss != null ? INR.format(position.stop_loss) : "—"}
+      <td className="px-3 py-3 text-right text-xs tabular-nums">
+        {position.stop_loss != null ? (
+          <span className="rounded-md bg-rose-50 px-1.5 py-0.5 text-rose-700 font-medium">
+            {INR.format(position.stop_loss)}
+          </span>
+        ) : (
+          <span className="text-slate-300">—</span>
+        )}
       </td>
 
-      {/* Target 1 */}
-      <td className="px-3 py-2.5 text-right text-slate-500 text-xs">
-        {position.target_price_1 != null ? INR.format(position.target_price_1) : "—"}
+      {/* TP1 */}
+      <td className="px-3 py-3 text-right text-xs tabular-nums">
+        {position.target_price_1 != null ? (
+          <span className="text-amber-700 font-medium">
+            {INR.format(position.target_price_1)}
+          </span>
+        ) : (
+          <span className="text-slate-300">—</span>
+        )}
       </td>
 
-      {/* Close Button */}
-      <td className="px-3 py-2.5 text-right">
+      {/* TP2 */}
+      <td className="px-3 py-3 text-right text-xs tabular-nums">
+        {position.target_price_2 != null ? (
+          <span className="text-emerald-600 font-medium">
+            {INR.format(position.target_price_2)}
+          </span>
+        ) : (
+          <span className="text-slate-300">—</span>
+        )}
+      </td>
+
+      {/* TP3 */}
+      <td className="px-3 py-3 text-right text-xs tabular-nums">
+        {position.target_price_3 != null ? (
+          <span className="text-emerald-700 font-medium">
+            {INR.format(position.target_price_3)}
+          </span>
+        ) : (
+          <span className="text-slate-300">—</span>
+        )}
+      </td>
+
+      {/* Charges */}
+      <td className="px-3 py-3 text-right text-xs text-slate-400 tabular-nums">
+        {INR.format(position.total_charges)}
+      </td>
+
+      {/* Actions */}
+      <td className="px-3 py-3 text-right" onClick={(e) => e.stopPropagation()}>
         <button
           onClick={() => onClose(position, livePnL?.last_price)}
           className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-rose-300 hover:bg-rose-50 hover:text-rose-700 transition-colors"
@@ -157,18 +219,99 @@ function PositionRow({ position, positionPnLMap, onClose }: PositionRowProps) {
   );
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Main component
-// ──────────────────────────────────────────────────────────────────────────────
+// ── Closed position row ───────────────────────────────────────────────────────
+
+function ClosedPositionRow({
+  position,
+  onClick,
+}: {
+  position: PaperPosition;
+  onClick: (p: PaperPosition) => void;
+}) {
+  const isLong = position.side === "LONG";
+  const isWin  = position.realized_pnl >= 0;
+
+  return (
+    <tr
+      className="border-t border-slate-100 transition-colors hover:bg-blue-50/40 cursor-pointer"
+      onClick={() => onClick(position)}
+    >
+      {/* Symbol */}
+      <td className="px-3 py-3">
+        <div className="font-semibold text-slate-900">{position.symbol}</div>
+        <div className="text-[10px] text-slate-400 uppercase tracking-wide mt-0.5">
+          NSE · EQ
+        </div>
+      </td>
+
+      {/* Side */}
+      <td className="px-3 py-3">
+        <span
+          className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold ${
+            isLong
+              ? "bg-emerald-100 text-emerald-700"
+              : "bg-rose-100 text-rose-700"
+          }`}
+        >
+          {isLong
+            ? <TrendingUp className="h-3 w-3" />
+            : <TrendingDown className="h-3 w-3" />}
+          {isLong ? "Long" : "Short"}
+        </span>
+      </td>
+
+      {/* Avg Entry */}
+      <td className="px-3 py-3 text-right text-slate-600 tabular-nums text-sm">
+        {INR.format(position.avg_cost_price)}
+      </td>
+
+      {/* Realized P&L */}
+      <td
+        className={`px-3 py-3 text-right font-semibold tabular-nums ${
+          isWin ? "text-emerald-600" : "text-rose-600"
+        }`}
+      >
+        {position.realized_pnl >= 0 ? "+" : ""}
+        {INR.format(position.realized_pnl)}
+      </td>
+
+      {/* Charges */}
+      <td className="px-3 py-3 text-right text-xs text-slate-400 tabular-nums">
+        {INR.format(position.total_charges)}
+      </td>
+
+      {/* Closed At */}
+      <td className="px-3 py-3 text-right text-xs text-slate-500">
+        {position.closed_at ? fmtIST(position.closed_at) : "—"}
+      </td>
+
+      {/* Drill-down caret */}
+      <td className="px-3 py-3 text-right">
+        <ChevronRight className="h-4 w-4 text-slate-300 ml-auto" />
+      </td>
+    </tr>
+  );
+}
+
+// ── Main component ────────────────────────────────────────────────────────────
+
+type ActiveTab = "open" | "closed";
 
 export function OpenPositionsTable() {
   const { accessToken, isAuthenticated, isAuthReady } = useAuth();
 
-  const [showCreate, setShowCreate] = useState(false);
-  const [closingPosition, setClosingPosition] = useState<{
+  const [activeTab,         setActiveTab]         = useState<ActiveTab>("open");
+  const [showCreate,        setShowCreate]         = useState(false);
+  const [closingPosition,   setClosingPosition]    = useState<{
     position: PaperPosition;
     livePrice?: number;
   } | null>(null);
+  const [detailPosition,    setDetailPosition]     = useState<{
+    position: PaperPosition;
+    lastPrice?: number;
+  } | null>(null);
+
+  // ── Data ──────────────────────────────────────────────────────────────────
 
   const {
     data: portfolio,
@@ -183,13 +326,18 @@ export function OpenPositionsTable() {
   const noPortfolio =
     portfolioError && (portfolioErr as any)?.statusCode === 404;
 
+  // Single call — no status filter — returns all positions.
+  // split client-side to avoid two round-trips.
   const {
-    data: positionsData,
+    data: allPositionsData,
     isLoading: positionsLoading,
     refetch: refetchPositions,
-  } = usePositions({ status: "OPEN" }, !!portfolio?.id);
+  } = usePositions(undefined, !!portfolio?.id);
 
-  const openPositions = positionsData?.positions ?? [];
+  const openPositions   = allPositionsData?.positions.filter((p) => p.status === "OPEN")   ?? [];
+  const closedPositions = allPositionsData?.positions.filter((p) => p.status === "CLOSED") ?? [];
+
+  // ── WebSocket live P&L ────────────────────────────────────────────────────
 
   const {
     isConnected: wsConnected,
@@ -199,14 +347,23 @@ export function OpenPositionsTable() {
   } = usePnLWebSocket(
     portfolio?.id,
     accessToken,
-    isAuthReady && isAuthenticated && !!portfolio?.id
+    isAuthReady && isAuthenticated && !!portfolio?.id,
   );
+
+  // ── Callbacks ─────────────────────────────────────────────────────────────
 
   const handleCloseRequested = useCallback(
     (position: PaperPosition, livePrice?: number) => {
       setClosingPosition({ position, livePrice });
     },
-    []
+    [],
+  );
+
+  const handleDetailRequested = useCallback(
+    (position: PaperPosition, lastPrice?: number) => {
+      setDetailPosition({ position, lastPrice });
+    },
+    [],
   );
 
   const handlePositionClosed = useCallback(() => {
@@ -215,7 +372,16 @@ export function OpenPositionsTable() {
     refetchPortfolio();
   }, [refetchPositions, refetchPortfolio]);
 
-  // ── Loading state ──────────────────────────────────────────────────────────
+  // When user clicks "Close Position" inside the detail modal, open close modal
+  const handleRequestCloseFromDetail = useCallback(() => {
+    if (!detailPosition) return;
+    const livePrice = positionPnLMap.current.get(detailPosition.position.id)?.last_price;
+    setDetailPosition(null);
+    setClosingPosition({ position: detailPosition.position, livePrice });
+  }, [detailPosition, positionPnLMap]);
+
+  // ── Loading ───────────────────────────────────────────────────────────────
+
   if (!isAuthReady || portfolioLoading) {
     return (
       <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
@@ -227,7 +393,8 @@ export function OpenPositionsTable() {
     );
   }
 
-  // ── No portfolio — prompt to create ───────────────────────────────────────
+  // ── No portfolio ──────────────────────────────────────────────────────────
+
   if (noPortfolio || (!portfolioLoading && !portfolio && !portfolioError)) {
     return (
       <>
@@ -264,7 +431,8 @@ export function OpenPositionsTable() {
     );
   }
 
-  // ── API error (not 404) ────────────────────────────────────────────────────
+  // ── API error (non-404) ───────────────────────────────────────────────────
+
   if (portfolioError && !noPortfolio) {
     return (
       <section className="rounded-2xl border border-rose-200 bg-rose-50 p-6 shadow-sm">
@@ -278,30 +446,45 @@ export function OpenPositionsTable() {
 
   if (!portfolio) return null;
 
-  // ── Main render ────────────────────────────────────────────────────────────
+  // ── Derived tab stats ─────────────────────────────────────────────────────
+
+  const activePositions = activeTab === "open" ? openPositions : closedPositions;
+  const totalUnrealized = allPositionsData?.total_unrealized_pnl ?? 0;
+  const totalRealized   = closedPositions.reduce((s, p) => s + p.realized_pnl, 0);
+
+  // ── Main render ───────────────────────────────────────────────────────────
+
   return (
     <>
       <section className="space-y-3">
-        {/* Portfolio Summary Card with live WebSocket stats */}
+        {/* Portfolio Summary Card */}
         <PortfolioSummaryCard
           portfolio={portfolio}
           liveStats={wsConnected ? portfolioStats : undefined}
-          onSettingsClick={() => {/* TODO: open settings modal */}}
+          onSettingsClick={() => {/* TODO: settings modal */}}
         />
 
         {/* Positions Panel */}
         <div className="rounded-2xl border border-slate-200 bg-white shadow-sm">
-          {/* Panel header */}
+
+          {/* Panel header with tabs */}
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
-            <div className="flex items-center gap-2.5">
-              <h3 className="text-sm font-semibold text-slate-900">Open Positions</h3>
-              {positionsLoading ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin text-slate-400" />
-              ) : (
-                <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-semibold text-slate-600">
-                  {openPositions.length}
-                </span>
-              )}
+            {/* Tabs */}
+            <div className="flex items-center gap-1 rounded-xl bg-slate-100 p-1">
+              <TabButton
+                active={activeTab === "open"}
+                label="Open"
+                count={openPositions.length}
+                loading={positionsLoading}
+                onClick={() => setActiveTab("open")}
+              />
+              <TabButton
+                active={activeTab === "closed"}
+                label="Closed"
+                count={closedPositions.length}
+                loading={positionsLoading}
+                onClick={() => setActiveTab("closed")}
+              />
             </div>
 
             {/* Feed status */}
@@ -314,53 +497,62 @@ export function OpenPositionsTable() {
                   : "bg-slate-100 text-slate-500"
               }`}
             >
-              {wsConnected ? (
-                <Wifi className="h-3 w-3" />
-              ) : (
-                <WifiOff className="h-3 w-3" />
-              )}
-              {wsConnected ? "Live" : wsState === "connecting" ? "Connecting…" : "Offline"}
+              {wsConnected
+                ? <Wifi className="h-3 w-3" />
+                : <WifiOff className="h-3 w-3" />}
+              {wsConnected
+                ? "Live"
+                : wsState === "connecting"
+                ? "Connecting…"
+                : "Offline"}
             </div>
           </div>
 
           {/* Empty state */}
-          {!positionsLoading && openPositions.length === 0 && (
-            <div className="flex flex-col items-center justify-center py-12 text-center">
+          {!positionsLoading && activePositions.length === 0 && (
+            <div className="flex flex-col items-center justify-center py-14 text-center">
               <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-slate-100">
-                <ChevronDown className="h-5 w-5 text-slate-400" />
+                <Activity className="h-5 w-5 text-slate-400" />
               </div>
-              <p className="text-sm font-medium text-slate-600">No open positions</p>
+              <p className="text-sm font-medium text-slate-600">
+                No {activeTab} positions
+              </p>
               <p className="mt-0.5 text-xs text-slate-400">
-                Place an order from a trade signal to start tracking.
+                {activeTab === "open"
+                  ? "Place an order from a trade signal to start tracking."
+                  : "Closed positions will appear here after you close a trade."}
               </p>
             </div>
           )}
 
-          {/* Positions Table */}
-          {openPositions.length > 0 && (
+          {/* ── Open Positions Table ───────────────────────────────────── */}
+          {activeTab === "open" && openPositions.length > 0 && (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[900px] text-sm">
+              <table className="w-full min-w-[1120px] text-sm">
                 <thead>
-                  <tr className="bg-slate-50 text-xs uppercase tracking-wide text-slate-400">
+                  <tr className="bg-slate-50 text-[11px] uppercase tracking-wide text-slate-400">
                     <th className="px-3 py-2.5 text-left">Symbol</th>
                     <th className="px-3 py-2.5 text-left">Side</th>
                     <th className="px-3 py-2.5 text-right">Qty</th>
                     <th className="px-3 py-2.5 text-right">Avg Cost</th>
                     <th className="px-3 py-2.5 text-right">Last Price</th>
-                    <th className="px-3 py-2.5 text-right">Unrealized P&L</th>
-                    <th className="px-3 py-2.5 text-right">P&L %</th>
+                    <th className="px-3 py-2.5 text-right">P&L</th>
                     <th className="px-3 py-2.5 text-right">Stop Loss</th>
-                    <th className="px-3 py-2.5 text-right">Target 1</th>
+                    <th className="px-3 py-2.5 text-right">TP1</th>
+                    <th className="px-3 py-2.5 text-right">TP2</th>
+                    <th className="px-3 py-2.5 text-right">TP3</th>
+                    <th className="px-3 py-2.5 text-right">Charges</th>
                     <th className="px-3 py-2.5 text-right"></th>
                   </tr>
                 </thead>
                 <tbody>
                   {openPositions.map((position) => (
-                    <PositionRow
+                    <OpenPositionRow
                       key={position.id}
                       position={position}
                       positionPnLMap={positionPnLMap}
                       onClose={handleCloseRequested}
+                      onDetail={handleDetailRequested}
                     />
                   ))}
                 </tbody>
@@ -368,36 +560,88 @@ export function OpenPositionsTable() {
             </div>
           )}
 
-          {/* Aggregate row */}
-          {openPositions.length > 0 && (
+          {/* ── Closed Positions Table ─────────────────────────────────── */}
+          {activeTab === "closed" && closedPositions.length > 0 && (
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[700px] text-sm">
+                <thead>
+                  <tr className="bg-slate-50 text-[11px] uppercase tracking-wide text-slate-400">
+                    <th className="px-3 py-2.5 text-left">Symbol</th>
+                    <th className="px-3 py-2.5 text-left">Side</th>
+                    <th className="px-3 py-2.5 text-right">Avg Entry</th>
+                    <th className="px-3 py-2.5 text-right">Realized P&L</th>
+                    <th className="px-3 py-2.5 text-right">Charges</th>
+                    <th className="px-3 py-2.5 text-right">Closed</th>
+                    <th className="px-3 py-2.5 text-right"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {closedPositions.map((position) => (
+                    <ClosedPositionRow
+                      key={position.id}
+                      position={position}
+                      onClick={(p) => handleDetailRequested(p)}
+                    />
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* Aggregate footer */}
+          {activePositions.length > 0 && (
             <div className="border-t border-slate-200 bg-slate-50 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 rounded-b-2xl text-xs">
               <span className="text-slate-500">
-                {openPositions.length} position{openPositions.length !== 1 ? "s" : ""}
+                {activePositions.length}{" "}
+                {activeTab === "open" ? "open" : "closed"}{" "}
+                position{activePositions.length !== 1 ? "s" : ""}
               </span>
               <div className="flex items-center gap-4">
-                <span className="text-slate-500">
-                  Total Unrealized:&nbsp;
-                  <span
-                    className={`font-semibold ${
-                      (positionsData?.total_unrealized_pnl ?? 0) >= 0
-                        ? "text-emerald-600"
-                        : "text-rose-600"
-                    }`}
-                  >
-                    {(positionsData?.total_unrealized_pnl ?? 0) >= 0 ? "+" : ""}
-                    {new Intl.NumberFormat("en-IN", {
-                      style: "currency",
-                      currency: "INR",
-                      minimumFractionDigits: 2,
-                      maximumFractionDigits: 2,
-                    }).format(positionsData?.total_unrealized_pnl ?? 0)}
+                {activeTab === "open" && (
+                  <span className="text-slate-500">
+                    Total Unrealized:&nbsp;
+                    <span
+                      className={`font-semibold ${
+                        totalUnrealized >= 0 ? "text-emerald-600" : "text-rose-600"
+                      }`}
+                    >
+                      {totalUnrealized >= 0 ? "+" : ""}
+                      {INR.format(totalUnrealized)}
+                    </span>
                   </span>
-                </span>
+                )}
+                {activeTab === "closed" && (
+                  <span className="text-slate-500">
+                    Total Realized:&nbsp;
+                    <span
+                      className={`font-semibold ${
+                        totalRealized >= 0 ? "text-emerald-600" : "text-rose-600"
+                      }`}
+                    >
+                      {totalRealized >= 0 ? "+" : ""}
+                      {INR.format(totalRealized)}
+                    </span>
+                  </span>
+                )}
               </div>
             </div>
           )}
         </div>
       </section>
+
+      {/* Position Detail Modal */}
+      {detailPosition && (
+        <PositionDetailModal
+          position={detailPosition.position}
+          lastPrice={detailPosition.lastPrice}
+          onClose={() => setDetailPosition(null)}
+          onRequestClosePosition={
+            detailPosition.position.status === "OPEN"
+              ? handleRequestCloseFromDetail
+              : undefined
+          }
+        />
+      )}
 
       {/* Close Position Modal */}
       {closingPosition && (
@@ -409,5 +653,45 @@ export function OpenPositionsTable() {
         />
       )}
     </>
+  );
+}
+
+// ── Tab button ────────────────────────────────────────────────────────────────
+
+function TabButton({
+  active,
+  label,
+  count,
+  loading,
+  onClick,
+}: {
+  active: boolean;
+  label: string;
+  count: number;
+  loading: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition-all ${
+        active
+          ? "bg-white text-slate-900 shadow-sm"
+          : "text-slate-500 hover:text-slate-700"
+      }`}
+    >
+      {label}
+      {loading ? (
+        <Loader2 className="h-3 w-3 animate-spin text-slate-400" />
+      ) : (
+        <span
+          className={`rounded-full px-1.5 py-0.5 text-[10px] font-bold ${
+            active ? "bg-slate-100 text-slate-600" : "bg-slate-200 text-slate-500"
+          }`}
+        >
+          {count}
+        </span>
+      )}
+    </button>
   );
 }

@@ -26,6 +26,9 @@ export function useSignals(filters: SignalFilters = {}) {
       if (filters.min_confidence !== undefined) {
         params.append("min_confidence", filters.min_confidence.toString());
       }
+      if (filters.is_nse_eligible !== undefined) {
+        params.append("eligible", filters.is_nse_eligible.toString());
+      }
       if (filters.page) params.append("page", filters.page.toString());
       if (filters.limit) params.append("limit", filters.limit.toString());
       

@@ -31,22 +31,23 @@ export type {
 // AI Event Types
 export type {
   EventType,
-  FakeNewsStatus,
-  FakeNewsFlag,
-  ProcessedEvent,
-  EventDetail,
-  ProcessedEventsResponse,
+  SentimentLabel,
+  MarketEvent,
+  MarketEventsResponse,
   EventFilters,
 } from './events';
 
 // AI Regime Types
 export type {
+  RegimeType,
+  TrendDirection,
+  RegimeStrength,
   RegimeIndicators,
-  CurrentRegime,
-  RegimeHistory,
-  RegimeHistoryResponse,
-  ActiveStrategy,
-  ActiveStrategiesResponse,
+  InstrumentRegime,
+  IndexRegime,
+  MarketBreadth,
+  MarketOverview,
+  IndexConstituentsResponse,
 } from './regime';
 
 // Analysis Types

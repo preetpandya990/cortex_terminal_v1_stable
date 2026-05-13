@@ -18,8 +18,9 @@ from app.models.ml_data import (
     MLAuditLog,
     Base,
 )
+from app.models.ml_feedback import MLFeedbackError
 from app.models.user import User, RefreshToken
-from app.models.trade_suggestions import TradeSuggestion, EventCorrelation
+from app.models.trade_suggestions import TradeSuggestion, EventCorrelation, UserSuggestionCompliance
 from app.models.watchlist import WatchlistItem
 from app.models.paper_trading import (
     Portfolio,
@@ -49,9 +50,11 @@ __all__ = [
     "MLPrediction",
     "MLModelMetadata",
     "MLAuditLog",
+    "MLFeedbackError",
     # Signals
     "TradeSuggestion",
     "EventCorrelation",
+    "UserSuggestionCompliance",
     # Watchlist
     "WatchlistItem",
     # Paper Trading

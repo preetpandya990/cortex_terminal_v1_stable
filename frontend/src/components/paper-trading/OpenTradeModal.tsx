@@ -6,11 +6,12 @@ import {
   ArrowDownRight,
   ArrowUpRight,
   Loader2,
+  Sparkles,
   TrendingDown,
   TrendingUp,
   X,
 } from "lucide-react";
-import { usePortfolioSummary, usePlaceOrder } from "@/hooks/usePaperTrading";
+import { usePortfolioSummary, usePlaceOrder, usePriceTargets } from "@/hooks/usePaperTrading";
 import { useToast } from "@/components/ui/toast";
 import type {
   OrderType,
@@ -80,16 +81,24 @@ export function OpenTradeModal({
   const [limitPrice, setLimitPrice] = useState<string>(
     livePrice != null ? livePrice.toFixed(2) : ""
   );
+  const [stopLoss, setStopLoss] = useState<string>(
+    suggestion?.stop_loss != null ? String(suggestion.stop_loss) : ""
+  );
+  const [takeProfit1, setTakeProfit1] = useState<string>(
+    suggestion?.take_profit_1 != null ? String(suggestion.take_profit_1) : ""
+  );
+  const [takeProfit2, setTakeProfit2] = useState<string>(
+    suggestion?.take_profit_2 != null ? String(suggestion.take_profit_2) : ""
+  );
+  const [takeProfit3, setTakeProfit3] = useState<string>(
+    suggestion?.take_profit_3 != null ? String(suggestion.take_profit_3) : ""
+  );
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
-
-  // Keep limitPrice in sync when live price arrives after mount
-  useEffect(() => {
-    if (livePrice != null && limitPrice === "") {
-      setLimitPrice(livePrice.toFixed(2));
-    }
-  }, [livePrice, limitPrice]);
+  // True when SL/TP fields were populated by ML and the user hasn't edited them
+  const [isAiSuggested, setIsAiSuggested] = useState(false);
 
   // ── Derived values ────────────────────────────────────────────────────────
+  // Computed before hooks so usePriceTargets can use the resolved entry price.
   const refPrice =
     orderType === "LIMIT"
       ? parseFloat(limitPrice) || 0
@@ -100,6 +109,43 @@ export function OpenTradeModal({
   const cash = portfolio?.current_cash ?? 0;
   const cashAfter = side === "BUY" ? cash - estimatedCost : cash + estimatedCost;
   const insufficientFunds = side === "BUY" && estimatedCost > cash && qty > 0;
+
+  // ── ML price targets (manual trades only) ────────────────────────────────
+  const {
+    data: priceTargets,
+    isLoading: priceTargetsLoading,
+  } = usePriceTargets(
+    !suggestion ? instrument.trading_symbol : null,
+    side,
+    refPrice,
+    !suggestion && refPrice > 0,
+  );
+
+  // Keep limitPrice in sync when live price arrives after mount
+  useEffect(() => {
+    if (livePrice != null && limitPrice === "") {
+      setLimitPrice(livePrice.toFixed(2));
+    }
+  }, [livePrice, limitPrice]);
+
+  // Sync SL/TP from suggestion if it arrives after mount (async Hawk-Eye load)
+  useEffect(() => {
+    if (!suggestion) return;
+    if (suggestion.stop_loss != null) setStopLoss(String(suggestion.stop_loss));
+    if (suggestion.take_profit_1 != null) setTakeProfit1(String(suggestion.take_profit_1));
+    if (suggestion.take_profit_2 != null) setTakeProfit2(String(suggestion.take_profit_2));
+    if (suggestion.take_profit_3 != null) setTakeProfit3(String(suggestion.take_profit_3));
+  }, [suggestion]);
+
+  // Auto-fill SL/TP from ML price targets for manual trades
+  useEffect(() => {
+    if (!priceTargets) return;
+    setStopLoss(String(priceTargets.stop_loss));
+    setTakeProfit1(String(priceTargets.take_profit_1));
+    setTakeProfit2(String(priceTargets.take_profit_2));
+    setTakeProfit3(String(priceTargets.take_profit_3));
+    setIsAiSuggested(true);
+  }, [priceTargets]);
 
   // ── Validation ────────────────────────────────────────────────────────────
   function validate(): boolean {
@@ -113,6 +159,16 @@ export function OpenTradeModal({
     if (insufficientFunds) {
       errors.funds = `Insufficient cash. Need ${fmt(estimatedCost)}, have ${fmt(cash)}.`;
     }
+    const sl = stopLoss !== "" ? parseFloat(stopLoss) : null;
+    const tp1 = takeProfit1 !== "" ? parseFloat(takeProfit1) : null;
+    const tp2 = takeProfit2 !== "" ? parseFloat(takeProfit2) : null;
+    const tp3 = takeProfit3 !== "" ? parseFloat(takeProfit3) : null;
+    if (sl !== null && sl <= 0) errors.stopLoss = "Stop loss must be a positive price.";
+    if (tp1 !== null && tp1 <= 0) errors.takeProfit1 = "Target 1 must be a positive price.";
+    if (tp2 !== null && tp2 <= 0) errors.takeProfit2 = "Target 2 must be a positive price.";
+    if (tp3 !== null && tp3 <= 0) errors.takeProfit3 = "Target 3 must be a positive price.";
+    if (tp2 !== null && tp1 === null) errors.takeProfit2 = "Set Target 1 before Target 2.";
+    if (tp3 !== null && tp2 === null) errors.takeProfit3 = "Set Target 2 before Target 3.";
     setFieldErrors(errors);
     return Object.keys(errors).length === 0;
   }
@@ -122,6 +178,18 @@ export function OpenTradeModal({
     e.preventDefault();
     if (!validate()) return;
 
+    const sl = stopLoss !== "" ? parseFloat(stopLoss) : undefined;
+    const tp1 = takeProfit1 !== "" ? parseFloat(takeProfit1) : undefined;
+    const tp2 = takeProfit2 !== "" ? parseFloat(takeProfit2) : undefined;
+    const tp3 = takeProfit3 !== "" ? parseFloat(takeProfit3) : undefined;
+
+    const riskFields = {
+      ...(sl != null && { stop_loss: sl }),
+      ...(tp1 != null && { take_profit_1: tp1 }),
+      ...(tp2 != null && { take_profit_2: tp2 }),
+      ...(tp3 != null && { take_profit_3: tp3 }),
+    };
+
     const payload: PlaceOrderRequest = suggestion
       ? {
           suggestion_id: suggestion.suggestion_id,
@@ -130,6 +198,7 @@ export function OpenTradeModal({
           order_type: orderType,
           quantity: parseInt(quantity, 10),
           ...(orderType === "LIMIT" && { price: parseFloat(limitPrice) }),
+          ...riskFields,
         }
       : {
           symbol: instrument.trading_symbol,
@@ -140,6 +209,7 @@ export function OpenTradeModal({
           order_type: orderType,
           quantity: parseInt(quantity, 10),
           ...(orderType === "LIMIT" && { price: parseFloat(limitPrice) }),
+          ...riskFields,
         };
 
     try {
@@ -366,6 +436,76 @@ export function OpenTradeModal({
               {fieldErrors.quantity && (
                 <p className="text-xs text-rose-600">{fieldErrors.quantity}</p>
               )}
+            </div>
+
+            {/* Risk Management */}
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                  Risk Management
+                  <span className="normal-case font-normal text-slate-400 ml-1">(optional)</span>
+                </p>
+                {priceTargetsLoading && !suggestion && (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-indigo-50 border border-indigo-200 px-2 py-0.5 text-[10px] font-semibold text-indigo-500">
+                    <Loader2 className="h-2.5 w-2.5 animate-spin" />
+                    Computing…
+                  </span>
+                )}
+                {isAiSuggested && !priceTargetsLoading && (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-indigo-50 border border-indigo-200 px-2 py-0.5 text-[10px] font-semibold text-indigo-600">
+                    <Sparkles className="h-2.5 w-2.5" />
+                    ML Suggested
+                  </span>
+                )}
+              </div>
+
+              {/* Stop Loss */}
+              <div className="space-y-1.5">
+                <label className="block text-xs font-medium text-slate-500">
+                  Stop Loss (₹)
+                </label>
+                <input
+                  type="number"
+                  value={stopLoss}
+                  onChange={(e) => { setStopLoss(e.target.value); setIsAiSuggested(false); }}
+                  min={0.01}
+                  step={0.05}
+                  disabled={priceTargetsLoading && !suggestion}
+                  className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 placeholder-slate-400 focus:border-rose-400 focus:outline-none focus:ring-2 focus:ring-rose-400/20 transition disabled:bg-slate-50 disabled:animate-pulse"
+                  placeholder={priceTargetsLoading && !suggestion ? "Calculating…" : "Auto-close when price falls below"}
+                />
+                {fieldErrors.stopLoss && (
+                  <p className="text-xs text-rose-600">{fieldErrors.stopLoss}</p>
+                )}
+              </div>
+
+              {/* Targets row */}
+              <div className="grid grid-cols-3 gap-2">
+                {(
+                  [
+                    { label: "Target 1", value: takeProfit1, setter: setTakeProfit1, errorKey: "takeProfit1" },
+                    { label: "Target 2", value: takeProfit2, setter: setTakeProfit2, errorKey: "takeProfit2" },
+                    { label: "Target 3", value: takeProfit3, setter: setTakeProfit3, errorKey: "takeProfit3" },
+                  ] as const
+                ).map(({ label, value, setter, errorKey }) => (
+                  <div key={label} className="space-y-1.5">
+                    <label className="block text-xs font-medium text-slate-500">{label} (₹)</label>
+                    <input
+                      type="number"
+                      value={value}
+                      onChange={(e) => { setter(e.target.value); setIsAiSuggested(false); }}
+                      min={0.01}
+                      step={0.05}
+                      disabled={priceTargetsLoading && !suggestion}
+                      className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-400/20 transition disabled:bg-slate-50 disabled:animate-pulse"
+                      placeholder={priceTargetsLoading && !suggestion ? "…" : "—"}
+                    />
+                    {fieldErrors[errorKey] && (
+                      <p className="text-[11px] text-rose-600">{fieldErrors[errorKey]}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
             </div>
 
             {/* Cost summary */}

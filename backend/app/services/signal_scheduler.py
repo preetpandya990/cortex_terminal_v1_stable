@@ -209,7 +209,13 @@ class SignalScheduler:
         async with sem:
             try:
                 async with self._db_factory() as db:
-                    loader = FeatureLoader(db=db, redis=self._redis)
+                    loader = FeatureLoader(
+                        db=db,
+                        redis=self._redis,
+                        sequence_length=getattr(self._ml_predictor, "sequence_length", 60),
+                        n_features=getattr(self._ml_predictor, "n_features", 49),
+                        feature_names=getattr(self._ml_predictor, "feature_names", ()),
+                    )
                     tabular, sequence, current_price, volatility = (
                         await loader.load_features(symbol=symbol, timeframe="1d")
                     )
@@ -324,7 +330,13 @@ class SignalScheduler:
                     return
 
                 feature_loader = (
-                    FeatureLoader(db=db, redis=self._redis)
+                    FeatureLoader(
+                        db=db,
+                        redis=self._redis,
+                        sequence_length=getattr(self._ml_predictor, "sequence_length", 60),
+                        n_features=getattr(self._ml_predictor, "n_features", 49),
+                        feature_names=getattr(self._ml_predictor, "feature_names", ()),
+                    )
                     if self._ml_predictor
                     else None
                 )

@@ -102,19 +102,50 @@ async def worker_lifespan() -> AsyncGenerator[tuple[async_sessionmaker, AsyncSes
             ensemble = await loader.load_production_ensemble()
 
         predictor = EnsemblePredictor.from_loaded_ensemble(ensemble, cache=redis_client)
-        ml_components = {"ensemble_predictor": predictor}
+        ml_components = {
+            "ensemble_predictor":        predictor,
+            "ensemble_sequence_length":  ensemble.sequence_length,
+            "ensemble_n_features":       ensemble.n_features,
+            "ensemble_feature_names":    ensemble.feature_names,  # tuple[str, ...]
+        }
 
         logger.info(
-            "ML components initialized: XGBoost v%s (%.0f%%) + GRU v%s (%.0f%%)",
+            "ML components initialized: XGBoost v%s (%.0f%%) + GRU v%s (%.0f%%) | "
+            "features=%d sequence_len=%d",
             ensemble.xgboost_version, ensemble.xgboost_weight * 100,
             ensemble.gru_version,     ensemble.gru_weight    * 100,
+            ensemble.n_features,      ensemble.sequence_length,
         )
     except Exception as exc:
         logger.error("Failed to initialize ML components: %s", exc, exc_info=True)
-        logger.warning("Worker will continue without ML predictions")
+        logger.warning(
+            "Worker will continue WITHOUT ML predictions — "
+            "all correlation attempts will be rejected with ML_NEUTRAL"
+        )
     
+    # ── Startup verification: log exactly which ML components are present ────
+    _REQUIRED_ML_KEYS = {
+        "ensemble_predictor",
+        "ensemble_sequence_length",
+        "ensemble_n_features",
+        "ensemble_feature_names",
+    }
+    _missing = _REQUIRED_ML_KEYS - ml_components.keys()
+    if _missing:
+        logger.warning(
+            "Worker starting with INCOMPLETE ML components — missing: %s. "
+            "Correlations will be rejected at the ML_NEUTRAL gate until these "
+            "are available. Check ML registry and model loader logs above.",
+            sorted(_missing),
+        )
+    else:
+        logger.info(
+            "ML component verification passed — all %d required keys present",
+            len(_REQUIRED_ML_KEYS),
+        )
+
     logger.info("Worker resources initialized successfully")
-    
+
     try:
         yield session_factory, redis_client, ml_components, upstox_client
     finally:
@@ -420,21 +451,44 @@ async def correlation_loop(
     try:
         # Initialize services
         from app.ai.fusion.signal_assembler import SignalAssembler
+        from app.ml.inference.feature_loader import FeatureLoader
         from app.services.market_calendar import nse_calendar
         from app.services.market_scanner import MarketScannerService
-        
+
+        _ml_predictor    = ml_components.get("ensemble_predictor")
+        _seq_len         = ml_components.get("ensemble_sequence_length", 60)
+        _n_features      = ml_components.get("ensemble_n_features", 37)
+        _feature_names   = ml_components.get("ensemble_feature_names", ())
+        _ml_available    = _ml_predictor is not None
+
+        if not _ml_available:
+            logger.warning(
+                "Correlation loop starting WITHOUT ML predictor — "
+                "all correlations will be rejected at the ML_NEUTRAL gate. "
+                "Check worker startup logs for ML initialization errors."
+            )
+
         scanner_svc = MarketScannerService(cache=redis_client)
+
+        # assembler and engine are per-loop singletons so that circuit-breaker
+        # state accumulates correctly across cycles.  feature_loader is injected
+        # per-cycle (inside the session context) because FeatureLoader holds a
+        # reference to the DB session which must not outlive its context manager.
         assembler = SignalAssembler(
-            ensemble_predictor=ml_components.get("ensemble_predictor"),
-            feature_loader=ml_components.get("feature_loader"),
+            ensemble_predictor=_ml_predictor,
+            feature_loader=None,  # injected per-cycle below
+            redis=redis_client._redis,  # ML prediction cache — 30 s TTL per symbol/timeframe
         )
-        
         engine = EventCorrelationEngine(
             signal_assembler=assembler,
             redis=redis_client._redis,
+            scanner_cache=redis_client,   # CacheService — reads scanner:results:v2:1d
         )
-        
-        logger.info("Correlation engine initialized successfully")
+
+        logger.info(
+            "Correlation engine initialized — ml_available=%s features=%d seq_len=%d",
+            _ml_available, _n_features, _seq_len,
+        )
 
         loop_iteration = 0
 
@@ -451,6 +505,18 @@ async def correlation_loop(
 
             try:
                 async with session_factory() as session:
+                    # Bind a fresh FeatureLoader to this cycle's session so that
+                    # gather_ml_signals() has a live connection.  Cleared after
+                    # the session exits to prevent use-after-close bugs.
+                    if _ml_available:
+                        assembler.feature_loader = FeatureLoader(
+                            db=session,
+                            redis=redis_client._redis,
+                            sequence_length=_seq_len,
+                            n_features=_n_features,
+                            feature_names=_feature_names,
+                        )
+
                     # ── Pathway 1: Scanner Anomalies (market-hours only) ──────
                     if market.is_open_now:
                         try:
@@ -549,7 +615,12 @@ async def correlation_loop(
                             f"Pathway 2 error: {e}",
                             exc_info=True
                         )
-                
+
+                # Session is now closed — discard the stale FeatureLoader so
+                # any accidental post-cycle access fails fast rather than
+                # silently using a closed DB connection.
+                assembler.feature_loader = None
+
                 # Log cycle performance
                 cycle_duration = (datetime.now(timezone.utc) - cycle_start).total_seconds()
                 logger.debug(

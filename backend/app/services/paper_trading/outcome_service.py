@@ -164,7 +164,12 @@ async def get_outcome_stats(
         by_exit_reason[o.exit_reason] = by_exit_reason.get(o.exit_reason, 0) + 1
 
     # Segmented breakdowns
-    by_confidence = _segment_stats(outcomes, lambda o: o.suggestion_confidence_level)
+    # Confidence: use the populated field directly; fall back to "no_signal" only
+    # when neither a TradeSuggestion nor a matching AITradingSignal was found.
+    by_confidence = _segment_stats(
+        outcomes,
+        lambda o: o.suggestion_confidence_level or "no_signal",
+    )
     by_regime = _segment_stats(outcomes, lambda o: o.market_regime_at_entry)
     by_direction = _segment_stats(outcomes, lambda o: o.signal_direction)
 
@@ -255,6 +260,59 @@ def _populate_ml_fields(outcome: PaperTradeOutcome) -> None:
         outcome.hit_tp3 = True
 
 
+def _derive_confidence_level(confidence_score: Decimal) -> str:
+    """
+    Map a 0–1 AITradingSignal confidence score to HIGH / MEDIUM / LOW
+    using the same proportional thresholds as the correlation engine
+    (which uses consensus_score on 0–100: HIGH ≥ 80, MEDIUM ≥ 60).
+    """
+    pct = float(confidence_score) * 100.0
+    if pct >= 80.0:
+        return "HIGH"
+    if pct >= 60.0:
+        return "MEDIUM"
+    return "LOW"
+
+
+async def _find_matching_ai_signal(
+    session: AsyncSession,
+    symbol: str,
+    direction: str,
+    opened_at: datetime,
+    closed_at: datetime,
+):
+    """
+    Find the best AITradingSignal for a manually-opened position that wasn't
+    linked to a TradeSuggestion.
+
+    Looks for a same-symbol, same-direction signal within a ±2-day window
+    around the position's lifetime and returns the most recent match.
+    Returns None if no match is found.
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import and_, desc
+
+    from app.ai.fusion.models import AITradingSignal
+
+    window_start = opened_at - timedelta(days=2)
+    window_end = closed_at + timedelta(days=2)
+
+    result = await session.execute(
+        select(AITradingSignal).where(
+            and_(
+                AITradingSignal.symbol == symbol,
+                AITradingSignal.action == direction,
+                AITradingSignal.signal_timestamp >= window_start,
+                AITradingSignal.signal_timestamp <= window_end,
+            )
+        )
+        .order_by(desc(AITradingSignal.signal_timestamp))
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 async def _get_regime_at_entry(
     session: AsyncSession,
     outcome: PaperTradeOutcome,
@@ -263,23 +321,25 @@ async def _get_regime_at_entry(
     Fetch the market regime that was active at the time the position was opened.
 
     Queries ai_regime_detections for the most recent detection for this symbol
-    that was valid at or before the outcome's position entry time.
+    whose detection_timestamp is at or before the position's entry time.
 
-    Returns None gracefully if the table doesn't exist or has no data.
+    Returns None gracefully when no detection exists or on any DB error.
     """
     try:
-        from sqlalchemy import text
-        # Position opened_at is reconstructed from hold_duration and created_at
         from datetime import timedelta
+
+        from sqlalchemy import text
+
         entry_time = outcome.created_at - timedelta(seconds=outcome.hold_duration_seconds)
 
         stmt = text(
             """
-            SELECT regime
+            SELECT regime_type
             FROM ai_regime_detections
             WHERE symbol = :symbol
-              AND detected_at <= :entry_time
-            ORDER BY detected_at DESC
+              AND DATE(detection_timestamp AT TIME ZONE 'Asia/Kolkata')
+                  <= DATE(:entry_time AT TIME ZONE 'Asia/Kolkata')
+            ORDER BY detection_timestamp DESC
             LIMIT 1
             """
         )

@@ -1,18 +1,178 @@
 "use client";
 
 import { memo, useMemo } from "react";
-import { ArrowUpRight, ArrowDownRight, CheckCircle2, Clock } from "lucide-react";
+import {
+  TrendingUp,
+  TrendingDown,
+  CheckCircle2,
+  Clock,
+  ShieldCheck,
+  ShieldX,
+  ChevronRight,
+} from "lucide-react";
 import { Card, CardContent, CardFooter, CardHeader } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import type { TradeSuggestion } from "@/types/trade_suggestions";
-import { CONFIDENCE_COLORS, DIRECTION_COLORS } from "@/types/trade_suggestions";
+import type { TradeSuggestion, StrategyComplianceInfo } from "@/types/trade_suggestions";
 
 interface TradeSuggestionCardProps {
   suggestion: TradeSuggestion;
   onViewDetails?: (suggestionId: string) => void;
   className?: string;
+}
+
+function toTitleCase(str: string): string {
+  return str
+    .toLowerCase()
+    .split(" ")
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
+function StrategyBadge({ compliance }: { compliance: StrategyComplianceInfo }) {
+  const title = compliance.passed
+    ? `Passes the validation criteria of ${compliance.strategy_name}`
+    : `Does not pass the validation criteria of ${compliance.strategy_name}`;
+
+  return (
+    <Badge
+      variant="outline"
+      title={title}
+      className={cn(
+        "flex items-center gap-1 border text-xs cursor-default select-none",
+        compliance.passed
+          ? "bg-emerald-50 border-emerald-200 text-emerald-700"
+          : "bg-amber-50 border-amber-200 text-amber-700"
+      )}
+    >
+      {compliance.passed ? (
+        <ShieldCheck className="h-3 w-3 shrink-0" />
+      ) : (
+        <ShieldX className="h-3 w-3 shrink-0" />
+      )}
+      <span className="max-w-[80px] truncate">{compliance.strategy_name}</span>
+    </Badge>
+  );
+}
+
+function DirectionPill({ direction }: { direction: "BUY" | "SELL" }) {
+  const isBuy = direction === "BUY";
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-bold tracking-wide uppercase",
+        isBuy
+          ? "bg-emerald-600 text-white"
+          : "bg-rose-600 text-white"
+      )}
+    >
+      {isBuy ? (
+        <TrendingUp className="h-3.5 w-3.5 stroke-[2.5]" />
+      ) : (
+        <TrendingDown className="h-3.5 w-3.5 stroke-[2.5]" />
+      )}
+      {direction}
+    </span>
+  );
+}
+
+function ConfidencePill({ level }: { level: "HIGH" | "MEDIUM" | "LOW" }) {
+  const styles = {
+    HIGH:   "bg-emerald-50 border-emerald-300 text-emerald-700",
+    MEDIUM: "bg-amber-50  border-amber-300  text-amber-700",
+    LOW:    "bg-red-50    border-red-300    text-red-700",
+  };
+  const labels = { HIGH: "High", MEDIUM: "Medium", LOW: "Low" };
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center rounded-md border px-2 py-0.5 text-xs font-semibold",
+        styles[level]
+      )}
+    >
+      {labels[level]}
+    </span>
+  );
+}
+
+function ConsensusBar({ score }: { score: number }) {
+  const color =
+    score >= 80 ? "bg-emerald-500" : score >= 60 ? "bg-amber-500" : "bg-rose-400";
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-medium text-slate-500">Consensus</span>
+        <span className="text-xs font-bold tabular-nums text-slate-800">
+          {score.toFixed(1)}%
+        </span>
+      </div>
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
+        <div
+          className={cn("h-full rounded-full transition-all duration-500", color)}
+          style={{ width: `${score}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function AgentRow() {
+  return (
+    <div className="flex items-center gap-1.5">
+      <span className="text-xs text-slate-400 mr-0.5">Signals</span>
+      <Badge
+        variant="outline"
+        className="gap-1 border-blue-200 bg-blue-50 text-blue-700 text-[11px] py-0"
+      >
+        <CheckCircle2 className="h-2.5 w-2.5" />
+        Scanner
+      </Badge>
+      <Badge
+        variant="outline"
+        className="gap-1 border-violet-200 bg-violet-50 text-violet-700 text-[11px] py-0"
+      >
+        <CheckCircle2 className="h-2.5 w-2.5" />
+        AI
+      </Badge>
+      <Badge
+        variant="outline"
+        className="gap-1 border-indigo-200 bg-indigo-50 text-indigo-700 text-[11px] py-0"
+      >
+        <CheckCircle2 className="h-2.5 w-2.5" />
+        ML
+      </Badge>
+    </div>
+  );
+}
+
+function PriceGrid({ suggestion }: { suggestion: TradeSuggestion }) {
+  if (!suggestion.entry_price) return null;
+  return (
+    <div className="grid grid-cols-3 gap-2 rounded-lg border border-slate-100 bg-slate-50/60 p-2.5">
+      <div>
+        <p className="text-[10px] uppercase tracking-wide text-slate-400 mb-0.5">Entry</p>
+        <p className="text-sm font-semibold text-slate-900 tabular-nums">
+          ₹{suggestion.entry_price.toFixed(2)}
+        </p>
+      </div>
+      {suggestion.stop_loss ? (
+        <div>
+          <p className="text-[10px] uppercase tracking-wide text-slate-400 mb-0.5">Stop</p>
+          <p className="text-sm font-semibold text-rose-600 tabular-nums">
+            ₹{suggestion.stop_loss.toFixed(2)}
+          </p>
+        </div>
+      ) : <div />}
+      {suggestion.risk_reward_ratio ? (
+        <div>
+          <p className="text-[10px] uppercase tracking-wide text-slate-400 mb-0.5">R/R</p>
+          <p className="text-sm font-semibold text-emerald-600 tabular-nums">
+            1:{suggestion.risk_reward_ratio.toFixed(1)}
+          </p>
+        </div>
+      ) : <div />}
+    </div>
+  );
 }
 
 function TradeSuggestionCardComponent({
@@ -21,162 +181,87 @@ function TradeSuggestionCardComponent({
   className,
 }: TradeSuggestionCardProps) {
   const isBuy = suggestion.signal_direction === "BUY";
-  const directionColor = isBuy ? "text-green-600" : "text-red-600";
-  const directionBg = isBuy ? "bg-green-50" : "bg-red-50";
-  const directionBorder = isBuy ? "border-green-200" : "border-red-200";
 
-  const confidenceColor = useMemo(() => {
-    const level = suggestion.confidence_level;
-    if (level === "HIGH") return "bg-green-100 text-green-700 border-green-200";
-    if (level === "MEDIUM") return "bg-yellow-100 text-yellow-700 border-yellow-200";
-    return "bg-orange-100 text-orange-700 border-orange-200";
-  }, [suggestion.confidence_level]);
+  const ticker = suggestion.trading_symbol ?? suggestion.symbol;
+  const companyName = suggestion.company_name
+    ? toTitleCase(suggestion.company_name)
+    : null;
 
   const timeRemaining = useMemo(() => {
-    const now = new Date().getTime();
-    const expiry = new Date(suggestion.expires_at).getTime();
-    const diff = expiry - now;
-
+    const diff = new Date(suggestion.expires_at).getTime() - Date.now();
     if (diff <= 0) return "Expired";
-
-    const hours = Math.floor(diff / (1000 * 60 * 60));
-    const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
-
-    if (hours > 0) return `${hours}h ${minutes}m`;
-    return `${minutes}m`;
+    const h = Math.floor(diff / 3_600_000);
+    const m = Math.floor((diff % 3_600_000) / 60_000);
+    return h > 0 ? `${h}h ${m}m` : `${m}m`;
   }, [suggestion.expires_at]);
 
   const isExpired = timeRemaining === "Expired";
 
   return (
     <Card
+      onClick={() => !isExpired && onViewDetails?.(suggestion.suggestion_id)}
       className={cn(
-        "border-slate-200 bg-white transition-all hover:shadow-md",
+        "relative overflow-hidden border border-slate-200 bg-white transition-all duration-200",
+        "hover:border-slate-300 hover:shadow-[0_4px_20px_-4px_rgba(0,0,0,0.12)]",
+        !isExpired && "cursor-pointer",
         isExpired && "opacity-60",
         className
       )}
     >
-      <CardHeader className="pb-3">
+      {/* Accent bar */}
+      <div
+        className={cn(
+          "absolute inset-y-0 left-0 w-[3px]",
+          isBuy ? "bg-emerald-500" : "bg-rose-500"
+        )}
+      />
+      {/* ── Header ── */}
+      <CardHeader className="pb-3 pt-4 px-4">
         <div className="flex items-start justify-between gap-3">
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 mb-1">
-              <h3 className="text-lg font-semibold text-slate-900 truncate">
-                {suggestion.symbol}
-              </h3>
-              <Badge
-                className={cn(
-                  "flex items-center gap-1 border",
-                  isBuy
-                    ? "bg-green-50 text-green-700 border-green-200"
-                    : "bg-red-50 text-red-700 border-red-200"
-                )}
-              >
-                {isBuy ? (
-                  <ArrowUpRight className="h-3 w-3" />
-                ) : (
-                  <ArrowDownRight className="h-3 w-3" />
-                )}
-                {suggestion.signal_direction}
-              </Badge>
+          {/* Left: ticker + company name */}
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2.5 flex-wrap">
+              <span className="text-xl font-bold tracking-tight text-slate-900 leading-none">
+                {ticker}
+              </span>
+              <DirectionPill direction={suggestion.signal_direction} />
             </div>
-            <p className="text-xs text-slate-500 truncate">
-              {suggestion.trading_symbol || suggestion.instrument_key}
-            </p>
+            {companyName ? (
+              <p className="mt-1 text-xs text-slate-500 leading-snug truncate">
+                {companyName}
+              </p>
+            ) : null}
           </div>
-          <Badge className={cn("border", confidenceColor)}>
-            {suggestion.confidence_level}
-          </Badge>
+
+          {/* Right: confidence + strategy badge */}
+          <div className="flex flex-col items-end gap-1.5 shrink-0">
+            <ConfidencePill level={suggestion.confidence_level} />
+            {suggestion.strategy_compliance ? (
+              <StrategyBadge compliance={suggestion.strategy_compliance} />
+            ) : null}
+          </div>
         </div>
       </CardHeader>
 
-      <CardContent className="space-y-4 pb-3">
-        {/* Consensus Score Bar */}
-        <div className="space-y-1.5">
-          <div className="flex items-center justify-between text-xs">
-            <span className="font-medium text-slate-600">Consensus Score</span>
-            <span className="font-semibold text-slate-900">
-              {suggestion.consensus_score.toFixed(1)}%
-            </span>
-          </div>
-          <div className="h-2 w-full rounded-full bg-slate-100 overflow-hidden">
-            <div
-              className={cn(
-                "h-full rounded-full transition-all",
-                suggestion.consensus_score >= 80
-                  ? "bg-green-500"
-                  : suggestion.consensus_score >= 60
-                    ? "bg-yellow-500"
-                    : "bg-orange-500"
-              )}
-              style={{ width: `${suggestion.consensus_score}%` }}
-            />
-          </div>
-        </div>
-
-        {/* Agent Signals */}
-        <div className="flex items-center gap-2">
-          <span className="text-xs font-medium text-slate-500">Validated by:</span>
-          <div className="flex items-center gap-1.5">
-            <Badge variant="outline" className="text-xs gap-1 bg-blue-50 border-blue-200 text-blue-700">
-              <CheckCircle2 className="h-3 w-3" />
-              Scanner
-            </Badge>
-            <Badge variant="outline" className="text-xs gap-1 bg-purple-50 border-purple-200 text-purple-700">
-              <CheckCircle2 className="h-3 w-3" />
-              AI
-            </Badge>
-            <Badge variant="outline" className="text-xs gap-1 bg-indigo-50 border-indigo-200 text-indigo-700">
-              <CheckCircle2 className="h-3 w-3" />
-              ML
-            </Badge>
-          </div>
-        </div>
-
-        {/* Trade Parameters */}
-        {suggestion.entry_price && (
-          <div className="grid grid-cols-2 gap-3 pt-2 border-t border-slate-100">
-            <div>
-              <p className="text-xs text-slate-500 mb-0.5">Entry Price</p>
-              <p className="text-sm font-semibold text-slate-900">
-                ₹{suggestion.entry_price.toFixed(2)}
-              </p>
-            </div>
-            {suggestion.stop_loss && (
-              <div>
-                <p className="text-xs text-slate-500 mb-0.5">Stop Loss</p>
-                <p className="text-sm font-semibold text-slate-900">
-                  ₹{suggestion.stop_loss.toFixed(2)}
-                </p>
-              </div>
-            )}
-            {suggestion.risk_reward_ratio && (
-              <div className="col-span-2">
-                <p className="text-xs text-slate-500 mb-0.5">Risk/Reward</p>
-                <p className="text-sm font-semibold text-green-600">
-                  1:{suggestion.risk_reward_ratio.toFixed(1)}
-                </p>
-              </div>
-            )}
-          </div>
-        )}
+      {/* ── Body ── */}
+      <CardContent className="space-y-3 px-4 pb-3">
+        <ConsensusBar score={suggestion.consensus_score} />
+        <AgentRow />
+        <PriceGrid suggestion={suggestion} />
       </CardContent>
 
-      <CardFooter className="flex items-center justify-between pt-3 border-t border-slate-100">
-        <div className="flex items-center gap-1.5 text-xs text-slate-500">
-          <Clock className="h-3.5 w-3.5" />
-          <span className={cn(isExpired && "text-red-600 font-medium")}>
+      {/* ── Footer ── */}
+      <CardFooter className="flex items-center justify-between px-4 py-3 border-t border-slate-100">
+        <div className="flex items-center gap-1.5 text-xs text-slate-400">
+          <Clock className="h-3 w-3 shrink-0" />
+          <span className={cn(isExpired ? "text-rose-600 font-semibold" : "")}>
             {isExpired ? "Expired" : `Expires in ${timeRemaining}`}
           </span>
         </div>
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={() => onViewDetails?.(suggestion.suggestion_id)}
-          disabled={isExpired}
-          className="text-xs"
-        >
-          View Details
-        </Button>
+        <span className="flex items-center gap-0.5 text-xs text-slate-400">
+          View details
+          <ChevronRight className="h-3.5 w-3.5" />
+        </span>
       </CardFooter>
     </Card>
   );

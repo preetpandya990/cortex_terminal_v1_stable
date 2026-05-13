@@ -129,6 +129,8 @@ def serialise_signal(signal: AITradingSignal) -> dict[str, Any]:
     return {
         "signal_id": str(signal.id),
         "symbol": signal.symbol,
+        "company_name": signal.company_name or None,
+        "is_nse_eligible": bool(signal.is_nse_eligible),
         "signal_type": signal.action.lower(),
         "confidence": float(signal.confidence_score),
         "calibrated_confidence": float(signal.confidence_score),

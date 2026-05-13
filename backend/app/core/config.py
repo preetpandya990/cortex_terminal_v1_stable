@@ -87,7 +87,22 @@ class Settings(BaseSettings):
     SIGNAL_FREQUENCY_THRESHOLD: int = Field(100, ge=10, le=1000)
 
     # ── Worker Loops ───────────────────────────────────────────────────────────
-    REGIME_IDLE_SLEEP_SECONDS: int = Field(60, ge=30, le=300)
+    REGIME_IDLE_SLEEP_SECONDS: int = Field(
+        60,
+        ge=30,
+        le=300,
+        description="[Deprecated — no longer used by regime detection loop]",
+    )
+    REGIME_DETECTION_HOUR_IST: int = Field(
+        16,
+        ge=15,
+        le=20,
+        description=(
+            "Hour of day (IST, 24h clock) at which the daily post-market "
+            "regime detection run is triggered. Default 16 = 16:00 IST, "
+            "30 min after NSE close (15:30). Must be ≥15 and ≤20."
+        ),
+    )
     DRIFT_CHECK_INTERVAL_SECONDS: int = Field(300, ge=60, le=3600)
     SAFETY_CHECK_INTERVAL_SECONDS: int = Field(30, ge=10, le=300)
 
@@ -182,6 +197,16 @@ class Settings(BaseSettings):
     SIGNAL_SCHEDULER_FEATURE_CONCURRENCY: int = Field(20, ge=5, le=50)
     SIGNAL_SCHEDULER_ASSEMBLY_CONCURRENCY: int = Field(10, ge=2, le=20)
     SIGNAL_ON_DEMAND_CACHE_TTL: int = Field(900, ge=60, le=3600)  # 15 minutes
+
+    # ── Symbol Validation ──────────────────────────────────────────────────────
+    ENABLE_SYMBOL_VALIDATION: bool = Field(
+        True,
+        description=(
+            "Validate symbols against instrument_master before signal assembly. "
+            "Symbols not found as NSE EQ equities are rejected with a clear error. "
+            "Disable only for emergency operations or integration testing."
+        ),
+    )
 
     # ── Computed Properties ────────────────────────────────────────────────────
     @property

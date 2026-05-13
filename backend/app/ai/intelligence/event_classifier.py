@@ -17,13 +17,17 @@ Combined decay: 0.7 · 0.5^(t/fast_hl) + 0.3 · 0.5^(t/slow_hl)
 from __future__ import annotations
 
 import logging
+import re
 from decimal import Decimal
 from typing import Any
 
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.fusion.models import AINLPResult, AIEventClassification
 from app.ai.intelligence.llm_client import get_ollama_client
+from app.models.upstox_data import InstrumentMaster
+from app.services.symbol_validator import symbol_validator
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +57,132 @@ _VALID_EVENT_TYPES = frozenset(_DECAY_HALF_LIVES.keys())
 def _half_lives_for(event_type: str) -> tuple[int, int]:
     """Return (fast_hl, slow_hl) for an event type, falling back to 'general'."""
     return _DECAY_HALF_LIVES.get(event_type, (_DEFAULT_FAST_HL, _DEFAULT_SLOW_HL))
+
+
+_SYMBOL_RE = re.compile(r'^[A-Z0-9&\-]{2,20}$')
+# Minimum candidate length to attempt name-based matching.
+# Short strings (< 4 chars) like "LT" are treated as exact tickers only —
+# a 2-char candidate would produce false positives via substring matching
+# (e.g. "LT" appears inside "LIMITED" for every company name).
+_MIN_NAME_MATCH_LEN = 4
+
+
+async def normalize_and_validate_symbols(
+    db: AsyncSession,
+    raw_symbols: list[str],
+    *,
+    exchange: str = "NSE",
+) -> list[str]:
+    """
+    Validate and normalize raw LLM/NER strings into verified NSE trading symbols.
+
+    Two-pass strategy:
+
+    Pass 1 — Exact symbol match (cached via SymbolValidatorService)
+        Delegates to ``symbol_validator.validate_symbols()`` which uses Redis
+        caching + a single batched DB query.  Handles the common case where the
+        LLM correctly outputs NSE tickers ("RELIANCE", "TCS").
+
+    Pass 2 — Company name match (DB ILIKE, for remaining unresolved candidates)
+        For candidates that did not match as exact tickers and are at least
+        ``_MIN_NAME_MATCH_LEN`` characters long, run a trigram-accelerated
+        ILIKE query against ``instrument_master.name``.  Handles NER output
+        like "Reliance Industries Limited" or "HDFC Bank".
+        Results are merged into the ordered output set.
+
+    Only NSE EQ equities are returned; derivatives and indices are excluded.
+    Returns a deduplicated, order-preserving list of valid trading_symbol values.
+    Fails gracefully — DB or cache errors always return an empty list rather
+    than propagating upstream.
+    """
+    if not raw_symbols:
+        return []
+
+    candidates: list[str] = [
+        s.strip().upper() for s in raw_symbols if s and s.strip()
+    ]
+    if not candidates:
+        return []
+
+    # Ordered-set accumulator preserving first-occurrence order.
+    validated: dict[str, None] = {}
+
+    # ── Pass 1: exact symbol validation (cached) ───────────────────────────────
+    try:
+        exact_hits = await symbol_validator.validate_symbols(candidates, db)
+        for sym in exact_hits:
+            validated[sym] = None
+    except Exception as exc:
+        logger.warning(
+            "SymbolValidatorService.validate_symbols failed: %s — "
+            "falling back to name-only matching", exc,
+        )
+
+    # Collect candidates that were not resolved by exact match.
+    unresolved = [
+        c for c in candidates
+        if c not in validated and len(c) >= _MIN_NAME_MATCH_LEN
+    ]
+
+    # ── Pass 2: company-name substring match ───────────────────────────────────
+    if unresolved:
+        try:
+            # Build ILIKE conditions — the GIN trigram index on upper(name)
+            # makes these fast even without an exact prefix match.
+            name_conds = [
+                func.upper(InstrumentMaster.name).contains(c)
+                for c in unresolved
+            ]
+
+            stmt = (
+                select(InstrumentMaster.trading_symbol, InstrumentMaster.name)
+                .where(
+                    InstrumentMaster.exchange == exchange,
+                    InstrumentMaster.instrument_type == "EQ",
+                    or_(*name_conds),
+                )
+                # Cap results at (unresolved * 3) to guard against pathological
+                # name overlaps while still returning all plausible matches.
+                .limit(max(len(unresolved) * 3, 10))
+            )
+            result = await db.execute(stmt)
+            rows = result.all()
+
+            # Map upper(name) → trading_symbol for fast Python-side lookup.
+            name_map: dict[str, str] = {
+                row.name.upper(): row.trading_symbol
+                for row in rows
+                if row.name
+            }
+
+            for c in unresolved:
+                if c in validated:
+                    continue
+                for known_name, sym in name_map.items():
+                    # Require the candidate to appear as a meaningful substring:
+                    # at least _MIN_NAME_MATCH_LEN chars and the sym is not yet seen.
+                    if c in known_name and sym not in validated:
+                        validated[sym] = None
+                        break
+
+        except Exception as exc:
+            logger.warning(
+                "Name-based symbol resolution failed: %s — "
+                "returning only exact-match results", exc,
+            )
+
+    valid_list = list(validated.keys())
+
+    if len(valid_list) < len(set(candidates)):
+        dropped = [c for c in candidates if c not in valid_list]
+        if dropped:
+            logger.debug(
+                "Symbol normalisation: %d/%d candidates resolved; "
+                "unresolved (dropped): %s",
+                len(valid_list), len(set(candidates)), dropped,
+            )
+
+    return valid_list
 
 
 class EventClassifier:
@@ -99,11 +229,17 @@ class EventClassifier:
         # the canonical lookup table to ensure consistency across the ensemble.
         fast_hl = result.get("decay_hours", fast_hl)
 
+        # Validate and normalise affected_symbols against instrument_master so
+        # that raw NER entity strings ("Reliance Industries") and LLM hallucinations
+        # are filtered before being stored and used by the correlation engine.
+        raw_symbols: list[str] = result.get("affected_symbols") or []
+        validated_symbols = await normalize_and_validate_symbols(db, raw_symbols)
+
         classification = AIEventClassification(
             nlp_result_id=nlp_result_id,
             event_type=result["event_type"],
             impact_score=Decimal(str(result["impact_score"])),
-            affected_symbols=result.get("affected_symbols", []),
+            affected_symbols=validated_symbols,
             classification_confidence=Decimal(str(result["confidence"])),
             reasoning=result.get("reasoning", ""),
             decay_half_life_hours=fast_hl,

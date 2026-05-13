@@ -45,6 +45,7 @@ import type {
   OutcomesListResponse,
   OutcomeStatsResponse,
   PnlSnapshotsListResponse,
+  PriceTargetsResponse,
   QtySuggestionResponse,
   OrdersQueryParams,
   PositionsQueryParams,
@@ -62,6 +63,10 @@ export interface WatchlistItem {
   position: number;
   created_at: string;
   updated_at: string;
+  /** Most recent daily close — seeds priceFeed on page load when market is closed */
+  last_close: number | null;
+  /** Previous daily close — used for % change calculation before first live tick */
+  prev_close: number | null;
 }
 
 export interface WatchlistItemCreate {
@@ -587,6 +592,13 @@ export const tradeSuggestionsAPI = {
       'Failed to fetch trade suggestions'
     );
   },
+
+  getStats: async () => {
+    return requestData(
+      api.get('/trade-suggestions/stats/summary'),
+      'Failed to fetch trade suggestion stats'
+    );
+  },
 };
 export const ingestionAPI = {
   getSources: async () => {
@@ -715,6 +727,19 @@ export const paperTradingAPI = {
         params: { suggestion_id: suggestionId },
       }),
       'Failed to fetch quantity suggestion'
+    );
+  },
+
+  getPriceTargets: async (
+    symbol: string,
+    direction: string,
+    entryPrice: number,
+  ): Promise<PriceTargetsResponse> => {
+    return requestData(
+      api.get<PriceTargetsResponse>('/paper-trading/price-targets', {
+        params: { symbol, direction, entry_price: entryPrice },
+      }),
+      'Failed to fetch price targets'
     );
   },
 

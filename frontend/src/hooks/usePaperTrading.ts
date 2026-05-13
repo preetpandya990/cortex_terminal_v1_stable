@@ -20,6 +20,7 @@ import type {
   PlaceOrderRequest,
   PnlSnapshotsQueryParams,
   PositionsQueryParams,
+  TransactionType,
   UpdatePortfolioSettingsRequest,
 } from '@/types/paper_trading';
 
@@ -43,6 +44,8 @@ export const paperTradingKeys = {
   outcomeStats: () => [...paperTradingKeys.all, 'outcome-stats'] as const,
   pnlSnapshots: (params?: PnlSnapshotsQueryParams) =>
     [...paperTradingKeys.all, 'pnl-snapshots', params] as const,
+  priceTargets: (symbol: string | null, direction: TransactionType) =>
+    [...paperTradingKeys.all, 'price-targets', symbol, direction] as const,
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -204,5 +207,35 @@ export function usePnlSnapshots(params?: PnlSnapshotsQueryParams) {
     queryKey: paperTradingKeys.pnlSnapshots(params),
     queryFn: () => paperTradingAPI.getPnlSnapshots(params),
     staleTime: 300_000,
+  });
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Price Targets (ML-assisted SL/TP for manual trades)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Fetch ML-computed stop-loss and take-profit levels for a manual trade.
+ *
+ * Fires only when a valid symbol and a positive entry price are available.
+ * staleTime matches the backend cache TTL (4 hours) so repeated opens of the
+ * same manual trade modal are served instantly from the React Query cache.
+ *
+ * retry: false — a 404 (no OHLCV data) is a permanent condition for that
+ * symbol, not a transient error. Retrying would just delay the failure UX.
+ */
+export function usePriceTargets(
+  symbol: string | null,
+  direction: TransactionType,
+  entryPrice: number,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: paperTradingKeys.priceTargets(symbol, direction),
+    queryFn: () => paperTradingAPI.getPriceTargets(symbol!, direction, entryPrice),
+    enabled: enabled && !!symbol && entryPrice > 0,
+    staleTime: 14_400_000,   // 4 hours — matches backend cache TTL
+    retry: false,
+    refetchOnWindowFocus: false,
   });
 }

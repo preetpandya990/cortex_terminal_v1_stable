@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo } from "react";
-import { ArrowUpRight, ArrowDownRight, X, Clock, TrendingUp, Brain, Cpu, Target, Shield } from "lucide-react";
+import { TrendingUp as TrendingUpIcon, TrendingDown, Clock, Brain, Cpu, Target, Shield } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -12,6 +12,90 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { TradeSuggestion } from "@/types/trade_suggestions";
+
+const SIGNAL_SKIP_KEYS = new Set([
+  "instrument_key", "trading_symbol", "scanned_at",
+]);
+
+const SIGNAL_KEY_LABELS: Record<string, string> = {
+  signal:        "Direction",
+  score:         "Score",
+  rsi:           "RSI",
+  volume_ratio:  "Vol Ratio",
+  price_change_pct: "Price Δ%",
+  last_price:    "Price",
+  previous_close: "Prev Close",
+  volume:        "Volume",
+  direction:     "Direction",
+  confidence:    "Confidence",
+  event_count:   "Events",
+  sentiment:     "Sentiment",
+  available:     "Available",
+  ml_direction:  "Direction",
+  buy_prob:      "Buy Prob",
+  sell_prob:     "Sell Prob",
+  hold_prob:     "Hold Prob",
+};
+
+function formatSignalValue(key: string, value: unknown): string {
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  if (typeof value === "object") return JSON.stringify(value);
+  const n = Number(value);
+  if (!Number.isNaN(n)) {
+    if (["rsi", "price_change_pct", "buy_prob", "sell_prob", "hold_prob", "confidence"].includes(key)) {
+      return `${n.toFixed(2)}${["price_change_pct"].includes(key) ? "%" : ""}`;
+    }
+    if (["volume"].includes(key)) return n.toLocaleString("en-IN");
+    if (["score", "volume_ratio"].includes(key)) return n.toFixed(2);
+  }
+  return String(value);
+}
+
+function SignalPanel({
+  icon,
+  title,
+  data,
+  theme,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  data: Record<string, unknown>;
+  theme: "blue" | "violet" | "indigo";
+}) {
+  const themeStyles = {
+    blue:   { wrap: "bg-blue-50 border-blue-200",   label: "text-blue-900", val: "text-blue-700" },
+    violet: { wrap: "bg-violet-50 border-violet-200", label: "text-violet-900", val: "text-violet-700" },
+    indigo: { wrap: "bg-indigo-50 border-indigo-200", label: "text-indigo-900", val: "text-indigo-700" },
+  }[theme];
+
+  const entries = Object.entries(data).filter(([k]) => !SIGNAL_SKIP_KEYS.has(k));
+
+  return (
+    <div className={cn("rounded-lg border p-3", themeStyles.wrap)}>
+      <div className="flex items-center gap-2 mb-2.5">
+        {icon}
+        <p className={cn("text-sm font-semibold", themeStyles.label)}>{title}</p>
+      </div>
+      {entries.length === 0 ? (
+        <p className={cn("text-xs italic", themeStyles.val)}>No signal data</p>
+      ) : (
+        <div className="grid grid-cols-2 gap-x-4 gap-y-1.5">
+          {entries.map(([key, value]) => (
+            <div key={key} className="flex items-baseline justify-between gap-1 min-w-0">
+              <span className={cn("text-[11px] truncate shrink-0", themeStyles.val)}>
+                {SIGNAL_KEY_LABELS[key] ?? key.replace(/_/g, " ")}
+              </span>
+              <span className={cn("text-[11px] font-semibold tabular-nums", themeStyles.label)}>
+                {formatSignalValue(key, value)}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 interface SuggestionDetailModalProps {
   suggestion: TradeSuggestion | null;
@@ -43,44 +127,57 @@ export function SuggestionDetailModal({
   if (!suggestion) return null;
 
   const isBuy = suggestion.signal_direction === "BUY";
-  const confidenceColor = {
-    HIGH: "bg-green-100 text-green-700 border-green-200",
-    MEDIUM: "bg-yellow-100 text-yellow-700 border-yellow-200",
-    LOW: "bg-orange-100 text-orange-700 border-orange-200",
-  }[suggestion.confidence_level];
+  const ticker = suggestion.trading_symbol ?? suggestion.symbol;
+  const companyName = suggestion.company_name
+    ? suggestion.company_name
+        .toLowerCase()
+        .split(" ")
+        .map((w: string) => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(" ")
+    : null;
+
+  const confidenceStyles = {
+    HIGH:   "bg-emerald-50 border-emerald-300 text-emerald-700",
+    MEDIUM: "bg-amber-50   border-amber-300   text-amber-700",
+    LOW:    "bg-red-50     border-red-300     text-red-700",
+  };
+  const confidenceColor = confidenceStyles[suggestion.confidence_level];
 
   return (
     <Dialog open={open} onOpenChange={(isOpen) => !isOpen && onClose()}>
       <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <div className="flex items-start justify-between gap-4">
-            <div className="flex-1">
-              <DialogTitle className="text-2xl font-bold text-slate-900 mb-2">
-                {suggestion.symbol}
+            <div className="flex-1 min-w-0">
+              <DialogTitle className="text-2xl font-bold text-slate-900 leading-none mb-1">
+                {ticker}
               </DialogTitle>
-              <p className="text-sm text-slate-500">
-                {suggestion.trading_symbol || suggestion.instrument_key}
-              </p>
+              {companyName ? (
+                <p className="text-sm text-slate-500">{companyName}</p>
+              ) : null}
             </div>
-            <div className="flex items-center gap-2">
-              <Badge
+            <div className="flex items-center gap-2 shrink-0">
+              <span
                 className={cn(
-                  "flex items-center gap-1 border",
-                  isBuy
-                    ? "bg-green-50 text-green-700 border-green-200"
-                    : "bg-red-50 text-red-700 border-red-200"
+                  "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-bold tracking-wide uppercase",
+                  isBuy ? "bg-emerald-600 text-white" : "bg-rose-600 text-white"
                 )}
               >
                 {isBuy ? (
-                  <ArrowUpRight className="h-4 w-4" />
+                  <TrendingUpIcon className="h-4 w-4 stroke-[2.5]" />
                 ) : (
-                  <ArrowDownRight className="h-4 w-4" />
+                  <TrendingDown className="h-4 w-4 stroke-[2.5]" />
                 )}
                 {suggestion.signal_direction}
-              </Badge>
-              <Badge className={cn("border", confidenceColor)}>
-                {suggestion.confidence_level}
-              </Badge>
+              </span>
+              <span
+                className={cn(
+                  "inline-flex items-center rounded-md border px-2.5 py-1.5 text-sm font-semibold",
+                  confidenceColor
+                )}
+              >
+                {suggestion.confidence_level.charAt(0) + suggestion.confidence_level.slice(1).toLowerCase()}
+              </span>
             </div>
           </div>
         </DialogHeader>
@@ -117,52 +214,28 @@ export function SuggestionDetailModal({
             </h3>
             <div className="grid gap-3">
               {/* Scanner Signal */}
-              <div className="flex items-start gap-3 p-3 bg-blue-50 border border-blue-200 rounded-lg">
-                <TrendingUp className="h-5 w-5 text-blue-600 mt-0.5" />
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm font-medium text-blue-900">Technical Scanner</p>
-                  <div className="mt-1 text-xs text-blue-700 space-y-1">
-                    {Object.entries(suggestion.scanner_signal).map(([key, value]) => (
-                      <div key={key} className="flex items-center gap-2">
-                        <span className="font-medium">{key}:</span>
-                        <span>{typeof value === 'object' ? JSON.stringify(value) : String(value)}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
+              <SignalPanel
+                icon={<TrendingUpIcon className="h-4 w-4 text-blue-600" />}
+                title="Technical Scanner"
+                data={suggestion.scanner_signal}
+                theme="blue"
+              />
 
               {/* AI Signal */}
-              <div className="flex items-start gap-3 p-3 bg-purple-50 border border-purple-200 rounded-lg">
-                <Brain className="h-5 w-5 text-purple-600 mt-0.5" />
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm font-medium text-purple-900">AI Intelligence</p>
-                  <div className="mt-1 text-xs text-purple-700 space-y-1">
-                    {Object.entries(suggestion.ai_signal).map(([key, value]) => (
-                      <div key={key} className="flex items-center gap-2">
-                        <span className="font-medium">{key}:</span>
-                        <span>{typeof value === 'object' ? JSON.stringify(value) : String(value)}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
+              <SignalPanel
+                icon={<Brain className="h-4 w-4 text-violet-600" />}
+                title="AI Intelligence"
+                data={suggestion.ai_signal}
+                theme="violet"
+              />
 
               {/* ML Signal */}
-              <div className="flex items-start gap-3 p-3 bg-indigo-50 border border-indigo-200 rounded-lg">
-                <Cpu className="h-5 w-5 text-indigo-600 mt-0.5" />
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm font-medium text-indigo-900">ML Predictor</p>
-                  <div className="mt-1 text-xs text-indigo-700 space-y-1">
-                    {Object.entries(suggestion.ml_signal).map(([key, value]) => (
-                      <div key={key} className="flex items-center gap-2">
-                        <span className="font-medium">{key}:</span>
-                        <span>{typeof value === 'object' ? JSON.stringify(value) : String(value)}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
+              <SignalPanel
+                icon={<Cpu className="h-4 w-4 text-indigo-600" />}
+                title="ML Predictor"
+                data={suggestion.ml_signal}
+                theme="indigo"
+              />
             </div>
           </div>
 

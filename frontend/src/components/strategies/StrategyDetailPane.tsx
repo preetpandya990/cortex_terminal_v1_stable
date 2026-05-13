@@ -621,7 +621,7 @@ export function StrategyDetailPane({
                         </button>
                       )}
                     </div>
-                  ) : !isAdmin ? (
+                  ) : (
                     <button
                       onClick={() => onSubscribeRequest({
                         id: strategy.id,
@@ -642,7 +642,7 @@ export function StrategyDetailPane({
                       <Zap className="h-3.5 w-3.5 text-amber-400" aria-hidden="true" />
                       Subscribe to this strategy
                     </button>
-                  ) : null}
+                  )}
                 </div>
               )}
 

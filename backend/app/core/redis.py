@@ -162,7 +162,7 @@ class RedisChannels:
     CORRELATIONS_REJECTED = "cai:correlations:rejected"
     """
     Correlation analysis rejected (low consensus).
-    
+
     Payload:
         {
             "correlation_id": "uuid",
@@ -170,6 +170,40 @@ class RedisChannels:
             "rejection_reason": "LOW_CONSENSUS" | "CONFLICTING_SIGNALS" | "TIMEOUT",
             "consensus_score": 45.2,
             "rejected_at": "2026-04-22T12:00:00Z"
+        }
+    """
+
+    # ── ML Feedback ────────────────────────────────────────────────────────────
+    ML_FEEDBACK_ERRORS = "cai:ml:feedback_errors"
+    """
+    ML feedback computation failed after all retry attempts.
+
+    Payload:
+        {
+            "outcome_id": "uuid",
+            "symbol": "RELIANCE",
+            "portfolio_id": "uuid",
+            "user_id": 42,
+            "error_message": "...",
+            "error_type": "sqlalchemy.exc.OperationalError",
+            "attempt_count": 3,
+            "first_attempt_at": "2026-05-13T12:00:00Z",
+            "last_attempt_at": "2026-05-13T12:00:33Z",
+            "ml_feedback_error_id": "uuid"
+        }
+    """
+
+    ML_REGIME_ERRORS = "cai:ml:regime_detection_errors"
+    """
+    Regime detection batch run encountered a critical failure.
+
+    Payload:
+        {
+            "error": "...",
+            "symbols_attempted": 100,
+            "symbols_processed": 42,
+            "run_date": "2026-05-13",
+            "timestamp": "2026-05-13T10:35:00Z"
         }
     """
 

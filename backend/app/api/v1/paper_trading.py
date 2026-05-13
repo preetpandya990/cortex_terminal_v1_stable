@@ -49,7 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth import get_current_user, require_role
 from app.core.database import get_db
 from app.core.limiter import limiter
-from app.core.redis import get_redis
+from app.core.redis import get_redis, get_cache_service
 from app.core.security import get_current_user_id
 from app.models.paper_trading import PaperFill, PaperOrder, PaperPnlSnapshot, PaperTradeOutcome
 from app.models.user import User
@@ -71,6 +71,7 @@ from app.schemas.paper_trading import (
     PortfolioResponse,
     PortfolioSummaryResponse,
     PositionsListResponse,
+    PriceTargetsResponse,
     QtySuggestionResponse,
     UpdatePortfolioSettingsRequest,
 )
@@ -78,6 +79,74 @@ from app.services.paper_trading import portfolio_service, order_service, positio
 from app.services.paper_trading.pnl_worker import _PNL_CHANNEL_PREFIX
 
 logger = logging.getLogger(__name__)
+
+# ── PnL WebSocket constants ────────────────────────────────────────────────────
+_PNL_WS_QUEUE_MAXSIZE = 128
+_PNL_WS_HEARTBEAT_S   = 30.0
+_PNL_WS_RECV_TIMEOUT  = 60.0   # client inactivity before the loop continues
+
+
+# ── PnL WebSocket task helpers ────────────────────────────────────────────────
+
+async def _pnl_listener(
+    pubsub: Any,
+    queue: asyncio.Queue[dict[str, Any]],
+) -> None:
+    """Forward Redis PnL pub/sub frames to the outbound queue."""
+    try:
+        async for message in pubsub.listen():
+            if message["type"] != "message":
+                continue
+            raw = message["data"]
+            if isinstance(raw, bytes):
+                raw = raw.decode()
+            try:
+                frame = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            try:
+                queue.put_nowait(frame)
+            except asyncio.QueueFull:
+                # Drop oldest frame to make room for the fresh one
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                queue.put_nowait(frame)
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("PnL WS listener error")
+
+
+async def _pnl_sender(
+    websocket: WebSocket,
+    queue: asyncio.Queue[dict[str, Any]],
+) -> None:
+    """Drain the outbound queue and write frames to the WebSocket client."""
+    try:
+        while True:
+            frame = await queue.get()
+            await websocket.send_json(frame)
+    except asyncio.CancelledError:
+        pass
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        logger.exception("PnL WS sender error")
+
+
+async def _pnl_heartbeat(queue: asyncio.Queue[dict[str, Any]]) -> None:
+    """Enqueue a server ping every 30 s so the client can detect stale connections."""
+    try:
+        while True:
+            await asyncio.sleep(_PNL_WS_HEARTBEAT_S)
+            try:
+                queue.put_nowait({"type": "ping", "ts": datetime.now(timezone.utc).isoformat()})
+            except asyncio.QueueFull:
+                pass
+    except asyncio.CancelledError:
+        pass
 
 router = APIRouter(dependencies=[Depends(get_current_user_id)])
 ws_router = APIRouter()
@@ -219,6 +288,122 @@ async def get_qty_suggestion(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Price Targets (ML-assisted SL/TP for manual trades)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_PRICE_TARGETS_CACHE_KEY = "cai:pt:vol:{symbol}"
+_PRICE_TARGETS_CACHE_TTL = 14_400  # 4 hours — volatility is a daily-scale measure
+
+
+@router.get(
+    "/price-targets",
+    response_model=PriceTargetsResponse,
+    summary="Compute ML-ensemble SL/TP levels for a manual trade",
+)
+@limiter.limit("60/minute")
+async def get_price_targets(
+    request: Request,
+    symbol: str = Query(..., min_length=1, max_length=20, description="NSE trading symbol"),
+    direction: str = Query(..., pattern="^(BUY|SELL)$", description="Trade direction"),
+    entry_price: float = Query(..., gt=0, description="Intended entry price"),
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+    cache: Any = Depends(get_cache_service),
+) -> PriceTargetsResponse:
+    """
+    Compute stop-loss and take-profit levels for a manual paper trade.
+
+    Primary path — ML ensemble (XGBoost + GRU, source: "ml_ensemble"):
+      Loads 49-feature vectors via FeatureLoader, runs the live ensemble to
+      obtain a calibrated annualised volatility, and applies the standard
+      vol-based SL/TP formula.  EnsemblePredictor maintains its own 5-minute
+      Redis cache so repeated opens of the same symbol are effectively free.
+
+    Fallback path — OHLCV historical volatility (source: "historical_volatility"):
+      Used when the ML predictor is unavailable or feature data is absent.
+      Computes vol from 63 daily log-returns and caches the intermediate
+      context per symbol for 4 hours.
+
+    Returns HTTP 404 when neither path can produce meaningful price targets
+    (insufficient OHLCV data or no instrument record for the symbol).
+    """
+    from decimal import Decimal as D
+    from app.exceptions import DataNotFoundError
+    from app.core.redis import get_redis
+    from app.services.paper_trading.price_target_service import (
+        PriceTargets,
+        compute_price_targets_ml,
+        fetch_volatility_context,
+        apply_formula,
+        volatility_context_to_dict,
+        volatility_context_from_dict,
+    )
+
+    symbol_upper = symbol.strip().upper()
+    entry_dec    = D(str(entry_price))
+    targets: PriceTargets | None = None
+
+    # ── Primary path: ML ensemble ─────────────────────────────────────────────
+    ml_predictor = getattr(request.app.state, "ml_predictor", None)
+    ml_ensemble  = getattr(request.app.state, "ml_ensemble",  None)
+
+    if ml_predictor is not None and ml_ensemble is not None:
+        try:
+            targets = await compute_price_targets_ml(
+                session=session,
+                redis=get_redis(),
+                predictor=ml_predictor,
+                ensemble=ml_ensemble,
+                symbol=symbol_upper,
+                direction=direction,
+                entry_price=entry_dec,
+            )
+        except Exception as exc:
+            logger.warning(
+                "ML price target computation failed for %s — falling back to OHLCV: %s",
+                symbol_upper, exc,
+            )
+
+    # ── Fallback: OHLCV historical volatility ─────────────────────────────────
+    if targets is None:
+        cache_key = _PRICE_TARGETS_CACHE_KEY.format(symbol=symbol_upper)
+        cached = await cache.get(cache_key)
+        if cached is not None:
+            ctx = volatility_context_from_dict(cached)
+        else:
+            ctx = await fetch_volatility_context(session, symbol_upper)
+            if ctx is None:
+                raise DataNotFoundError(
+                    f"Insufficient OHLCV data for '{symbol_upper}'. "
+                    "Price targets cannot be computed."
+                )
+            await cache.set(cache_key, volatility_context_to_dict(ctx), ttl=_PRICE_TARGETS_CACHE_TTL)
+
+        targets = apply_formula(
+            symbol=symbol_upper,
+            direction=direction,
+            entry_price=entry_dec,
+            ctx=ctx,
+            source="historical_volatility",
+        )
+
+    return PriceTargetsResponse(
+        symbol=targets.symbol,
+        direction=targets.direction,
+        entry_price=float(targets.entry_price),
+        stop_loss=float(targets.stop_loss),
+        take_profit_1=float(targets.take_profit_1),
+        take_profit_2=float(targets.take_profit_2),
+        take_profit_3=float(targets.take_profit_3),
+        volatility_annualized=targets.volatility_annualized,
+        regime_type=targets.regime_type,
+        candles_used=targets.candles_used,
+        source=targets.source,
+        computed_at=targets.computed_at,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Orders
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -256,19 +441,16 @@ async def place_order(
 
     # Schedule ML feedback computation if a fill + outcome was written
     if fill is not None:
-        from app.models.paper_trading import PaperTradeOutcome
-        outcome_stmt = select(PaperTradeOutcome).where(
-            PaperTradeOutcome.position_id.in_(
-                select(PaperTradeOutcome.position_id)
-            )
-        )
-        # Simpler: look up outcome by portfolio + most recent created_at
         outcome = await _latest_outcome_for_portfolio(
             session, paper_order.portfolio_id
         )
         if outcome:
             background_tasks.add_task(
-                _compute_ml_feedback_bg, outcome.id
+                _compute_ml_feedback_bg,
+                outcome.id,
+                outcome.symbol,
+                outcome.portfolio_id,
+                outcome.user_id,
             )
 
     return PaperOrderResponse.model_validate(paper_order)
@@ -484,7 +666,13 @@ async def close_position(
             session, position.portfolio_id
         )
         if outcome:
-            background_tasks.add_task(_compute_ml_feedback_bg, outcome.id)
+            background_tasks.add_task(
+                _compute_ml_feedback_bg,
+                outcome.id,
+                outcome.symbol,
+                outcome.portfolio_id,
+                outcome.user_id,
+            )
 
     return PaperPositionResponse.model_validate(position)
 
@@ -728,38 +916,44 @@ async def pnl_websocket(
 
     pubsub = redis.pubsub()
     await pubsub.subscribe(channel)
-    logger.info("WS client connected to PnL channel: %s uid=%d", channel, uid)
+    logger.info("PnL WS connected: channel=%s uid=%d", channel, uid)
+
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=_PNL_WS_QUEUE_MAXSIZE)
+    tasks: list[asyncio.Task[None]] = [
+        asyncio.create_task(_pnl_listener(pubsub, queue),   name="pnl-listener"),
+        asyncio.create_task(_pnl_sender(websocket, queue),  name="pnl-sender"),
+        asyncio.create_task(_pnl_heartbeat(queue),          name="pnl-heartbeat"),
+    ]
 
     try:
         while True:
-            # Forward messages from Redis pub/sub to the WebSocket
-            message = await pubsub.get_message(
-                ignore_subscribe_messages=True, timeout=1.0
-            )
-            if message is not None and message.get("type") == "message":
-                data = message["data"]
-                if isinstance(data, bytes):
-                    data = data.decode()
-                await websocket.send_text(data)
-
-            # Check for client ping / disconnect
             try:
-                client_msg = await asyncio.wait_for(
-                    websocket.receive_text(), timeout=0.01
+                raw = await asyncio.wait_for(
+                    websocket.receive_text(), timeout=_PNL_WS_RECV_TIMEOUT
                 )
-                # Client may send a ping; we just echo "pong"
-                if client_msg == "ping":
-                    await websocket.send_text(json.dumps({"type": "pong"}))
             except asyncio.TimeoutError:
-                pass
+                # No client message for 60 s — loop again; heartbeat keeps link alive
+                continue
+
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            if msg.get("type") == "ping":
+                await queue.put({"type": "pong", "ts": datetime.now(timezone.utc).isoformat()})
 
     except WebSocketDisconnect:
-        logger.info("WS PnL client disconnected: %s uid=%d", channel, uid)
-    except Exception as exc:
-        logger.warning("WS PnL error for %s: %s", channel, exc)
+        logger.info("PnL WS disconnected: channel=%s uid=%d", channel, uid)
+    except Exception:
+        logger.exception("PnL WS unexpected error: channel=%s uid=%d", channel, uid)
     finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await pubsub.unsubscribe(channel)
         await pubsub.aclose()
+        logger.info("PnL WS cleaned up: channel=%s uid=%d", channel, uid)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -780,12 +974,28 @@ async def _latest_outcome_for_portfolio(
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
-async def _compute_ml_feedback_bg(outcome_id: UUID) -> None:
-    """Background task: compute ML feedback in a separate DB session."""
+async def _compute_ml_feedback_bg(
+    outcome_id: UUID,
+    symbol: str,
+    portfolio_id: UUID,
+    user_id: int,
+) -> None:
+    """
+    Background task: compute ML feedback with exponential-backoff retry.
+
+    Delegates to compute_ml_feedback_with_retry() which handles:
+      - 3 attempts with exp backoff + jitter
+      - MLFeedbackError DB record on final failure
+      - Redis cai:ml:feedback_errors alert on final failure
+      - Prometheus instrumentation
+    """
     from app.core.database import AsyncSessionLocal
-    try:
-        async with AsyncSessionLocal() as session:
-            await outcome_service.compute_ml_feedback(session, outcome_id)
-            await session.commit()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Background ML feedback failed for %s: %s", outcome_id, exc)
+    from app.core.retry import compute_ml_feedback_with_retry
+
+    await compute_ml_feedback_with_retry(
+        outcome_id=outcome_id,
+        symbol=symbol,
+        portfolio_id=portfolio_id,
+        user_id=user_id,
+        session_factory=AsyncSessionLocal,
+    )

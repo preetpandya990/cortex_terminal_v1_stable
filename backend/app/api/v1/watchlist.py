@@ -6,14 +6,17 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db
 from app.core.security import CurrentUserID, get_current_user_id
+from app.models.upstox_data import UpstoxOHLCV
 from app.models.watchlist import WatchlistItem
 
 router = APIRouter()
+
+_DAILY_TF = "1d"
 
 
 # ── Request/Response Models ────────────────────────────────────────────────────
@@ -33,6 +36,11 @@ class WatchlistItemResponse(BaseModel):
     position: int
     created_at: datetime
     updated_at: datetime
+    # Last two daily closes — used to seed the live price feed on page load.
+    # last_close  = most recent daily bar close
+    # prev_close  = close of the bar before that (for % change calc)
+    last_close: float | None = None
+    prev_close: float | None = None
 
     class Config:
         from_attributes = True
@@ -48,15 +56,65 @@ class WatchlistReorderRequest(BaseModel):
 async def get_watchlist(
     user_id: CurrentUserID,
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> list[WatchlistItem]:
-    """Get user's watchlist items ordered by position."""
-    stmt = (
+) -> list[WatchlistItemResponse]:
+    """
+    Return watchlist items ordered by position.
+
+    Each item is enriched with `last_close` and `prev_close` from the two most
+    recent daily OHLCV bars so the frontend can seed the live price feed on page
+    load — preventing stale "—" prices when the market is closed.
+    """
+    # Fetch watchlist rows
+    items_result = await db.execute(
         select(WatchlistItem)
         .where(WatchlistItem.user_id == int(user_id))
         .order_by(WatchlistItem.position)
     )
-    result = await db.execute(stmt)
-    return list(result.scalars().all())
+    items = list(items_result.scalars().all())
+    if not items:
+        return []
+
+    instrument_keys = [i.instrument_key for i in items]
+
+    # Window query: rank daily bars per instrument by timestamp DESC, keep ranks 1 & 2
+    ranked = (
+        select(
+            UpstoxOHLCV.instrument_key,
+            UpstoxOHLCV.close,
+            func.row_number()
+            .over(
+                partition_by=UpstoxOHLCV.instrument_key,
+                order_by=UpstoxOHLCV.timestamp.desc(),
+            )
+            .label("rn"),
+        )
+        .where(
+            UpstoxOHLCV.instrument_key.in_(instrument_keys),
+            UpstoxOHLCV.timeframe == _DAILY_TF,
+        )
+        .subquery()
+    )
+    ohlcv_result = await db.execute(
+        select(ranked.c.instrument_key, ranked.c.close, ranked.c.rn).where(
+            ranked.c.rn <= 2
+        )
+    )
+    ohlcv_rows = ohlcv_result.all()
+
+    # Build {instrument_key: {1: last_close, 2: prev_close}} lookup
+    close_map: dict[str, dict[int, float]] = {}
+    for row in ohlcv_rows:
+        close_map.setdefault(row.instrument_key, {})[row.rn] = float(row.close)
+
+    responses: list[WatchlistItemResponse] = []
+    for item in items:
+        closes = close_map.get(item.instrument_key, {})
+        resp = WatchlistItemResponse.model_validate(item)
+        resp.last_close = closes.get(1)
+        resp.prev_close = closes.get(2)
+        responses.append(resp)
+
+    return responses
 
 
 @router.post("/", response_model=WatchlistItemResponse, status_code=status.HTTP_201_CREATED)

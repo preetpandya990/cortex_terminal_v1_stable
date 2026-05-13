@@ -52,6 +52,12 @@ export interface PlaceOrderRequest {
   quantity: number;
   price?: number;
   trigger_price?: number;
+
+  /** Risk management — optional for both manual and signal-backed orders. */
+  stop_loss?: number;
+  take_profit_1?: number;
+  take_profit_2?: number;
+  take_profit_3?: number;
 }
 
 export interface ClosePositionRequest {
@@ -139,6 +145,7 @@ export interface PaperPosition {
   avg_cost_price: number;
   last_price: number | null;
   unrealized_pnl: number | null;
+  pnl_pct: number | null;
   realized_pnl: number;
   total_charges: number;
   side: PositionSide;
@@ -245,6 +252,21 @@ export interface PnlSnapshotsListResponse {
 // ============================================================================
 // Utility Responses
 // ============================================================================
+
+export interface PriceTargetsResponse {
+  symbol: string;
+  direction: string;
+  entry_price: number;
+  stop_loss: number;
+  take_profit_1: number;
+  take_profit_2: number;
+  take_profit_3: number;
+  volatility_annualized: number;
+  regime_type: string | null;
+  candles_used: number;
+  source: "ml_ensemble" | "historical_volatility";
+  computed_at: string;
+}
 
 export interface QtySuggestionResponse {
   suggested_qty: number;

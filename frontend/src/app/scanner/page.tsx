@@ -238,23 +238,23 @@ export default function ScannerPage() {
         <ScanSuccessBanner payload={scanStream.result} />
       ) : null}
 
-      {scanData && scanData.live_prices_available === false ? (
+      {scannerContext?.is_market_open && scanData?.live_prices_available === false ? (
         <Card className="border-amber-200 bg-amber-50/70">
           <CardHeader className="py-3">
             <CardTitle className="flex items-center gap-2 text-amber-700 text-sm font-medium">
               <DatabaseZap className="h-4 w-4" />
-              Live prices unavailable — results reflect last stored close prices. Connect your Upstox account to enable live data.
+              Live prices unavailable — results reflect last stored close prices. Check your Upstox connection.
             </CardTitle>
           </CardHeader>
         </Card>
       ) : null}
 
-      {scanData && scanData.stale_instrument_count > 0 ? (
+      {scannerContext?.is_market_open && (scanData?.stale_instrument_count ?? 0) > 0 ? (
         <Card className="border-amber-200 bg-amber-50/70">
           <CardHeader className="py-3">
             <CardTitle className="flex items-center gap-2 text-amber-700 text-sm font-medium">
               <DatabaseZap className="h-4 w-4" />
-              {scanData.stale_instrument_count} instrument{scanData.stale_instrument_count !== 1 ? 's' : ''} showing stale data — live prices unavailable for these symbols. Hover the ⚠ icon on a row for details.
+              {scanData!.stale_instrument_count} instrument{scanData!.stale_instrument_count !== 1 ? 's' : ''} showing stale data — live prices unavailable for these symbols. Hover the ⚠ icon on a row for details.
             </CardTitle>
           </CardHeader>
         </Card>

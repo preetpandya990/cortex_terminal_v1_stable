@@ -294,6 +294,28 @@ class PlaceOrderRequest(BaseModel):
         description="Stop-loss trigger price (required for SL and SL-M orders)",
     )
 
+    # ── Risk management — optional for both manual and signal-backed orders ───
+    stop_loss: float | None = Field(
+        default=None,
+        gt=0,
+        description="Stop-loss price; enables auto-close when breached by the P&L worker",
+    )
+    take_profit_1: float | None = Field(
+        default=None,
+        gt=0,
+        description="First take-profit target; enables auto-close at TP1",
+    )
+    take_profit_2: float | None = Field(
+        default=None,
+        gt=0,
+        description="Second take-profit target",
+    )
+    take_profit_3: float | None = Field(
+        default=None,
+        gt=0,
+        description="Third take-profit target",
+    )
+
     @model_validator(mode="after")
     def validate_all(self) -> "PlaceOrderRequest":
         # Exactly one trade source must be provided
@@ -522,6 +544,10 @@ class PaperPositionResponse(BaseModel):
     avg_cost_price: float
     last_price: float | None
     unrealized_pnl: float | None
+    pnl_pct: float | None = Field(
+        default=None,
+        description="(last_price − avg_cost_price) / avg_cost_price × 100; None until first price tick",
+    )
     realized_pnl: float
     total_charges: float
     side: PositionSide
@@ -550,6 +576,14 @@ class PaperPositionResponse(BaseModel):
     @classmethod
     def coerce_decimal_optional(cls, v: Any) -> float | None:
         return _to_float(v)
+
+    @model_validator(mode="after")
+    def compute_pnl_pct(self) -> "PaperPositionResponse":
+        if self.last_price is not None and self.avg_cost_price > 0:
+            self.pnl_pct = round(
+                (self.last_price - self.avg_cost_price) / self.avg_cost_price * 100, 4
+            )
+        return self
 
 
 class PaperPositionDetailResponse(BaseModel):
@@ -790,6 +824,57 @@ class QtySuggestionResponse(BaseModel):
         default=None,
         description="Warning if suggestion lacks stop_loss (qty calc falls back to 1%)",
     )
+
+
+class PriceTargetsResponse(BaseModel):
+    """
+    ML ensemble stop-loss and take-profit levels for a manual trade.
+
+    Primary path (source="ml_ensemble"):
+        Annualised volatility extracted from XGBoost+GRU ensemble features
+        (49 features, 60-day sequence). EnsemblePredictor caches results for
+        5 minutes so repeated requests for the same symbol are instant.
+
+    Fallback path (source="historical_volatility"):
+        Used when the ML predictor is unavailable. Derived from 63 daily
+        log-returns via the same vol-based formula.
+
+    Both paths use EnsemblePredictor._post_process() formula, ensuring manual
+    and signal-backed trades share a consistent risk model.
+    """
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    symbol: str
+    direction: str = Field(description="BUY or SELL")
+    entry_price: float = Field(gt=0)
+    stop_loss: float = Field(gt=0)
+    take_profit_1: float = Field(gt=0)
+    take_profit_2: float = Field(gt=0)
+    take_profit_3: float = Field(gt=0)
+    volatility_annualized: float = Field(
+        gt=0,
+        description="Annualised historical volatility used for the computation",
+    )
+    regime_type: str | None = Field(
+        default=None,
+        description="Most recent market regime for this symbol (informational)",
+    )
+    candles_used: int = Field(
+        ge=1,
+        description="Number of daily candles used in the volatility computation",
+    )
+    source: str = Field(
+        default="historical_volatility",
+        description="Computation method: 'ml_ensemble' (primary) or 'historical_volatility' (fallback)",
+    )
+    computed_at: datetime
+
+    @field_validator("stop_loss", "take_profit_1", "take_profit_2", "take_profit_3",
+                     "entry_price", "volatility_annualized", mode="before")
+    @classmethod
+    def coerce_decimal(cls, v: Any) -> float:
+        return _to_float_required(v)
 
 
 class OutcomeStatsBreakdown(BaseModel):

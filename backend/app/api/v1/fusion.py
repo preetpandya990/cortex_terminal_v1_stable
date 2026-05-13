@@ -19,8 +19,68 @@ from app.api.deps import get_db
 from app.core.auth import get_current_user, require_role
 from app.core.limiter import limiter
 from app.core.redis import get_pubsub_client, PubSubClient
+from app.services.symbol_validator import symbol_validator
 
 router = APIRouter()
+
+
+async def _enrich_event_titles(signals_data: list[dict], db: AsyncSession) -> None:
+    """
+    Backfill article_title and summary for contributing events where the stored
+    JSONB has article_title=null (all signals assembled before the rss_fetcher fix).
+
+    Strategy: collect every AIEventClassification.id that is missing a title,
+    do one batch JOIN query (classifications → nlp → processed → raw), then
+    extract the headline from the first line of raw_content (RSS fetcher always
+    stores content as "{title}\n\n{description}").  Mutates signals_data in-place.
+    """
+    from app.ai.fusion.models import (
+        AIEventClassification,
+        AINLPResult,
+        AIProcessedEvent,
+        AIRawEvent,
+    )
+
+    # Map classification_id → list of event dicts that need enrichment
+    needs: dict[int, list[dict]] = {}
+    for sig in signals_data:
+        for event in sig.get("contributing_factors", {}).get("events", []):
+            if not event.get("article_title"):
+                try:
+                    cls_id = int(event["event_id"])
+                    needs.setdefault(cls_id, []).append(event)
+                except (ValueError, KeyError):
+                    pass
+
+    if not needs:
+        return
+
+    stmt = (
+        select(
+            AIEventClassification.id.label("cls_id"),
+            AIRawEvent.raw_content,
+            func.jsonb_extract_path_text(
+                AIRawEvent.extra_data, "title"
+            ).label("jsonb_title"),
+        )
+        .outerjoin(AINLPResult, AINLPResult.id == AIEventClassification.nlp_result_id)
+        .outerjoin(AIProcessedEvent, AIProcessedEvent.id == AINLPResult.processed_event_id)
+        .outerjoin(AIRawEvent, AIRawEvent.id == AIProcessedEvent.raw_event_id)
+        .where(AIEventClassification.id.in_(list(needs.keys())))
+    )
+    rows = (await db.execute(stmt)).all()
+
+    for row in rows:
+        raw = row.raw_content or ""
+        parts = raw.split("\n\n", 1)
+        title = row.jsonb_title or (parts[0].strip() if parts else None)
+        summary = parts[1].strip()[:300] if len(parts) > 1 else None
+
+        for event_dict in needs.get(row.cls_id, []):
+            if title:
+                event_dict["article_title"] = title
+            if summary and not event_dict.get("summary"):
+                event_dict["summary"] = summary
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -41,7 +101,15 @@ async def generate_signal(
     ml_predictor = getattr(request.app.state, "ml_predictor", None)
 
     feature_loader = (
-        FeatureLoader(db=db, redis=get_redis()) if ml_predictor else None
+        FeatureLoader(
+            db=db,
+            redis=get_redis(),
+            sequence_length=ml_predictor.sequence_length,
+            n_features=ml_predictor.n_features,
+            feature_names=ml_predictor.feature_names,
+        )
+        if ml_predictor
+        else None
     )
 
     assembler = SignalAssembler(
@@ -49,8 +117,26 @@ async def generate_signal(
         feature_loader=feature_loader,
     )
 
+    _sym = symbol.upper()
+
+    # Explicit user-facing requests are hard-rejected for ineligible symbols.
+    # The internal pipeline (event processor, scheduler) calls assemble_signal()
+    # directly and stores Non-NSE signals with is_nse_eligible=False instead.
+    if not await symbol_validator.validate_symbol(_sym, db):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "symbol_not_eligible",
+                "symbol": _sym,
+                "message": (
+                    f"Symbol '{_sym}' is not eligible: not found in instrument_master "
+                    "as an NSE EQ equity. Only NSE-listed equities can be requested on-demand."
+                ),
+            },
+        )
+
     try:
-        signal = await assembler.assemble_signal(db, pubsub, symbol)
+        signal = await assembler.assemble_signal(db, pubsub, _sym)
         return serialise_signal(signal)
     except Exception as exc:
         raise HTTPException(
@@ -67,6 +153,7 @@ async def get_all_signals(
     signal_type: Optional[str] = None,
     time_horizon: Optional[str] = None,
     min_confidence: Optional[float] = None,
+    eligible: Optional[bool] = None,
     db: AsyncSession = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
@@ -81,6 +168,8 @@ async def get_all_signals(
       signal_type    — buy / sell / hold
       time_horizon   — intraday / swing / positional
       min_confidence — 0.0–1.0 inclusive threshold on calibrated_confidence
+      eligible       — true = NSE-listed equities only; false = Non-NSE informational
+                       signals; omit = return both (admin / bulk views)
     """
     from app.ai.fusion.models import AITradingSignal
 
@@ -99,6 +188,8 @@ async def get_all_signals(
         predicates.append(AITradingSignal.time_horizon == time_horizon)
     if min_confidence is not None:
         predicates.append(AITradingSignal.confidence_score >= min_confidence)
+    if eligible is not None:
+        predicates.append(AITradingSignal.is_nse_eligible == eligible)
 
     where_clause = and_(*predicates)
 
@@ -117,8 +208,10 @@ async def get_all_signals(
         )
     ).scalars().all()
 
+    signals_data = [serialise_signal(s) for s in rows]
+    await _enrich_event_titles(signals_data, db)
     return {
-        "signals": [serialise_signal(s) for s in rows],
+        "signals": signals_data,
         "total": total,
         "page": page,
         "limit": limit,
@@ -183,4 +276,6 @@ async def get_signals(
         )
     ).scalars().all()
 
-    return [serialise_signal(s) for s in rows]
+    signals_data = [serialise_signal(s) for s in rows]
+    await _enrich_event_titles(signals_data, db)
+    return signals_data

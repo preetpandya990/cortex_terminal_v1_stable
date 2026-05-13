@@ -5,6 +5,7 @@ SQLAlchemy 2.0 models for multi-agent validated trade suggestions.
 """
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Integer, Numeric, String, Text, text
@@ -37,6 +38,9 @@ class TradeSuggestion(Base):
     symbol: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     instrument_key: Mapped[str] = mapped_column(String(100), nullable=False)
     trading_symbol: Mapped[str | None] = mapped_column(String(50))
+    # Denormalized from instrument_master.name — populated at suggestion creation
+    # time by the correlation engine to avoid a live JOIN on every API read.
+    company_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     
     # Consensus metadata
     consensus_score: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)
@@ -83,6 +87,11 @@ class TradeSuggestion(Base):
         server_default=text("NOW()")
     )
     
+    # Market regime and time horizon — populated at generation time from signal context;
+    # fed into the strategy filter pipeline's regime_gate and session_gate.
+    regime_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    time_horizon: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
     # Strategy linkage (Phase 2 — Rule Engine)
     strategy_id: Mapped[UUID | None] = mapped_column(
         PG_UUID(as_uuid=True),
@@ -101,6 +110,12 @@ class TradeSuggestion(Base):
     )
 
     # Relationships
+    compliance_rows: Mapped[list["UserSuggestionCompliance"]] = relationship(
+        "UserSuggestionCompliance",
+        back_populates="suggestion",
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
     correlations: Mapped[list["EventCorrelation"]] = relationship(
         "EventCorrelation",
         back_populates="suggestion",
@@ -236,4 +251,74 @@ class EventCorrelation(Base):
             f"trigger_type={self.trigger_type}, "
             f"consensus_reached={self.consensus_reached}, "
             f"latency={self.total_latency_ms}ms)>"
+        )
+
+
+class UserSuggestionCompliance(Base):
+    """
+    Per-user strategy compliance evaluation result for a trade suggestion.
+
+    Written by the correlation engine immediately after each TradeSuggestion
+    is committed — one row per (suggestion, user, strategy) triple.  Rows are
+    immutable once written; re-evaluation is handled via ON CONFLICT DO NOTHING
+    so the worker is safe to re-run without creating duplicates.
+
+    The API uses this table two ways:
+      hard_gate  — only suggestions with passed=TRUE are surfaced to the user.
+      soft_filter — all suggestions surface; matched strategies are tagged on
+                    the card via the pipeline_result JSONB.
+
+    pipeline_result stores the full PipelineResult.to_dict() payload, which
+    includes gate-level audit details (blocked_at, per-gate timing) useful
+    for debugging and the strategy match badge tooltip.
+    """
+
+    __tablename__ = "user_suggestion_compliance"
+
+    __table_args__ = (
+        # Unique — safe ON CONFLICT DO NOTHING upsert from the worker.
+        # Matching indexes are created in migration 0024.
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    suggestion_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("trade_suggestions.suggestion_id", ondelete="CASCADE"),
+        nullable=False,
+        index=False,  # covered by uq_usc_suggestion_user_strategy
+    )
+    user_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    strategy_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("strategies.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+
+    # Full PipelineResult.to_dict() — includes strategy_name, blocked_at, per-gate details
+    pipeline_result: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    evaluated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("NOW()"),
+    )
+
+    # Relationships
+    suggestion: Mapped["TradeSuggestion"] = relationship(
+        "TradeSuggestion",
+        back_populates="compliance_rows",
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<UserSuggestionCompliance(suggestion={self.suggestion_id}, "
+            f"user={self.user_id}, strategy={self.strategy_id}, "
+            f"passed={self.passed})>"
         )
