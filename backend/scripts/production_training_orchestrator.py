@@ -1603,6 +1603,31 @@ class ProductionTrainingOrchestrator:
             logger.error("Model registry registration failed: %s", e)
             raise
 
+        # Sync training_date back to the governance registry (ai_ml_models).
+        # MLModelMetadata.trained_at is the authoritative timestamp set by the
+        # DB at INSERT time; without this sync the governance UI shows the
+        # original registration date (when the model was first created in
+        # ai_ml_models) instead of the actual retrain date.
+        try:
+            from datetime import timezone
+            from sqlalchemy import update as _sa_update
+            from app.ai.fusion.models import AIMLModel as _GovernanceModel
+
+            for model_type, meta in (("xgboost", xgb_meta), ("gru", gru_meta)):
+                trained_at = meta.trained_at or datetime.now(timezone.utc)
+                await self.db.execute(
+                    _sa_update(_GovernanceModel)
+                    .where(_GovernanceModel.model_type == model_type)
+                    .values(
+                        training_date=trained_at,
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                )
+            await self.db.commit()
+            logger.info("✓ Governance training_date synced for xgboost + gru")
+        except Exception as e:
+            logger.warning("Governance training_date sync failed (non-fatal): %s", e)
+
         logger.info("✓ Model registry registration complete")
         return model_paths
 

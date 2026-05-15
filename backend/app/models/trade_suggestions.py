@@ -55,11 +55,11 @@ class TradeSuggestion(Base):
     
     # Trade parameters
     entry_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
-    stop_loss: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
+    stop_loss: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
     risk_reward_ratio: Mapped[Decimal | None] = mapped_column(Numeric(5, 2))
-    take_profit_1: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
-    take_profit_2: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
-    take_profit_3: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
+    take_profit_1: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    take_profit_2: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    take_profit_3: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
     
     # Temporal metadata
     generated_at: Mapped[datetime] = mapped_column(
@@ -162,7 +162,7 @@ class TradeSuggestion(Base):
             name="trade_suggestions_trigger_pathway_check"
         ),
         CheckConstraint(
-            "status IN ('active', 'expired', 'executed', 'invalidated')",
+            "status IN ('active', 'expired', 'executed', 'invalidated', 'superseded')",
             name="trade_suggestions_status_check"
         ),
     )

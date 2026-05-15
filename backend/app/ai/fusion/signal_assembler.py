@@ -663,13 +663,18 @@ class SignalAssembler:
         if _settings.ENABLE_SYMBOL_VALIDATION:
             _is_nse_eligible = await symbol_validator.validate_symbol(symbol, db)
 
-        # Resolve company name — the eligibility check above already warmed the
-        # Redis eligibility cache, so get_company_name() is a second cache read
-        # (separate key) with near-zero overhead for any previously seen symbol.
-        # Failures are non-fatal; company_name stays None rather than blocking assembly.
+        # Resolve company name and instrument_key from instrument_master.
+        # Both calls hit separate Redis keys warmed by the eligibility check above,
+        # so overhead is negligible for any previously seen symbol.
+        # Failures are non-fatal; fields stay None rather than blocking assembly.
         _company_name: str | None = None
+        _instrument_key: str | None = None
         try:
             _company_name = await symbol_validator.get_company_name(symbol, db)
+        except Exception:
+            pass
+        try:
+            _instrument_key = await symbol_validator.get_instrument_key(symbol, db)
         except Exception:
             pass
 
@@ -741,6 +746,7 @@ class SignalAssembler:
             ml_predictions=fused["ml_predictions"],
             technical_indicators=fused["technical_indicators"],
             reasoning=reasoning,
+            extra_data={"instrument_key": _instrument_key} if _instrument_key else None,
         )
 
         db.add(signal)

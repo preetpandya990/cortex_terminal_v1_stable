@@ -143,6 +143,22 @@ class RedisChannels:
         }
     """
 
+    MARKET_FEED_HEALTH = "cai:market-feed:health"
+    """
+    Upstream Upstox WebSocket health-status events.
+
+    Published by MarketFeedService whenever the Upstox WS connects or drops.
+    Subscribed by /upstox/market-feed/ws handlers and forwarded unconditionally
+    to all connected frontend clients so they can display live/stale indicators.
+
+    Payload:
+        {
+            "type": "upstream_status",
+            "status": "connected" | "reconnecting",
+            "ts": 1704067200500   (Unix epoch ms)
+        }
+    """
+
     # ── Correlation Events ─────────────────────────────────────────────────────
     CORRELATIONS_COMPLETED = "cai:correlations:completed"
     """

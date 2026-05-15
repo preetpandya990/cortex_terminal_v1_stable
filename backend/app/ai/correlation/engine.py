@@ -50,6 +50,12 @@ SCANNER_WEIGHT = 0.30
 AI_WEIGHT = 0.40
 ML_WEIGHT = 0.30
 
+# Deduplication thresholds — a new signal must exceed at least one of these
+# to supersede an existing active suggestion for the same instrument+direction.
+# Below all thresholds the new signal is suppressed (no new row created).
+DRASTIC_SCORE_DELTA = 5.0        # consensus_score change ≥ 5 points
+DRASTIC_PRICE_DELTA_PCT = 0.02   # entry_price change ≥ 2%
+
 
 class CircuitBreaker:
     """
@@ -523,13 +529,26 @@ class EventCorrelationEngine:
         Returns:
             TradeSuggestion if consensus reached, None otherwise
         """
-        # Map to unified direction
+        # Map to unified direction.
         # Scanner output uses "signal" key ("buy"/"sell"); "direction" is the
         # legacy / Pathway-2-synthetic key.  Accept both.
+        # Neutral/hold/unknown signals are hard-rejected — mapping them to SELL
+        # would introduce a systematic directional bias (all non-BUY → SELL).
         _scanner_signal_raw = (
             scanner_signal.get("signal") or scanner_signal.get("direction") or ""
         ).lower()
-        scanner_dir = "BUY" if _scanner_signal_raw in ("buy", "bullish") else "SELL"
+        if _scanner_signal_raw in ("buy", "bullish"):
+            scanner_dir = "BUY"
+        elif _scanner_signal_raw in ("sell", "bearish"):
+            scanner_dir = "SELL"
+        else:
+            await self._record_correlation(
+                db, correlation_id, trigger_type, trigger_timestamp,
+                None,
+                f"NEUTRAL_SIGNAL: scanner={_scanner_signal_raw!r}",
+                latencies,
+            )
+            return None
 
         # Derive scanner confidence from the anomaly score (0–20 nominal range).
         # score=5 → 25%, score=10 → 50%, score=20 → 100%; capped at 100.
@@ -635,13 +654,103 @@ class EventCorrelationEngine:
             "intraday" if trigger_type == "SCANNER_ANOMALY" else "swing"
         )
 
-        # Create trade suggestion
+        # ── Instrument identification ─────────────────────────────────────────
         symbol = scanner_signal.get("instrument_key") or ml_signal.get("symbol", "UNKNOWN")
         # trading_symbol is the human-readable NSE ticker (e.g. "RELIANCE").
         # In Pathway 2 both fields equal the ticker; in Pathway 1 the scanner
         # provides the real trading_symbol separately from the instrument_key.
         trading_sym: str | None = scanner_signal.get("trading_symbol")
+        direction = "BUY" if all_buy else "SELL"
 
+        # ── Deduplication guard ───────────────────────────────────────────────
+        # Before writing anything, check whether an active suggestion already
+        # exists for this (instrument_key, direction) pair.  The partial unique
+        # index idx_trade_suggestions_active_unique enforces this constraint at
+        # the DB level; this application-level check is the first line of defence
+        # and avoids unnecessary INSERT attempts.
+        #
+        # SELECT FOR UPDATE serializes concurrent workers: only one process at a
+        # time can check-and-modify the active suggestion for a given symbol.
+        existing_stmt = (
+            select(TradeSuggestion)
+            .where(
+                TradeSuggestion.instrument_key == symbol,
+                TradeSuggestion.signal_direction == direction,
+                TradeSuggestion.status == "active",
+            )
+            .with_for_update(skip_locked=False)
+        )
+        existing_result = await db.execute(existing_stmt)
+        existing = existing_result.scalar_one_or_none()
+
+        if existing is not None:
+            score_delta = abs(consensus_score - float(existing.consensus_score))
+            price_delta_pct = (
+                abs(float(entry_price) / float(existing.entry_price) - 1.0)
+                if entry_price and existing.entry_price
+                else 0.0
+            )
+            confidence_changed = confidence_level != existing.confidence_level
+
+            is_drastic = (
+                score_delta >= DRASTIC_SCORE_DELTA
+                or price_delta_pct >= DRASTIC_PRICE_DELTA_PCT
+                or confidence_changed
+            )
+
+            if not is_drastic:
+                # Signal is not materially different from the existing one.
+                # Record the suppression for audit/metrics and return without
+                # creating a new row — the existing suggestion stays active.
+                await self._record_correlation(
+                    db, correlation_id, trigger_type, trigger_timestamp,
+                    None,
+                    (
+                        f"DUPLICATE_SUPPRESSED: existing={existing.suggestion_id} "
+                        f"score_delta={score_delta:.2f} "
+                        f"price_delta_pct={price_delta_pct:.3f}"
+                    ),
+                    latencies,
+                )
+                logger.debug(
+                    "Pipeline stage=duplicate_suppressed correlation_id=%s "
+                    "symbol=%s direction=%s existing_id=%s score_delta=%.2f",
+                    correlation_id, symbol, direction,
+                    existing.suggestion_id, score_delta,
+                )
+                return None
+
+            # New signal is materially different — supersede the existing suggestion.
+            # Publish a superseded event before the commit so the frontend can
+            # remove the old card before the new one arrives.
+            superseded_id = existing.suggestion_id
+            existing.status = "superseded"
+            existing.updated_at = trigger_timestamp
+            logger.info(
+                "Pipeline stage=superseding correlation_id=%s "
+                "superseded_id=%s symbol=%s direction=%s "
+                "score_delta=%.2f price_delta_pct=%.2f%% confidence_changed=%s",
+                correlation_id, superseded_id, symbol, direction,
+                score_delta, price_delta_pct * 100, confidence_changed,
+                extra={
+                    "pipeline_stage": "superseding",
+                    "correlation_id": str(correlation_id),
+                    "superseded_id": str(superseded_id),
+                },
+            )
+            # Notify WebSocket clients that the old suggestion is gone.
+            # Published after the DB commit below; captured here for the
+            # publish block at the end of this method.
+            _superseded_payload: dict | None = {
+                "suggestion_id": str(superseded_id),
+                "symbol": symbol,
+                "expired_at": trigger_timestamp.isoformat(),
+                "reason": "SUPERSEDED",
+            }
+        else:
+            _superseded_payload = None
+
+        # ── Resolve company name ──────────────────────────────────────────────
         # Resolve company name before committing the suggestion so that the
         # company_name column is populated in one shot — avoiding a later JOIN.
         # This is a best-effort lookup; failures must never block suggestion creation.
@@ -664,7 +773,7 @@ class EventCorrelationEngine:
             company_name=company_name,
             consensus_score=Decimal(str(round(consensus_score, 2))),
             confidence_level=confidence_level,
-            signal_direction="BUY" if all_buy else "SELL",
+            signal_direction=direction,
             trigger_pathway="TECHNICAL_FIRST" if trigger_type == "SCANNER_ANOMALY" else "FUNDAMENTAL_FIRST",
             scanner_signal=scanner_signal,
             ai_signal=ai_signal,
@@ -780,6 +889,21 @@ class EventCorrelationEngine:
             )
         except Exception as e:
             logger.error("Failed to publish suggestion %s to Redis: %s", suggestion.suggestion_id, e)
+
+        # Notify WebSocket clients that the superseded suggestion is gone.
+        # Published after the new suggestion so the frontend replaces rather
+        # than just removes the card.
+        if _superseded_payload is not None:
+            try:
+                await self.redis.publish(
+                    RedisChannels.SUGGESTIONS_EXPIRED,
+                    json.dumps(_superseded_payload),
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to publish superseded event for %s to Redis: %s",
+                    _superseded_payload.get("suggestion_id"), e,
+                )
 
         return suggestion
 

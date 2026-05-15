@@ -131,6 +131,10 @@ def serialise_signal(signal: AITradingSignal) -> dict[str, Any]:
         "symbol": signal.symbol,
         "company_name": signal.company_name or None,
         "is_nse_eligible": bool(signal.is_nse_eligible),
+        # Upstox instrument key (e.g. "NSE_EQ|INE001A01036") — stored in extra_data
+        # at assembly time for new signals; None for legacy rows (REST layer backfills
+        # these via _enrich_instrument_keys before sending the response).
+        "instrument_key": (signal.extra_data or {}).get("instrument_key") or None,
         "signal_type": signal.action.lower(),
         "confidence": float(signal.confidence_score),
         "calibrated_confidence": float(signal.confidence_score),

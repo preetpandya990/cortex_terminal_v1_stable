@@ -61,13 +61,13 @@ export function useCAIWebSocket(options: UseCAIWebSocketOptions = {}): UseCAIWeb
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const intentionalDisconnectRef = useRef(false);
+  // Set when the server sends TOKEN_EXPIRED — skips backoff and reconnects immediately.
+  const tokenExpiredRef = useRef(false);
 
-  // Keep the latest token in a ref so the connect callback always sends the
-  // current value without needing it as a dep (which would cause reconnects on refresh).
+  // Token in a ref — synchronously updated each render so connect() always reads
+  // the latest value.  Never added to effect deps (would force reconnect on refresh).
   const accessTokenRef = useRef(accessToken);
-  useEffect(() => {
-    accessTokenRef.current = accessToken;
-  }, [accessToken]);
+  accessTokenRef.current = accessToken;
 
   // Keep callbacks in a ref so they can be updated without recreating connect/disconnect.
   const callbacksRef = useRef({ onMessage, onSignal, onRegime, onEvent, onModelAlert });
@@ -92,6 +92,16 @@ export function useCAIWebSocket(options: UseCAIWebSocketOptions = {}): UseCAIWeb
       }
 
       if (message.type === 'heartbeat') return;
+
+      // Server is evicting us due to token expiry — arm the fast-reconnect flag.
+      // The 4001 close fires immediately after; onclose will bypass backoff.
+      if (message.type === 'error' && message.code === 'TOKEN_EXPIRED') {
+        tokenExpiredRef.current = true;
+        return;
+      }
+
+      // Reauth acknowledgements are protocol-level — don't forward to callers.
+      if (message.type === 'reauthed') return;
 
       if (message.channel && message.data) {
         const caiMessage: CAIMessage = message;
@@ -146,6 +156,7 @@ export function useCAIWebSocket(options: UseCAIWebSocketOptions = {}): UseCAIWeb
     }
 
     intentionalDisconnectRef.current = false;
+    tokenExpiredRef.current = false; // reset on every fresh connect attempt
     setStatus('connecting');
 
     try {
@@ -195,11 +206,22 @@ export function useCAIWebSocket(options: UseCAIWebSocketOptions = {}): UseCAIWeb
         console.log('[CAI WebSocket] Connection closed:', event.code, event.reason);
         wsRef.current = null;
 
-        if (!intentionalDisconnectRef.current) {
-          scheduleReconnect();
-        } else {
+        if (intentionalDisconnectRef.current) {
           setStatus('disconnected');
+          return;
         }
+
+        // TOKEN_EXPIRED: the background refresh has already delivered a fresh token.
+        // Bypass exponential backoff — reconnect immediately with the new token.
+        if (tokenExpiredRef.current && accessTokenRef.current) {
+          tokenExpiredRef.current = false;
+          reconnectAttemptsRef.current = 0;
+          setStatus('reconnecting');
+          reconnectTimeoutRef.current = setTimeout(() => connectRef.current(), 100);
+          return;
+        }
+
+        scheduleReconnect();
       };
 
       wsRef.current = ws;
@@ -258,6 +280,18 @@ export function useCAIWebSocket(options: UseCAIWebSocketOptions = {}): UseCAIWeb
     // connect/disconnect are stable useCallbacks; auth state drives re-evaluation.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoConnect, canConnect]);
+
+  // Token rotation effect — when accessToken changes while connected, send a reauth
+  // frame in-band.  The CAI backend stores the fresh payload so the next heartbeat
+  // expiry check (`close_expired`) sees the new `exp` and does NOT evict the client.
+  // If the connection is not open, accessTokenRef is already updated and the next
+  // connect() call will use the fresh token in the auth frame.
+  useEffect(() => {
+    if (!accessToken) return;
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'reauth', token: accessToken }));
+    }
+  }, [accessToken]);
 
   return { status, connect, disconnect, sendPing };
 }

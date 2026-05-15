@@ -60,6 +60,8 @@ export interface TradingSignal {
   /** True when the symbol exists in instrument_master as an NSE EQ equity (tradeable).
    *  False for companies referenced in news/RSS that are not listed on the platform. */
   is_nse_eligible: boolean;
+  /** Upstox instrument key (e.g. "NSE_EQ|INE001A01036"). Present for NSE-eligible signals only. */
+  instrument_key: string | null;
   signal_type: SignalType;
   confidence: number;
   calibrated_confidence: number;

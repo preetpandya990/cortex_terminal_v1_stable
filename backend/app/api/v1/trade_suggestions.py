@@ -892,11 +892,39 @@ async def websocket_endpoint(
                 message = json.loads(data)
                 message_type = message.get("type")
                 
+                # In-band auth — client sends this immediately after onopen.
+                # Sets up the per-user room so the client receives user-scoped events.
+                if message_type == "auth":
+                    token_str = message.get("token", "")
+                    try:
+                        from app.core.security import decode_token
+                        payload = decode_token(token_str)
+                        authed_user_id = str(payload.sub)
+                        user_room = f"user:{authed_user_id}"
+                        await manager.subscribe_to_room(client_id, user_room)
+                        conn = manager.connections.get(client_id)
+                        if conn:
+                            conn.user_id = authed_user_id
+                        logger.info("Trade WS client %s authenticated as user %s", client_id, authed_user_id)
+                    except Exception as exc:
+                        logger.warning("Trade WS in-band auth failed for client %s: %s", client_id, exc)
+
+                # Reauth — client is rotating its JWT; validate and acknowledge.
+                # No state change needed here: user rooms are already set up.
+                elif message_type == "reauth":
+                    token_str = message.get("token", "")
+                    try:
+                        from app.core.security import decode_token
+                        decode_token(token_str)  # validate only
+                        logger.debug("Trade WS client %s reauthed", client_id)
+                    except Exception as exc:
+                        logger.warning("Trade WS reauth failed for client %s: %s", client_id, exc)
+
                 # Handle pong responses
-                if message_type == "pong":
+                elif message_type == "pong":
                     # Silently acknowledge pong (no logging to reduce noise)
                     pass
-                
+
                 # Handle ping requests
                 elif message_type == "ping":
                     await manager.send_to_client(client_id, {

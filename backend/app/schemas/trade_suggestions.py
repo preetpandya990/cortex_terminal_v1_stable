@@ -41,6 +41,7 @@ class SuggestionStatus(str, Enum):
     EXPIRED = "expired"
     EXECUTED = "executed"
     INVALIDATED = "invalidated"
+    SUPERSEDED = "superseded"
 
 
 class TriggerType(str, Enum):

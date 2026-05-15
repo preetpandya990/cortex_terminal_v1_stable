@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '@/contexts/AuthContext';
 import { strategiesAPI } from '@/lib/api';
+import { PriceInput } from '@/components/ui/PriceInput';
 import type { StrategyActivation, ActivationState } from '@/types/strategies';
 import { cn } from '@/lib/utils';
 
@@ -131,20 +132,20 @@ function ExitModal({
 
         <div className="space-y-3">
           <div>
-            <label className="mb-1 block text-xs font-medium text-slate-700">
-              Exit price <span className="font-normal text-slate-400">(optional — leave blank for market price)</span>
+            <label htmlFor="exit-price" className="mb-1 block text-xs font-medium text-slate-700">
+              Exit price{" "}
+              <span className="font-normal text-slate-400">(optional — leave blank for market price)</span>
             </label>
-            <input
-              type="number"
-              step="0.05"
-              min="0.01"
-              placeholder="e.g. 2940.00"
+            <PriceInput
+              id="exit-price"
               value={price}
-              onChange={e => setPrice(e.target.value)}
-              className="w-full rounded-md border border-slate-200 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-400"
+              onChange={setPrice}
+              error={error || undefined}
+              focusVariant="neutral"
+              className="rounded-md py-2 focus:ring-slate-400"
+              placeholder="e.g. 2940.00"
             />
           </div>
-          {error && <p className="text-xs text-rose-600">{error}</p>}
         </div>
 
         <div className="mt-5 flex justify-end gap-2">

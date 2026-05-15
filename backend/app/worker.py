@@ -575,6 +575,11 @@ async def correlation_loop(
                         )
                     
                     # ── Pathway 2: High-Impact News Events ───────────────
+                    # Events are fetched with a 5-minute sliding window, but
+                    # the loop runs every 30s — each event would be processed
+                    # ~10 times within its window without the Redis dedup guard.
+                    # We set a key per event_id with a TTL equal to the window
+                    # so each event is processed exactly once per window.
                     try:
                         cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
                         stmt = (
@@ -585,30 +590,53 @@ async def correlation_loop(
                             )
                         )
                         events = (await session.execute(stmt)).scalars().all()
-                        
+
                         if events:
-                            logger.info(
-                                f"[Correlation #{loop_iteration}] "
-                                f"Processing {len(events)} high-impact news events"
-                            )
-                            
+                            unprocessed = []
                             for event in events:
-                                try:
-                                    suggestions = await engine.on_news_event(session, event)
-                                    if suggestions:
-                                        logger.info(
-                                            f"[Correlation #{loop_iteration}] "
-                                            f"Generated {len(suggestions)} suggestions "
-                                            f"from news event {event.id}"
+                                dedup_key = f"cortex:correlated:event:{event.id}"
+                                already_processed = await redis_client._redis.exists(dedup_key)
+                                if not already_processed:
+                                    unprocessed.append(event)
+
+                            if unprocessed:
+                                logger.info(
+                                    "[Correlation #%d] Processing %d/%d high-impact news events "
+                                    "(%d already processed this window)",
+                                    loop_iteration,
+                                    len(unprocessed),
+                                    len(events),
+                                    len(events) - len(unprocessed),
+                                )
+
+                                for event in unprocessed:
+                                    try:
+                                        suggestions = await engine.on_news_event(session, event)
+                                        # Mark as processed regardless of whether suggestions
+                                        # were generated — prevents retry storms on events
+                                        # that fail consensus (e.g. ML_NEUTRAL, DIRECTION_MISMATCH).
+                                        dedup_key = f"cortex:correlated:event:{event.id}"
+                                        await redis_client._redis.setex(dedup_key, 300, "1")
+                                        if suggestions:
+                                            logger.info(
+                                                "[Correlation #%d] Generated %d suggestions "
+                                                "from news event %s",
+                                                loop_iteration, len(suggestions), event.id,
+                                            )
+                                    except Exception as e:
+                                        logger.error(
+                                            "[Correlation #%d] Error processing event %s: %s",
+                                            loop_iteration, event.id, e,
+                                            exc_info=True,
                                         )
-                                except Exception as e:
-                                    logger.error(
-                                        f"[Correlation #{loop_iteration}] "
-                                        f"Error processing event {event.id}: {e}",
-                                        exc_info=True
-                                    )
-                                    continue
-                    
+                                        continue
+                            else:
+                                logger.debug(
+                                    "[Correlation #%d] All %d high-impact events already "
+                                    "processed this window",
+                                    loop_iteration, len(events),
+                                )
+
                     except Exception as e:
                         logger.error(
                             f"[Correlation #{loop_iteration}] "

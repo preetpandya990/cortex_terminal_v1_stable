@@ -157,9 +157,9 @@ export function DeprecatedModelsPanel({
                           </Badge>
                         </TableCell>
                         <TableCell>
-                          {model.accuracy_metrics?.accuracy != null ? (
+                          {model.metrics?.accuracy != null ? (
                             <span className="text-sm text-muted-foreground">
-                              {(model.accuracy_metrics.accuracy * 100).toFixed(1)}%
+                              {(model.metrics.accuracy * 100).toFixed(1)}%
                             </span>
                           ) : (
                             <span className="text-xs text-muted-foreground">—</span>

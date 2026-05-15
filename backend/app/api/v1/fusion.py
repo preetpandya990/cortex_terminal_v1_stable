@@ -24,6 +24,42 @@ from app.services.symbol_validator import symbol_validator
 router = APIRouter()
 
 
+async def _enrich_instrument_keys(signals_data: list[dict], db: AsyncSession) -> None:
+    """
+    Backfill instrument_key for NSE-eligible signals that were assembled before
+    the extra_data denormalization was introduced.  One batch query against
+    instrument_master; mutates signals_data in-place.
+    """
+    from app.models.upstox_data import InstrumentMaster
+
+    symbols_needing_key = {
+        sig["symbol"]
+        for sig in signals_data
+        if sig.get("is_nse_eligible") and not sig.get("instrument_key")
+    }
+    if not symbols_needing_key:
+        return
+
+    rows = (
+        await db.execute(
+            select(
+                InstrumentMaster.trading_symbol,
+                InstrumentMaster.instrument_key,
+            ).where(
+                InstrumentMaster.trading_symbol.in_(symbols_needing_key),
+                InstrumentMaster.exchange == "NSE",
+                InstrumentMaster.instrument_type == "EQ",
+            )
+        )
+    ).all()
+
+    key_map = {row.trading_symbol: row.instrument_key for row in rows}
+
+    for sig in signals_data:
+        if sig.get("is_nse_eligible") and not sig.get("instrument_key"):
+            sig["instrument_key"] = key_map.get(sig["symbol"])
+
+
 async def _enrich_event_titles(signals_data: list[dict], db: AsyncSession) -> None:
     """
     Backfill article_title and summary for contributing events where the stored
@@ -209,6 +245,7 @@ async def get_all_signals(
     ).scalars().all()
 
     signals_data = [serialise_signal(s) for s in rows]
+    await _enrich_instrument_keys(signals_data, db)
     await _enrich_event_titles(signals_data, db)
     return {
         "signals": signals_data,
@@ -277,5 +314,6 @@ async def get_signals(
     ).scalars().all()
 
     signals_data = [serialise_signal(s) for s in rows]
+    await _enrich_instrument_keys(signals_data, db)
     await _enrich_event_titles(signals_data, db)
     return signals_data

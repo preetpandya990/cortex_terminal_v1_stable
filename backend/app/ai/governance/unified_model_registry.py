@@ -198,9 +198,10 @@ class UnifiedModelRegistry:
     @staticmethod
     def _assert_valid_transition(from_state: str, to_state: str) -> None:
         valid: dict[str, list[str]] = {
-            "shadow": ["paper"],
-            "paper":  ["live", "shadow"],
-            "live":   ["shadow"],
+            "shadow":  ["paper"],
+            "paper":   ["live", "shadow"],
+            "live":    ["shadow"],
+            "retired": ["shadow"],   # restore path — re-enters shadow for re-evaluation
         }
         if to_state not in valid.get(from_state, []):
             raise ValueError(

@@ -2,8 +2,8 @@
  * useWebSocket — Production-Grade WebSocket with Auto-Reconnect
  * ==============================================================
  *
- * Architecture (2026 best practices):
- *   • All mutable connection state lives in refs — stable references across renders.
+ * Architecture:
+ *   • All mutable connection state lives in refs — stable across renders.
  *   • A single useReducer-based forceUpdate drives re-renders on state transitions;
  *     no state variables that would trigger the connection effect.
  *   • Dependencies array is fully explicit — no lint suppressions on it.
@@ -12,10 +12,22 @@
  *     duplicate processing when the server sends the same payload twice.
  *   • Proactive ping from client every heartbeatInterval ms so the server can
  *     detect stale connections even when no application messages are flowing.
- *   • Manual reconnect() method resets the attempt counter and retries from scratch,
- *     allowing the caller to recover after max-attempts exhaustion.
- *   • Token sent in-band after connect — never in the URL.
+ *   • Manual reconnect() method resets the attempt counter and retries from scratch.
  *   • Rooms are re-subscribed automatically on every reconnect.
+ *
+ * Token lifecycle (zero-downtime rotation):
+ *   • `token` is intentionally NOT in the connection-effect dependency array.
+ *     Adding it would close/reopen the socket on every 15-minute background refresh.
+ *   • Instead, the token lives in a ref that is synchronously updated each render,
+ *     before any effects fire.
+ *   • A dedicated effect sends `{ type: "reauth", token }` over the live connection
+ *     whenever the prop changes — the server validates the new token in-band with
+ *     zero session interruption.
+ *   • If the server still closes with 4001 (TOKEN_EXPIRED), the client bypasses
+ *     the exponential-backoff queue and reconnects immediately with the fresh token
+ *     already held in the ref.
+ *   • Token is sent in-band after connect (`{ type: "auth", token }`) — never in
+ *     the URL (which would expose it in server logs and browser history).
  *
  * Usage:
  * ```tsx
@@ -34,7 +46,7 @@
 
 import { useEffect, useRef, useMemo, useCallback, useReducer } from 'react';
 
-export type WebSocketMessage = 
+export type WebSocketMessage =
   | {
       type: 'new_suggestion';
       suggestion_id: string;
@@ -160,15 +172,23 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
   const [, forceUpdate] = useReducer((x: number) => x + 1, 0);
 
   // ── Refs ──────────────────────────────────────────────────────────────────────
-  const wsRef                    = useRef<WebSocket | null>(null);
-  const isConnectedRef           = useRef(false);
-  const reconnectTimeoutRef      = useRef<NodeJS.Timeout | null>(null);
-  const heartbeatIntervalRef     = useRef<NodeJS.Timeout | null>(null);
-  const shouldReconnectRef       = useRef(true);
+  const wsRef                     = useRef<WebSocket | null>(null);
+  const isConnectedRef            = useRef(false);
+  const reconnectTimeoutRef       = useRef<NodeJS.Timeout | null>(null);
+  const heartbeatIntervalRef      = useRef<NodeJS.Timeout | null>(null);
+  const shouldReconnectRef        = useRef(true);
   const reconnectAttemptsCountRef = useRef(0);
-  const subscribedRoomsRef       = useRef<Set<string>>(new Set());
+  const subscribedRoomsRef        = useRef<Set<string>>(new Set());
   // Sliding window of recent message IDs for deduplication.
-  const recentMessageIdsRef      = useRef<string[]>([]);
+  const recentMessageIdsRef       = useRef<string[]>([]);
+  // Set to true when server sends TOKEN_EXPIRED — bypasses backoff on next close.
+  const tokenExpiredRef           = useRef(false);
+
+  // Token in a ref so it never appears in the connection-effect deps.
+  // Updated synchronously each render (before effects fire) so connect() always
+  // reads the latest value regardless of when it is called.
+  const tokenRef = useRef(token);
+  tokenRef.current = token;
 
   // Callbacks in a ref so they update without triggering the connection effect.
   const callbacksRef = useRef({ onMessage, onConnect, onDisconnect, onError });
@@ -177,9 +197,9 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
   }, [onMessage, onConnect, onDisconnect, onError]);
 
   // ── Connection effect ─────────────────────────────────────────────────────────
+  // NOTE: `token` is intentionally absent from this dependency array.
+  // Token rotation is handled by the dedicated reauth effect below.
   useEffect(() => {
-    // Don't open a socket until the caller explicitly enables it — guards against
-    // connecting before authentication state is ready.
     if (!enabled) return;
 
     shouldReconnectRef.current = true;
@@ -192,6 +212,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
     const connect = () => {
       if (ws?.readyState === WebSocket.OPEN) return;
 
+      tokenExpiredRef.current = false; // reset on each fresh attempt
       wsLog('Connecting to', url);
 
       try {
@@ -203,8 +224,9 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
 
           // In-band auth handshake — credentials stay out of URLs, server logs,
           // and browser history.
-          if (token) {
-            ws?.send(JSON.stringify({ type: 'auth', token }));
+          const currentToken = tokenRef.current;
+          if (currentToken) {
+            ws?.send(JSON.stringify({ type: 'auth', token: currentToken }));
           }
 
           isConnectedRef.current = true;
@@ -212,8 +234,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           forceUpdate();
 
           // Proactive client-initiated ping so the server can detect stale sockets
-          // even during quiet periods.  Server sends pings too; we respond to those
-          // with pongs in onmessage below — this is the client's own keep-alive.
+          // even during quiet periods.
           heartbeatIntervalId = setInterval(() => {
             if (ws?.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify({ type: 'ping', timestamp: new Date().toISOString() }));
@@ -228,8 +249,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
             }
           });
 
-          // Auto-subscribe to configured rooms (only those not already in
-          // subscribedRoomsRef to avoid duplicate subscription messages).
+          // Auto-subscribe to configured rooms not already tracked.
           stableAutoSubscribeRooms.forEach((room) => {
             if (ws?.readyState === WebSocket.OPEN && !subscribedRoomsRef.current.has(room)) {
               ws.send(JSON.stringify({ type: 'subscribe', room }));
@@ -244,9 +264,32 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           try {
             const data: WebSocketMessage = JSON.parse(event.data as string);
 
+            // ── Infrastructure messages ──────────────────────────────────────
+
+            // Server signaling that our JWT expired — arm the fast-reconnect flag.
+            // The 4001 close will fire immediately after; we skip backoff there.
+            if (data.type === 'error' && (data as { type: 'error'; code: string }).code === 'TOKEN_EXPIRED') {
+              wsLog('TOKEN_EXPIRED received — will fast-reconnect on close');
+              tokenExpiredRef.current = true;
+              return;
+            }
+
+            // Reauth and pong acknowledgements are protocol-level — don't forward.
+            if (
+              (data.type as string) === 'reauthed' ||
+              data.type === 'pong'
+            ) {
+              return;
+            }
+
+            if (data.type === 'ping') {
+              if (ws?.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'pong', timestamp: new Date().toISOString() }));
+              }
+              return;
+            }
+
             // ── Deduplication ────────────────────────────────────────────────
-            // Build a stable fingerprint for this message.  For suggestion events
-            // we use suggestion_id + type; for others we fall back to a JSON hash.
             let msgId: string | null = null;
             if ('suggestion_id' in data && data.suggestion_id) {
               msgId = `${data.type}:${data.suggestion_id}`;
@@ -260,19 +303,9 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
                 return;
               }
               recentMessageIdsRef.current.push(msgId);
-              // Keep window bounded — drop oldest entries when full.
               if (recentMessageIdsRef.current.length > _DEDUP_WINDOW) {
                 recentMessageIdsRef.current = recentMessageIdsRef.current.slice(-_DEDUP_WINDOW);
               }
-            }
-
-            // ── Protocol messages ────────────────────────────────────────────
-            if (data.type === 'ping') {
-              // Respond to server-initiated ping with a pong.
-              if (ws?.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'pong', timestamp: new Date().toISOString() }));
-              }
-              return; // Ping/pong are infrastructure; don't forward to caller.
             }
 
             if (data.type === 'subscribed') {
@@ -309,6 +342,17 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           wsRef.current = null;
           callbacksRef.current.onDisconnect?.();
 
+          // TOKEN_EXPIRED close: the background refresh has already produced a fresh
+          // token (held in tokenRef). Skip backoff entirely and reconnect immediately.
+          if (tokenExpiredRef.current && tokenRef.current && shouldReconnectRef.current && reconnect) {
+            wsLog('Fast-reconnect after TOKEN_EXPIRED (fresh token available)');
+            tokenExpiredRef.current = false;
+            reconnectAttemptsCountRef.current = 0;
+            reconnectTimeout = setTimeout(connect, 100);
+            reconnectTimeoutRef.current = reconnectTimeout;
+            return;
+          }
+
           if (
             shouldReconnectRef.current &&
             reconnect &&
@@ -316,8 +360,6 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           ) {
             reconnectAttemptsCountRef.current += 1;
 
-            // Exponential backoff: delay doubles each attempt, capped at 30 s,
-            // with ±25 % random jitter to prevent thundering-herd reconnects.
             const base = Math.min(reconnectInterval * Math.pow(2, reconnectAttemptsCountRef.current), 30_000);
             const jitter = base * 0.25 * (Math.random() * 2 - 1);
             const delay = Math.max(0, base + jitter);
@@ -350,7 +392,21 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
       ws?.close(1000, 'Client unmount');
       isConnectedRef.current = false;
     };
-  }, [url, token, enabled, reconnect, reconnectAttempts, reconnectInterval, heartbeatInterval, stableAutoSubscribeRooms]);
+  // `token` is intentionally absent — see tokenRef pattern above.
+  }, [url, enabled, reconnect, reconnectAttempts, reconnectInterval, heartbeatInterval, stableAutoSubscribeRooms]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Token rotation effect ──────────────────────────────────────────────────
+  // When the token prop changes (background JWT refresh), send a reauth frame
+  // over the live connection so the server can update its stored payload.
+  // If the connection is not currently open, tokenRef is already updated — the
+  // next connect() call will use the fresh token in the auth frame.
+  useEffect(() => {
+    if (!token) return;
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'reauth', token }));
+      wsLog('Sent reauth with rotated token');
+    }
+  }, [token]);
 
   // ── Stable public API ─────────────────────────────────────────────────────────
 
@@ -398,17 +454,11 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
   }, []);
 
   const reconnectFn = useCallback(() => {
-    // Reset attempt counter so the next close will schedule a fresh backoff
-    // sequence instead of hitting the max-attempts guard.
     shouldReconnectRef.current = true;
     reconnectAttemptsCountRef.current = 0;
-    // Close any existing socket — the onclose handler will schedule reconnect.
     if (wsRef.current) {
       wsRef.current.close(1000, 'Manual reconnect');
     } else {
-      // No open socket — trigger connect directly via a dummy close simulation.
-      // The effect cannot be re-triggered from here, so we open a new WebSocket
-      // inline using the same logic path as the effect.
       wsLog('No open socket — triggering fresh connect via forceUpdate');
       forceUpdate();
     }

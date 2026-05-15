@@ -9,7 +9,7 @@
  *           signal history (audit trail).
  */
 
-import { type ReactNode } from "react";
+import { type ReactNode, useCallback } from "react";
 import {
   X,
   TrendingUp,
@@ -22,9 +22,15 @@ import {
   Activity,
   BarChart3,
   Newspaper,
+  Plus,
+  Check,
+  Loader2,
 } from "lucide-react";
 import { isPast, differenceInHours } from "date-fns";
 import { useSignalAudit } from "@/hooks/useSignals";
+import { useWatchlist } from "@/hooks/useWatchlist";
+import { useAuth } from "@/contexts/AuthContext";
+import { Button } from "@/components/ui/button";
 import { EVENT_TYPE_META } from "@/types/events";
 import {
   SignalType,
@@ -431,6 +437,45 @@ export interface SignalDetailModalProps {
 
 export function SignalDetailModal({ signal, onClose }: SignalDetailModalProps) {
   const { data: auditData } = useSignalAudit(signal.signal_id);
+  const { isAuthenticated } = useAuth();
+  const {
+    items: watchlistItems,
+    addToWatchlist,
+    removeFromWatchlist,
+    isAdding,
+    isRemoving,
+  } = useWatchlist();
+
+  const watchlistEntry = signal.instrument_key
+    ? watchlistItems.find((i) => i.instrument_key === signal.instrument_key)
+    : undefined;
+  const inWatchlist = !!watchlistEntry;
+  const watchlistItemId = watchlistEntry?.id ?? null;
+
+  const handleToggleWatchlist = useCallback(async () => {
+    if (!isAuthenticated || !signal.instrument_key) return;
+    try {
+      if (inWatchlist && watchlistItemId !== null) {
+        await removeFromWatchlist(watchlistItemId);
+      } else {
+        await addToWatchlist({
+          instrument_key: signal.instrument_key,
+          trading_symbol: signal.symbol,
+          name: signal.company_name ?? undefined,
+          exchange: "NSE",
+        });
+      }
+    } catch (error) {
+      console.error("[SignalDetailModal] Failed to toggle watchlist:", error);
+    }
+  }, [
+    isAuthenticated,
+    inWatchlist,
+    watchlistItemId,
+    removeFromWatchlist,
+    addToWatchlist,
+    signal,
+  ]);
 
   const dirMeta =
     DIRECTION_META[signal.signal_type] ?? DIRECTION_META[SignalType.HOLD];
@@ -498,13 +543,33 @@ export function SignalDetailModal({ signal, onClose }: SignalDetailModalProps) {
             </div>
           </div>
 
-          <button
-            onClick={onClose}
-            className="shrink-0 rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-600 transition-colors"
-            aria-label="Close"
-          >
-            <X className="h-4 w-4" />
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            {isAuthenticated && signal.is_nse_eligible && signal.instrument_key && (
+              <Button
+                variant={inWatchlist ? "outline" : "default"}
+                size="sm"
+                onClick={handleToggleWatchlist}
+                disabled={isAdding || isRemoving}
+                className="gap-2"
+              >
+                {isAdding || isRemoving ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : inWatchlist ? (
+                  <Check className="h-4 w-4" />
+                ) : (
+                  <Plus className="h-4 w-4" />
+                )}
+                {inWatchlist ? "In Watchlist" : "Add to Watchlist"}
+              </Button>
+            )}
+            <button
+              onClick={onClose}
+              className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-600 transition-colors"
+              aria-label="Close"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
         </div>
 
         {/* ── Scrollable body ─────────────────────────────────────────── */}

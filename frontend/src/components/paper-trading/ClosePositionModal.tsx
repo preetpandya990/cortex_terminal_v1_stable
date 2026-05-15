@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { X, AlertTriangle, TrendingDown, TrendingUp } from "lucide-react";
 import { useClosePosition } from "@/hooks/usePaperTrading";
+import { PriceInput, getNSETickSize } from "@/components/ui/PriceInput";
 import type {
   ClosePositionRequest,
   ExitReason,
@@ -204,20 +205,21 @@ export function ClosePositionModal({ position, livePrice, onClose, onClosed }: P
           {/* Limit Price (conditional) */}
           {orderType === "LIMIT" && (
             <div className="space-y-1.5">
-              <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
+              <label
+                htmlFor="close-limit-price"
+                className="block text-xs font-semibold uppercase tracking-wide text-slate-500"
+              >
                 Limit Price (₹)
               </label>
-              <input
-                type="number"
+              <PriceInput
+                id="close-limit-price"
                 value={limitPrice}
-                onChange={(e) => setLimitPrice(e.target.value)}
-                min={0.01}
-                step={0.05}
-                className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition"
+                onChange={setLimitPrice}
+                tickSize={currentPrice > 0 ? getNSETickSize(currentPrice) : undefined}
+                error={fieldErrors.limitPrice}
+                focusVariant="neutral"
+                className="py-2"
               />
-              {fieldErrors.limitPrice && (
-                <p className="text-xs text-rose-600">{fieldErrors.limitPrice}</p>
-              )}
             </div>
           )}
 

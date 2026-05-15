@@ -82,6 +82,7 @@ logger = logging.getLogger(__name__)
 
 # ── PnL WebSocket constants ────────────────────────────────────────────────────
 _PNL_WS_QUEUE_MAXSIZE = 128
+_PNL_WS_AUTH_TIMEOUT  = 10.0   # seconds to wait for the in-band auth frame
 _PNL_WS_HEARTBEAT_S   = 30.0
 _PNL_WS_RECV_TIMEOUT  = 60.0   # client inactivity before the loop continues
 
@@ -876,41 +877,62 @@ async def list_pnl_snapshots(
 @ws_router.websocket("/paper-trading/ws/pnl")
 async def pnl_websocket(
     websocket: WebSocket,
-    token: str | None = Query(None, description="JWT token"),
     redis: Redis = Depends(get_redis),
     session: AsyncSession = Depends(get_db),
 ) -> None:
     """
     Real-time portfolio P&L stream.
 
-    The client sends a JWT token as a query parameter.  On connection:
-      1. Token is validated and the user's active portfolio is resolved.
-      2. The WebSocket subscribes to `cai:paper:pnl:{portfolio_id}`.
-      3. Frames published by the P&L worker every ~500 ms are forwarded as-is.
-      4. The connection closes cleanly on disconnect or token expiry.
+    Authentication (in-band — token never appears in URLs or server logs):
+      Client must send ``{ type: "auth", token: "<jwt>" }`` as the very first frame
+      within 10 seconds.  On success the server responds with
+      ``{ type: "connected", portfolio_id: "..." }`` and begins streaming P&L frames.
+
+    Token rotation (zero-downtime):
+      Send ``{ type: "reauth", token: "<new_jwt>" }`` at any time.  The server
+      validates the new token (must belong to the same user) and responds with
+      ``{ type: "reauthed" }`` or ``{ type: "error", code: "REAUTH_FAILED" }``.
+
+    Close codes:
+      4001 — auth failed (bad/expired token or auth timeout)
+      4004 — no active portfolio for this user
 
     Frame format: LivePnLUpdate JSON (see schemas/paper_trading.py).
     """
-    # Authenticate
-    if token is None:
-        await websocket.close(code=4001, reason="Missing token")
-        return
+    from app.core.security import decode_token
 
+    await websocket.accept()
+
+    # ── In-band auth: wait for first frame ────────────────────────────────────
+    uid: int = 0
     try:
-        from app.core.security import decode_token
-        payload_data = decode_token(token)
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=_PNL_WS_AUTH_TIMEOUT)
+        frame = json.loads(raw)
+        if frame.get("type") != "auth" or not frame.get("token"):
+            raise ValueError("expected {type: 'auth', token: '...'}")
+        payload_data = decode_token(frame["token"])
         uid = int(payload_data.get("sub", 0))
-    except Exception:
+        if not uid:
+            raise ValueError("token missing sub claim")
+    except asyncio.TimeoutError:
+        logger.warning("PnL WS auth timeout")
+        await websocket.send_json({"type": "error", "code": "AUTH_TIMEOUT"})
+        await websocket.close(code=4001, reason="Auth timeout")
+        return
+    except Exception as exc:
+        logger.warning("PnL WS auth failed: %s", exc)
+        await websocket.send_json({"type": "error", "code": "AUTH_FAILED"})
         await websocket.close(code=4001, reason="Invalid token")
         return
 
     try:
         portfolio = await portfolio_service.get_active_portfolio(session, uid)
     except Exception:
+        await websocket.send_json({"type": "error", "code": "NO_PORTFOLIO"})
         await websocket.close(code=4004, reason="No active portfolio")
         return
 
-    await websocket.accept()
+    await websocket.send_json({"type": "connected", "portfolio_id": str(portfolio.id)})
     portfolio_id = portfolio.id
     channel = f"{_PNL_CHANNEL_PREFIX}{portfolio_id}"
 
@@ -940,8 +962,22 @@ async def pnl_websocket(
             except json.JSONDecodeError:
                 continue
 
-            if msg.get("type") == "ping":
+            msg_type = msg.get("type")
+
+            if msg_type == "ping":
                 await queue.put({"type": "pong", "ts": datetime.now(timezone.utc).isoformat()})
+
+            elif msg_type == "reauth":
+                # Proactive in-band token rotation — validate that it belongs to the same user.
+                try:
+                    new_payload = decode_token(msg.get("token", ""))
+                    new_uid = int(new_payload.get("sub", 0))
+                    if new_uid != uid:
+                        raise ValueError("reauth token belongs to a different user")
+                    await queue.put({"type": "reauthed"})
+                except Exception as exc:
+                    logger.warning("PnL WS reauth failed for uid=%d: %s", uid, exc)
+                    await queue.put({"type": "error", "code": "REAUTH_FAILED"})
 
     except WebSocketDisconnect:
         logger.info("PnL WS disconnected: channel=%s uid=%d", channel, uid)

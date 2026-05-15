@@ -16,7 +16,7 @@ from app.models.watchlist import WatchlistItem
 
 router = APIRouter()
 
-_DAILY_TF = "1d"
+_DAILY_TF = "1D"
 
 
 # ── Request/Response Models ────────────────────────────────────────────────────

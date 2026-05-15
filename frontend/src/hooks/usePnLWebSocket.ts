@@ -6,22 +6,34 @@
  * and maintains a per-position live P&L map for zero-re-render row updates.
  *
  * Architecture:
- *  - Token passed as ?token= query param (backend WS endpoint requirement).
+ *  - In-band auth: `{ type: "auth", token }` sent as first frame after open.
+ *    The token is NEVER placed in the URL (would expose it in server logs and
+ *    browser history).
+ *  - Token rotation (zero-downtime): when `token` prop changes, a dedicated
+ *    effect sends `{ type: "reauth", token }` over the live connection.
+ *    The `token` prop is intentionally NOT in the main connection-effect deps —
+ *    adding it would tear down and rebuild the stream on every 15-min refresh.
+ *  - `connected` state is set only after the server's `{ type: "connected" }`
+ *    confirmation frame, not on raw `onopen` — guarantees the auth handshake
+ *    completed before the UI treats the stream as live.
+ *  - TOKEN_EXPIRED close: if the server sends `TOKEN_EXPIRED` before the 4001
+ *    close, the client holds a fresh token in its ref and reconnects immediately
+ *    (bypassing exponential backoff).
  *  - LivePnLUpdate frames merged into a ref-backed position map (no re-render per tick).
  *  - Portfolio aggregate stats exposed as stable state — one re-render per frame max.
  *  - Exponential backoff reconnect (1 s → 30 s cap, ±20 % jitter), 10 attempts.
- *  - Auth failures (4001 / 4004) abort reconnect immediately — stale token retries are futile.
- *  - Server heartbeat pings ({type:"ping"}) answered with {type:"pong"} in-band.
- *  - attempt counter reset on every effect re-run so URL/token changes start fresh.
+ *  - Auth failures (4001 / 4004) abort reconnect — stale credentials cannot self-heal.
+ *  - Server heartbeat pings answered with pongs in-band.
+ *  - Attempt counter reset on every effect re-run so portfolioId changes start fresh.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { WS_BASE_URL } from '@/lib/api';
 import type { LivePnLUpdate, LivePositionPnL } from '@/types/paper_trading';
 
-// ── Close codes that must not trigger reconnect ───────────────────────────────
+// ── Fatal close codes — do NOT retry ─────────────────────────────────────────
 const FATAL_CLOSE_CODES = new Set([
-  4001, // Invalid or expired token
+  4001, // Auth failed (bad token, timeout, or wrong user)
   4004, // No active portfolio
 ]);
 
@@ -88,37 +100,47 @@ export function usePnLWebSocket(
 
   const positionPnLMap = useRef<Map<string, LivePositionPnL>>(new Map());
 
-  const wsRef          = useRef<WebSocket | null>(null);
-  const heartbeatRef   = useRef<ReturnType<typeof setInterval> | null>(null);
-  const reconnectRef   = useRef<ReturnType<typeof setTimeout>  | null>(null);
-  const attemptsRef    = useRef(0);
-  const shouldReconnectRef = useRef(true);
-  // Stable ref so connect() inside useEffect always sees fresh values
-  const connectRef     = useRef<(() => void) | null>(null);
+  const wsRef             = useRef<WebSocket | null>(null);
+  const heartbeatRef      = useRef<ReturnType<typeof setInterval> | null>(null);
+  const reconnectRef      = useRef<ReturnType<typeof setTimeout>  | null>(null);
+  const attemptsRef       = useRef(0);
+  const shouldReconnectRef   = useRef(true);
+  const tokenExpiredRef      = useRef(false); // set by TOKEN_EXPIRED message
+  const connectRef           = useRef<(() => void) | null>(null);
 
+  // Token in a ref — synchronously updated each render (before effects fire) so
+  // every connect() call uses the latest value.  NEVER added to connection-effect
+  // deps — doing so would tear down the stream on every background JWT rotation.
+  const tokenRef = useRef(token);
+  tokenRef.current = token;
+
+  // URL contains only the non-sensitive endpoint path.  It changes only when
+  // portfolioId changes (different portfolio → different Redis channel → reconnect).
   const url = useMemo(() => {
-    if (!portfolioId || !token) return null;
-    return `${WS_BASE_URL}/paper-trading/ws/pnl?portfolio_id=${portfolioId}&token=${encodeURIComponent(token)}`;
-  }, [portfolioId, token]);
+    if (!portfolioId) return null;
+    return `${WS_BASE_URL}/paper-trading/ws/pnl`;
+  }, [portfolioId]);
 
   const clearTimers = useCallback(() => {
     if (heartbeatRef.current) { clearInterval(heartbeatRef.current); heartbeatRef.current = null; }
     if (reconnectRef.current)  { clearTimeout(reconnectRef.current);  reconnectRef.current  = null; }
   }, []);
 
+  // ── Connection effect ───────────────────────────────────────────────────────
+  // NOTE: `token` is intentionally absent from deps — see tokenRef pattern above.
   useEffect(() => {
     if (!enabled || !url) return;
 
-    // Reset state for this URL / token combination
-    attemptsRef.current       = 0;
+    attemptsRef.current        = 0;
     shouldReconnectRef.current = true;
 
     const connect = () => {
       if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
+      tokenExpiredRef.current = false; // reset on every fresh attempt
       setConnectionState('connecting');
-      let ws: WebSocket;
 
+      let ws: WebSocket;
       try {
         ws = new WebSocket(url);
       } catch (err) {
@@ -130,15 +152,14 @@ export function usePnLWebSocket(
       wsRef.current = ws;
 
       ws.onopen = () => {
-        setConnectionState('connected');
-        attemptsRef.current = 0;
-
-        // Periodic client→server ping so the backend knows the client is alive
-        heartbeatRef.current = setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'ping' }));
-          }
-        }, CLIENT_HEARTBEAT_MS);
+        // Send auth frame immediately — token never goes in the URL.
+        const currentToken = tokenRef.current;
+        if (currentToken) {
+          ws.send(JSON.stringify({ type: 'auth', token: currentToken }));
+        } else {
+          console.warn('[PnLWS] No token available for in-band auth');
+        }
+        // `connected` state and heartbeat are set after server confirms auth below.
       };
 
       ws.onmessage = (event: MessageEvent) => {
@@ -149,7 +170,32 @@ export function usePnLWebSocket(
           return;
         }
 
-        // Server heartbeat — respond with pong, nothing else to do
+        // ── Auth confirmation ─────────────────────────────────────────────────
+        if (frame.type === 'connected') {
+          setConnectionState('connected');
+          attemptsRef.current = 0;
+          // Start heartbeat now that the session is authenticated and live.
+          heartbeatRef.current = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'ping' }));
+            }
+          }, CLIENT_HEARTBEAT_MS);
+          return;
+        }
+
+        // ── Error frames ──────────────────────────────────────────────────────
+        if (frame.type === 'error') {
+          const code = frame.code as string;
+          if (code === 'TOKEN_EXPIRED') {
+            // Server is about to close with 4001 — but we have a fresh token.
+            // Arm the fast-reconnect flag; onclose will bypass backoff.
+            tokenExpiredRef.current = true;
+          }
+          // AUTH_FAILED / NO_PORTFOLIO / REAUTH_FAILED are handled in onclose.
+          return;
+        }
+
+        // ── Protocol frames ───────────────────────────────────────────────────
         if (frame.type === 'ping') {
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'pong' }));
@@ -157,17 +203,19 @@ export function usePnLWebSocket(
           return;
         }
 
-        // Ignore our own pong echoes or unknown frame types
-        if (frame.type === 'pong' || !Array.isArray(frame.positions)) return;
+        if (frame.type === 'pong' || frame.type === 'reauthed') return;
+
+        // ── P&L data frame ────────────────────────────────────────────────────
+        if (!Array.isArray(frame.positions)) return;
 
         const update = frame as unknown as LivePnLUpdate;
 
-        // Update per-position map — no re-render
+        // Merge into ref-backed map — no re-render per individual position
         update.positions.forEach((pos) => {
           positionPnLMap.current.set(pos.position_id, pos);
         });
 
-        // Portfolio aggregate — one re-render per frame
+        // Portfolio aggregate — triggers one re-render per ~500 ms frame
         setPortfolioStats({
           total_unrealized_pnl: update.total_unrealized_pnl,
           total_realized_pnl:   update.total_realized_pnl,
@@ -179,7 +227,6 @@ export function usePnLWebSocket(
       };
 
       ws.onerror = () => {
-        // onclose fires right after; state set there
         clearTimers();
       };
 
@@ -187,14 +234,23 @@ export function usePnLWebSocket(
         wsRef.current = null;
         clearTimers();
 
-        // Auth / config errors — retrying with the same token is pointless
+        // TOKEN_EXPIRED + we have a fresh token → immediate reconnect, no backoff.
+        if (tokenExpiredRef.current && tokenRef.current && shouldReconnectRef.current) {
+          tokenExpiredRef.current = false;
+          attemptsRef.current = 0;
+          setConnectionState('disconnected');
+          reconnectRef.current = setTimeout(connect, 100);
+          return;
+        }
+
+        // Fatal auth / config errors — retrying with the same credentials is futile.
         if (FATAL_CLOSE_CODES.has(event.code)) {
           console.warn(`[PnLWS] Fatal close ${event.code}: ${event.reason} — reconnect suppressed`);
           setConnectionState('error');
           return;
         }
 
-        // Clean disconnect or unmount
+        // Clean disconnect or explicit unmount.
         if (event.code === 1000 || !shouldReconnectRef.current) {
           setConnectionState('disconnected');
           return;
@@ -224,7 +280,21 @@ export function usePnLWebSocket(
       wsRef.current = null;
       setConnectionState('disconnected');
     };
-  }, [url, enabled, clearTimers]);
+  // `token` intentionally absent — handled by the reauth effect below.
+  }, [url, enabled, clearTimers]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Token rotation effect ───────────────────────────────────────────────────
+  // When the JWT rotates (background refresh), send a reauth frame in-band so
+  // the stream continues uninterrupted.  If the connection is not open at that
+  // moment, tokenRef is already updated and the next connect() uses the fresh token.
+  useEffect(() => {
+    if (!token) return;
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'reauth', token }));
+    }
+  }, [token]);
+
+  // ── Public API ──────────────────────────────────────────────────────────────
 
   const disconnect = useCallback(() => {
     shouldReconnectRef.current = false;
@@ -238,10 +308,10 @@ export function usePnLWebSocket(
     clearTimers();
     wsRef.current?.close(1000, 'Manual reconnect');
     wsRef.current = null;
-    attemptsRef.current       = 0;
+    attemptsRef.current        = 0;
     shouldReconnectRef.current = true;
     setConnectionState('disconnected');
-    // Trigger connect on next tick so state flushes first
+    // Trigger connect on next tick so state flushes first.
     setTimeout(() => connectRef.current?.(), 0);
   }, [clearTimers]);
 

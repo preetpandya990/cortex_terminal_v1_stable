@@ -37,6 +37,7 @@ _ELIGIBLE_TTL    = 3_600   # 1 hour
 _INELIGIBLE_TTL  =   300   # 5 minutes — allows quick recovery on new instruments
 _ELIG_KEY_PFX    = "cortex:sym:elig:"   # cortex:sym:elig:{SYMBOL}
 _NAME_KEY_PFX    = "cortex:sym:name:"   # cortex:sym:name:{SYMBOL}
+_IKEY_KEY_PFX    = "cortex:sym:ikey:"   # cortex:sym:ikey:{SYMBOL}
 _EXCHANGE        = "NSE"
 _INSTRUMENT_TYPE = "EQ"
 
@@ -207,6 +208,40 @@ class SymbolValidatorService:
         # Cache result; empty string represents "no name" to avoid repeated DB hits.
         await self._cache_set(cache_key, name or "", _ELIGIBLE_TTL)
         return name
+
+    async def get_instrument_key(
+        self, symbol: str, db: AsyncSession
+    ) -> str | None:
+        """
+        Return the Upstox instrument_key for *symbol* (e.g. ``NSE_EQ|INE001A01036``).
+
+        Cached in Redis for ``_ELIGIBLE_TTL`` seconds.  Returns ``None`` when
+        the symbol is not found in instrument_master.
+        """
+        symbol = symbol.strip().upper()
+        if not symbol:
+            return None
+
+        cache_key = f"{_IKEY_KEY_PFX}{symbol}"
+
+        cached = await self._cache_get(cache_key)
+        if cached is not None:
+            return cached or None  # empty string sentinel → None
+
+        stmt = (
+            select(InstrumentMaster.instrument_key)
+            .where(
+                InstrumentMaster.trading_symbol == symbol,
+                InstrumentMaster.exchange == _EXCHANGE,
+                InstrumentMaster.instrument_type == _INSTRUMENT_TYPE,
+            )
+            .limit(1)
+        )
+        result = await db.execute(stmt)
+        key: str | None = result.scalar_one_or_none()
+
+        await self._cache_set(cache_key, key or "", _ELIGIBLE_TTL)
+        return key
 
     async def get_company_names(
         self, symbols: list[str], db: AsyncSession

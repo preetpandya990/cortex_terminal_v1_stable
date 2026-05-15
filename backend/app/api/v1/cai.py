@@ -70,6 +70,21 @@ class CAIConnectionManager:
         self._clients[client_id] = (ws, token)
         logger.info("CAI stream client connected: %s (total=%d)", client_id, len(self._clients))
 
+    def update_token(self, client_id: str, new_payload: TokenPayload) -> bool:
+        """Rotate the stored token payload for an existing client (in-band reauth).
+
+        Returns True if the client was found and updated, False otherwise.
+        Called in response to a ``{ type: "reauth", token: "..." }`` frame so the
+        next heartbeat expiry check sees the fresh token rather than the original.
+        """
+        entry = self._clients.get(client_id)
+        if entry is None:
+            return False
+        ws, _ = entry
+        self._clients[client_id] = (ws, new_payload)
+        logger.info("CAI stream token refreshed for client %s", client_id)
+        return True
+
     def remove(self, client_id: str) -> None:
         self._clients.pop(client_id, None)
         logger.info("CAI stream client disconnected: %s (total=%d)", client_id, len(self._clients))
@@ -215,14 +230,31 @@ async def cai_stream(websocket: WebSocket) -> None:
         cai_manager.remove(client_id)
         return
 
-    # ── Step 3: read loop (client pings / disconnect detection) ──────────────
+    # ── Step 3: read loop (client pings / in-band reauth / disconnect) ──────────
     try:
         while True:
             raw = await websocket.receive_text()
             try:
                 msg = json.loads(raw)
-                if msg.get("type") == "ping":
+                msg_type = msg.get("type")
+
+                if msg_type == "ping":
                     await websocket.send_text(json.dumps({"type": "pong"}))
+
+                elif msg_type == "reauth":
+                    # Client is proactively rotating its JWT before it expires.
+                    # Validate and update the stored payload so close_expired() sees
+                    # the fresh expiry — preventing a spurious 4001 disconnect.
+                    new_token_str = msg.get("token", "")
+                    try:
+                        new_payload = decode_token(new_token_str, expected_type="access")
+                        cai_manager.update_token(client_id, new_payload)
+                        await websocket.send_text(json.dumps({"type": "reauthed"}))
+                    except (CortexInvalidTokenError, ValueError) as exc:
+                        logger.warning("CAI stream reauth failed for client %s: %s", client_id, exc)
+                        await websocket.send_text(json.dumps({"type": "error", "code": "REAUTH_FAILED"}))
+                        # Do NOT close — the old token is still valid until the heartbeat evicts it
+
             except json.JSONDecodeError:
                 pass  # non-JSON frames are silently ignored
     except WebSocketDisconnect:

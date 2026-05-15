@@ -10,11 +10,19 @@ Candle endpoints:
   - Cache in Redis (30 s intraday, 300 s historical)
 
 Market-feed WebSocket (/upstox/market-feed/ws):
-  - Authenticated via JWT query param (?token=<jwt>)
+  - Authentication: in-band first frame {type:"auth", token:"<jwt>"}
   - Client sends  {type:"sub",   instrument_keys:[...]} to subscribe
   - Client sends  {type:"unsub", instrument_keys:[...]} to unsubscribe
+  - Client sends  {type:"reauth", token:"<new_jwt>"}    to rotate token in-band
+  - Client sends  {type:"pong"}                         heartbeat reply
+  - Server sends  {type:"connected"}
+  - Server sends  {type:"reauthed"}
+  - Server sends  {type:"upstream_status", status:"connected"|"reconnecting", ts}
   - Server sends  {type:"ltpc",  instrument_key, ltp, cp, ts} on every tick
+  - Server sends  {type:"subscribed",   instrument_keys, ts}
+  - Server sends  {type:"unsubscribed", instrument_keys, ts}
   - Server sends  {type:"ping",  ts} heartbeat every 30 s
+  - Server sends  {type:"error", code, message}
   - Uses MarketFeedService (singleton) + Redis fan-out for horizontal scale
 
 All HTTP endpoints require JWT authentication.
@@ -22,6 +30,7 @@ All HTTP endpoints require JWT authentication.
 import asyncio
 import json
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -57,6 +66,7 @@ settings = get_settings()
 router    = APIRouter(dependencies=[Depends(get_current_user_id)])
 ws_router = APIRouter()
 
+_WS_AUTH_TIMEOUT  = 10.0   # seconds to wait for the in-band auth frame
 _WS_HEARTBEAT_S   = 30.0
 _WS_QUEUE_MAXSIZE = 256
 
@@ -347,12 +357,36 @@ def _verify_ws_token(token: str) -> str | None:
         return None
 
 
+def _enqueue(queue: asyncio.Queue[dict[str, Any]], data: dict[str, Any]) -> None:
+    """
+    Put data onto the outbound queue.  On overflow, drop the oldest entry
+    to make room for the incoming frame (newest-wins backpressure).
+    """
+    try:
+        queue.put_nowait(data)
+    except asyncio.QueueFull:
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        queue.put_nowait(data)
+
+
 async def _redis_listener(
     pubsub: Any,
     queue: asyncio.Queue[dict[str, Any]],
     subscribed_keys: set[str],
 ) -> None:
-    """Subscribe to Redis market-feed channel, forward matching ticks to queue."""
+    """
+    Listen on both MARKET_FEED_LTPC and MARKET_FEED_HEALTH Redis channels.
+
+    LTPC ticks are filtered by subscribed_keys (the set of instruments this
+    client has actively subscribed to).
+
+    Health-status frames (upstream_status) are forwarded unconditionally so
+    the frontend can display live/stale indicators regardless of which
+    instruments are currently subscribed.
+    """
     try:
         async for message in pubsub.listen():
             if message["type"] != "message":
@@ -361,17 +395,20 @@ async def _redis_listener(
                 data = json.loads(message["data"])
             except (json.JSONDecodeError, TypeError):
                 continue
+
+            channel: str = message.get("channel", "")
+
+            if channel == RedisChannels.MARKET_FEED_HEALTH:
+                # Upstream health events — forward to all clients unconditionally.
+                _enqueue(queue, data)
+                continue
+
+            # MARKET_FEED_LTPC — forward only ticks for instruments this
+            # client has subscribed to.
             if data.get("instrument_key") not in subscribed_keys:
                 continue
-            try:
-                queue.put_nowait(data)
-            except asyncio.QueueFull:
-                # Drop oldest tick to make room for the fresh one
-                try:
-                    queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-                queue.put_nowait(data)
+            _enqueue(queue, data)
+
     except asyncio.CancelledError:
         pass
     except Exception:
@@ -409,40 +446,58 @@ async def _heartbeat(queue: asyncio.Queue[dict[str, Any]]) -> None:
 
 
 @ws_router.websocket("/market-feed/ws")
-async def websocket_market_feed(
-    websocket: WebSocket,
-    token: str | None = Query(None, description="JWT access token"),
-) -> None:
+async def websocket_market_feed(websocket: WebSocket) -> None:
     """
     Unified real-time ltpc market-feed WebSocket.
 
-    Authentication:
-      Pass JWT as ?token=<jwt> query param.
-      Unauthenticated connections are rejected immediately.
+    Authentication (in-band — token never appears in URLs, server logs, or browser history):
+      Client must send ``{ type: "auth", token: "<jwt>" }`` as the very first frame
+      within 10 seconds of connecting.  The server responds with ``{ type: "connected" }``
+      on success, or ``{ type: "error", code: "AUTH_FAILED"|"AUTH_TIMEOUT" }`` + close 4001
+      on failure.
+
+    Token rotation (zero-downtime):
+      Send ``{ type: "reauth", token: "<new_jwt>" }`` at any time over the live connection.
+      The server validates the new token and responds with ``{ type: "reauthed" }`` or
+      ``{ type: "error", code: "REAUTH_FAILED" }`` (connection kept open on failure).
 
     Client → Server:
+      {type: "auth",  token: "..."}            — first frame (mandatory, ≤10 s)
+      {type: "reauth", token: "..."}           — proactive token rotation
       {type: "sub",   instrument_keys: [...]}  — start receiving ltpc ticks
       {type: "unsub", instrument_keys: [...]}  — stop receiving ltpc ticks
       {type: "pong"}                           — heartbeat reply (optional)
 
     Server → Client:
+      {type: "connected"}
+      {type: "reauthed"}
+      {type: "upstream_status", status: "connected"|"reconnecting", ts}
       {type: "ltpc",         instrument_key, ltp, cp, ts}
       {type: "subscribed",   instrument_keys, ts}
       {type: "unsubscribed", instrument_keys, ts}
       {type: "ping",         ts}   — server heartbeat every 30 s
-      {type: "error",        code, message}   — validation error (connection stays open)
+      {type: "error",        code, message}
     """
     await websocket.accept()
 
-    # ── Auth ───────────────────────────────────────────────────────────────────
-    if not token:
-        await websocket.send_json(ErrorEvent(code="AUTH_REQUIRED", message="Missing token").model_dump())
+    # ── In-band auth: wait for first frame ────────────────────────────────────
+    user_id: str | None = None
+    try:
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=_WS_AUTH_TIMEOUT)
+        frame = json.loads(raw)
+        if frame.get("type") != "auth" or not frame.get("token"):
+            raise ValueError("expected {type: 'auth', token: '...'}")
+        user_id = _verify_ws_token(frame["token"])
+        if not user_id:
+            raise ValueError("invalid or expired token")
+    except asyncio.TimeoutError:
+        logger.warning("Market-feed WS auth timeout")
+        await websocket.send_json(ErrorEvent(code="AUTH_TIMEOUT", message="Auth frame not received within 10 s").model_dump())
         await websocket.close(code=4001)
         return
-
-    user_id = _verify_ws_token(token)
-    if not user_id:
-        await websocket.send_json(ErrorEvent(code="AUTH_REQUIRED", message="Invalid or expired token").model_dump())
+    except (ValueError, json.JSONDecodeError) as exc:
+        logger.warning("Market-feed WS auth failed: %s", exc)
+        await websocket.send_json(ErrorEvent(code="AUTH_FAILED", message="Invalid or expired token").model_dump())
         await websocket.close(code=4001)
         return
 
@@ -453,13 +508,27 @@ async def websocket_market_feed(
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=_WS_QUEUE_MAXSIZE)
     subscribed_keys: set[str] = set()
 
-    # Dedicated pub/sub connection for this client (redis-py requires a fresh pubsub per coroutine)
+    # Dedicated pub/sub connection — redis-py requires one pubsub object per
+    # coroutine; subscribe to both LTPC ticks and upstream health events.
     pubsub = redis.pubsub()
-    await pubsub.subscribe(RedisChannels.MARKET_FEED_LTPC)
+    await pubsub.subscribe(RedisChannels.MARKET_FEED_LTPC, RedisChannels.MARKET_FEED_HEALTH)
 
     listener_task  = asyncio.create_task(_redis_listener(pubsub, queue, subscribed_keys), name=f"mf_listener_{conn_id}")
     sender_task    = asyncio.create_task(_sender(websocket, queue), name=f"mf_sender_{conn_id}")
     heartbeat_task = asyncio.create_task(_heartbeat(queue), name=f"mf_heartbeat_{conn_id}")
+
+    # ── Confirm auth and send initial upstream status ─────────────────────────
+    # Two frames are sent atomically here:
+    #   1. "connected" — confirms the auth handshake succeeded.
+    #   2. "upstream_status" — tells the client whether the Upstox feed is
+    #      currently live or reconnecting, so it can show the correct indicator
+    #      immediately without waiting for the next health event from Redis.
+    await websocket.send_json({"type": "connected"})
+    await websocket.send_json({
+        "type": "upstream_status",
+        "status": "connected" if market_feed.is_upstream_connected else "reconnecting",
+        "ts": int(time.time() * 1000),
+    })
 
     logger.info("Market-feed WS connected: user=%s conn=%s", user_id, conn_id)
 
@@ -517,6 +586,19 @@ async def websocket_market_feed(
                     UnsubscribedEvent(instrument_keys=cmd.instrument_keys).model_dump()
                 )
 
+            elif msg_type == "reauth":
+                # Proactive in-band token rotation — validate and acknowledge.
+                # The connection stays alive regardless of outcome; the old token
+                # remains in effect until it expires naturally if reauth fails.
+                new_user_id = _verify_ws_token(data.get("token", ""))
+                if new_user_id:
+                    user_id = new_user_id
+                    await websocket.send_json({"type": "reauthed"})
+                else:
+                    await websocket.send_json(
+                        ErrorEvent(code="REAUTH_FAILED", message="New token is invalid or expired").model_dump()
+                    )
+
             elif msg_type == "pong":
                 pass  # Heartbeat reply — no action needed
 
@@ -554,7 +636,7 @@ async def websocket_market_feed(
             await market_feed.unsubscribe_many(list(subscribed_keys))
 
         try:
-            await pubsub.unsubscribe(RedisChannels.MARKET_FEED_LTPC)
+            await pubsub.unsubscribe(RedisChannels.MARKET_FEED_LTPC, RedisChannels.MARKET_FEED_HEALTH)
             await pubsub.aclose()
         except Exception:
             pass
