@@ -119,6 +119,57 @@ api.interceptors.request.use(
   (error) => Promise.reject(error),
 );
 
+/**
+ * Extract a human-readable reason from an API error.
+ *
+ * The backend wraps EVERY error as `{ error: { message, errors? } }`
+ * (backend/app/core/exception_handlers.py). Request-validation failures arrive
+ * as `error.errors: [{ field, message }]`. Reading top-level `detail`/`message`
+ * (the old code + the prior modal fix) never matched this shape, so the UI
+ * fell back to axios's opaque "Request failed with status code N" and hid the
+ * real reason (e.g. the T+1 CNC settlement block). Defensive fallbacks keep
+ * this correct for any non-enveloped error too.
+ */
+export function apiErrorMessage(error: unknown): string {
+  const data = (error as { response?: { data?: unknown } } | undefined)?.response
+    ?.data as
+    | {
+        error?: {
+          message?: unknown;
+          errors?: Array<{ field?: string; message?: string }>;
+        };
+        detail?: unknown;
+        message?: unknown;
+      }
+    | undefined;
+
+  const env = data?.error;
+  if (env) {
+    if (Array.isArray(env.errors) && env.errors.length) {
+      const fields = env.errors
+        .map((e) => (e?.field ? `${e.field}: ${e.message ?? ''}` : e?.message))
+        .filter(Boolean)
+        .join('; ');
+      if (fields) return fields;
+    }
+    if (typeof env.message === 'string' && env.message.trim()) return env.message;
+  }
+
+  const detail = data?.detail;
+  if (typeof detail === 'string' && detail.trim()) return detail;
+  if (Array.isArray(detail)) {
+    const msg = detail
+      .map((d) => (d && typeof d === 'object' ? (d as { msg?: string }).msg : null))
+      .filter(Boolean)
+      .join('; ');
+    if (msg) return msg;
+  }
+  if (typeof data?.message === 'string' && data.message.trim()) return data.message;
+
+  const axiosMsg = (error as { message?: string } | undefined)?.message;
+  return axiosMsg && axiosMsg.trim() ? axiosMsg : 'Request failed.';
+}
+
 api.interceptors.response.use(
   // Success — pass through without logging (use network tab for that).
   (response) => response,
@@ -140,8 +191,7 @@ api.interceptors.response.use(
       status === 404;
 
     if (!isSuppressed) {
-      const payload = error.response?.data as { detail?: string; message?: string } | undefined;
-      const detail = payload?.detail ?? payload?.message ?? error.message ?? 'unknown error';
+      const detail = apiErrorMessage(error);
       // Use a flat string — object args are dropped as {} in the Next.js error overlay
       // when any property is undefined (JSON.stringify omits undefined values).
       console.error(
@@ -958,6 +1008,15 @@ export const strategiesAPI = {
       'Failed to cancel backtest'
     );
   },
+};
+
+// Company Fundamentals API
+export const fundamentalsAPI = {
+  get: (instrumentKey: string) =>
+    requestData(
+      api.get(`/fundamentals/${encodeURIComponent(instrumentKey)}`),
+      'Failed to fetch company fundamentals',
+    ),
 };
 
 export const watchlistAPI = {

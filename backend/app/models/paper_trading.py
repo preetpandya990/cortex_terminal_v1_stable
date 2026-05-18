@@ -497,6 +497,10 @@ class PaperPosition(Base):
             "avg_cost_price > 0",
             name="ck_paper_positions_cost_price_positive",
         ),
+        CheckConstraint(
+            "product_type IN ('CNC', 'MIS')",
+            name="ck_paper_positions_product_type",
+        ),
         # Partial unique index in migration:
         #   uq_paper_positions_portfolio_symbol_open
         #   ON paper_positions (portfolio_id, symbol) WHERE status = 'OPEN'
@@ -543,6 +547,16 @@ class PaperPosition(Base):
     )
 
     side: Mapped[str] = mapped_column(String(5), nullable=False)
+
+    # Authoritative, MUTABLE product type for this position. Set from the
+    # opening order at open time; mutated by a CNC↔MIS conversion. This — not
+    # the (immutable) opening order — is the single source of truth the
+    # close / T+1-settlement / charge logic reads.
+    product_type: Mapped[str] = mapped_column(
+        String(10),
+        nullable=False,
+        server_default=text("'CNC'"),
+    )
 
     # Snapshot of suggestion targets at open time (survives suggestion expiry)
     target_price_1: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
@@ -600,6 +614,70 @@ class PaperPosition(Base):
             f"<PaperPosition(id={self.id}, symbol={self.symbol}, "
             f"qty={self.quantity}, avg_cost={self.avg_cost_price}, "
             f"side={self.side}, status={self.status})>"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PaperPositionConversion
+# ──────────────────────────────────────────────────────────────────────────────
+
+class PaperPositionConversion(Base):
+    """
+    Append-only audit of a CNC↔MIS product-type conversion on an OPEN position.
+
+    Phase 1 supports full-position, same-trading-day conversions only. Exactly
+    one row is written per successful conversion; never updated or deleted —
+    the absence of an updated_at column signals that invariant.
+    """
+
+    __tablename__ = "paper_position_conversions"
+
+    __table_args__ = (
+        CheckConstraint(
+            "from_product IN ('CNC', 'MIS') AND to_product IN ('CNC', 'MIS')",
+            name="ck_position_conversions_products",
+        ),
+        CheckConstraint(
+            "from_product <> to_product",
+            name="ck_position_conversions_distinct",
+        ),
+        CheckConstraint(
+            "quantity > 0",
+            name="ck_position_conversions_quantity_positive",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    position_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("paper_positions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    portfolio_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("portfolios.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    from_product: Mapped[str] = mapped_column(String(10), nullable=False)
+    to_product: Mapped[str] = mapped_column(String(10), nullable=False)
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    note: Mapped[str | None] = mapped_column(String(255))
+    converted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<PaperPositionConversion(position_id={self.position_id}, "
+            f"{self.from_product}->{self.to_product}, qty={self.quantity})>"
         )
 
 

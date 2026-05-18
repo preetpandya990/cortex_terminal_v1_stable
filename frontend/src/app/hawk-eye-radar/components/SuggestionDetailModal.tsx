@@ -10,7 +10,9 @@ import {
 } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
+import { FundamentalsTab } from "@/components/hawk-eye-radar/FundamentalsTab";
 import type { TradeSuggestion } from "@/types/trade_suggestions";
 
 const SIGNAL_SKIP_KEYS = new Set([
@@ -182,179 +184,197 @@ export function SuggestionDetailModal({
           </div>
         </DialogHeader>
 
-        <div className="space-y-6 mt-4">
-          {/* Consensus Score */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-slate-700">Consensus Score</h3>
-              <span className="text-2xl font-bold text-slate-900">
-                {suggestion.consensus_score.toFixed(1)}%
-              </span>
-            </div>
-            <div className="h-3 bg-slate-100 rounded-full overflow-hidden">
-              <div
-                className={cn(
-                  "h-full transition-all rounded-full",
-                  suggestion.consensus_score >= 80
-                    ? "bg-green-500"
-                    : suggestion.consensus_score >= 60
-                    ? "bg-yellow-500"
-                    : "bg-orange-500"
-                )}
-                style={{ width: `${suggestion.consensus_score}%` }}
-              />
-            </div>
-          </div>
+        <Tabs defaultValue="signal" className="mt-4">
+          <TabsList className="grid w-full grid-cols-2">
+            <TabsTrigger value="signal">Signal Details</TabsTrigger>
+            <TabsTrigger value="fundamentals">Fundamentals</TabsTrigger>
+          </TabsList>
 
-          {/* Agent Signals */}
-          <div className="space-y-3">
-            <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
-              <Brain className="h-4 w-4" />
-              Multi-Agent Signals
-            </h3>
-            <div className="grid gap-3">
-              {/* Scanner Signal */}
-              <SignalPanel
-                icon={<TrendingUpIcon className="h-4 w-4 text-blue-600" />}
-                title="Technical Scanner"
-                data={suggestion.scanner_signal}
-                theme="blue"
-              />
+          {/* ── Signal Details tab ───────────────────────────────────────── */}
+          <TabsContent value="signal">
+            <div className="space-y-6 mt-4">
+              {/* Consensus Score */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-sm font-semibold text-slate-700">Consensus Score</h3>
+                  <span className="text-2xl font-bold text-slate-900">
+                    {suggestion.consensus_score.toFixed(1)}%
+                  </span>
+                </div>
+                <div className="h-3 bg-slate-100 rounded-full overflow-hidden">
+                  <div
+                    className={cn(
+                      "h-full transition-all rounded-full",
+                      suggestion.consensus_score >= 80
+                        ? "bg-green-500"
+                        : suggestion.consensus_score >= 60
+                        ? "bg-yellow-500"
+                        : "bg-orange-500",
+                    )}
+                    style={{ width: `${suggestion.consensus_score}%` }}
+                  />
+                </div>
+              </div>
 
-              {/* AI Signal */}
-              <SignalPanel
-                icon={<Brain className="h-4 w-4 text-violet-600" />}
-                title="AI Intelligence"
-                data={suggestion.ai_signal}
-                theme="violet"
-              />
+              {/* Agent Signals */}
+              <div className="space-y-3">
+                <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
+                  <Brain className="h-4 w-4" />
+                  Multi-Agent Signals
+                </h3>
+                <div className="grid gap-3">
+                  <SignalPanel
+                    icon={<TrendingUpIcon className="h-4 w-4 text-blue-600" />}
+                    title="Technical Scanner"
+                    data={suggestion.scanner_signal}
+                    theme="blue"
+                  />
+                  <SignalPanel
+                    icon={<Brain className="h-4 w-4 text-violet-600" />}
+                    title="AI Intelligence"
+                    data={suggestion.ai_signal}
+                    theme="violet"
+                  />
+                  <SignalPanel
+                    icon={<Cpu className="h-4 w-4 text-indigo-600" />}
+                    title="ML Predictor"
+                    data={suggestion.ml_signal}
+                    theme="indigo"
+                  />
+                </div>
+              </div>
 
-              {/* ML Signal */}
-              <SignalPanel
-                icon={<Cpu className="h-4 w-4 text-indigo-600" />}
-                title="ML Predictor"
-                data={suggestion.ml_signal}
-                theme="indigo"
-              />
-            </div>
-          </div>
+              {/* Trade Parameters */}
+              {suggestion.entry_price && (
+                <div className="space-y-3">
+                  <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
+                    <Target className="h-4 w-4" />
+                    Trade Parameters
+                  </h3>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                      <p className="text-xs text-slate-500 mb-1">Entry Price</p>
+                      <p className="text-lg font-semibold text-slate-900">
+                        ₹{suggestion.entry_price.toFixed(2)}
+                      </p>
+                    </div>
+                    {suggestion.stop_loss && (
+                      <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
+                        <p className="text-xs text-red-600 mb-1 flex items-center gap-1">
+                          <Shield className="h-3 w-3" />
+                          Stop Loss
+                        </p>
+                        <p className="text-lg font-semibold text-red-700">
+                          ₹{suggestion.stop_loss.toFixed(2)}
+                        </p>
+                      </div>
+                    )}
+                  </div>
 
-          {/* Trade Parameters */}
-          {suggestion.entry_price && (
-            <div className="space-y-3">
-              <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
-                <Target className="h-4 w-4" />
-                Trade Parameters
-              </h3>
-              <div className="grid grid-cols-2 gap-3">
+                  {(suggestion.take_profit_1 ||
+                    suggestion.take_profit_2 ||
+                    suggestion.take_profit_3) && (
+                    <div className="space-y-2">
+                      <p className="text-xs font-medium text-slate-600">Take Profit Targets</p>
+                      <div className="grid grid-cols-3 gap-2">
+                        {suggestion.take_profit_1 && (
+                          <div className="p-2 bg-green-50 border border-green-200 rounded text-center">
+                            <p className="text-xs text-green-600 mb-0.5">Target 1</p>
+                            <p className="text-sm font-semibold text-green-700">
+                              ₹{suggestion.take_profit_1.toFixed(2)}
+                            </p>
+                          </div>
+                        )}
+                        {suggestion.take_profit_2 && (
+                          <div className="p-2 bg-green-50 border border-green-200 rounded text-center">
+                            <p className="text-xs text-green-600 mb-0.5">Target 2</p>
+                            <p className="text-sm font-semibold text-green-700">
+                              ₹{suggestion.take_profit_2.toFixed(2)}
+                            </p>
+                          </div>
+                        )}
+                        {suggestion.take_profit_3 && (
+                          <div className="p-2 bg-green-50 border border-green-200 rounded text-center">
+                            <p className="text-xs text-green-600 mb-0.5">Target 3</p>
+                            <p className="text-sm font-semibold text-green-700">
+                              ₹{suggestion.take_profit_3.toFixed(2)}
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {suggestion.risk_reward_ratio && (
+                    <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                      <p className="text-xs text-blue-600 mb-1">Risk/Reward Ratio</p>
+                      <p className="text-lg font-semibold text-blue-700">
+                        1:{suggestion.risk_reward_ratio.toFixed(2)}
+                      </p>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Temporal Metadata */}
+              <div className="space-y-3">
+                <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
+                  <Clock className="h-4 w-4" />
+                  Timing
+                </h3>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                    <p className="text-xs text-slate-500 mb-1">Generated</p>
+                    <p className="text-sm font-medium text-slate-900">
+                      {new Date(suggestion.generated_at).toLocaleString("en-IN", {
+                        dateStyle: "medium",
+                        timeStyle: "short",
+                      })}
+                    </p>
+                  </div>
+                  <div
+                    className={cn(
+                      "p-3 border rounded-lg",
+                      timeRemaining === "Expired"
+                        ? "bg-red-50 border-red-200"
+                        : "bg-amber-50 border-amber-200",
+                    )}
+                  >
+                    <p
+                      className={cn(
+                        "text-xs mb-1",
+                        timeRemaining === "Expired" ? "text-red-600" : "text-amber-600",
+                      )}
+                    >
+                      {timeRemaining === "Expired" ? "Expired" : "Time Remaining"}
+                    </p>
+                    <p
+                      className={cn(
+                        "text-sm font-medium",
+                        timeRemaining === "Expired" ? "text-red-700" : "text-amber-700",
+                      )}
+                    >
+                      {timeRemaining}
+                    </p>
+                  </div>
+                </div>
                 <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
-                  <p className="text-xs text-slate-500 mb-1">Entry Price</p>
-                  <p className="text-lg font-semibold text-slate-900">
-                    ₹{suggestion.entry_price.toFixed(2)}
+                  <p className="text-xs text-slate-500 mb-1">Trigger Pathway</p>
+                  <p className="text-sm font-medium text-slate-900">
+                    {suggestion.trigger_pathway.replace(/_/g, " ")}
                   </p>
                 </div>
-                {suggestion.stop_loss && (
-                  <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
-                    <p className="text-xs text-red-600 mb-1 flex items-center gap-1">
-                      <Shield className="h-3 w-3" />
-                      Stop Loss
-                    </p>
-                    <p className="text-lg font-semibold text-red-700">
-                      ₹{suggestion.stop_loss.toFixed(2)}
-                    </p>
-                  </div>
-                )}
-              </div>
-
-              {/* Take Profit Targets */}
-              {(suggestion.take_profit_1 || suggestion.take_profit_2 || suggestion.take_profit_3) && (
-                <div className="space-y-2">
-                  <p className="text-xs font-medium text-slate-600">Take Profit Targets</p>
-                  <div className="grid grid-cols-3 gap-2">
-                    {suggestion.take_profit_1 && (
-                      <div className="p-2 bg-green-50 border border-green-200 rounded text-center">
-                        <p className="text-xs text-green-600 mb-0.5">Target 1</p>
-                        <p className="text-sm font-semibold text-green-700">
-                          ₹{suggestion.take_profit_1.toFixed(2)}
-                        </p>
-                      </div>
-                    )}
-                    {suggestion.take_profit_2 && (
-                      <div className="p-2 bg-green-50 border border-green-200 rounded text-center">
-                        <p className="text-xs text-green-600 mb-0.5">Target 2</p>
-                        <p className="text-sm font-semibold text-green-700">
-                          ₹{suggestion.take_profit_2.toFixed(2)}
-                        </p>
-                      </div>
-                    )}
-                    {suggestion.take_profit_3 && (
-                      <div className="p-2 bg-green-50 border border-green-200 rounded text-center">
-                        <p className="text-xs text-green-600 mb-0.5">Target 3</p>
-                        <p className="text-sm font-semibold text-green-700">
-                          ₹{suggestion.take_profit_3.toFixed(2)}
-                        </p>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {/* Risk/Reward Ratio */}
-              {suggestion.risk_reward_ratio && (
-                <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg">
-                  <p className="text-xs text-blue-600 mb-1">Risk/Reward Ratio</p>
-                  <p className="text-lg font-semibold text-blue-700">
-                    1:{suggestion.risk_reward_ratio.toFixed(2)}
-                  </p>
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Temporal Metadata */}
-          <div className="space-y-3">
-            <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
-              <Clock className="h-4 w-4" />
-              Timing
-            </h3>
-            <div className="grid grid-cols-2 gap-3">
-              <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
-                <p className="text-xs text-slate-500 mb-1">Generated</p>
-                <p className="text-sm font-medium text-slate-900">
-                  {new Date(suggestion.generated_at).toLocaleString('en-IN', {
-                    dateStyle: 'medium',
-                    timeStyle: 'short',
-                  })}
-                </p>
-              </div>
-              <div className={cn(
-                "p-3 border rounded-lg",
-                timeRemaining === "Expired"
-                  ? "bg-red-50 border-red-200"
-                  : "bg-amber-50 border-amber-200"
-              )}>
-                <p className={cn(
-                  "text-xs mb-1",
-                  timeRemaining === "Expired" ? "text-red-600" : "text-amber-600"
-                )}>
-                  {timeRemaining === "Expired" ? "Expired" : "Time Remaining"}
-                </p>
-                <p className={cn(
-                  "text-sm font-medium",
-                  timeRemaining === "Expired" ? "text-red-700" : "text-amber-700"
-                )}>
-                  {timeRemaining}
-                </p>
               </div>
             </div>
-            <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
-              <p className="text-xs text-slate-500 mb-1">Trigger Pathway</p>
-              <p className="text-sm font-medium text-slate-900">
-                {suggestion.trigger_pathway.replace(/_/g, ' ')}
-              </p>
+          </TabsContent>
+
+          {/* ── Fundamentals tab — lazy mounted (TabsContent returns null when inactive) ── */}
+          <TabsContent value="fundamentals">
+            <div className="mt-4">
+              <FundamentalsTab instrumentKey={suggestion.instrument_key} />
             </div>
-          </div>
-        </div>
+          </TabsContent>
+        </Tabs>
 
         {/* Footer Actions */}
         <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-200 mt-6">

@@ -76,7 +76,7 @@ export function OpenTradeModal({
 
   const [side, setSide]             = useState<TransactionType>(suggestedSide);
   const [orderType, setOrderType]   = useState<OrderType>("MARKET");
-  const [productType]               = useState<ProductType>("CNC");
+  const [productType, setProductType] = useState<ProductType>("CNC");
   const [quantity, setQuantity]     = useState<string>("1");
   const [limitPrice, setLimitPrice] = useState<string>(
     livePrice != null ? livePrice.toFixed(2) : "",
@@ -405,6 +405,34 @@ export function OpenTradeModal({
                   </button>
                 ))}
               </div>
+            </div>
+
+            {/* Product type */}
+            <div className="space-y-1.5">
+              <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
+                Product Type
+              </label>
+              <div className="flex gap-2">
+                {(["CNC", "MIS"] as ProductType[]).map((pt) => (
+                  <button
+                    key={pt}
+                    type="button"
+                    onClick={() => setProductType(pt)}
+                    className={`flex-1 rounded-xl border py-2 text-xs font-semibold transition ${
+                      productType === pt
+                        ? "border-blue-500 bg-blue-600 text-white"
+                        : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                    }`}
+                  >
+                    {pt}
+                  </button>
+                ))}
+              </div>
+              <p className="text-[11px] text-slate-500">
+                {productType === "CNC"
+                  ? "Delivery — settles T+1; cannot be closed the same day."
+                  : "Intraday — can be opened and closed the same day."}
+              </p>
             </div>
 
             {/* Limit price (conditional) */}

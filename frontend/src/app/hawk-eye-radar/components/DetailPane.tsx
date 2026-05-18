@@ -27,6 +27,7 @@ import { CandlestickChart } from "@/components/charts/CandlestickChart";
 import { TimeframeSelector } from "@/components/charts/TimeframeSelector";
 import { IndicatorSelector } from "@/components/charts/IndicatorSelector";
 import { AnalysisCardsSection } from "@/components/AnalysisCardsSection";
+import { FundamentalsTab } from "@/components/hawk-eye-radar/FundamentalsTab";
 import { OpenTradeModal } from "@/components/paper-trading/OpenTradeModal";
 import { useWatchlist } from "@/hooks/useWatchlist";
 import { useAuth } from "@/contexts/AuthContext";
@@ -662,6 +663,11 @@ export function DetailPane({ instrument, onClose, showAnalysis = true, suggestio
                     instrumentKey={instrument.instrument_key}
                     symbol={instrument.trading_symbol ?? undefined}
                   />
+                )}
+
+                {/* Fundamentals section — always below analysis */}
+                {showAnalysis && (
+                  <FundamentalsTab instrumentKey={instrument.instrument_key} />
                 )}
               </CardContent>
             </Card>

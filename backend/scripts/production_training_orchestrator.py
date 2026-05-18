@@ -64,12 +64,13 @@ from app.ml.features.symbol_selector import (
 )
 from app.ml.features.feature_pipeline import prepare_training_data  # noqa: F401
 from app.ml.features.target_generator import create_targets_batch, get_class_weights
-from app.ml.training.walk_forward import WalkForwardSplitter, Split
+from app.ml.evaluation.cpcv import PanelPurgedCPCV, purged_holdout_split
 from app.ml.training.xgboost_trainer import XGBoostTrainer
 from app.ml.training.gru_trainer import GRUTrainer, CrossSectionalSequenceGenerator, configure_gpu
 from app.ml.training.ensemble_trainer import EnsembleTrainer
 from app.ml.training.evaluator import ModelEvaluator, EvaluationResults
 from app.ml.training.checkpoint_manager import CheckpointManager, find_checkpoint
+from app.ml.training.exceptions import MissingReturnsError, StaleCheckpointError
 from app.ml.model_registry import ModelRegistry
 from app.ml.inference.onnx_converter import ONNXConverter
 
@@ -92,13 +93,25 @@ class TrainingConfig:
     n_symbols: int = 2551
     lookback_years: int = 10
     sequence_length: int = 60
-    n_features: int = 49  # 44 technical + 5 sentiment
+    n_features: int = 69  # 44 technical + 5 sentiment + 20 fundamental
+    include_fundamentals: bool = True
 
     # Walk-forward validation
     initial_train_days: int = 730  # 2 years
     validation_days: int = 90      # 3 months
     test_days: int = 30            # 1 month
     step_days: int = 30            # 1 month steps
+
+    # Combinatorial Purged CV (A2) — supersedes the decorative walk-forward
+    # fields above for the training pipeline. Those remain only for the
+    # standalone WalkForwardSplitter utility still exported by app.ml.training.
+    # NOTE: at resume these are read from the persisted cv_plan.json, never
+    # from here, so a config edit cannot silently change folds (single source).
+    cpcv_n_groups: int = 8            # N — López de Prado groups
+    cpcv_n_test: int = 2              # k — test groups/combo (≥2 ⇒ path distribution)
+    cpcv_horizon: int = 5             # label look-ahead (== target horizon) → purge
+    cpcv_embargo: int = 5             # extra trading-days dropped after each test block
+    cpcv_hpo_train_frac: float = 0.8  # one-time purged HPO-holdout train fraction
 
     # Hyperparameter tuning
     xgboost_trials: int = 100
@@ -353,19 +366,25 @@ class ProductionTrainingOrchestrator:
 
             # ── Step 4 ────────────────────────────────────────────────────────
             logger.info("\n" + "=" * 100)
-            logger.info("STEP 4: WALK-FORWARD VALIDATION SETUP")
+            logger.info("STEP 4: COMBINATORIAL PURGED CV PLAN")
             logger.info("=" * 100)
 
             if cp.is_done("step_4_splits"):
-                splits = cp.load_splits()
+                cv_plan = cp.load_cv_plan()
                 await self._free_raw_features()
-                logger.info("→ Resuming: step_4 skipped  (%d splits from checkpoint)", len(splits))
+                logger.info(
+                    "→ Resuming: step_4 skipped  (CPCV plan: %s splits / %s paths)",
+                    cv_plan.get("n_splits"), cv_plan.get("n_paths"),
+                )
             else:
                 t0 = time.monotonic()
-                splits = await self._setup_walk_forward_validation()
+                cv_plan = await self._build_cv_plan()
                 await self._free_raw_features()
-                logger.info("Saving step_4 checkpoint (%d splits)...", len(splits))
-                cp.save_splits(splits)
+                logger.info(
+                    "Saving step_4 checkpoint (CPCV plan: %s splits / %s paths)...",
+                    cv_plan.get("n_splits"), cv_plan.get("n_paths"),
+                )
+                cp.save_cv_plan(cv_plan)
                 cp.mark_done("step_4_splits", time.monotonic() - t0)
 
             # ── Step 5 ────────────────────────────────────────────────────────
@@ -393,7 +412,7 @@ class ProductionTrainingOrchestrator:
                 if not hasattr(self, 'targets_data') or not self.targets_data:
                     self.targets_data, self.class_weights = cp.load_targets()
                 t0 = time.monotonic()
-                xgboost_results = await self._train_xgboost_with_optimization(splits)
+                xgboost_results = await self._train_xgboost_with_optimization(cv_plan)
                 logger.info("Saving step_5 checkpoint (XGBoost model)...")
                 cp.save_xgboost(
                     xgboost_results['model'],
@@ -439,7 +458,7 @@ class ProductionTrainingOrchestrator:
                 if not hasattr(self, 'targets_data') or not self.targets_data:
                     self.targets_data, self.class_weights = cp.load_targets()
                 t0 = time.monotonic()
-                gru_results = await self._train_gru_with_optimization(splits)
+                gru_results = await self._train_gru_with_optimization(cv_plan)
                 logger.info("Saving step_6 checkpoint (GRU SavedModel)...")
                 cp.save_gru_model(
                     gru_results['model'],
@@ -468,7 +487,7 @@ class ProductionTrainingOrchestrator:
                 logger.info("→ Resuming: step_7 skipped  (ensemble weights from checkpoint)")
             else:
                 t0 = time.monotonic()
-                ensemble_results = await self._create_and_optimize_ensemble(splits)
+                ensemble_results = await self._create_and_optimize_ensemble(cv_plan)
                 logger.info("Saving step_7 checkpoint (ensemble weights)...")
                 cp.save_ensemble(ensemble_results['optimized_weights'])
                 cp.mark_done("step_7_ensemble", time.monotonic() - t0)
@@ -486,7 +505,7 @@ class ProductionTrainingOrchestrator:
                 logger.info("→ Resuming: step_8 skipped  (evaluation from checkpoint)")
             else:
                 t0 = time.monotonic()
-                evaluation_results = await self._evaluate_all_models(splits)
+                evaluation_results = await self._evaluate_all_models(cv_plan)
                 logger.info("Saving step_8 checkpoint (evaluation results)...")
                 cp.save_evaluation({
                     k: asdict(v) for k, v in evaluation_results.items()
@@ -753,42 +772,56 @@ class ProductionTrainingOrchestrator:
                 raise ValueError(f"NaN in targets for {symbol}")
         logger.info("✓ Targets validation passed")
 
-    async def _setup_walk_forward_validation(self) -> List[Split]:
-        logger.info(
-            "Setting up walk-forward splits  train=%dd  val=%dd  test=%dd  step=%dd",
-            self.config.initial_train_days, self.config.validation_days,
-            self.config.test_days, self.config.step_days,
-        )
+    async def _build_cv_plan(self) -> Dict[str, Any]:
+        """Build the Combinatorial-Purged-CV plan from the global unique
+        timestamp axis (the union of every symbol's post-dead-zone timestamps).
 
-        splitter = WalkForwardSplitter(
-            initial_train_days=self.config.initial_train_days,
-            validation_days=self.config.validation_days,
-            test_days=self.config.test_days,
-            step_days=self.config.step_days,
-        )
+        The C(N,k) combinatorial splits are deliberately NOT materialised here:
+        they are regenerated deterministically at step-5 from the rebuilt
+        XGBoost panel and guarded by the axis fingerprint (resume
+        reproducibility — A1 fail-loud philosophy). Step-4 persists only the
+        CPCV parameters, group boundaries, n_splits / n_paths, the axis
+        fingerprint, and the one-time purged HPO-holdout descriptor.
 
-        # Use cached max_timestamps (populated in step 2 from raw features or manifest)
-        max_ts = getattr(self, '_max_timestamps_cached', None)
-        if max_ts is None:
-            max_ts = max(len(df) for df in self.raw_features_data.values())
+        All step-5+ code reads CPCV parameters from this persisted plan — never
+        from live config — so a config edit cannot silently change folds on
+        resume (single source of truth).
+        """
+        if not getattr(self, 'targets_data', None):
+            # Resume robustness — mirror the step-5 lazy-load contract.
+            self.targets_data, self.class_weights = self.cp.load_targets()
 
-        end_date   = datetime.now()
-        start_date = end_date - timedelta(days=self.config.lookback_years * 365)
-        dates      = pd.date_range(start=start_date, end=end_date, freq='D')[:max_ts]
-        dummy_df   = pd.DataFrame({'timestamp': dates})
-
-        splits = splitter.create_splits(dummy_df, n_splits=10)
-
-        logger.info("✓ Walk-forward setup complete  splits=%d", len(splits))
-        for i, s in enumerate(splits):
-            logger.info(
-                "  Split %2d: train [%s → %s]  val [%s → %s]  test [%s → %s]",
-                i + 1,
-                s.train_start.date(), s.train_end.date(),
-                s.val_start.date(),   s.val_end.date(),
-                s.test_start.date(),  s.test_end.date(),
+        ts_parts = [
+            self.targets_data[s]['features_df']['timestamp'].values
+            for s in self.symbols
+            if s in self.targets_data
+        ]
+        if not ts_parts:
+            raise ValueError(
+                "Cannot build CV plan — no symbol timestamps present in targets_data."
             )
-        return splits
+        all_ts = np.concatenate(ts_parts)
+
+        cpcv = PanelPurgedCPCV(
+            all_ts,
+            horizon=self.config.cpcv_horizon,
+            n_groups=self.config.cpcv_n_groups,
+            n_test=self.config.cpcv_n_test,
+            embargo=self.config.cpcv_embargo,
+        )
+        plan = cpcv.plan_summary()
+        plan["hpo_holdout"] = {
+            "train_frac": self.config.cpcv_hpo_train_frac,
+            "horizon":    self.config.cpcv_horizon,
+            "embargo":    self.config.cpcv_embargo,
+        }
+        logger.info(
+            "✓ CPCV plan built  N=%d k=%d → %d splits / %d paths  "
+            "(%d unique timestamps, axis fp %s…)",
+            cpcv.n_groups, cpcv.n_test, plan["n_splits"], plan["n_paths"],
+            plan["n_unique_timestamps"], plan["axis_fingerprint"][:12],
+        )
+        return plan
 
     async def _free_raw_features(self) -> None:
         """Release raw_features_data — no longer needed after step 4."""
@@ -797,34 +830,47 @@ class ProductionTrainingOrchestrator:
             gc.collect()
             logger.info("✓ raw_features_data released (~1.3 GB freed)")
 
-    async def _train_xgboost_with_optimization(self, splits: List[Split]) -> Dict[str, Any]:
+    async def _train_xgboost_with_optimization(self, cv_plan: Dict[str, Any]) -> Dict[str, Any]:
         from app.ml.features.feature_pipeline import normalize_features, get_all_feature_names
 
-        feature_names = get_all_feature_names(include_sentiment=True)
+        feature_names = get_all_feature_names(
+            include_sentiment=True,
+            include_fundamentals=self.config.include_fundamentals,
+        )
 
-        X_list, y_list = [], []
+        # ── Panel build — features, labels, AND the per-row timestamp +
+        # forward-return arrays CPCV / the OOF backtest paths need (the old
+        # path tracked neither, which is why "walk-forward" was decorative).
+        X_list, y_list, ts_list, r_list = [], [], [], []
         for symbol in self.symbols:
             if symbol not in self.targets_data:
                 continue
-            df_raw = self.targets_data[symbol]['features_df']
-            y      = self.targets_data[symbol]['target']
+            entry  = self.targets_data[symbol]
+            df_raw = entry['features_df']
+            y      = entry['target']
+            r      = entry['forward_return']
+            ts     = df_raw['timestamp'].values
             norm_df = normalize_features(
                 df_raw, method='rolling', window=60, feature_cols=feature_names
             )
             available = [c for c in feature_names if c in norm_df.columns]
             X_tab = norm_df[available].values.astype(np.float32)
-            n = min(len(X_tab), len(y))
+            n = min(len(X_tab), len(y), len(r), len(ts))
             if n == 0:
                 continue
             X_list.append(X_tab[:n])
             y_list.append(y[:n])
+            r_list.append(np.asarray(r[:n], dtype=np.float32))
+            ts_list.append(np.asarray(ts[:n], dtype="datetime64[ns]"))
 
-        X_all = np.vstack(X_list)
-        y_all = np.concatenate(y_list)
-        del X_list, y_list
+        X_all  = np.vstack(X_list)
+        y_all  = np.concatenate(y_list)
+        r_all  = np.concatenate(r_list)
+        ts_all = np.concatenate(ts_list)
+        del X_list, y_list, r_list, ts_list
 
         logger.info(
-            "XGBoost data prepared  samples=%d  features=%d  class_dist=%s",
+            "XGBoost panel prepared  samples=%d  features=%d  class_dist=%s",
             len(X_all), X_all.shape[1],
             dict(zip(*np.unique(y_all, return_counts=True))),
         )
@@ -833,45 +879,140 @@ class ProductionTrainingOrchestrator:
             objective='binary:logistic', num_class=2, random_state=42
         )
 
-        split_idx = int(len(X_all) * 0.8)
-        X_train, X_val = X_all[:split_idx], X_all[split_idx:]
-        y_train, y_val = y_all[:split_idx], y_all[split_idx:]
-
-        logger.info("Hyperparameter optimisation: %d trials...", self.config.xgboost_trials)
-
-        from sklearn.model_selection import train_test_split
-        X_tr, X_v, y_tr, y_v = train_test_split(
-            X_train, y_train, test_size=0.2, random_state=42, stratify=y_train
+        # ── Reconstruct the CPCV plan on THIS panel; the axis fingerprint must
+        # match step-4 exactly or the panel was rebuilt non-deterministically
+        # (resume would silently use different folds — fail loud, A1 rule).
+        cpcv = PanelPurgedCPCV(
+            ts_all,
+            horizon=cv_plan["horizon"],
+            n_groups=cv_plan["n_groups"],
+            n_test=cv_plan["n_test"],
+            embargo=cv_plan["embargo"],
         )
+        if cpcv.axis_fingerprint != cv_plan["axis_fingerprint"]:
+            raise StaleCheckpointError(
+                "XGBoost panel timestamp axis does not match the step-4 CV "
+                f"plan (panel fp {cpcv.axis_fingerprint[:12]}… vs plan "
+                f"{cv_plan['axis_fingerprint'][:12]}…). The panel was rebuilt "
+                "non-deterministically; resuming would use different CPCV "
+                "folds. Start a clean run with --fresh."
+            )
+        n_paths = cpcv.total_paths
 
+        # ── HPO ONCE on a purged + embargoed holdout (replaces the old
+        # stratified-random train_test_split — that was look-ahead leakage on
+        # time-series data, the core of RC-2).
+        hpo = cv_plan["hpo_holdout"]
+        hpo_tr, hpo_va = purged_holdout_split(
+            ts_all,
+            horizon=hpo["horizon"],
+            embargo=hpo["embargo"],
+            train_frac=hpo["train_frac"],
+        )
+        logger.info(
+            "Purged HPO holdout  train=%d  val=%d  | %d Optuna trials (AUC-PR)…",
+            len(hpo_tr), len(hpo_va), self.config.xgboost_trials,
+        )
         best_params = await asyncio.to_thread(
             self.xgboost_trainer.tune_hyperparameters,
-            X_tr, y_tr, X_v, y_v,
+            X_all[hpo_tr], y_all[hpo_tr], X_all[hpo_va], y_all[hpo_va],
             n_trials=self.config.xgboost_trials,
             timeout=7200,
             n_jobs=4,
         )
         logger.info("✓ XGBoost HPO complete  best_params=%s", best_params)
 
-        xgboost_model = await asyncio.to_thread(
+        # Reference early-stopped fit on the purged holdout → the tuned round
+        # count reused (fixed) by every CPCV refit + the final model. (This
+        # also fits an interim leakage-safe calibrator on the holdout; A4
+        # replaces it with the CPCV-OOF calibrator.)
+        await asyncio.to_thread(
             self.xgboost_trainer.train,
-            X_train, y_train, X_val, y_val,
+            X_all[hpo_tr], y_all[hpo_tr], X_all[hpo_va], y_all[hpo_va],
             params=best_params,
             early_stopping_rounds=self.config.early_stopping_patience,
         )
+        best_rounds = max(1, (self.xgboost_trainer.model.best_iteration or 0) + 1)
+        logger.info("✓ Tuned boosting rounds (fixed for CPCV + final): %d", best_rounds)
 
-        feature_importance = xgboost_model.get_score(importance_type='weight')
-        logger.info("✓ XGBoost training complete  importance_entries=%d", len(feature_importance))
+        # ── 28-combo Combinatorial Purged CV → φ out-of-sample backtest paths.
+        # Each combo: fixed-round refit on purged+embargoed train, predict the
+        # held-out test groups, route every test row to its path. The result
+        # is φ coherent OOS prediction series (the honest, leakage-free perf
+        # distribution that feeds Deflated-Sharpe / PBO in A3).
+        oof_proba = [list() for _ in range(n_paths)]
+        oof_idx   = [list() for _ in range(n_paths)]
+        n_splits  = cpcv.n_splits(cpcv.n_groups, cpcv.n_test)
+        for i, sp in enumerate(cpcv.split(), 1):
+            if sp.train_idx.size == 0 or sp.test_idx.size == 0:
+                raise ValueError(
+                    f"CPCV combo {sp.combo_id} produced an empty train/test "
+                    f"set (train={sp.train_idx.size}, test={sp.test_idx.size}). "
+                    "Refusing to bias the path distribution by skipping it — "
+                    "the data window is too short for these CPCV parameters."
+                )
+            booster = await asyncio.to_thread(
+                self.xgboost_trainer.fit_fixed,
+                X_all[sp.train_idx], y_all[sp.train_idx],
+                params=best_params,
+                num_boost_round=best_rounds,
+                class_weights=None,  # XGBoost path is class-weight-free (ATR dead-zone ⇒ ~balanced)
+            )
+            proba_up = XGBoostTrainer.proba_up(booster, X_all[sp.test_idx])
+            for p in np.unique(sp.test_path_of_row):
+                mask = sp.test_path_of_row == p
+                oof_idx[p].append(sp.test_idx[mask])
+                oof_proba[p].append(proba_up[mask])
+            del booster
+            if i % 7 == 0 or i == n_splits:
+                gc.collect()
+                logger.info("  CPCV progress: %d/%d combos refit", i, n_splits)
+
+        # Assemble the φ paths (each path covers every group exactly once → a
+        # full OOS series), time-ordered.
+        cpcv_oof = {"n_paths": n_paths, "best_rounds": best_rounds, "paths": []}
+        for p in range(n_paths):
+            idx = np.concatenate(oof_idx[p])
+            order = np.argsort(ts_all[idx], kind="stable")
+            idx = idx[order]
+            cpcv_oof["paths"].append({
+                "proba":          np.concatenate(oof_proba[p])[order].astype(np.float32),
+                "y":              y_all[idx].astype(np.int8),
+                "forward_return": r_all[idx].astype(np.float32),
+                "timestamp":      ts_all[idx],
+            })
+        del oof_proba, oof_idx
+        gc.collect()
+        logger.info("✓ CPCV OOF assembled  paths=%d  (%d combos refit)", n_paths, n_splits)
+
+        # ── Final production model: all-data refit at the fixed tuned round
+        # count (owner decision — a live trading model must see the most recent
+        # regime; the CPCV OOF above remains the honest performance estimate).
+        prod = await asyncio.to_thread(
+            self.xgboost_trainer.fit_fixed,
+            X_all, y_all,
+            params=best_params,
+            num_boost_round=best_rounds,
+            class_weights=None,
+        )
+        self.xgboost_trainer.model = prod
+        feature_importance = prod.get_score(importance_type='weight')
+        logger.info(
+            "✓ XGBoost final model: all-data refit (%d samples, %d rounds)  "
+            "importance_entries=%d", len(X_all), best_rounds, len(feature_importance),
+        )
 
         return {
-            'model':              xgboost_model,
+            'model':              prod,
             'best_params':        best_params,
             'feature_importance': feature_importance,
-            'training_samples':   len(X_train),
-            'validation_samples': len(X_val),
+            'training_samples':   len(X_all),       # final model = all data
+            'validation_samples': len(hpo_va),      # purged HPO holdout
+            'best_rounds':        best_rounds,
+            'cpcv_oof':           cpcv_oof,          # → persisted in A2.6 for A3/A4/A5
         }
 
-    async def _train_gru_with_optimization(self, splits: List[Split]) -> Dict[str, Any]:
+    async def _train_gru_with_optimization(self, cv_plan: Dict[str, Any]) -> Dict[str, Any]:
         """
         Train GRU with full sub-checkpoint support.
 
@@ -895,11 +1036,20 @@ class ProductionTrainingOrchestrator:
             normalize_features, create_sequences, get_all_feature_names,
         )
 
-        feature_names = get_all_feature_names(include_sentiment=True)
+        feature_names = get_all_feature_names(
+            include_sentiment=True,
+            include_fundamentals=self.config.include_fundamentals,
+        )
         seq_len       = self.config.sequence_length
         n_feat        = len(feature_names)
-        TRAIN_FRAC    = 0.8
         VAL_CAP       = 30_000
+        # Leakage-safe split params come from the persisted CV plan (single
+        # source of truth; A2). The GRU uses a deterministic PER-SYMBOL purged
+        # split — full combinatorial CPCV is deferred to Workstream B (TFT),
+        # exactly per the locked A2 decision (no over-engineering a model that
+        # is being replaced; the leakage fix itself is NOT deferred).
+        train_frac    = cv_plan["hpo_holdout"]["train_frac"]
+        purge_gap     = cv_plan["horizon"] + cv_plan["embargo"]
 
         cp = self.cp
 
@@ -907,26 +1057,33 @@ class ProductionTrainingOrchestrator:
         if cp.gru_has_eval_arrays():
             # Skip sequence building — load eval arrays from checkpoint.
             X_val, y_val, r_val, eval_meta = cp.load_gru_eval_arrays()
-            split_idx = eval_meta["split_idx"]
-            n_total   = eval_meta["n_total"]
-            # Reconstruct gru_plan from saved meta so we can rebuild X_train only.
-            gru_plan: List[Tuple[str, int, int]] = [
-                (entry[0], entry[1], entry[2]) for entry in eval_meta["gru_plan"]
+            n_train_total = eval_meta["n_train_total"]
+            # Reconstruct the per-symbol purged plan (symbol, y_start, n_tr,
+            # n_va) so X_train is rebuilt deterministically and identically.
+            gru_plan: List[Tuple[str, int, int, int]] = [
+                (e[0], e[1], e[2], e[3]) for e in eval_meta["gru_plan"]
             ]
-            # Restore class_weights if not already set (may differ if loaded late)
             if self.class_weights is None:
                 self.class_weights = {
                     int(k): float(v) for k, v in eval_meta["class_weights"].items()
                 }
             logger.info(
-                "→ sub-A resumed: eval arrays loaded from checkpoint  X=%s  split_idx=%d",
-                X_val.shape, split_idx,
+                "→ sub-A resumed: eval arrays loaded  X=%s  n_train_total=%d",
+                X_val.shape, n_train_total,
             )
         else:
-            # ── Pass 1: count sequences per symbol ───────────────────────────
+            # ── Pass 1: per-symbol PURGED split plan ──────────────────────────
+            # Each symbol's sequences are already chronological. The first
+            # `train_frac` → train; the last block → val; a `purge_gap`
+            # (= horizon + embargo) of sequences BETWEEN them is DROPPED so no
+            # train label window [t, t+h] (+embargo) can overlap that symbol's
+            # val period. Deterministic & leakage-safe (kills RC-2 for the
+            # sequence path); the old positional-across-symbols cut +
+            # np.random.choice subsample are gone.
             gru_candidates = self.symbols[: self.config.gru_n_symbols * 2]
-            gru_plan = []
-            n_total  = 0
+            gru_plan: List[Tuple[str, int, int, int]] = []
+            n_train_total = 0
+            n_val_total   = 0
             for symbol in gru_candidates:
                 if symbol not in self.targets_data:
                     continue
@@ -940,27 +1097,37 @@ class ProductionTrainingOrchestrator:
                 n       = min(n_seq, len(y_sym) - y_start)
                 if n <= 0:
                     continue
-                gru_plan.append((symbol, y_start, n))
-                n_total += n
+                n_tr = int(n * train_frac)
+                n_va = max(0, n - n_tr - purge_gap)
+                if n_tr <= 0 or n_va <= 0:
+                    continue  # too few sequences for a purged train+val
+                gru_plan.append((symbol, y_start, n_tr, n_va))
+                n_train_total += n_tr
+                n_val_total   += n_va
                 if len(gru_plan) >= self.config.gru_n_symbols:
                     break
 
-            if not gru_plan:
-                raise ValueError("No symbols produced aligned GRU data — check targets_data")
+            if not gru_plan or n_val_total == 0:
+                raise ValueError(
+                    "No symbols produced a valid purged train+val GRU split — "
+                    "check targets_data / sequence_length / purge gap."
+                )
 
             logger.info(
-                "GRU plan: %d symbols  %d sequences  (seq_len=%d  features=%d)",
-                len(gru_plan), n_total, seq_len, n_feat,
+                "GRU purged plan: %d symbols  train=%d  val=%d  "
+                "(seq_len=%d  features=%d  gap=%d)",
+                len(gru_plan), n_train_total, n_val_total, seq_len, n_feat, purge_gap,
             )
 
-            # ── Pre-allocate & fill X_all, y_all, r_all ──────────────────────
-            # float16 halves RAM (1.5 GB vs 3 GB); cast to float32 in tf.data pipeline.
-            X_all = np.empty((n_total, seq_len, n_feat), dtype=np.float16)
-            y_all = np.empty(n_total, dtype=np.int32)
-            r_all = np.empty(n_total, dtype=np.float32)  # h-bar forward returns
-
+            # ── Build ONLY the held-out val arrays (small; persisted via
+            # sub-A). X_train is rebuilt separately below — the full combined
+            # array is never materialised, so peak memory is strictly lower
+            # than the old build-X_all-then-split design.
+            X_val = np.empty((n_val_total, seq_len, n_feat), dtype=np.float16)
+            y_val = np.empty(n_val_total, dtype=np.int32)
+            r_val = np.empty(n_val_total, dtype=np.float32)
             cursor = 0
-            for symbol, y_start, n in gru_plan:
+            for symbol, y_start, n_tr, n_va in gru_plan:
                 df_raw = self.targets_data[symbol]['features_df']
                 y_sym  = self.targets_data[symbol]['target']
                 r_sym  = self.targets_data[symbol]['forward_return']
@@ -968,48 +1135,39 @@ class ProductionTrainingOrchestrator:
                     df_raw, method='rolling', window=seq_len, feature_cols=feature_names
                 )
                 X_seq, _, _ = create_sequences(norm_df, seq_len, feature_names)
-                take = min(len(X_seq), n, n_total - cursor)
-                if take <= 0:
-                    break
-                X_all[cursor:cursor + take] = X_seq[:take]
-                y_all[cursor:cursor + take] = y_sym[y_start:y_start + take]
-                r_all[cursor:cursor + take] = r_sym[y_start:y_start + take]
-                cursor += take
+                m       = len(X_seq)
+                take_tr = min(n_tr, m)
+                v0      = take_tr + purge_gap                  # skip the purge gap
+                take_va = max(0, min(n_va, m - v0, n_val_total - cursor))
+                if take_va <= 0:
+                    continue
+                X_val[cursor:cursor + take_va] = X_seq[v0:v0 + take_va]
+                y_val[cursor:cursor + take_va] = y_sym[y_start + v0:y_start + v0 + take_va]
+                r_val[cursor:cursor + take_va] = r_sym[y_start + v0:y_start + v0 + take_va]
+                cursor += take_va
 
-            # Trim to actual filled rows
-            X_all = X_all[:cursor]
-            y_all = y_all[:cursor]
-            r_all = r_all[:cursor]
-            logger.info("✓ GRU sequences written: %d samples across %d symbols", cursor, len(gru_plan))
+            X_val = X_val[:cursor]
+            y_val = y_val[:cursor]
+            r_val = r_val[:cursor]
 
-            # ── Split train / val ─────────────────────────────────────────────
-            split_idx = int(n_total * TRAIN_FRAC)
-            X_val_view = X_all[split_idx:]
-            y_val_view = y_all[split_idx:]
-            r_val_view = r_all[split_idx:]
-            if len(X_val_view) > VAL_CAP:
-                val_idx = np.random.choice(len(X_val_view), VAL_CAP, replace=False)
-                X_val = X_val_view[val_idx].copy()
-                y_val = y_val_view[val_idx].copy()
-                r_val = r_val_view[val_idx].copy()
-            else:
-                val_idx = None
-                X_val = X_val_view.copy()
-                y_val = y_val_view.copy()
-                r_val = r_val_view.copy()
-            del X_val_view, y_val_view, r_val_view
+            # Deterministic memory cap (replaces np.random.choice): the val
+            # pool is already purged, so a FIXED-seed uniform sample is
+            # unbiased AND identical across resumes.
+            if len(X_val) > VAL_CAP:
+                keep = np.sort(
+                    np.random.default_rng(42).choice(len(X_val), VAL_CAP, replace=False)
+                )
+                X_val = X_val[keep].copy()
+                y_val = y_val[keep].copy()
+                r_val = r_val[keep].copy()
+            logger.info("✓ GRU val arrays built: %d sequences (cap=%d)", len(X_val), VAL_CAP)
 
-            # Save sub-A before releasing X_all / targets_data
             cp.save_gru_eval_arrays(
                 X_val, y_val, r_val,
                 class_weights=self.class_weights or {},
                 gru_plan=gru_plan,
-                n_total=n_total,
-                split_idx=split_idx,
-                val_idx=val_idx,
+                n_train_total=n_train_total,
             )
-
-            del X_all, y_all
             gc.collect()
 
         # ── Free targets_data now (not needed for training path ahead) ────────
@@ -1026,7 +1184,7 @@ class ProductionTrainingOrchestrator:
         # ── Build X_train (always rebuilt — too large to persist) ─────────────
         # Load targets_data if not already freed (sub-A path freed it above)
         # On the sub-A resume path we need to reload targets_data to rebuild X_train.
-        n_train = split_idx
+        n_train = n_train_total
         logger.info(
             "Building X_train from targets_data  n_train=%d  (%.2f GB float16)...",
             n_train, n_train * seq_len * n_feat * 2 / 1e9,
@@ -1037,11 +1195,14 @@ class ProductionTrainingOrchestrator:
             logger.info("  Loading targets_data from checkpoint for X_train rebuild...")
             self.targets_data, _ = self.cp.load_targets()
 
-        # float16 halves RAM footprint; cast to float32 in tf.data pipeline below.
+        # Per symbol: the FIRST n_tr (chronological) sequences = train. The
+        # purge gap + val tail are excluded, so no train label window overlaps
+        # that symbol's val period — identical to the persisted purged plan.
+        # float16 halves RAM; cast to float32 in the tf.data pipeline below.
         X_train = np.empty((n_train, seq_len, n_feat), dtype=np.float16)
         y_train = np.empty(n_train, dtype=np.int32)
         cursor  = 0
-        for symbol, y_start, n in gru_plan:
+        for symbol, y_start, n_tr, n_va in gru_plan:
             if symbol not in self.targets_data:
                 continue
             df_raw = self.targets_data[symbol]['features_df']
@@ -1050,11 +1211,11 @@ class ProductionTrainingOrchestrator:
                 df_raw, method='rolling', window=seq_len, feature_cols=feature_names
             )
             X_seq, _, _ = create_sequences(norm_df, seq_len, feature_names)
-            # Cap by actual sequences produced — NaN-dropping in normalize_features
-            # can yield fewer rows than the count recorded in gru_plan during pass 1.
-            take = min(len(X_seq), n, n_train - cursor)
+            # Clamp to actual sequences produced — NaN-drops in
+            # normalize_features can yield fewer rows than planned in pass 1.
+            take = min(n_tr, len(X_seq), n_train - cursor)
             if take <= 0:
-                break
+                continue
             X_train[cursor:cursor + take] = X_seq[:take]
             y_train[cursor:cursor + take] = y_sym[y_start:y_start + take]
             cursor += take
@@ -1294,7 +1455,7 @@ class ProductionTrainingOrchestrator:
                     _MAX_OOM_RETRIES + 1,
                 )
 
-    async def _create_and_optimize_ensemble(self, splits: List[Split]) -> Dict[str, Any]:
+    async def _create_and_optimize_ensemble(self, cv_plan: Dict[str, Any]) -> Dict[str, Any]:
         logger.info("Optimizing ensemble weights on %d validation samples...", len(self.gru_eval_y))
 
         xgboost_model = self.xgboost_trainer.model
@@ -1311,12 +1472,14 @@ class ProductionTrainingOrchestrator:
         y_val     = self.gru_eval_y
 
         eff_metric = self.config.ensemble_optimization_metric
-        if self.gru_eval_returns is None and eff_metric == 'sharpe_ratio':
-            logger.warning(
-                "Forward returns unavailable (old checkpoint) — "
-                "falling back to accuracy for ensemble optimisation."
+        if self.gru_eval_returns is None:
+            raise MissingReturnsError(
+                "Forward returns (gru_eval_returns) are unavailable at ensemble "
+                "weight optimisation. Refusing to fall back to an accuracy "
+                "objective — silently changing the model-selection metric is "
+                "exactly the RC-1 failure that shipped an unvalidated model. "
+                "Re-run with --fresh so forward returns are regenerated."
             )
-            eff_metric = 'accuracy'
 
         optimized_weights = await asyncio.to_thread(
             self.ensemble_trainer.optimize_weights,
@@ -1333,13 +1496,19 @@ class ProductionTrainingOrchestrator:
             'validation_samples': len(y_val),
         }
 
-    async def _evaluate_all_models(self, splits: List[Split]) -> Dict[str, EvaluationResults]:
+    async def _evaluate_all_models(self, cv_plan: Dict[str, Any]) -> Dict[str, EvaluationResults]:
         import xgboost as xgb
 
         X_test_seq   = self.gru_eval_X
         X_test_tab   = self.gru_eval_X[:, -1, :]
         y_test       = self.gru_eval_y
         test_returns = self.gru_eval_returns
+        if test_returns is None:
+            raise MissingReturnsError(
+                "Forward returns unavailable at model evaluation. Refusing to "
+                "emit 0.0 financial metrics for an unvalidated model (RC-1). "
+                "Re-run with --fresh so forward returns are regenerated."
+            )
 
         logger.info("Evaluating on %d test samples...", len(y_test))
         evaluation_results = {}
@@ -1552,9 +1721,16 @@ class ProductionTrainingOrchestrator:
             # active production record and computes exactly those features,
             # so n_features changing between runs never requires code changes.
             from app.ml.features.feature_pipeline import get_all_feature_names
-            include_sentiment = getattr(self.config, "include_sentiment", True)
-            feature_names = get_all_feature_names(include_sentiment=include_sentiment)
-            logger.info("  Feature manifest: %d features (sentiment=%s)", len(feature_names), include_sentiment)
+            include_sentiment     = getattr(self.config, "include_sentiment", True)
+            include_fundamentals  = getattr(self.config, "include_fundamentals", True)
+            feature_names = get_all_feature_names(
+                include_sentiment=include_sentiment,
+                include_fundamentals=include_fundamentals,
+            )
+            logger.info(
+                "  Feature manifest: %d features (sentiment=%s, fundamentals=%s)",
+                len(feature_names), include_sentiment, include_fundamentals,
+            )
 
             xgb_meta = await registry.register_model(
                 version                 = f"{self.config.model_version}_xgboost",

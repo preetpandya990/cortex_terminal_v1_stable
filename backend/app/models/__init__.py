@@ -39,6 +39,16 @@ from app.models.strategies import (
     StrategyBacktestRun,
     StrategyAuditLog,
 )
+from app.models.fundamentals import (
+    CompanyFundamentalsProfile,
+    CompanyKeyRatios,
+    CompanyIncomeStatement,
+    CompanyBalanceSheet,
+    CompanyCashFlow,
+    CompanyShareHoldings,
+    CompanyCorporateActions,
+    CompanyCompetitors,
+)
 
 __all__ = [
     "Base",
@@ -72,4 +82,13 @@ __all__ = [
     "StrategyTrade",
     "StrategyBacktestRun",
     "StrategyAuditLog",
+    # Company Fundamentals
+    "CompanyFundamentalsProfile",
+    "CompanyKeyRatios",
+    "CompanyIncomeStatement",
+    "CompanyBalanceSheet",
+    "CompanyCashFlow",
+    "CompanyShareHoldings",
+    "CompanyCorporateActions",
+    "CompanyCompetitors",
 ]

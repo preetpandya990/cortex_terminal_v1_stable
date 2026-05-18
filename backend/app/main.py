@@ -20,7 +20,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from app.api.v1 import (
-    admin_strategies, admin_users, auth, cai, fusion, governance, hawk_eye,
+    admin_strategies, admin_users, auth, cai, fusion, fundamentals, governance, hawk_eye,
     ingestion, intelligence, market_data, ml_drift, ml_patterns, ml_predictions, paper_trading,
     safety, scanner, strategies, strategy, trade_suggestions, upstox, health,
     users, watchlist, ai_sentiment, ai_stream,
@@ -298,6 +298,13 @@ def create_app() -> FastAPI:
     app.include_router(cai.router, prefix=f"{settings.API_V1_PREFIX}/cai", tags=["Cortex AI"])
     app.include_router(cai.ws_router, prefix=f"{settings.API_V1_PREFIX}/cai", tags=["Cortex AI WebSocket"])
     
+    # Company Fundamentals
+    app.include_router(
+        fundamentals.router,
+        prefix=f"{settings.API_V1_PREFIX}/fundamentals",
+        tags=["Company Fundamentals"],
+    )
+
     # Health
     app.include_router(health.router, prefix=settings.API_V1_PREFIX, tags=["Health"])
 

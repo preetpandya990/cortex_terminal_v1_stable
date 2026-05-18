@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { X, AlertTriangle, TrendingDown, TrendingUp } from "lucide-react";
 import { useClosePosition } from "@/hooks/usePaperTrading";
+import { apiErrorMessage } from "@/lib/api";
 import { PriceInput, getNSETickSize } from "@/components/ui/PriceInput";
 import type {
   ClosePositionRequest,
@@ -58,8 +59,12 @@ export function ClosePositionModal({ position, livePrice, onClose, onClosed }: P
 
   function validate(): boolean {
     const errors: Record<string, string> = {};
-    if (quantity <= 0 || quantity > position.quantity) {
-      errors.quantity = `Quantity must be between 1 and ${position.quantity}.`;
+    // Must be a whole number in range. `Number.isInteger` also rejects NaN
+    // (cleared/invalid field) and fractional values — both previously slipped
+    // past `x <= 0 || x > max` (NaN compares false to both) and produced an
+    // opaque server-side HTTP 422.
+    if (!Number.isInteger(quantity) || quantity <= 0 || quantity > position.quantity) {
+      errors.quantity = `Quantity must be a whole number between 1 and ${position.quantity}.`;
     }
     if (orderType === "LIMIT") {
       const price = parseFloat(limitPrice);
@@ -91,9 +96,7 @@ export function ClosePositionModal({ position, livePrice, onClose, onClosed }: P
     }
   }
 
-  const errorMessage = error
-    ? ((error as any)?.message ?? "Failed to close position.")
-    : null;
+  const errorMessage = error ? apiErrorMessage(error) : null;
 
   return (
     <div

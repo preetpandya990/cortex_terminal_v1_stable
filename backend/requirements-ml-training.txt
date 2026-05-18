@@ -1,35 +1,36 @@
-# Cortex AI — ML Training Dependencies
-# =====================================
-# Additional dependencies for model training (not needed for inference)
-# Install with: pip install -r requirements-ml-training.txt
+# Cortex AI — ML Training / Evaluation Extras
+# ============================================================================
+# Install with:  pip install -r requirements.txt -r requirements-ml-training.txt
+#
+# ⚠️  SINGLE SOURCE OF TRUTH
+# The core ML/AI stack — tensorflow[and-cuda], torch, keras (via TF), onnx,
+# onnxruntime-gpu, xgboost, optuna, scikit-learn, transformers, optimum,
+# numpy, pandas — is pinned ONLY in requirements.txt. It is intentionally NOT
+# repeated here.
+#
+# Rationale: this file previously re-pinned tensorflow==2.15.0 / keras==2.15.0 /
+# onnx==1.15.0 independently of requirements.txt. That divergence is exactly
+# what caused the cascading GPU-training breakage (TF/Keras 2-vs-3 + numpy ABI):
+# a `pip install -r requirements-ml-training.txt` would silently downgrade
+# TensorFlow 2.21→2.15 and force Keras 2. Never re-pin the core stack here.
+#
+# This file holds ONLY training/evaluation-time extras not already governed by
+# requirements.txt, pinned to the verified-good environment (2026-05-18).
+#
+# Note: Combinatorial Purged CV, Deflated Sharpe, PBO and the cost-aware
+# backtest are implemented in-house (app/ml/evaluation/) — NOT via skfolio or
+# mlfinlab — to avoid a numpy 1.x→2.x dependency cascade and paid-tier licences.
+# See ML_IMPLEMENTATION_PLAN.md §3 for the rationale.
 
-# ── ML Training Frameworks ─────────────────────────────────────────────────────
-xgboost==2.0.3                  # Gradient boosting (latest stable)
-tensorflow==2.15.0              # Deep learning framework
-keras==2.15.0                   # High-level neural networks API
+# ── Scientific / serialization (used directly by training & evaluation) ───────
+scipy==1.12.0                   # DSR/statistics (scipy.stats), optimisation (calibrator)
+joblib==1.3.2                   # Model + calibrator serialisation (ConfidenceCalibrator.save)
 
-# ── Hyperparameter Tuning ──────────────────────────────────────────────────────
-optuna==3.5.0                   # Hyperparameter optimization for XGBoost
-keras-tuner==1.4.7              # Hyperparameter optimization for Keras
+# ── Progress ──────────────────────────────────────────────────────────────────
+tqdm==4.67.3                    # Training/backfill progress bars
 
-# ── Model Export ───────────────────────────────────────────────────────────────
-onnx==1.15.0                    # ONNX format
-tf2onnx==1.16.1                 # TensorFlow to ONNX converter
-skl2onnx==1.16.0                # Scikit-learn to ONNX (for XGBoost)
-
-# ── Feature Engineering ────────────────────────────────────────────────────────
-# Note: We use custom feature engineering in app/ml/features/
-# No external TA library needed
-
-# ── Utilities ──────────────────────────────────────────────────────────────────
-scikit-learn==1.4.0             # ML utilities (metrics, preprocessing)
-scipy==1.12.0                   # Scientific computing
-joblib==1.3.2                   # Model serialization
-
-# ── Visualization (Optional) ───────────────────────────────────────────────────
-matplotlib==3.8.2               # Plotting
-seaborn==0.13.1                 # Statistical visualization
-plotly==5.18.0                  # Interactive plots
-
-# ── Progress Tracking ──────────────────────────────────────────────────────────
-tqdm==4.66.1                    # Progress bars
+# ── Visualization (OPTIONAL — not installed by default) ───────────────────────
+# Enable explicitly for local analysis/plots; not required by the pipeline.
+# matplotlib==3.10.7
+# seaborn==0.13.2
+# plotly==6.7.0
