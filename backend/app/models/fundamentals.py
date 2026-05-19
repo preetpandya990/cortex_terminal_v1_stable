@@ -80,6 +80,7 @@ class CompanyKeyRatios(Base):
     roe_sector:       Mapped[float | None] = mapped_column(Numeric(10, 4), nullable=True)
     roce_sector:      Mapped[float | None] = mapped_column(Numeric(10, 4), nullable=True)
     ev_ebitda_sector: Mapped[float | None] = mapped_column(Numeric(10, 4), nullable=True)
+    extra_ratios:     Mapped[list | None]  = mapped_column(JSONB(astext_type=Text()), nullable=True)
     fetched_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False,
     )
@@ -210,6 +211,7 @@ class CompanyCorporateActions(Base):
     isin:            Mapped[str]        = mapped_column(String(20),  nullable=False)
     action_type:     Mapped[str]        = mapped_column(String(50),  nullable=False)
     expiry_date_str: Mapped[str | None] = mapped_column(String(50),  nullable=True)
+    expiry_date:     Mapped[date | None] = mapped_column(Date(),     nullable=True)
     amount:          Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
     ratio:           Mapped[str | None]   = mapped_column(String(20), nullable=True)
     event_details:   Mapped[list | None]  = mapped_column(JSONB(astext_type=Text()), nullable=True)

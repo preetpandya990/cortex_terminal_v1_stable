@@ -55,6 +55,7 @@ from app.models.paper_trading import PaperFill, PaperOrder, PaperPnlSnapshot, Pa
 from app.models.user import User
 from app.schemas.paper_trading import (
     ClosePositionRequest,
+    ConvertPositionRequest,
     CreatePortfolioRequest,
     ExitReason,
     OrdersListResponse,
@@ -675,6 +676,46 @@ async def close_position(
                 outcome.user_id,
             )
 
+    return PaperPositionResponse.model_validate(position)
+
+
+@router.post(
+    "/positions/{position_id}/convert",
+    response_model=PaperPositionResponse,
+    summary="Convert position product type (CNC↔MIS)",
+)
+@limiter.limit("30/minute")
+async def convert_position(
+    request: Request,
+    position_id: UUID = Path(..., description="Position UUID"),
+    payload: ConvertPositionRequest = ...,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> PaperPositionResponse:
+    """
+    Convert an open position's product type between CNC and MIS.
+
+    Phase 1 constraints (422 if violated):
+      - Position must be OPEN.
+      - Same trading day only (position.opened_at IST date == today IST).
+      - Full-position conversion; partial conversion is not yet supported.
+      - NRML is not supported.
+
+    The authoritative `product_type` on the position is updated immediately.
+    All subsequent close operations will use the new product type for charge
+    calculation and T+1 settlement enforcement.
+
+    An immutable audit record is written to `paper_position_conversions`.
+    """
+    from app.services.paper_trading import conversion_service
+
+    position = await conversion_service.convert_position(
+        session=session,
+        position_id=position_id,
+        user_id=_user_id(current_user),
+        payload=payload,
+    )
+    await session.commit()
     return PaperPositionResponse.model_validate(position)
 
 

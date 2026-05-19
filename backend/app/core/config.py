@@ -166,6 +166,17 @@ class Settings(BaseSettings):
     NSE_MARKET_OPEN_IST: str = "09:15"
     NSE_MARKET_CLOSE_IST: str = "15:30"
 
+    # ── Fundamentals Refresh Scheduler ─────────────────────────────────────────
+    # Times are 24h HH:MM in IST.
+    # DAILY_RATIOS: key-ratios endpoint runs post-market-close every trading day.
+    # CORP_ACTIONS: corporate-actions runs each evening (no trading-day gate).
+    # NIGHTLY_UNIVERSE: full 9-endpoint refresh of all EQ instruments at this time.
+    # PRIORITY_LOOKBACK_DAYS: instruments with a signal in this many days form Tier 1.
+    FUNDAMENTALS_DAILY_RATIOS_TIME_IST:    str = "15:45"
+    FUNDAMENTALS_CORP_ACTIONS_TIME_IST:    str = "18:30"
+    FUNDAMENTALS_NIGHTLY_UNIVERSE_TIME_IST: str = "01:00"
+    FUNDAMENTALS_PRIORITY_LOOKBACK_DAYS:   int = Field(7, ge=1, le=30)
+
     # ── Signal Scheduler ───────────────────────────────────────────────────────
     # Nifty 50 + Nifty Next 50 — scheduled signal generation every 15 minutes
     # during NSE market hours.  Override via env var as a comma-separated string.

@@ -14,6 +14,7 @@ import {
 import { paperTradingAPI } from '@/lib/api';
 import type {
   ClosePositionRequest,
+  ConvertPositionRequest,
   CreatePortfolioRequest,
   OrdersQueryParams,
   OutcomesQueryParams,
@@ -127,6 +128,23 @@ export function useClosePosition() {
       queryClient.invalidateQueries({ queryKey: paperTradingKeys.positions() });
       queryClient.invalidateQueries({ queryKey: paperTradingKeys.portfolio() });
       queryClient.invalidateQueries({ queryKey: paperTradingKeys.orders() });
+    },
+  });
+}
+
+export function useConvertPosition() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      positionId,
+      payload,
+    }: {
+      positionId: string;
+      payload: ConvertPositionRequest;
+    }) => paperTradingAPI.convertPosition(positionId, payload),
+    onSuccess: (_data, { positionId }) => {
+      queryClient.invalidateQueries({ queryKey: paperTradingKeys.positions() });
+      queryClient.invalidateQueries({ queryKey: paperTradingKeys.positionDetail(positionId) });
     },
   });
 }

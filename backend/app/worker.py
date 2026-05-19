@@ -1,7 +1,7 @@
 """
 Cortex AI Worker Process - Background Task Orchestration
 
-Production-grade worker process managing 10 concurrent background loops:
+Production-grade worker process managing 11 concurrent background loops:
 - RSS ingestion (news feeds)
 - Event processing (ML predictions)
 - Regime detection (market conditions)
@@ -12,6 +12,7 @@ Production-grade worker process managing 10 concurrent background loops:
 - Correlation engine (trade suggestions)
 - Suggestion expiry (TTL management)
 - Cache invalidation (real-time cache consistency)
+- Fundamentals refresh (key-ratios, corp-actions, financials, holdings, nightly universe)
 
 Graceful shutdown with SIGTERM handling and 30s timeout.
 """
@@ -36,6 +37,7 @@ from app.core.redis import init_redis, close_redis, get_cache_service
 from app.ml.monitoring.drift_scheduler import drift_detection_loop
 from app.models.trade_suggestions import TradeSuggestion
 from app.services.data_ingestion_worker import data_ingestion_loop
+from app.services.fundamentals_refresh import FundamentalsRefreshScheduler
 from app.services.upstox_client import UpstoxClient
 
 logger = logging.getLogger(__name__)
@@ -685,8 +687,8 @@ async def correlation_loop(
 async def main() -> None:
     """
     Main worker orchestration function.
-    
-    Spawns 8 concurrent background tasks and manages graceful shutdown.
+
+    Spawns 11 concurrent background tasks and manages graceful shutdown.
     """
     # Register signal handlers
     signal.signal(signal.SIGTERM, signal_handler)
@@ -708,7 +710,13 @@ async def main() -> None:
         ensemble_predictor = ml_components.get("ensemble_predictor")
         feature_loader = ml_components.get("feature_loader")
         
-        # Create 10 background tasks
+        # Create 11 background tasks
+        fundamentals_scheduler = FundamentalsRefreshScheduler(
+            session_factory=session_factory,
+            redis=redis_client,
+            shutdown=shutdown_event,
+        )
+
         tasks = [
             asyncio.create_task(rss_ingestion_loop(session_factory), name="rss_ingestion"),
             asyncio.create_task(
@@ -735,6 +743,10 @@ async def main() -> None:
             asyncio.create_task(
                 cache_invalidation_loop(redis_client),
                 name="cache_invalidation"
+            ),
+            asyncio.create_task(
+                fundamentals_scheduler.run(),
+                name="fundamentals_refresh"
             ),
         ]
         

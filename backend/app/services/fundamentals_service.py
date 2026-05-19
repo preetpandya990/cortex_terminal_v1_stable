@@ -29,6 +29,7 @@ import asyncio
 import calendar
 import json
 import logging
+import random
 import time
 import urllib.parse
 from datetime import date, datetime, timezone
@@ -57,7 +58,10 @@ settings = get_settings()
 
 _FUNDAMENTALS_BASE = "https://api.upstox.com/v2/fundamentals/"
 _REDIS_KEY_PREFIX  = "cai:fundamentals:"
-_REDIS_TTL         = 86_400  # 24 hours
+_REDIS_TTL         = 86_400  # 24 hours base TTL
+_REDIS_TTL_JITTER  = 0.10    # ±10% jitter applied at write time to spread expirations
+_LIVE_FETCH_LOCK_PREFIX = "cai:fundamentals:inflight:"
+_LIVE_FETCH_LOCK_TTL    = 120  # seconds; covers worst-case 9-endpoint fetch time
 
 # Module-level lazy singleton — shared across all requests, no lifespan registration needed.
 _http_client: httpx.AsyncClient | None = None
@@ -142,11 +146,27 @@ def parse_period_to_date(period: str) -> date:
     return date(dt.year, dt.month, last_day)
 
 
+def _parse_action_date(s: str | None) -> date | None:
+    """'15-Jun-2026' → date(2026, 6, 15)  |  None / malformed → None"""
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s.strip(), "%d-%b-%Y").date()
+    except (ValueError, TypeError):
+        return None
+
+
 def _auth_headers() -> dict[str, str]:
     token = settings.UPSTOX_ACCESS_TOKEN
     if not token:
         raise RuntimeError("UPSTOX_ACCESS_TOKEN not configured — cannot fetch fundamentals")
     return {"Authorization": f"Bearer {token}"}
+
+
+def _jittered_ttl() -> int:
+    """Return _REDIS_TTL ± _REDIS_TTL_JITTER to spread cache expirations across the fleet."""
+    factor = 1.0 + random.uniform(-_REDIS_TTL_JITTER, _REDIS_TTL_JITTER)
+    return int(_REDIS_TTL * factor)
 
 
 # ── Fetch helpers ──────────────────────────────────────────────────────────────
@@ -160,13 +180,13 @@ async def _fetch(
     GET a single fundamentals endpoint with rate-limiting and retry.
 
     Rate control: acquires the global _rate_lock before each attempt, enforcing
-    a minimum gap of 1/_RATE_RPS ≈ 143ms between successive HTTP calls across
-    ALL concurrent coroutines. This caps sustained throughput at 7 req/s =
-    420 req/min, safely under Upstox's 500 req/min hard limit.
+    a minimum gap of 1/_RATE_RPS seconds between successive HTTP calls across
+    ALL concurrent coroutines. This caps sustained throughput at 1.0 req/s =
+    1800 req/30min, safely under Upstox's 2000 req/30min hard limit.
 
     Retry: on HTTP 429 the slot is released and the coroutine sleeps outside
-    the lock (so other requests can proceed) with exponential backoff (2, 4, 8,
-    16 s). Up to _MAX_RETRIES_429 retries per endpoint.
+    the lock (so other requests can proceed) with exponential backoff starting
+    at 60s (60, 120, 240, 480s). Up to _MAX_RETRIES_429 retries per endpoint.
 
     Other errors are soft-logged and return None so a single failing endpoint
     never aborts the other concurrent fetches for the same instrument.
@@ -220,7 +240,7 @@ async def _fetch(
 
 
 async def _fetch_all_raw(isin: str, instrument_key: str) -> dict[str, Any]:
-    """Fetch all 8 endpoints concurrently. Returns dict of raw API data (or None per endpoint)."""
+    """Fetch all 9 endpoints concurrently. Returns dict of raw API data (or None per endpoint)."""
     client = await _get_client()
 
     # Competitors endpoint requires URL-encoded NSE_EQ|ISIN path param (confirmed from live tests).
@@ -229,9 +249,10 @@ async def _fetch_all_raw(isin: str, instrument_key: str) -> dict[str, Any]:
     results = await asyncio.gather(
         _fetch(f"{isin}/profile",            client),
         _fetch(f"{isin}/key-ratios",         client),
-        _fetch(f"{isin}/income-statement",   client, {"type": "consolidated", "time_period": "yearly"}),
-        _fetch(f"{isin}/balance-sheet",      client, {"type": "consolidated"}),
-        _fetch(f"{isin}/cash-flow",          client, {"type": "consolidated"}),
+        _fetch(f"{isin}/income-statement",   client, {"type": "standalone", "time_period": "yearly"}),
+        _fetch(f"{isin}/income-statement",   client, {"type": "standalone", "time_period": "quarterly"}),
+        _fetch(f"{isin}/balance-sheet",      client, {"type": "standalone"}),
+        _fetch(f"{isin}/cash-flow",          client, {"type": "standalone"}),
         _fetch(f"{isin}/share-holdings",     client),
         _fetch(f"{isin}/corporate-actions",  client),
         _fetch(f"{encoded_key}/competitors", client),
@@ -239,8 +260,8 @@ async def _fetch_all_raw(isin: str, instrument_key: str) -> dict[str, Any]:
     )
 
     keys = [
-        "profile", "key_ratios", "income_statement", "balance_sheet",
-        "cash_flow", "share_holdings", "corporate_actions", "competitors",
+        "profile", "key_ratios", "income_statement", "income_statement_quarterly",
+        "balance_sheet", "cash_flow", "share_holdings", "corporate_actions", "competitors",
     ]
     return dict(zip(keys, results))
 
@@ -293,6 +314,7 @@ async def _upsert_key_ratios(
         "roe_sector":       parse_ratio_value(mapping.get("ROE",       {}).get("sector_value")),
         "roce_sector":      parse_ratio_value(mapping.get("ROCE",      {}).get("sector_value")),
         "ev_ebitda_sector": parse_ratio_value(mapping.get("EV/EBITDA", {}).get("sector_value")),
+        "extra_ratios":     data,
         "fetched_at":       datetime.now(timezone.utc),
     }
     stmt = pg_insert(CompanyKeyRatios).values(**row)
@@ -569,6 +591,7 @@ async def _replace_corporate_actions(
             "isin":            isin,
             "action_type":     item.get("name", ""),
             "expiry_date_str": item.get("expiry_date"),
+            "expiry_date":     _parse_action_date(item.get("expiry_date")),
             "amount":          item.get("amount"),
             "ratio":           item.get("ratio"),
             "event_details":   item.get("event_details"),
@@ -647,18 +670,25 @@ async def _replace_competitors(
 
 # ── DB assembly helpers ────────────────────────────────────────────────────────
 
-async def _assemble_income_statement(instrument_key: str, db: AsyncSession) -> list | None:
+async def _assemble_income_statement(
+    instrument_key: str,
+    db: AsyncSession,
+    *,
+    time_period: str = "yearly",
+) -> tuple[list | None, datetime | None]:
     result = await db.execute(
         select(CompanyIncomeStatement)
         .where(
             CompanyIncomeStatement.instrument_key == instrument_key,
-            CompanyIncomeStatement.time_period == "yearly",
+            CompanyIncomeStatement.time_period    == time_period,
+            CompanyIncomeStatement.statement_type == "standalone",
         )
         .order_by(CompanyIncomeStatement.period_date)
     )
     rows = result.scalars().all()
     if not rows:
-        return None
+        return None, None
+    fetched_at = max(r.fetched_at for r in rows)
     pivot: dict[str, dict] = {}
     for r in rows:
         pd_key = r.period_date.isoformat()
@@ -672,11 +702,11 @@ async def _assemble_income_statement(instrument_key: str, db: AsyncSession) -> l
         pivot[pd_key]["net_profit_change_pct"] = r.net_profit_change_pct
 
     cat_defs = [
-        ("revenue",    "revenue",    "revenue_change_pct"),
+        ("revenue",          "revenue",    "revenue_change_pct"),
         ("operating_profit", "op_profit",  "op_profit_change_pct"),
-        ("net_profit", "net_profit", "net_profit_change_pct"),
+        ("net_profit",       "net_profit", "net_profit_change_pct"),
     ]
-    return [
+    data = [
         {
             "category": cat_name,
             "history": [
@@ -692,17 +722,24 @@ async def _assemble_income_statement(instrument_key: str, db: AsyncSession) -> l
         }
         for cat_name, val_col, pct_col in cat_defs
     ]
+    return data, fetched_at
 
 
-async def _assemble_balance_sheet(instrument_key: str, db: AsyncSession) -> list | None:
+async def _assemble_balance_sheet(
+    instrument_key: str, db: AsyncSession
+) -> tuple[list | None, datetime | None]:
     result = await db.execute(
         select(CompanyBalanceSheet)
-        .where(CompanyBalanceSheet.instrument_key == instrument_key)
+        .where(
+            CompanyBalanceSheet.instrument_key == instrument_key,
+            CompanyBalanceSheet.statement_type == "standalone",
+        )
         .order_by(CompanyBalanceSheet.period_date)
     )
     rows = result.scalars().all()
     if not rows:
-        return None
+        return None, None
+    fetched_at = max(r.fetched_at for r in rows)
     return [
         {
             "total_asset":     r.total_asset,
@@ -712,18 +749,24 @@ async def _assemble_balance_sheet(instrument_key: str, db: AsyncSession) -> list
             "period_date":     r.period_date,
         }
         for r in rows
-    ]
+    ], fetched_at
 
 
-async def _assemble_cash_flow(instrument_key: str, db: AsyncSession) -> list | None:
+async def _assemble_cash_flow(
+    instrument_key: str, db: AsyncSession
+) -> tuple[list | None, datetime | None]:
     result = await db.execute(
         select(CompanyCashFlow)
-        .where(CompanyCashFlow.instrument_key == instrument_key)
+        .where(
+            CompanyCashFlow.instrument_key == instrument_key,
+            CompanyCashFlow.statement_type == "standalone",
+        )
         .order_by(CompanyCashFlow.period_date)
     )
     rows = result.scalars().all()
     if not rows:
-        return None
+        return None, None
+    fetched_at = max(r.fetched_at for r in rows)
     pivot: dict[str, dict] = {}
     for r in rows:
         pd_key = r.period_date.isoformat()
@@ -738,11 +781,11 @@ async def _assemble_cash_flow(instrument_key: str, db: AsyncSession) -> list | N
             "financing_cf_change_pct": r.financing_cf_change_pct,
         }
     cat_defs = [
-        ("operating",  "operating_cf",  "operating_cf_change_pct"),
-        ("investing",  "investing_cf",  "investing_cf_change_pct"),
-        ("financing",  "financing_cf",  "financing_cf_change_pct"),
+        ("operating", "operating_cf", "operating_cf_change_pct"),
+        ("investing", "investing_cf", "investing_cf_change_pct"),
+        ("financing", "financing_cf", "financing_cf_change_pct"),
     ]
-    return [
+    data = [
         {
             "category": cat_name,
             "history": [
@@ -758,9 +801,12 @@ async def _assemble_cash_flow(instrument_key: str, db: AsyncSession) -> list | N
         }
         for cat_name, val_col, pct_col in cat_defs
     ]
+    return data, fetched_at
 
 
-async def _assemble_share_holdings(instrument_key: str, db: AsyncSession) -> list | None:
+async def _assemble_share_holdings(
+    instrument_key: str, db: AsyncSession
+) -> tuple[list | None, datetime | None]:
     result = await db.execute(
         select(CompanyShareHoldings)
         .where(CompanyShareHoldings.instrument_key == instrument_key)
@@ -768,7 +814,8 @@ async def _assemble_share_holdings(instrument_key: str, db: AsyncSession) -> lis
     )
     rows = result.scalars().all()
     if not rows:
-        return None
+        return None, None
+    fetched_at = max(r.fetched_at for r in rows)
     return [
         {
             "promoters_pct":        r.promoters_pct,
@@ -780,10 +827,12 @@ async def _assemble_share_holdings(instrument_key: str, db: AsyncSession) -> lis
             "period_date":          r.period_date,
         }
         for r in rows
-    ]
+    ], fetched_at
 
 
-async def _assemble_corporate_actions(instrument_key: str, db: AsyncSession) -> list | None:
+async def _assemble_corporate_actions(
+    instrument_key: str, db: AsyncSession
+) -> tuple[list | None, datetime | None]:
     result = await db.execute(
         select(CompanyCorporateActions)
         .where(CompanyCorporateActions.instrument_key == instrument_key)
@@ -791,27 +840,32 @@ async def _assemble_corporate_actions(instrument_key: str, db: AsyncSession) -> 
     )
     rows = result.scalars().all()
     if not rows:
-        return None
+        return None, None
+    fetched_at = max(r.fetched_at for r in rows)
     return [
         {
             "action_type":     r.action_type,
             "expiry_date_str": r.expiry_date_str,
+            "expiry_date":     r.expiry_date,
             "amount":          r.amount,
             "ratio":           r.ratio,
             "event_details":   r.event_details,
         }
         for r in rows
-    ]
+    ], fetched_at
 
 
-async def _assemble_competitors(instrument_key: str, db: AsyncSession) -> list | None:
+async def _assemble_competitors(
+    instrument_key: str, db: AsyncSession
+) -> tuple[list | None, datetime | None]:
     result = await db.execute(
         select(CompanyCompetitors)
         .where(CompanyCompetitors.instrument_key == instrument_key)
     )
     rows = result.scalars().all()
     if not rows:
-        return None
+        return None, None
+    fetched_at = max(r.fetched_at for r in rows)
     return [
         {
             "instrument_key":  r.competitor_key,
@@ -824,7 +878,7 @@ async def _assemble_competitors(instrument_key: str, db: AsyncSession) -> list |
             "mcap_usd_unit":   r.mcap_usd_unit,
         }
         for r in rows
-    ]
+    ], fetched_at
 
 
 def _build_share_holdings_response(sh_raw: list) -> list | None:
@@ -880,6 +934,7 @@ async def fetch_and_store_all(
     await _upsert_profile(instrument_key, isin, raw.get("profile") or {}, db)
     await _upsert_key_ratios(instrument_key, isin, raw.get("key_ratios") or [], db)
     await _upsert_income_statement(instrument_key, isin, raw.get("income_statement") or {}, db)
+    await _upsert_income_statement(instrument_key, isin, raw.get("income_statement_quarterly") or {}, db)
     await _upsert_balance_sheet(instrument_key, isin, raw.get("balance_sheet") or {}, db)
     await _upsert_cash_flow(instrument_key, isin, raw.get("cash_flow") or {}, db)
     comp_raw   = raw.get("competitors") or []
@@ -900,12 +955,24 @@ async def fetch_and_store_all(
     def _kr(name: str, field: str) -> float | None:
         return parse_ratio_value(kr_mapping.get(name, {}).get(field))
 
-    income_raw  = raw.get("income_statement") or {}
+    income_raw            = raw.get("income_statement") or {}
+    income_quarterly_raw  = raw.get("income_statement_quarterly") or {}
     bs_raw      = raw.get("balance_sheet") or {}
     cf_raw      = raw.get("cash_flow") or {}
     sh_raw      = raw.get("share_holdings") or []
     ca_raw      = raw.get("corporate_actions") or []
     # comp_raw and symbol_map already defined above (used by _replace_competitors)
+
+    _IS_CAT_MAP = {
+        "revenue":          "revenue",
+        "operating_profit": "operating_profit",
+        "net_profit":       "net_profit",
+    }
+    _CF_CAT_MAP = {
+        "operating": "operating",
+        "investing":  "investing",
+        "financing":  "financing",
+    }
 
     def _build_category_history(categories: list, cat_map: dict) -> list:
         result = []
@@ -928,8 +995,12 @@ async def fetch_and_store_all(
             result.append({"category": display, "history": history})
         return result
 
-    income_categories = income_raw.get("income_statement", []) if isinstance(income_raw, dict) else []
-    cf_categories     = cf_raw.get("cash_flow", []) if isinstance(cf_raw, dict) else []
+    income_categories           = income_raw.get("income_statement", [])            if isinstance(income_raw, dict)           else []
+    income_quarterly_categories = income_quarterly_raw.get("income_statement", [])  if isinstance(income_quarterly_raw, dict) else []
+    cf_categories               = cf_raw.get("cash_flow", [])                       if isinstance(cf_raw, dict)               else []
+
+    income_yearly_list    = _build_category_history(income_categories,           _IS_CAT_MAP)
+    income_quarterly_list = _build_category_history(income_quarterly_categories, _IS_CAT_MAP)
 
     return {
         "available":       True,
@@ -950,10 +1021,10 @@ async def fetch_and_store_all(
             }
             for item in kr_raw
         ] if kr_raw else None,
-        "income_statement": _build_category_history(
-            income_categories,
-            {"revenue": "revenue", "operating_profit": "operating_profit", "net_profit": "net_profit"},
-        ) or None,
+        "income_statement": {
+            "yearly":    income_yearly_list,
+            "quarterly": income_quarterly_list,
+        },
         "balance_sheet": [
             {
                 "total_asset":     entry.get("total_asset"),
@@ -968,15 +1039,13 @@ async def fetch_and_store_all(
             }
             for entry in (bs_raw.get("history", []) if isinstance(bs_raw, dict) else [])
         ] or None,
-        "cash_flow": _build_category_history(
-            cf_categories,
-            {"operating": "operating", "investing": "investing", "financing": "financing"},
-        ) or None,
+        "cash_flow": _build_category_history(cf_categories, _CF_CAT_MAP) or None,
         "share_holdings": _build_share_holdings_response(sh_raw) or None,
         "corporate_actions": [
             {
                 "action_type":     item.get("name", ""),
                 "expiry_date_str": item.get("expiry_date"),
+                "expiry_date":     _parse_action_date(item.get("expiry_date")),
                 "amount":          item.get("amount"),
                 "ratio":           item.get("ratio"),
                 "event_details":   item.get("event_details"),
@@ -997,7 +1066,125 @@ async def fetch_and_store_all(
             for item in comp_raw
         ] if comp_raw else None,
         "fetched_at": now,
+        "section_fetched_at": {
+            "profile":           now,
+            "key_ratios":        now,
+            "income_statement":  now,
+            "balance_sheet":     now,
+            "cash_flow":         now,
+            "share_holdings":    now,
+            "corporate_actions": now,
+            "competitors":       now,
+        },
     }
+
+
+# ── Targeted (single-section) fetch functions ──────────────────────────────────
+# Used by the refresh scheduler to update individual data sections without
+# triggering a full 9-endpoint fetch. Each function:
+#   1. Fetches only its endpoint(s) from Upstox
+#   2. Upserts into DB
+#   3. Commits
+#   4. Deletes the Redis cache key so the next read re-assembles from fresh DB data
+
+async def _invalidate_redis_cache(instrument_key: str, redis: Any) -> None:
+    """Delete the Redis cache entry for this instrument after a targeted DB update."""
+    try:
+        await redis.delete(_redis_key(instrument_key))
+    except Exception as exc:
+        logger.warning("Redis invalidation failed for %s: %s", instrument_key, exc)
+
+
+async def fetch_and_store_key_ratios(
+    instrument_key: str,
+    isin: str,
+    db: AsyncSession,
+    redis: Any,
+) -> None:
+    """Fetch key-ratios endpoint only; upsert into DB; invalidate Redis cache."""
+    client = await _get_client()
+    data   = await _fetch(f"{isin}/key-ratios", client)
+    await _upsert_key_ratios(instrument_key, isin, data or [], db)
+    await db.commit()
+    await _invalidate_redis_cache(instrument_key, redis)
+
+
+async def fetch_and_store_corporate_actions(
+    instrument_key: str,
+    isin: str,
+    db: AsyncSession,
+    redis: Any,
+) -> None:
+    """Fetch corporate-actions endpoint only; replace in DB; invalidate Redis cache."""
+    client = await _get_client()
+    data   = await _fetch(f"{isin}/corporate-actions", client)
+    await _replace_corporate_actions(instrument_key, isin, data or [], db)
+    await db.commit()
+    await _invalidate_redis_cache(instrument_key, redis)
+
+
+async def fetch_and_store_financials(
+    instrument_key: str,
+    isin: str,
+    db: AsyncSession,
+    redis: Any,
+) -> None:
+    """
+    Fetch income-statement (yearly + quarterly), balance-sheet, and cash-flow.
+    4 concurrent Upstox requests; upserts are sequential (single AsyncSession).
+    """
+    client = await _get_client()
+
+    is_yearly, is_quarterly, bs_data, cf_data = await asyncio.gather(
+        _fetch(f"{isin}/income-statement", client, {"type": "standalone", "time_period": "yearly"}),
+        _fetch(f"{isin}/income-statement", client, {"type": "standalone", "time_period": "quarterly"}),
+        _fetch(f"{isin}/balance-sheet",    client, {"type": "standalone"}),
+        _fetch(f"{isin}/cash-flow",        client, {"type": "standalone"}),
+    )
+
+    await _upsert_income_statement(instrument_key, isin, is_yearly   or {}, db)
+    await _upsert_income_statement(instrument_key, isin, is_quarterly or {}, db)
+    await _upsert_balance_sheet(instrument_key, isin, bs_data or {}, db)
+    await _upsert_cash_flow(instrument_key, isin, cf_data or {}, db)
+    await db.commit()
+    await _invalidate_redis_cache(instrument_key, redis)
+
+
+async def fetch_and_store_share_holdings(
+    instrument_key: str,
+    isin: str,
+    db: AsyncSession,
+    redis: Any,
+) -> None:
+    """Fetch share-holdings endpoint only; upsert into DB; invalidate Redis cache."""
+    client = await _get_client()
+    data   = await _fetch(f"{isin}/share-holdings", client)
+    await _upsert_share_holdings(instrument_key, isin, data or [], db)
+    await db.commit()
+    await _invalidate_redis_cache(instrument_key, redis)
+
+
+async def fetch_and_store_profile_and_competitors(
+    instrument_key: str,
+    isin: str,
+    db: AsyncSession,
+    redis: Any,
+) -> None:
+    """Fetch profile + competitors; upsert into DB; invalidate Redis cache."""
+    client      = await _get_client()
+    encoded_key = urllib.parse.quote(instrument_key, safe="")
+
+    profile_data, comp_data = await asyncio.gather(
+        _fetch(f"{isin}/profile",            client),
+        _fetch(f"{encoded_key}/competitors", client),
+    )
+
+    await _upsert_profile(instrument_key, isin, profile_data or {}, db)
+    comp_list  = comp_data or []
+    symbol_map = await _resolve_competitor_symbols(comp_list, db)
+    await _replace_competitors(instrument_key, isin, comp_list, symbol_map, db)
+    await db.commit()
+    await _invalidate_redis_cache(instrument_key, redis)
 
 
 async def assemble_from_db(instrument_key: str, db: AsyncSession) -> dict[str, Any] | None:
@@ -1020,21 +1207,33 @@ async def assemble_from_db(instrument_key: str, db: AsyncSession) -> dict[str, A
     kr = kr_result.scalar_one_or_none()
 
     # Sequential reads — same AsyncSession concurrency constraint as writes.
-    income   = await _assemble_income_statement(instrument_key, db)
-    balance  = await _assemble_balance_sheet(instrument_key, db)
-    cashflow = await _assemble_cash_flow(instrument_key, db)
-    holdings = await _assemble_share_holdings(instrument_key, db)
-    actions  = await _assemble_corporate_actions(instrument_key, db)
-    comps    = await _assemble_competitors(instrument_key, db)
+    income_yearly,    income_yearly_fat    = await _assemble_income_statement(instrument_key, db, time_period="yearly")
+    income_quarterly, income_quarterly_fat = await _assemble_income_statement(instrument_key, db, time_period="quarterly")
+    balance,  balance_fat = await _assemble_balance_sheet(instrument_key, db)
+    cashflow, cf_fat      = await _assemble_cash_flow(instrument_key, db)
+    holdings, sh_fat      = await _assemble_share_holdings(instrument_key, db)
+    actions,  ca_fat      = await _assemble_corporate_actions(instrument_key, db)
+    comps,    comp_fat    = await _assemble_competitors(instrument_key, db)
+
+    # income_statement is always returned as a structured container.
+    # Consumers show "data not yet available" when both lists are empty.
+    income_fat = max(
+        (f for f in (income_yearly_fat, income_quarterly_fat) if f is not None),
+        default=None,
+    )
+    income_data = {
+        "yearly":    income_yearly    or [],
+        "quarterly": income_quarterly or [],
+    }
 
     key_ratios = None
     if kr:
         kr_map = {
-            "P/E":       (kr.pe,       kr.pe_sector),
-            "P/B":       (kr.pb,       kr.pb_sector),
-            "ROA":       (kr.roa,      kr.roa_sector),
-            "ROE":       (kr.roe,      kr.roe_sector),
-            "ROCE":      (kr.roce,     kr.roce_sector),
+            "P/E":       (kr.pe,        kr.pe_sector),
+            "P/B":       (kr.pb,        kr.pb_sector),
+            "ROA":       (kr.roa,       kr.roa_sector),
+            "ROE":       (kr.roe,       kr.roe_sector),
+            "ROCE":      (kr.roce,      kr.roce_sector),
             "EV/EBITDA": (kr.ev_ebitda, kr.ev_ebitda_sector),
         }
         key_ratios = [
@@ -1053,14 +1252,24 @@ async def assemble_from_db(instrument_key: str, db: AsyncSession) -> dict[str, A
             "sector_mcap_usd":      float(profile.sector_mcap_usd) if profile.sector_mcap_usd else None,
             "sector_mcap_usd_unit": profile.sector_mcap_usd_unit,
         },
-        "key_ratios":       key_ratios,
-        "income_statement": income,
-        "balance_sheet":    balance,
-        "cash_flow":        cashflow,
-        "share_holdings":   holdings,
+        "key_ratios":        key_ratios,
+        "income_statement":  income_data,
+        "balance_sheet":     balance,
+        "cash_flow":         cashflow,
+        "share_holdings":    holdings,
         "corporate_actions": actions,
-        "competitors":      comps,
-        "fetched_at":       profile.fetched_at,
+        "competitors":       comps,
+        "fetched_at":        profile.fetched_at,
+        "section_fetched_at": {
+            "profile":           profile.fetched_at,
+            "key_ratios":        kr.fetched_at if kr else None,
+            "income_statement":  income_fat,
+            "balance_sheet":     balance_fat,
+            "cash_flow":         cf_fat,
+            "share_holdings":    sh_fat,
+            "corporate_actions": ca_fat,
+            "competitors":       comp_fat,
+        },
     }
 
 
@@ -1084,14 +1293,25 @@ async def get_fundamentals(
     """
     Primary read path:
       1. Redis cache hit → return immediately (fast path, ~1ms)
-      2. DB populated   → assemble, write to Redis, return
-      3. Neither        → live fetch, persist to DB + Redis, return
+      2. DB populated   → assemble, write to Redis with jitter, return
+      3. Neither        → acquire NX distributed lock, live fetch, persist, return
+
+    TTL jitter (±10%) prevents a cache stampede when many instruments were
+    fetched at the same time (e.g. after a backfill run) and their TTLs expire
+    simultaneously.
+
+    The NX lock on path 3 ensures that if many requests arrive for the same
+    instrument simultaneously (thundering herd), only one coroutine executes
+    the 9-endpoint live fetch; the others wait and then hit the DB/cache that
+    the winner just populated.
 
     Non-EQ instruments are rejected before this function is called (see API layer).
     """
+    rkey = _redis_key(instrument_key)
+
     # 1. Redis
     try:
-        cached = await redis.get(_redis_key(instrument_key))
+        cached = await redis.get(rkey)
         if cached:
             return _deserialize(cached)
     except Exception as exc:
@@ -1102,23 +1322,62 @@ async def get_fundamentals(
         db_data = await assemble_from_db(instrument_key, db)
         if db_data:
             try:
-                await redis.set(_redis_key(instrument_key), _serialize(db_data), ex=_REDIS_TTL)
+                await redis.set(rkey, _serialize(db_data), ex=_jittered_ttl())
             except Exception as exc:
                 logger.warning("Redis write failed for %s: %s", instrument_key, exc)
             return db_data
     except Exception as exc:
         logger.error("DB assembly failed for %s: %s", instrument_key, exc)
 
-    # 3. Live fetch
+    # 3. Live fetch — guarded by a Redis NX lock to prevent thundering herd.
+    #    Multiple coroutines racing to path 3 for the same instrument_key will
+    #    serialise: the first acquires the lock, fetches and caches; the rest
+    #    poll at 1-second intervals until the lock releases, then hit path 1/2.
     try:
         isin = extract_isin(instrument_key)
     except ValueError as exc:
         return {"available": False, "instrument_key": instrument_key, "isin": None, "reason": str(exc)}
 
+    lock_key = f"{_LIVE_FETCH_LOCK_PREFIX}{instrument_key}"
+
+    # Try to acquire the NX lock (SET ... NX EX).
+    try:
+        acquired = await redis._redis.set(lock_key, "1", nx=True, ex=_LIVE_FETCH_LOCK_TTL)
+    except Exception:
+        acquired = True  # Redis unavailable — proceed without lock (safe degradation)
+
+    if not acquired:
+        # Another coroutine holds the lock. Poll until it releases or TTL expires,
+        # then re-check Redis/DB before considering a fresh fetch.
+        logger.debug("Live fetch lock contention for %s — waiting for peer", instrument_key)
+        for _ in range(_LIVE_FETCH_LOCK_TTL):
+            await asyncio.sleep(1.0)
+            try:
+                still_locked = await redis._redis.exists(lock_key)
+            except Exception:
+                still_locked = False
+            if not still_locked:
+                break
+
+        # Re-check Redis and DB — the lock holder should have populated both.
+        try:
+            cached = await redis.get(rkey)
+            if cached:
+                return _deserialize(cached)
+        except Exception:
+            pass
+        try:
+            db_data = await assemble_from_db(instrument_key, db)
+            if db_data:
+                return db_data
+        except Exception:
+            pass
+        # Fallthrough: lock holder may have failed — attempt our own fetch.
+
     try:
         live_data = await fetch_and_store_all(instrument_key, isin, db)
         try:
-            await redis.set(_redis_key(instrument_key), _serialize(live_data), ex=_REDIS_TTL)
+            await redis.set(rkey, _serialize(live_data), ex=_jittered_ttl())
         except Exception as exc:
             logger.warning("Redis write failed for %s: %s", instrument_key, exc)
         return live_data
@@ -1130,6 +1389,13 @@ async def get_fundamentals(
             "isin":           None,
             "reason":         "fetch_failed",
         }
+    finally:
+        # Release the lock only if we were the one that acquired it.
+        if acquired:
+            try:
+                await redis._redis.delete(lock_key)
+            except Exception:
+                pass
 
 
 async def is_eq_instrument(instrument_key: str, db: AsyncSession) -> bool:

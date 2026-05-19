@@ -241,7 +241,6 @@ async def close_position(
     delegates to apply_sell_fill_to_position.
     """
     from app.services.paper_trading.order_service import (
-        _execute_fill,
         _get_ltp,
         _compute_settlement_date,
     )
@@ -262,24 +261,10 @@ async def close_position(
         )
 
     # ── T+1 check for CNC ────────────────────────────────────────────────────
-    # Infer product_type from the opening order (simple approach: check fills)
+    # Use position.product_type — the authoritative, mutable field that reflects
+    # any CNC↔MIS conversion that occurred after the opening fill.
     from app.services.paper_trading.order_service import _assert_t1_settlement
-    from app.models.paper_trading import PaperOrder as PO
-    opening_order_stmt = (
-        select(PO)
-        .join(PaperFill, PO.id == PaperFill.order_id)
-        .where(
-            and_(
-                PaperFill.portfolio_id == position.portfolio_id,
-                PaperFill.symbol == position.symbol,
-                PO.transaction_type == "BUY",
-            )
-        )
-        .order_by(PO.placed_at.desc())
-        .limit(1)
-    )
-    opening_order = (await session.execute(opening_order_stmt)).scalar_one_or_none()
-    if opening_order and opening_order.product_type == "CNC":
+    if position.product_type == "CNC":
         await _assert_t1_settlement(session, position.portfolio_id, position.symbol)
 
     # ── Resolve exit price ────────────────────────────────────────────────────
@@ -300,7 +285,7 @@ async def close_position(
         slippage = ltp * _DEFAULT_SLIPPAGE_BPS / Decimal("10000")
         exit_price = (ltp - slippage).quantize(Decimal("0.0001"))
 
-    product_type = opening_order.product_type if opening_order else "CNC"
+    product_type: str = position.product_type
 
     charges = calculate_charges(
         transaction_type="SELL",

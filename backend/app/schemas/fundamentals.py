@@ -41,6 +41,7 @@ class KeyRatioItem(_OrmBase):
     name:          str
     company_value: float | None
     sector_value:  float | None
+    extra_ratios:  list[dict] | None = None
 
 
 class PeriodValue(_OrmBase):
@@ -53,6 +54,17 @@ class PeriodValue(_OrmBase):
 class CategoryHistory(_OrmBase):
     category: str
     history:  list[PeriodValue]
+
+
+class IncomeStatementData(BaseModel):
+    """Yearly and quarterly standalone income statement history.
+
+    Both lists are always present. An empty list indicates data has not yet
+    been fetched for that cadence (e.g. quarterly data is populated separately
+    from the initial backfill and may arrive later).
+    """
+    yearly:    list[CategoryHistory]
+    quarterly: list[CategoryHistory]
 
 
 class BalanceSheetEntry(_OrmBase):
@@ -76,6 +88,7 @@ class ShareHoldingEntry(_OrmBase):
 class CorporateAction(_OrmBase):
     action_type:     str
     expiry_date_str: str | None
+    expiry_date:     date | None = None
     amount:          float | None
     ratio:           str | None
     event_details:   list[dict] | None
@@ -109,12 +122,13 @@ class FundamentalsFullResponse(BaseModel):
 
     profile:          ProfileData | None = None
     key_ratios:       list[KeyRatioItem] | None = None
-    income_statement: list[CategoryHistory] | None = None
+    income_statement: IncomeStatementData | None = None
     balance_sheet:    list[BalanceSheetEntry] | None = None
     cash_flow:        list[CategoryHistory] | None = None
     share_holdings:   list[ShareHoldingEntry] | None = None
     corporate_actions: list[CorporateAction] | None = None
     competitors:      list[CompetitorEntry] | None = None
     fetched_at:       datetime | None = None
+    section_fetched_at: dict[str, datetime | None] | None = None
 
     model_config = ConfigDict(from_attributes=True)

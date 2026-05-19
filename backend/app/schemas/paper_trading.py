@@ -375,6 +375,33 @@ class ClosePositionRequest(BaseModel):
         return self
 
 
+class ConvertPositionRequest(BaseModel):
+    """
+    Request a CNC↔MIS product-type conversion on an open position.
+
+    Phase 1 constraints (enforced by the service layer):
+      - Position must be OPEN.
+      - to_product must differ from the current position.product_type.
+      - Only CNC ↔ MIS is supported (NRML is out of scope for Phase 1).
+      - Full-position conversion only — partial conversions are not yet supported.
+      - Same trading day only: the position must have been opened today (IST).
+    """
+
+    to_product: ProductType = Field(
+        ...,
+        description="Target product type (CNC or MIS only — NRML not supported in Phase 1)",
+    )
+
+    @field_validator("to_product")
+    @classmethod
+    def no_nrml(cls, v: ProductType) -> ProductType:
+        if v == ProductType.NRML:
+            raise ValueError(
+                "NRML product type is not supported for position conversion (Phase 1)."
+            )
+        return v
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Response Schemas
 # ──────────────────────────────────────────────────────────────────────────────
@@ -544,6 +571,9 @@ class PaperPositionResponse(BaseModel):
     avg_cost_price: float
     last_price: float | None
     unrealized_pnl: float | None
+    product_type: str = Field(
+        description="Authoritative product type; mutated by CNC↔MIS conversions",
+    )
     pnl_pct: float | None = Field(
         default=None,
         description="(last_price − avg_cost_price) / avg_cost_price × 100; None until first price tick",

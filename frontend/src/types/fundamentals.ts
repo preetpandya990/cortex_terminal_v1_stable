@@ -48,9 +48,15 @@ export interface ShareHoldingEntry {
   period_date: string;
 }
 
+export interface IncomeStatementData {
+  yearly:    CategoryHistory[];
+  quarterly: CategoryHistory[];
+}
+
 export interface CorporateAction {
   action_type: string;
   expiry_date_str: string | null;
+  expiry_date: string | null;
   amount: number | null;
   ratio: string | null;
   event_details: { name: string; value: string }[] | null;
@@ -74,11 +80,12 @@ export interface FundamentalsFullResponse {
   reason: string | null;
   profile: ProfileData | null;
   key_ratios: KeyRatioItem[] | null;
-  income_statement: CategoryHistory[] | null;
+  income_statement: IncomeStatementData | null;
   balance_sheet: BalanceSheetEntry[] | null;
   cash_flow: CategoryHistory[] | null;
   share_holdings: ShareHoldingEntry[] | null;
   corporate_actions: CorporateAction[] | null;
   competitors: CompetitorEntry[] | null;
   fetched_at: string | null;
+  section_fetched_at: Record<string, string | null> | null;
 }

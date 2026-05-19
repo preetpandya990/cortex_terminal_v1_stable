@@ -1,6 +1,7 @@
 """Paper Trading service package."""
 from app.services.paper_trading import (
     charge_calculator,
+    conversion_service,
     outcome_service,
     order_service,
     pnl_worker,
@@ -11,6 +12,7 @@ from app.services.paper_trading import (
 
 __all__ = [
     "charge_calculator",
+    "conversion_service",
     "outcome_service",
     "order_service",
     "pnl_worker",

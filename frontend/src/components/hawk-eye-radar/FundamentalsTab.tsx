@@ -27,6 +27,7 @@ import { cn } from "@/lib/utils";
 import { useFundamentals } from "@/hooks/useFundamentals";
 import type {
   CategoryHistory,
+  IncomeStatementData,
   KeyRatioItem,
   BalanceSheetEntry,
   ShareHoldingEntry,
@@ -67,7 +68,7 @@ function formatMcap(
 
 // ─── Pivot helper for category-history financial tables ───────────────────────
 
-function pivotCategoryHistory(data: CategoryHistory[]) {
+function pivotCategoryHistory(data: CategoryHistory[], maxPeriods = 4) {
   const periodSet = new Set<string>();
   const byCategory: Record<string, Record<string, { value: number; change_pct: number | null }>> =
     {};
@@ -83,12 +84,10 @@ function pivotCategoryHistory(data: CategoryHistory[]) {
     }
   }
 
-  // ISO date strings sort lexicographically = chronologically
-  const periods = Array.from(periodSet).sort();
-  // Keep only the last 4 years
-  const trimmed = periods.slice(-4);
+  // ISO date strings sort lexicographically = chronologically; take most recent N periods
+  const periods = Array.from(periodSet).sort().slice(-maxPeriods);
 
-  return { periods: trimmed, byCategory };
+  return { periods, byCategory };
 }
 
 // Period label from balance sheet entries (uses the period string from the entry)
@@ -351,12 +350,21 @@ const IS_CATEGORIES = [
   { key: "net_profit",       label: "Net Profit" },
 ];
 
-function IncomeStatementSection({ data }: { data: CategoryHistory[] }) {
-  const { periods, byCategory } = pivotCategoryHistory(data);
+type IncomeView = "yearly" | "quarterly";
+
+function IncomeStatementSection({ data }: { data: IncomeStatementData }) {
+  const hasYearly    = data.yearly.length > 0;
+  const hasQuarterly = data.quarterly.length > 0;
+  const hasAnyData   = hasYearly || hasQuarterly;
+
+  const [view, setView] = useState<IncomeView>(hasYearly ? "yearly" : "quarterly");
+
+  const activeData   = view === "yearly" ? data.yearly : data.quarterly;
+  const maxPeriods   = view === "yearly" ? 4 : 8;
+  const { periods, byCategory } = pivotCategoryHistory(activeData, maxPeriods);
 
   const periodLabels = periods.map((p) => {
-    // Find a matching entry with a "period" label string (e.g. "Mar 2025")
-    for (const cat of data) {
+    for (const cat of activeData) {
       const entry = cat.history.find((h) => h.period_date === p);
       if (entry) return entry.period;
     }
@@ -365,11 +373,59 @@ function IncomeStatementSection({ data }: { data: CategoryHistory[] }) {
 
   const rows = IS_CATEGORIES.map(({ key, label }) => ({
     label,
-    values: periods.map((p) => byCategory[key]?.[p]?.value ?? null),
+    values:  periods.map((p) => byCategory[key]?.[p]?.value   ?? null),
     changes: periods.map((p) => byCategory[key]?.[p]?.change_pct ?? null),
   }));
 
-  return <FinancialTable rows={rows} periods={periods} periodLabels={periodLabels} />;
+  return (
+    <div className="space-y-3">
+      {/* Annual / Quarterly toggle */}
+      <div className="flex items-center gap-2">
+        <div className="inline-flex items-center rounded-lg bg-slate-100 p-0.5 gap-0.5">
+          {(["yearly", "quarterly"] as IncomeView[]).map((v) => {
+            const label     = v === "yearly" ? "Annual" : "Quarterly";
+            const isActive  = view === v;
+            const isDisabled = v === "quarterly" ? !hasQuarterly : !hasYearly;
+            return (
+              <button
+                key={v}
+                type="button"
+                disabled={isDisabled}
+                onClick={() => setView(v)}
+                className={cn(
+                  "rounded-md px-3 py-1 text-xs font-semibold transition-colors",
+                  isActive
+                    ? "bg-white text-slate-900 shadow-sm"
+                    : isDisabled
+                    ? "text-slate-300 cursor-not-allowed"
+                    : "text-slate-500 hover:text-slate-700 cursor-pointer",
+                )}
+              >
+                {label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {hasAnyData ? (
+        activeData.length > 0 ? (
+          <FinancialTable rows={rows} periods={periods} periodLabels={periodLabels} />
+        ) : (
+          /* View has no data but the other one does — shouldn't normally happen since we
+             disable the empty-data tab, but guard defensively */
+          <p className="text-sm text-slate-400 italic">No data for this period type yet.</p>
+        )
+      ) : (
+        <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-5 text-center">
+          <p className="text-sm font-medium text-slate-600">Data not yet available</p>
+          <p className="mt-1 text-xs text-slate-400">
+            Income statement data is being populated. Check back soon.
+          </p>
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ─── Section: Balance Sheet ───────────────────────────────────────────────────
@@ -816,11 +872,9 @@ export function FundamentalsTab({ instrumentKey }: FundamentalsTabProps) {
         title="Income Statement"
         icon={<TrendingUp className="h-4 w-4" />}
       >
-        {data.income_statement?.length ? (
-          <IncomeStatementSection data={data.income_statement} />
-        ) : (
-          <p className="text-sm text-slate-400 italic">No income statement data</p>
-        )}
+        <IncomeStatementSection
+          data={data.income_statement ?? { yearly: [], quarterly: [] }}
+        />
       </CollapsibleSection>
 
       {/* 4. Balance Sheet */}

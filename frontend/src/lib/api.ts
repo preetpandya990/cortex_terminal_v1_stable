@@ -36,9 +36,11 @@ import type {
   UpdatePortfolioSettingsRequest,
   PlaceOrderRequest,
   ClosePositionRequest,
+  ConvertPositionRequest,
   Portfolio,
   PortfolioSummary,
   PaperOrder,
+  PaperPosition,
   PaperPositionDetail,
   OrdersListResponse,
   PositionsListResponse,
@@ -768,6 +770,13 @@ export const paperTradingAPI = {
     return requestData(
       api.post<PaperOrder>(`/paper-trading/positions/${positionId}/close`, payload),
       'Failed to close position'
+    );
+  },
+
+  convertPosition: async (positionId: string, payload: ConvertPositionRequest): Promise<PaperPosition> => {
+    return requestData(
+      api.post<PaperPosition>(`/paper-trading/positions/${positionId}/convert`, payload),
+      'Failed to convert position'
     );
   },
 

@@ -149,6 +149,7 @@ export interface PaperPosition {
   realized_pnl: number;
   total_charges: number;
   side: PositionSide;
+  product_type: ProductType;
   target_price_1: number | null;
   target_price_2: number | null;
   target_price_3: number | null;
@@ -157,6 +158,10 @@ export interface PaperPosition {
   opened_at: string;
   closed_at: string | null;
   updated_at: string;
+}
+
+export interface ConvertPositionRequest {
+  to_product: "CNC" | "MIS";
 }
 
 export interface PaperPositionDetail {

@@ -33,6 +33,7 @@ import { PortfolioSummaryCard } from "./PortfolioSummaryCard";
 import { CreatePortfolioModal } from "./CreatePortfolioModal";
 import { ClosePositionModal } from "./ClosePositionModal";
 import { PositionDetailModal } from "./PositionDetailModal";
+import { PortfolioSettingsModal } from "./PortfolioSettingsModal";
 import type { LivePositionPnL, PaperPosition } from "@/types/paper_trading";
 
 // ── Formatters ────────────────────────────────────────────────────────────────
@@ -302,6 +303,7 @@ export function OpenPositionsTable() {
 
   const [activeTab,         setActiveTab]         = useState<ActiveTab>("open");
   const [showCreate,        setShowCreate]         = useState(false);
+  const [showSettings,      setShowSettings]       = useState(false);
   const [closingPosition,   setClosingPosition]    = useState<{
     position: PaperPosition;
     livePrice?: number;
@@ -461,7 +463,7 @@ export function OpenPositionsTable() {
         <PortfolioSummaryCard
           portfolio={portfolio}
           liveStats={wsConnected ? portfolioStats : undefined}
-          onSettingsClick={() => {/* TODO: settings modal */}}
+          onSettingsClick={() => setShowSettings(true)}
         />
 
         {/* Positions Panel */}
@@ -628,6 +630,18 @@ export function OpenPositionsTable() {
           )}
         </div>
       </section>
+
+      {/* Portfolio Settings Modal */}
+      {showSettings && (
+        <PortfolioSettingsModal
+          portfolio={portfolio}
+          onClose={() => setShowSettings(false)}
+          onUpdated={() => {
+            setShowSettings(false);
+            refetchPortfolio();
+          }}
+        />
+      )}
 
       {/* Position Detail Modal */}
       {detailPosition && (

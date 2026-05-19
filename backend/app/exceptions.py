@@ -204,3 +204,13 @@ class IncorrectPasswordError(CortexBaseError):
     """Raised when the current_password provided for a profile update is wrong."""
     default_message = "Current password is incorrect"
     status_code = 422
+
+
+class ConversionNotAllowedError(CortexBaseError):
+    """
+    Raised when a CNC↔MIS product-type conversion is rejected.
+
+    Phase 1 permits full-position, same-trading-day conversions only.
+    """
+    default_message = "Position conversion is not permitted"
+    status_code = 422

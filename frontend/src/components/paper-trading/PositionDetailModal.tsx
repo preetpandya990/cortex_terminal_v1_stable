@@ -1,8 +1,17 @@
 "use client";
 
-import { X, TrendingUp, TrendingDown, Clock, Loader2, AlertCircle, Brain } from "lucide-react";
-import { usePositionDetail } from "@/hooks/usePaperTrading";
+import { X, TrendingUp, TrendingDown, Clock, Loader2, AlertCircle, Brain, ArrowLeftRight } from "lucide-react";
+import { usePositionDetail, useConvertPosition } from "@/hooks/usePaperTrading";
+import { useToast } from "@/components/ui/toast";
 import type { PaperFill, PaperPosition, PaperTradeOutcome } from "@/types/paper_trading";
+
+// Returns true if the ISO timestamp falls on today's date in IST.
+function isOpenedTodayIST(openedAt: string): boolean {
+  const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+  const toISTDate = (d: Date) =>
+    new Date(d.getTime() + IST_OFFSET_MS).toISOString().slice(0, 10);
+  return toISTDate(new Date(openedAt)) === toISTDate(new Date());
+}
 
 // ── Formatters ────────────────────────────────────────────────────────────────
 
@@ -381,6 +390,29 @@ export function PositionDetailModal({
   const isLong = position.side === "LONG";
 
   const { data: detail, isLoading, isError } = usePositionDetail(position.id);
+  const { mutateAsync: convertPosition, isPending: isConverting } = useConvertPosition();
+  const toast = useToast();
+
+  const canConvert =
+    isOpen &&
+    (position.product_type === "CNC" || position.product_type === "MIS") &&
+    isOpenedTodayIST(position.opened_at);
+
+  const convertTarget = position.product_type === "CNC" ? "MIS" : "CNC";
+
+  async function handleConvert() {
+    try {
+      await convertPosition({ positionId: position.id, payload: { to_product: convertTarget } });
+      toast.success(
+        `Converted to ${convertTarget}`,
+        `${position.symbol} · ${position.product_type} → ${convertTarget}`,
+      );
+      onClose();
+    } catch (err) {
+      const msg = (err as { message?: string })?.message ?? "Conversion failed.";
+      toast.error("Conversion failed", msg);
+    }
+  }
 
   const currentPrice =
     lastPrice ?? detail?.position.last_price ?? position.last_price;
@@ -610,18 +642,37 @@ export function PositionDetailModal({
           </div>
         </div>
 
-        {/* ── Footer action — open positions only ─────────────────────────── */}
-        {isOpen && onRequestClosePosition && (
+        {/* ── Footer actions — open positions only ────────────────────────── */}
+        {isOpen && (canConvert || onRequestClosePosition) && (
           <div className="shrink-0 border-t border-slate-200 px-5 py-4">
-            <button
-              onClick={() => {
-                onClose();
-                onRequestClosePosition();
-              }}
-              className="w-full rounded-xl bg-rose-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-rose-700 active:bg-rose-800 transition-colors"
-            >
-              Close Position
-            </button>
+            <div className={`flex gap-2.5 ${canConvert && onRequestClosePosition ? "" : ""}`}>
+              {canConvert && (
+                <button
+                  onClick={handleConvert}
+                  disabled={isConverting}
+                  className="flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 active:bg-slate-100 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+                  style={{ flex: onRequestClosePosition ? "0 0 auto" : "1 1 0%" }}
+                >
+                  {isConverting ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <ArrowLeftRight className="h-3.5 w-3.5" />
+                  )}
+                  {isConverting ? "Converting…" : `Convert to ${convertTarget}`}
+                </button>
+              )}
+              {onRequestClosePosition && (
+                <button
+                  onClick={() => {
+                    onClose();
+                    onRequestClosePosition();
+                  }}
+                  className="flex-1 rounded-xl bg-rose-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-rose-700 active:bg-rose-800 transition-colors"
+                >
+                  Close Position
+                </button>
+              )}
+            </div>
           </div>
         )}
       </div>

@@ -14,15 +14,16 @@ Usage
 Behaviour
 ---------
   - Queries all instrument_type='EQ' rows from instrument_master (~2,000–2,500)
-  - asyncio.Semaphore(40) caps concurrent in-flight requests to stay safely
-    under the Upstox 50 req/s rate limit (8 endpoints × 40 = 320 calls/burst,
-    spread across gather() which naturally throttles to ~40 concurrent)
+  - _CONCURRENCY = 5 caps concurrent in-flight instruments. The global rate
+    limiter in fundamentals_service enforces 1.0 req/s total (1800 req/30min),
+    the binding Upstox constraint. Higher concurrency only queues more coroutines
+    at the rate lock — no throughput benefit beyond 5 in-flight instruments.
   - Checkpoint file at .fundamentals_backfill_checkpoint stores the last
     successfully processed instrument_key; restarting resumes from there
   - Per-instrument errors are logged and skipped — they never abort the run
   - Final summary reports success count, skip count, and error count
 
-Expected runtime: ~2,500 instruments × 8 endpoints / 40 concurrency ≈ 8–12 min
+Expected runtime: ~2,500 instruments × 8 endpoints at 1.0 req/s ≈ 5.6 hours
 """
 from __future__ import annotations
 
