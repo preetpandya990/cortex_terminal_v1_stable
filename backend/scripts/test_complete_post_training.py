@@ -143,21 +143,19 @@ async def test_complete_workflow():
         ensemble_trainer = EnsembleTrainer(
             xgboost_model=xgb_trainer.model,
             gru_model=gru_trainer.model,
-            weights={'xgboost': 0.6, 'gru': 0.4}
+            weights={'xgboost': 0.6, 'gru': 0.4},
+            xgb_calibrator=getattr(xgb_trainer, 'calibrator', None),
+            gru_calibrator=getattr(gru_trainer, 'calibrator', None),
         )
-        
-        # Test weight optimization
-        optimized_weights = ensemble_trainer.optimize_weights(
-            X_tab_val, X_seq_val, y_val,
-            metric='sharpe_ratio'
+
+        # NOTE: accretion-gated net-DSR weight selection
+        # (optimize_weights_on_oof) requires the leakage-free joint CPCV-OOF /
+        # purged-val set and is exercised authoritatively by the production
+        # orchestrator (step 7) and tests/unit/test_ml_ensemble_a5.py. This
+        # smoke script only checks the calibration-aware inference path.
+        y_pred_ensemble, y_proba_ensemble = ensemble_trainer.predict(
+            X_tab_val, X_seq_val, apply_confidence_threshold=False
         )
-        logger.info(f"  Optimized weights: {optimized_weights}")
-        
-        # Test ensemble prediction
-        y_proba_ensemble = (optimized_weights['xgboost'] * y_proba_xgb + 
-                           optimized_weights['gru'] * y_proba_gru)
-        y_pred_ensemble = np.argmax(y_proba_ensemble, axis=1) - 1
-        
         ensemble_results = evaluator.evaluate(y_val, y_pred_ensemble, y_proba_ensemble)
         logger.info(f"  Ensemble accuracy: {ensemble_results.accuracy:.4f}")
         logger.info("✓ Ensemble training successful")

@@ -1,12 +1,15 @@
 "use client";
 
-import { memo, useMemo } from "react";
-import { TrendingUp, TrendingDown, Minus, X, GripVertical } from "lucide-react";
+import { memo, useMemo, useState } from "react";
+import { TrendingUp, TrendingDown, Minus, X, GripVertical, ArrowUpRight, ArrowDownRight } from "lucide-react";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useLtp } from "@/hooks/useLtp";
+import { useAuth } from "@/contexts/AuthContext";
+import { OpenTradeModal } from "@/components/paper-trading/OpenTradeModal";
 import type { WatchlistItem } from "@/lib/api";
+import type { PositionSide } from "@/types/paper_trading";
 
 interface GripHandlers {
   onPointerDown: (e: React.PointerEvent<HTMLElement>) => void;
@@ -23,6 +26,8 @@ interface WatchlistCardProps {
   isOver?: boolean;
   /** Pointer handlers for the grip handle; omit to disable drag on this card. */
   gripHandlers?: GripHandlers;
+  /** Side of any currently open position for this instrument. */
+  openSide?: PositionSide | null;
 }
 
 function WatchlistCardComponent({
@@ -33,7 +38,17 @@ function WatchlistCardComponent({
   isDragging = false,
   isOver = false,
   gripHandlers,
+  openSide = null,
 }: WatchlistCardProps) {
+  const { isAuthenticated } = useAuth();
+  const [tradeDirection, setTradeDirection] = useState<"BUY" | "SELL" | null>(null);
+
+  // No suggestion context on watchlist cards — signalDirection is always null.
+  // Buy: always shown when authenticated.
+  // Sell: only when an open position exists.
+  const showBuyButton  = isAuthenticated;
+  const showSellButton = isAuthenticated && openSide !== null;
+
   const snapshot   = useLtp(item.instrument_key);
   const ltp        = snapshot?.ltp ?? null;
   const prevClose  = snapshot?.cp ?? null;
@@ -160,7 +175,50 @@ function WatchlistCardComponent({
             </div>
           </div>
         )}
+
+        {/* Trade buttons */}
+        {(showBuyButton || showSellButton) && (
+          <div
+            className="pt-3 border-t border-slate-100 flex items-center gap-2"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {showBuyButton && (
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); setTradeDirection("BUY"); }}
+                className="flex-1 inline-flex items-center justify-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2 text-sm font-semibold text-emerald-700 shadow-sm hover:bg-emerald-100 transition-colors"
+              >
+                <ArrowUpRight className="h-4 w-4" />
+                Buy
+              </button>
+            )}
+            {showSellButton && (
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); setTradeDirection("SELL"); }}
+                className="flex-1 inline-flex items-center justify-center gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-2 text-sm font-semibold text-rose-700 shadow-sm hover:bg-rose-100 transition-colors"
+              >
+                <ArrowDownRight className="h-4 w-4" />
+                Sell
+              </button>
+            )}
+          </div>
+        )}
       </CardContent>
+
+      {tradeDirection !== null && (
+        <OpenTradeModal
+          instrument={{
+            name: item.name || item.trading_symbol,
+            trading_symbol: item.trading_symbol,
+            exchange: item.exchange,
+            instrument_key: item.instrument_key,
+          }}
+          livePrice={ltp}
+          initialDirection={tradeDirection}
+          onClose={() => setTradeDirection(null)}
+        />
+      )}
     </Card>
   );
 }

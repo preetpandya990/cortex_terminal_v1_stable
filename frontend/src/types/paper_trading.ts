@@ -19,6 +19,8 @@ export type OrderStatus = "PENDING" | "OPEN" | "COMPLETE" | "REJECTED" | "CANCEL
 export type PositionSide = "LONG" | "SHORT";
 export type PositionStatus = "OPEN" | "CLOSED";
 export type ExitReason = "TP1" | "TP2" | "TP3" | "SL" | "MANUAL" | "EXPIRED";
+export type MonitoringMode = "disabled" | "fixed_duration" | "end_of_session";
+export type MonitorStatus = "ACTIVE" | "COMPLETED" | "EXPIRED";
 
 // ============================================================================
 // Request Interfaces
@@ -87,7 +89,10 @@ export interface Portfolio {
 }
 
 export interface PortfolioSummary extends Portfolio {
+  reserved_cash: number;
+  available_cash: number;
   open_position_count: number;
+  pending_order_count: number;
   total_unrealized_pnl: number;
   total_realized_pnl: number;
   portfolio_value: number;
@@ -205,6 +210,51 @@ export interface PaperTradeOutcome {
   created_at: string;
 }
 
+export interface PostCloseMonitor {
+  id: string;
+  outcome_id: string;
+  position_id: string;
+  portfolio_id: string;
+  symbol: string;
+  direction: "LONG" | "SHORT";
+  close_reason: "SL" | "TP1" | "TP2" | "TP3";
+  close_price: number;
+  entry_price: number;
+  stop_loss: number | null;
+  remaining_tp1: number | null;
+  remaining_tp2: number | null;
+  remaining_tp3: number | null;
+  monitor_until: string;
+  status: MonitorStatus;
+  peak_favorable_price: number | null;
+  peak_adverse_price: number | null;
+  recovered_above_sl: boolean;
+  recovered_above_entry: boolean;
+  tp1_hit_at: string | null;
+  tp2_hit_at: string | null;
+  tp3_hit_at: string | null;
+  sl_recovery_at: string | null;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface PostCloseMonitorsListResponse {
+  monitors: PostCloseMonitor[];
+  total: number;
+  next_cursor: string | null;
+}
+
+export interface MonitoringConfigResponse {
+  mode: MonitoringMode;
+  duration_hours: number | null;
+  updated_at: string;
+}
+
+export interface UpdateMonitoringConfigRequest {
+  mode: MonitoringMode;
+  duration_hours?: number | null;
+}
+
 export interface PaperPnlSnapshot {
   id: number;
   portfolio_id: string;
@@ -320,8 +370,40 @@ export interface OutcomeStatsResponse {
 }
 
 // ============================================================================
+// Close Position Response
+// ============================================================================
+
+export interface ClosePositionResponse {
+  /** The position after the close operation (OPEN for queued LIMIT, CLOSED for MARKET). */
+  position: PaperPosition;
+  /** True when a LIMIT close was queued as a pending SELL order; false for immediate MARKET fill. */
+  queued: boolean;
+  /** Present only when queued=true — the newly created pending SELL order ID. */
+  pending_order_id: string | null;
+}
+
+// ============================================================================
 // Real-time WebSocket Payloads
 // ============================================================================
+
+export interface OrderFilledEvent {
+  type: "order_filled";
+  order_id: string;
+  portfolio_id: string;
+  symbol: string;
+  transaction_type: TransactionType;
+  fill_price: number;
+  quantity: number;
+  ts: string;
+}
+
+export interface OrderExpiredEvent {
+  type: "order_expired";
+  order_id: string;
+  portfolio_id: string;
+  symbol: string;
+  ts: string;
+}
 
 export interface LivePositionPnL {
   position_id: string;

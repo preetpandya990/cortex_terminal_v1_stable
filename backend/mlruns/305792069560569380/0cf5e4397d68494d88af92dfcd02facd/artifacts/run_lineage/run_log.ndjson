@@ -1,0 +1,2 @@
+{"ts": "2026-05-25T11:08:23.849444+00:00", "event": "run_start", "run_id": "20260525_163822", "mlflow_run_id": "0cf5e4397d68494d88af92dfcd02facd", "model_version": "1.0.0", "resumed": false}
+{"ts": "2026-05-25T11:09:48.461470+00:00", "event": "run_failed", "mlflow_run_id": "0cf5e4397d68494d88af92dfcd02facd", "promotion_report_path": null}

@@ -127,6 +127,18 @@ class ExitReason(str, Enum):
     EXPIRED = "EXPIRED"
 
 
+class MonitoringMode(str, Enum):
+    DISABLED = "disabled"
+    FIXED_DURATION = "fixed_duration"
+    END_OF_SESSION = "end_of_session"
+
+
+class MonitorStatus(str, Enum):
+    ACTIVE = "ACTIVE"
+    COMPLETED = "COMPLETED"
+    EXPIRED = "EXPIRED"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Shared Decimal → float converter
 # Used as a reusable validator across all response schemas
@@ -417,6 +429,10 @@ class PortfolioResponse(BaseModel):
     name: str
     initial_capital: float
     current_cash: float
+    reserved_cash: float = Field(
+        default=0.0,
+        description="Cash pre-committed by open LIMIT/SL/SL-M BUY orders",
+    )
     currency: str
     risk_per_trade_pct: float
     max_open_positions: int
@@ -425,7 +441,7 @@ class PortfolioResponse(BaseModel):
     updated_at: datetime
 
     @field_validator(
-        "initial_capital", "current_cash", "risk_per_trade_pct",
+        "initial_capital", "current_cash", "reserved_cash", "risk_per_trade_pct",
         mode="before",
     )
     @classmethod
@@ -451,6 +467,14 @@ class PortfolioSummaryResponse(BaseModel):
     name: str
     initial_capital: float
     current_cash: float
+    reserved_cash: float = Field(
+        default=0.0,
+        description="Cash pre-committed by open LIMIT/SL/SL-M BUY orders",
+    )
+    available_cash: float = Field(
+        default=0.0,
+        description="current_cash − reserved_cash; the true spendable balance",
+    )
     currency: str
     risk_per_trade_pct: float
     max_open_positions: int
@@ -461,6 +485,9 @@ class PortfolioSummaryResponse(BaseModel):
     # Live aggregate stats (not on the ORM model — populated by the service)
     open_position_count: int = Field(
         default=0, description="Number of currently open positions"
+    )
+    pending_order_count: int = Field(
+        default=0, description="Number of open LIMIT/SL/SL-M orders awaiting fill"
     )
     total_unrealized_pnl: float = Field(
         default=0.0, description="Sum of unrealized P&L across all open positions"
@@ -484,7 +511,8 @@ class PortfolioSummaryResponse(BaseModel):
     )
 
     @field_validator(
-        "initial_capital", "current_cash", "risk_per_trade_pct",
+        "initial_capital", "current_cash", "reserved_cash", "available_cash",
+        "risk_per_trade_pct",
         mode="before",
     )
     @classmethod
@@ -732,6 +760,72 @@ class PaperPnlSnapshotResponse(BaseModel):
     @classmethod
     def coerce_decimal_optional(cls, v: Any) -> float | None:
         return _to_float(v)
+
+
+class ClosePositionResponse(BaseModel):
+    """
+    Response for POST /positions/{id}/close.
+
+    For MARKET closes the position is immediately CLOSED or reduced.
+    For LIMIT closes a pending SELL order is queued and the position
+    remains OPEN until the pnl_worker matches it against a live tick.
+
+    `queued` distinguishes the two cases so the frontend can show the
+    appropriate toast without inspecting position.status.
+    """
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    position: PaperPositionResponse
+    queued: bool = Field(
+        description=(
+            "True when a LIMIT close order was queued rather than filled "
+            "immediately.  The position remains OPEN; check pending orders."
+        )
+    )
+    pending_order_id: UUID | None = Field(
+        default=None,
+        description="UUID of the queued SELL order (populated when queued=True)",
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Real-time WebSocket — event frames (appended to LivePnLUpdate channel)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class OrderFilledEvent(BaseModel):
+    """
+    Published to cai:paper:pnl:{portfolio_id} when a pending LIMIT/SL/SL-M
+    order is matched and filled by the pnl_worker matching engine.
+
+    The frontend uses this to show a fill notification and invalidate
+    the orders and positions query caches.
+    """
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    type: str = Field(default="order_filled", description="Frame type discriminator")
+    order_id: UUID
+    portfolio_id: UUID
+    symbol: str
+    transaction_type: str = Field(description="BUY or SELL")
+    fill_price: float
+    quantity: int
+    ts: str = Field(description="ISO 8601 UTC timestamp")
+
+
+class OrderExpiredEvent(BaseModel):
+    """
+    Published when a DAY-validity order is cancelled at market close (15:30 IST).
+    """
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    type: str = Field(default="order_expired", description="Frame type discriminator")
+    order_id: UUID
+    portfolio_id: UUID
+    symbol: str
+    ts: str
 
 
 # Resolve forward reference in PaperPositionDetailResponse
@@ -1047,3 +1141,119 @@ class LivePnLUpdate(BaseModel):
 
     # ISO 8601 timestamp of this frame (UTC)
     ts: datetime
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Post-Close Monitoring Schemas
+# ──────────────────────────────────────────────────────────────────────────────
+
+class UpdateMonitoringConfigRequest(BaseModel):
+    """
+    Update the account-wide post-close monitoring configuration.
+
+    mode='disabled'         — no post-close tracking (default)
+    mode='fixed_duration'   — monitor for duration_hours after each auto-close
+    mode='end_of_session'   — monitor until NSE market close (15:30 IST) on
+                              the same day as the auto-close; no-op when the
+                              close happens at or after 15:30 IST
+    """
+
+    mode: MonitoringMode
+    duration_hours: float | None = Field(
+        default=None,
+        gt=0,
+        le=72,
+        description=(
+            "Monitoring duration in hours (0 < h ≤ 72). "
+            "Required when mode='fixed_duration'; ignored otherwise."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_duration_required(self) -> "UpdateMonitoringConfigRequest":
+        if self.mode == MonitoringMode.FIXED_DURATION and self.duration_hours is None:
+            raise ValueError(
+                "duration_hours is required when mode='fixed_duration'"
+            )
+        return self
+
+
+class MonitoringConfigResponse(BaseModel):
+    """Current account-wide post-close monitoring settings."""
+
+    model_config = ConfigDict(from_attributes=True, protected_namespaces=())
+
+    mode: str
+    duration_hours: float | None = None
+    updated_at: datetime
+
+    @field_validator("duration_hours", mode="before")
+    @classmethod
+    def _coerce_duration(cls, v: Any) -> float | None:
+        return _to_float(v)
+
+
+class PostCloseMonitorResponse(BaseModel):
+    """
+    Serialised PostCloseMonitor record.
+
+    Returned by GET /post-close-monitors and GET /post-close-monitors/{id}.
+    All Decimal fields are coerced to float for JSON consistency.
+    """
+
+    model_config = ConfigDict(from_attributes=True, protected_namespaces=())
+
+    id: UUID
+    outcome_id: UUID
+    position_id: UUID
+    portfolio_id: UUID
+    symbol: str
+    direction: str
+    close_reason: str
+
+    close_price: float
+    entry_price: float
+    stop_loss: float | None = None
+
+    remaining_tp1: float | None = None
+    remaining_tp2: float | None = None
+    remaining_tp3: float | None = None
+
+    monitor_until: datetime
+    status: str
+
+    peak_favorable_price: float | None = None
+    peak_adverse_price: float | None = None
+    recovered_above_sl: bool
+    recovered_above_entry: bool
+
+    tp1_hit_at: datetime | None = None
+    tp2_hit_at: datetime | None = None
+    tp3_hit_at: datetime | None = None
+    sl_recovery_at: datetime | None = None
+
+    created_at: datetime
+    completed_at: datetime | None = None
+
+    @field_validator(
+        "close_price", "entry_price", "stop_loss",
+        "remaining_tp1", "remaining_tp2", "remaining_tp3",
+        "peak_favorable_price", "peak_adverse_price",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_decimal(cls, v: Any) -> float | None:
+        return _to_float(v)
+
+
+class PostCloseMonitorsListResponse(BaseModel):
+    """Paginated list of PostCloseMonitor records."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    monitors: list[PostCloseMonitorResponse]
+    total: int = Field(ge=0)
+    next_cursor: str | None = Field(
+        default=None,
+        description="Opaque cursor for the next page; None when on the last page",
+    )

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams, useRouter } from "next/navigation";
 import { Radar, Loader2, AlertCircle, Star } from "lucide-react";
@@ -16,8 +16,10 @@ import { useWebSocket, type WebSocketMessage } from "@/hooks/useWebSocket";
 import { useWatchlist } from "@/hooks/useWatchlist";
 import { useDragReorder } from "@/hooks/useDragReorder";
 import { useAuth } from "@/contexts/AuthContext";
+import { usePositions } from "@/hooks/usePaperTrading";
 import type { UpstoxInstrument } from "@/types/upstox";
 import type { TradeSuggestion, SuggestionFilters as Filters } from "@/types/trade_suggestions";
+import type { PositionSide } from "@/types/paper_trading";
 
 export default function HawkEyeRadarPage() {
   const searchParams = useSearchParams();
@@ -35,6 +37,15 @@ export default function HawkEyeRadarPage() {
     reorderWatchlist,
     isLoading: watchlistLoading,
   } = useWatchlist();
+
+  // Open positions — fetched once here and passed per-card for O(1) lookup.
+  // React Query deduplicates with DetailPane's identical call, so no extra requests.
+  const { data: openPositionsData } = usePositions({ status: "OPEN" }, isAuthenticated);
+  const openPositionsBySide = useMemo(() => {
+    const map = new Map<string, PositionSide>();
+    openPositionsData?.positions.forEach((p) => map.set(p.instrument_key, p.side));
+    return map;
+  }, [openPositionsData?.positions]);
 
   const { draggingId, overId, clickPreventedRef, getGripHandlers } = useDragReorder(
     useCallback(
@@ -261,6 +272,7 @@ export default function HawkEyeRadarPage() {
                   isDragging={draggingId === item.id}
                   isOver={overId === item.id}
                   gripHandlers={getGripHandlers(item.id)}
+                  openSide={openPositionsBySide.get(item.instrument_key) ?? null}
                 />
               ))}
             </div>

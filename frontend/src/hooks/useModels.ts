@@ -3,6 +3,7 @@ import { useAuth } from "@/contexts/AuthContext";
 import { api } from "@/lib/api-client";
 import type {
   DriftReportsResponse,
+  EnsembleStatus,
   GovernanceSummary,
   ModelFilters,
   ModelsResponse,
@@ -16,6 +17,7 @@ const STALE_TIME = 30_000; // 30 s — governance data doesn't change every seco
 export const governanceKeys = {
   all:          ["governance"] as const,
   summary:      () => [...governanceKeys.all, "summary"] as const,
+  ensemble:     () => [...governanceKeys.all, "ensemble-status"] as const,
   models:       (filters: ModelFilters) => [...governanceKeys.all, "models", filters] as const,
   driftReports: (filters: { modelId?: number; hours?: number }) =>
     [...governanceKeys.all, "drift-reports", filters] as const,
@@ -31,6 +33,20 @@ export function useGovernanceSummary() {
     queryFn:       async () => (await api.get<GovernanceSummary>("governance/summary")).data,
     enabled:       isAuthenticated,
     staleTime:     STALE_TIME,
+    refetchInterval: 60_000,
+  });
+}
+
+// ── Ensemble status (Single-Active-Member pattern) ───────────────────────────
+
+export function useEnsembleStatus() {
+  const { isAuthenticated } = useAuth();
+
+  return useQuery<EnsembleStatus>({
+    queryKey:        governanceKeys.ensemble(),
+    queryFn:         async () => (await api.get<EnsembleStatus>("governance/ensemble/status")).data,
+    enabled:         isAuthenticated,
+    staleTime:       STALE_TIME,
     refetchInterval: 60_000,
   });
 }

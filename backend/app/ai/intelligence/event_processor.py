@@ -28,6 +28,7 @@ from app.ai.intelligence.nlp_engine import NLPEngine
 from app.ai.intelligence.event_classifier import EventClassifier
 from app.ai.fusion.signal_assembler import SignalAssembler
 from app.core.config import get_settings
+from app.core.metrics import events_processed_total
 from app.core.redis import get_cache_service, PubSubClient, RedisChannels, get_pubsub_client
 
 logger = logging.getLogger(__name__)
@@ -121,11 +122,16 @@ class EventProcessor:
                         logger.error(f"Failed to generate signal for {symbol}: {e}", exc_info=True)
             
             await db.commit()
-            
+
+            _event_type = getattr(event_data.get("event"), "event_type", "raw_event") or "raw_event"
+            events_processed_total.labels(event_type=_event_type, status="success").inc()
+
             return signals[0] if signals else None
-            
+
         except Exception as e:
             logger.error(f"Failed to process raw event {event_id}: {e}", exc_info=True)
+            _event_type = getattr(event_data.get("event"), "event_type", "raw_event") or "raw_event"
+            events_processed_total.labels(event_type=_event_type, status="error").inc()
             await db.rollback()
             
             # Update processed event status to failed

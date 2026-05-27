@@ -36,6 +36,7 @@ import type {
   UpdatePortfolioSettingsRequest,
   PlaceOrderRequest,
   ClosePositionRequest,
+  ClosePositionResponse,
   ConvertPositionRequest,
   Portfolio,
   PortfolioSummary,
@@ -53,6 +54,10 @@ import type {
   PositionsQueryParams,
   OutcomesQueryParams,
   PnlSnapshotsQueryParams,
+  PostCloseMonitor,
+  PostCloseMonitorsListResponse,
+  MonitoringConfigResponse,
+  UpdateMonitoringConfigRequest,
 } from '@/types/paper_trading';
 
 // Watchlist types
@@ -766,9 +771,9 @@ export const paperTradingAPI = {
     );
   },
 
-  closePosition: async (positionId: string, payload: ClosePositionRequest): Promise<PaperOrder> => {
+  closePosition: async (positionId: string, payload: ClosePositionRequest): Promise<ClosePositionResponse> => {
     return requestData(
-      api.post<PaperOrder>(`/paper-trading/positions/${positionId}/close`, payload),
+      api.post<ClosePositionResponse>(`/paper-trading/positions/${positionId}/close`, payload),
       'Failed to close position'
     );
   },
@@ -822,6 +827,34 @@ export const paperTradingAPI = {
       'Failed to fetch P&L snapshots'
     );
   },
+
+  getPostCloseMonitorForOutcome: async (outcomeId: string): Promise<PostCloseMonitor | null> => {
+    const res = await requestData(
+      api.get<PostCloseMonitorsListResponse>('/paper-trading/post-close-monitors', {
+        params: { outcome_id: outcomeId, limit: 1 },
+      }),
+      'Failed to fetch post-close monitor'
+    );
+    return res.monitors[0] ?? null;
+  },
+
+  getPostCloseMonitor: async (monitorId: string): Promise<PostCloseMonitor> =>
+    requestData(
+      api.get<PostCloseMonitor>(`/paper-trading/post-close-monitors/${monitorId}`),
+      'Failed to fetch post-close monitor'
+    ),
+
+  getMonitoringConfig: async (): Promise<MonitoringConfigResponse> =>
+    requestData(
+      api.get<MonitoringConfigResponse>('/paper-trading/monitor-config'),
+      'Failed to fetch monitoring config'
+    ),
+
+  updateMonitoringConfig: async (payload: UpdateMonitoringConfigRequest): Promise<MonitoringConfigResponse> =>
+    requestData(
+      api.put<MonitoringConfigResponse>('/paper-trading/monitor-config', payload),
+      'Failed to update monitoring config'
+    ),
 };
 
 // User Profile & Preferences API

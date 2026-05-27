@@ -95,6 +95,16 @@ class UserPreferences(Base):
             "max_concurrent_activations >= 1 AND max_concurrent_activations <= 50",
             name="ck_user_prefs_max_activations",
         ),
+        CheckConstraint(
+            "post_close_monitor_mode IN ('disabled', 'fixed_duration', 'end_of_session')",
+            name="ck_user_prefs_pcm_mode",
+        ),
+        CheckConstraint(
+            "post_close_monitor_duration_hours IS NULL "
+            "OR (post_close_monitor_duration_hours > 0 "
+            "    AND post_close_monitor_duration_hours <= 72)",
+            name="ck_user_prefs_pcm_duration",
+        ),
         # uq_user_prefs_user_id: one row per user — enforced in the migration
     )
 
@@ -132,6 +142,20 @@ class UserPreferences(Base):
         nullable=False,
         default=10,
         server_default=text("10"),
+    )
+
+    # ── Post-close monitoring ──────────────────────────────────────────────────
+    # Controls whether closed trades (by SL/TP) continue to be price-tracked
+    # after close so counterfactual outcomes can be recorded for ML calibration.
+    post_close_monitor_mode: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="end_of_session",
+        server_default=text("'end_of_session'"),
+    )
+    # Only relevant when mode = 'fixed_duration'. Range: 0.5–72 hours.
+    post_close_monitor_duration_hours: Mapped[Decimal | None] = mapped_column(
+        Numeric(4, 1),
     )
 
     created_at: Mapped[datetime] = mapped_column(

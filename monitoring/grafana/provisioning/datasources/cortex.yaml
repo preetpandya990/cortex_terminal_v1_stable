@@ -1,0 +1,20 @@
+# Grafana Datasource Provisioning — Cortex AI
+# =============================================
+# GitOps-managed. Do not edit via the UI — changes will be overwritten.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: cortex-prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: "10s"
+      queryTimeout: "60s"
+      httpMethod: POST
+      prometheusType: Prometheus
+      prometheusVersion: "2.53.0"
+      exemplarTraceIdDestinations: []

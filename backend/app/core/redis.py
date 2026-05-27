@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
 
 from redis.asyncio import Redis
@@ -223,6 +225,27 @@ class RedisChannels:
         }
     """
 
+    # ── Paper Trading ──────────────────────────────────────────────────────────
+    PAPER_PENDING_ORDERS_UPDATED = "cai:paper:pending_orders_updated"
+    """
+    Signals the pending-order matching engine to rebuild its in-memory cache
+    for one or more instrument keys.
+
+    Published after:
+      - A new LIMIT/SL/SL-M order is placed (order_service.place_order)
+      - An order is cancelled (order_service.cancel_order)
+      - An order is filled by the engine (self-invalidation is skipped via SKIP_LOCKED)
+
+    Payload:
+        {
+            "instrument_key": "NSE_EQ|INE002A01018"   // single instrument to refresh
+        }
+    Or, for a full cache rebuild (e.g. on startup recovery):
+        {
+            "instrument_key": null
+        }
+    """
+
     @staticmethod
     def signals_for_symbol(symbol: str) -> str:
         """Get per-symbol signals channel."""
@@ -267,6 +290,24 @@ def get_redis() -> Redis:
     return _client
 
 
+# ── Redis metrics helper ───────────────────────────────────────────────────────
+@asynccontextmanager
+async def _track_redis(operation: str):
+    """Async context manager that records redis_operations_total and duration."""
+    from app.core.metrics import redis_operations_total, redis_operation_duration_seconds
+    start = time.perf_counter()
+    try:
+        yield
+        redis_operations_total.labels(operation=operation, status="success").inc()
+    except Exception:
+        redis_operations_total.labels(operation=operation, status="error").inc()
+        raise
+    finally:
+        redis_operation_duration_seconds.labels(operation=operation).observe(
+            time.perf_counter() - start
+        )
+
+
 # ── Cache Service ──────────────────────────────────────────────────────────────
 class CacheService:
     """Cache service with JSON serialization and retry logic."""
@@ -280,7 +321,8 @@ class CacheService:
         retry=retry_if_exception_type((ConnectionError, TimeoutError)),
     )
     async def get(self, key: str) -> Any | None:
-        raw = await self._redis.get(key)
+        async with _track_redis("get"):
+            raw = await self._redis.get(key)
         if raw is None:
             return None
         try:
@@ -295,7 +337,8 @@ class CacheService:
         retry=retry_if_exception_type((ConnectionError, TimeoutError)),
     )
     async def set(self, key: str, value: Any, ttl: int) -> None:
-        await self._redis.setex(key, ttl, json.dumps(value, default=str))
+        async with _track_redis("set"):
+            await self._redis.setex(key, ttl, json.dumps(value, default=str))
 
     @retry(
         stop=stop_after_attempt(3),
@@ -303,13 +346,15 @@ class CacheService:
         retry=retry_if_exception_type((ConnectionError, TimeoutError)),
     )
     async def delete(self, key: str) -> None:
-        await self._redis.delete(key)
+        async with _track_redis("delete"):
+            await self._redis.delete(key)
 
     async def delete_pattern(self, pattern: str) -> int:
-        keys = await self._redis.keys(pattern)
-        if not keys:
-            return 0
-        return await self._redis.delete(*keys)
+        async with _track_redis("delete_pattern"):
+            keys = await self._redis.keys(pattern)
+            if not keys:
+                return 0
+            return await self._redis.delete(*keys)
 
     async def get_cache_stats(self) -> dict:
         info = await self._redis.info("stats")

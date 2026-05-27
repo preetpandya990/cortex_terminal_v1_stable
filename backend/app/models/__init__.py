@@ -27,8 +27,10 @@ from app.models.paper_trading import (
     PaperOrder,
     PaperFill,
     PaperPosition,
+    PaperPositionConversion,
     PaperTradeOutcome,
     PaperPnlSnapshot,
+    PostCloseMonitor,
 )
 from app.models.strategies import (
     UserPreferences,
@@ -72,8 +74,10 @@ __all__ = [
     "PaperOrder",
     "PaperFill",
     "PaperPosition",
+    "PaperPositionConversion",
     "PaperTradeOutcome",
     "PaperPnlSnapshot",
+    "PostCloseMonitor",
     # Trading Strategies
     "UserPreferences",
     "Strategy",

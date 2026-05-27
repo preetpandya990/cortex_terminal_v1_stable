@@ -1,0 +1,8 @@
+artifact_location: file:///home/preet/code/Cortex_Merge_AI-ML/backend/mlruns/305792069560569380
+creation_time: 1779707303787
+experiment_id: '305792069560569380'
+last_update_time: 1779707303787
+lifecycle_stage: active
+name: cortex_ml_training
+trace_location: null
+workspace: default

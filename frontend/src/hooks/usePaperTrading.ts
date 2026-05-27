@@ -47,6 +47,8 @@ export const paperTradingKeys = {
     [...paperTradingKeys.all, 'pnl-snapshots', params] as const,
   priceTargets: (symbol: string | null, direction: TransactionType) =>
     [...paperTradingKeys.all, 'price-targets', symbol, direction] as const,
+  postCloseMonitor: (outcomeId: string | null | undefined) =>
+    [...paperTradingKeys.all, 'post-close-monitor', outcomeId] as const,
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -161,6 +163,16 @@ export function useOrders(params?: OrdersQueryParams) {
   });
 }
 
+/** Fetch only OPEN (pending) LIMIT/SL/SL-M orders for the active portfolio. */
+export function usePendingOrders() {
+  return useQuery({
+    queryKey: paperTradingKeys.orders({ status: 'OPEN' }),
+    queryFn: () => paperTradingAPI.getOrders({ status: 'OPEN' }),
+    staleTime: 10_000,
+    refetchInterval: 30_000,
+  });
+}
+
 export function usePlaceOrder() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -179,6 +191,8 @@ export function useCancelOrder() {
     mutationFn: (orderId: string) => paperTradingAPI.cancelOrder(orderId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: paperTradingKeys.orders() });
+      // Portfolio reserved_cash changes when a BUY order is cancelled
+      queryClient.invalidateQueries({ queryKey: paperTradingKeys.portfolio() });
     },
   });
 }
@@ -255,5 +269,51 @@ export function usePriceTargets(
     staleTime: 14_400_000,   // 4 hours — matches backend cache TTL
     retry: false,
     refetchOnWindowFocus: false,
+  });
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Post-Close Monitoring
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Fetch the post-close monitor for a specific trade outcome.
+ *
+ * Only fires for COMPLETED monitors on SL/TP1/TP2-closed positions; TP3 exits
+ * never produce a monitor. staleTime is long because completed monitors are
+ * immutable once the monitoring window ends.
+ */
+export function usePostCloseMonitor(outcomeId: string | null | undefined) {
+  return useQuery({
+    queryKey: paperTradingKeys.postCloseMonitor(outcomeId),
+    queryFn: () => paperTradingAPI.getPostCloseMonitorForOutcome(outcomeId!),
+    enabled: !!outcomeId,
+    staleTime: 300_000,   // 5 min — completed monitors are immutable
+    retry: false,
+  });
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Monitoring Config
+// ──────────────────────────────────────────────────────────────────────────────
+
+export const monitoringConfigKey = ['paper-trading', 'monitoring-config'] as const;
+
+export function useMonitoringConfig() {
+  return useQuery({
+    queryKey: monitoringConfigKey,
+    queryFn: () => paperTradingAPI.getMonitoringConfig(),
+    staleTime: 300_000,
+    retry: false,
+  });
+}
+
+export function useUpdateMonitoringConfig() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: paperTradingAPI.updateMonitoringConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: monitoringConfigKey });
+    },
   });
 }

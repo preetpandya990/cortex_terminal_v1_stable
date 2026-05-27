@@ -29,6 +29,7 @@ import {
   useDriftReports,
   useUpdateModelState,
   useTriggerDriftCheck,
+  useEnsembleStatus,
 } from "@/hooks/useModels";
 import { useCAIWebSocket } from "@/hooks/useCAIWebSocket";
 import {
@@ -36,6 +37,7 @@ import {
   VALID_TRANSITIONS,
   QUALITY_GATES,
   type DriftReport,
+  type EnsembleMember,
   type MLModel,
   type ModelMetrics,
 } from "@/types/models";
@@ -45,6 +47,8 @@ import {
   Brain,
   CheckCircle2,
   ChevronRight,
+  Layers,
+  MoonStar,
   RefreshCw,
   RotateCcw,
   ShieldCheck,
@@ -527,12 +531,205 @@ function EmptyState({ tab }: { tab: string }) {
   );
 }
 
+// ── Ensemble status card ──────────────────────────────────────────────────────
+
+function MemberRow({ m }: { m: EnsembleMember }) {
+  const isActive  = m.is_active;
+  const auc       = m.metrics.auc_pr;
+  const dsr       = m.metrics.deflated_sharpe;
+  const ece       = m.metrics.ece_after;
+  const acc       = m.metrics.accuracy;
+
+  // For dormant members show the AUC-PR gate gap bar
+  const gate      = m.activation_gate;
+  const aucCheck  = gate?.checks.find((c) => c.metric === "auc_pr");
+
+  return (
+    <div
+      className={[
+        "flex flex-col gap-3 rounded-xl border p-4 transition-colors",
+        isActive
+          ? "border-emerald-200 bg-emerald-50/60"
+          : "border-amber-200 bg-amber-50/40",
+      ].join(" ")}
+    >
+      {/* Header row */}
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex items-center gap-2.5">
+          <div
+            className={[
+              "flex h-8 w-8 shrink-0 items-center justify-center rounded-lg",
+              isActive ? "bg-emerald-500/12" : "bg-amber-500/12",
+            ].join(" ")}
+          >
+            {isActive
+              ? <Zap className="h-4 w-4 text-emerald-600" />
+              : <MoonStar className="h-4 w-4 text-amber-600" />
+            }
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold capitalize text-slate-900">
+                {m.model_name}
+              </span>
+              <Badge
+                variant="outline"
+                className={[
+                  "text-[10px] font-semibold",
+                  isActive
+                    ? "border-emerald-300 bg-emerald-50 text-emerald-700"
+                    : "border-amber-300 bg-amber-50 text-amber-700",
+                ].join(" ")}
+              >
+                {isActive ? "LIVE" : "DORMANT"}
+              </Badge>
+            </div>
+            <span className="text-[11px] text-slate-400">{m.model_version}</span>
+          </div>
+        </div>
+
+        {/* Weight pill */}
+        <div className="text-right">
+          <div className={[
+            "text-lg font-bold tabular-nums",
+            isActive ? "text-emerald-700" : "text-slate-400",
+          ].join(" ")}>
+            {(m.effective_weight * 100).toFixed(0)}%
+          </div>
+          <div className="text-[10px] uppercase tracking-wide text-slate-400">weight</div>
+          {/* A5 training-time recommendation — shown when it differs from effective_weight */}
+          {m.training_weight != null && Math.abs(m.training_weight - m.effective_weight) > 0.001 && (
+            <div
+              className="mt-0.5 text-[10px] text-slate-400"
+              title="A5 optimizer recommendation at training time"
+            >
+              A5: {(m.training_weight * 100).toFixed(0)}%
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Metrics row */}
+      <div className="grid grid-cols-4 gap-2">
+        {(
+          [
+            { label: "AUC-PR",   value: auc  != null ? auc.toFixed(4)             : "—" },
+            { label: "DSR",      value: dsr  != null ? dsr.toFixed(4)             : "—" },
+            { label: "ECE",      value: ece  != null ? ece.toFixed(4)             : "—" },
+            { label: "Accuracy", value: acc  != null ? `${(acc * 100).toFixed(1)}%` : "—" },
+          ] as const
+        ).map(({ label, value }) => (
+          <div key={label} className="rounded-lg bg-white/70 px-2.5 py-1.5 text-center shadow-sm">
+            <div className="text-[10px] font-medium uppercase tracking-wide text-slate-400">{label}</div>
+            <div className="mt-0.5 text-sm font-bold tabular-nums text-slate-800">{value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Dormant: activation gate progress */}
+      {!isActive && aucCheck && (
+        <div className="space-y-1">
+          <div className="flex items-center justify-between text-[11px]">
+            <span className="font-medium text-slate-500">AUC-PR gate to activate</span>
+            <span className={aucCheck.pass ? "font-bold text-emerald-600" : "font-bold text-amber-700"}>
+              {aucCheck.current.toFixed(4)}{" "}
+              <span className="font-normal text-slate-400">
+                / {aucCheck.required.toFixed(2)} ({aucCheck.gap >= 0 ? "+" : ""}{aucCheck.gap.toFixed(4)})
+              </span>
+            </span>
+          </div>
+          <div className="h-1.5 w-full overflow-hidden rounded-full bg-amber-100">
+            <div
+              className={[
+                "h-full rounded-full transition-all",
+                aucCheck.pass ? "bg-emerald-500" : "bg-amber-500",
+              ].join(" ")}
+              style={{ width: `${Math.min((aucCheck.current / aucCheck.required) * 100, 100).toFixed(1)}%` }}
+            />
+          </div>
+          <p className="text-[10px] text-slate-400">
+            Retrain with more data to close the gap.
+            When gate passes, set <code className="rounded bg-slate-100 px-1 font-mono text-slate-600">is_active=true</code> to enable full ensemble.
+          </p>
+        </div>
+      )}
+
+      {/* Ensemble non-accretive notice — explains why training_weight may show 0% */}
+      {!isActive && m.is_ensemble_accretive === false && (
+        <div className="flex items-start gap-1.5 rounded-lg border border-amber-200 bg-amber-50/70 px-2.5 py-2 text-[11px] text-amber-700">
+          <AlertTriangle className="mt-px h-3.5 w-3.5 shrink-0" />
+          <span>
+            <strong>Not accretive at training time</strong> — the A5 optimizer found this model did not
+            improve the ensemble blend (standalone {m.model_name.toUpperCase()} outperformed every combination).
+            The blending recommendation was weight&nbsp;0%. Effective serving weight is determined by active
+            membership, not this recommendation.
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function EnsembleStatusCard({ className }: { className?: string }) {
+  const { data, isLoading } = useEnsembleStatus();
+
+  const modeLabel =
+    data?.mode === "full_ensemble"  ? "Full Ensemble (XGBoost + GRU)" :
+    data?.mode === "xgboost_only"   ? "XGBoost-Only  ·  GRU Dormant"  :
+                                      "Degraded";
+
+  const modeBadgeClass =
+    data?.mode === "full_ensemble" ? "bg-emerald-500/10 text-emerald-700 border-emerald-400/30" :
+    data?.mode === "xgboost_only"  ? "bg-amber-500/10  text-amber-700  border-amber-400/30"    :
+                                     "bg-red-500/10    text-red-700    border-red-400/30";
+
+  return (
+    <Card className={className}>
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Layers className="h-4 w-4 text-slate-500" />
+            <CardTitle className="text-base font-semibold">Ensemble Composition</CardTitle>
+          </div>
+          {!isLoading && data && (
+            <Badge variant="outline" className={`text-xs font-semibold ${modeBadgeClass}`}>
+              {modeLabel}
+            </Badge>
+          )}
+        </div>
+        <p className="mt-0.5 text-xs text-slate-400">
+          Single-Active-Member Ensemble — production-tier members, active and dormant.
+        </p>
+      </CardHeader>
+
+      <CardContent className="pt-0">
+        {isLoading ? (
+          <div className="flex items-center justify-center py-8">
+            <RefreshCw className="h-5 w-5 animate-spin text-slate-300" />
+          </div>
+        ) : !data || data.members.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-8 text-center">
+            <Brain className="mb-2 h-6 w-6 text-slate-300" />
+            <p className="text-sm text-slate-400">No production-tier models registered.</p>
+          </div>
+        ) : (
+          <div className="grid gap-3 sm:grid-cols-2">
+            {data.members.map((m) => (
+              <MemberRow key={m.model_name} m={m} />
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 // ── Main component ────────────────────────────────────────────────────────────
 
 export function MLModelsPanel({ className, isAdmin = false }: MLModelsPanelProps) {
   const { success, error: toastError } = useToast();
 
-  const [activeTab,    setActiveTab]    = React.useState<string>(ModelState.LIVE);
+  const [activeTab,    setActiveTab]    = React.useState<string>("all");
   const [selectedModel, setSelectedModel] = React.useState<MLModel | null>(null);
   const [targetState,  setTargetState]  = React.useState<ModelState | null>(null);
   const [driftTarget,  setDriftTarget]  = React.useState<number | null>(null);

@@ -2,40 +2,76 @@
 Paper Trading — P&L Recompute Worker
 ======================================
 Background task that bridges the Upstox market feed tick stream into the
-paper trading subsystem:
+paper trading subsystem.
 
-  1. Subscribes to `cai:market-feed:ltpc` Redis pub/sub (same channel that
-     MarketFeedService publishes to after protobuf decoding + throttling).
+Architecture
+------------
+Four concurrent asyncio tasks run within a supervised lifecycle:
 
-  2. Writes each LTP into `cai:ltp:{instrument_key}` (simple string key,
-     TTL 5 min so stale prices auto-expire).
+  Tick Listener  (``_tick_listener``)
+    Subscribes to ``cai:market-feed:ltpc`` via ``pubsub.listen()`` — a true
+    blocking async generator backed by a real socket read.  No polling, no
+    sleep loops.  For each tick it:
+      1. Writes LTP to ``cai:ltp:{instrument_key}`` (5-min TTL).
+      2. Resolves affected portfolio_ids through a 60 s Redis hash cache
+         (falls back to DB on miss).
+      3. Enqueues each portfolio_id into a bounded ``asyncio.Queue``.
 
-  3. Maintains a `cai:paper:dirty_portfolios` Redis set: when an LTP arrives
-     for an instrument that has an open paper position, the portfolio_id is
-     added to the dirty set.
+  Recompute Loop  (``_recompute_loop``)
+    Blocks on ``queue.get()`` — wakes the instant any portfolio is dirtied.
+    Drains remaining queue items without blocking to deduplicate: a burst of
+    ticks for N positions in the same portfolio produces exactly one DB
+    round-trip.  For each unique portfolio it:
+      a. Fetches all OPEN positions from DB.
+      b. Reads LTPs from Redis, recomputes unrealized P&L.
+      c. Checks SL / TP1 / TP2 / TP3 breach conditions.
+      d. Auto-closes breached positions (calls position_service).
+      e. Publishes a ``LivePnLUpdate`` frame to
+         ``cai:paper:pnl:{portfolio_id}``.
 
-  4. Every 500 ms, drains the dirty set and for each dirty portfolio:
-       a. Fetches all OPEN positions from DB
-       b. Recomputes unrealized P&L using cached LTPs
-       c. Checks SL and TP1/TP2/TP3 breach conditions
-       d. Auto-closes breached positions (calls position_service)
-       e. Publishes a LivePnLUpdate frame to `cai:paper:pnl:{portfolio_id}`
+  Post-Close Monitor Loop  (``_post_close_monitor_loop``)
+    Subscribes independently to the market feed.  For each tick it checks
+    whether any post-close counterfactual monitor is active for the instrument
+    and, if so, evaluates it.  A 60 s sweep handles monitors that expire
+    between ticks.
 
-Architecture notes:
-  - The worker runs as a single asyncio task, started at app startup.
-  - It uses the WorkerSessionLocal (dedicated DB connection pool, isolated
-    from the API pool) so long DB operations do not starve API requests.
-  - Each 500 ms tick is a short burst of I/O; the task sleeps between ticks.
-  - If the worker loop throws an unhandled exception it logs and restarts
-    after a 5-second back-off to avoid log spam.
+  Pending-Order Matching Engine  (``_pending_order_match_loop``)
+    Subscribes to the market feed AND to ``cai:paper:pending_orders_updated``
+    for cache invalidation.  Maintains an in-memory dict keyed by
+    instrument_key mapping to lists of pending order slots.  For each tick:
+      a. Evaluates ``_limit_condition_met()`` for every cached order.
+      b. Fills matched orders via ``execute_pending_order_fill()`` under a
+         ``SELECT FOR UPDATE SKIP LOCKED`` guard to prevent double-fill.
+      c. Publishes ``order_filled`` / ``order_expired`` WS events to
+         ``cai:paper:pnl:{portfolio_id}``.
+    A 60 s sweep expires DAY orders past 15:30 IST (10:00 UTC).
+
+This replaces the former 500 ms clock-gate.  Latency from a market tick to
+a browser WS frame is now bounded only by the DB query (~5–20 ms) rather
+than the artificial 500 ms recompute interval.
+
+Concurrency notes
+-----------------
+- ``WorkerSessionLocal`` is a dedicated DB pool isolated from the API pool;
+  auto-close operations never stall REST request handling.
+- The queue is bounded (``_QUEUE_MAX_SIZE``) to prevent unbounded memory
+  growth under heavy tick loads.  Overflow drops the oldest stale entry
+  because the LTP cache always reflects the latest price.
+- If any inner task exits for any reason, the supervisor cancels all others
+  and restarts after a 5 s back-off.
+- The matching engine uses ``SKIP LOCKED`` on PaperOrder rows so two worker
+  processes (e.g. rolling deploy) never double-fill the same order.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, time, timezone
 from decimal import Decimal
+from time import monotonic
+from typing import Any
 from uuid import UUID
 
 from redis.asyncio import Redis
@@ -47,29 +83,56 @@ from app.core.redis import RedisChannels
 logger = logging.getLogger(__name__)
 
 # ── Redis key constants ────────────────────────────────────────────────────────
-_LTP_KEY_PREFIX = "cai:ltp:"
-_LTP_TTL_SECONDS = 300          # 5-minute TTL — stale if no tick for 5 min
-_DIRTY_SET_KEY = "cai:paper:dirty_portfolios"
-_PNL_CHANNEL_PREFIX = "cai:paper:pnl:"
+_LTP_KEY_PREFIX        = "cai:ltp:"
+_LTP_TTL_SECONDS       = 300   # 5-min TTL; stale price auto-expires
+_PNL_CHANNEL_PREFIX    = "cai:paper:pnl:"
 
-# ── Symbol → portfolio mapping key (HSET: symbol → JSON list of portfolio_ids)
+# ── Symbol → portfolio mapping cache (HSET: instrument_key → JSON list[str])
 _SYMBOL_PORTFOLIOS_KEY = "cai:paper:symbol_portfolios"
-_SYMBOL_PORTFOLIOS_TTL = 60     # Rebuild every 60 s
+_SYMBOL_PORTFOLIOS_TTL = 60    # seconds before DB re-query
 
-# Tick interval
-_RECOMPUTE_INTERVAL_MS = 500
+# ── Queue sizing ───────────────────────────────────────────────────────────────
+_QUEUE_MAX_SIZE        = 256   # drops oldest on overflow; latest LTP wins
+
+# ── Matching engine constants ──────────────────────────────────────────────────
+# DAY orders expire at NSE market close: 15:30 IST = 10:00 UTC.
+_NSE_CLOSE_UTC         = time(10, 0, 0)
+# Sweep expired DAY orders every 60 s; also catches post-market no-tick periods.
+_DAY_EXPIRY_SWEEP_S    = 60.0
+
 _ZERO = Decimal("0")
 
 
+# ── In-memory pending order slot ───────────────────────────────────────────────
+
+@dataclass(slots=True)
+class _PendingOrderSlot:
+    """
+    Lightweight in-memory representation of a pending LIMIT/SL/SL-M order.
+
+    Holds the minimum fields needed for the hot-path condition check in
+    ``_check_and_fill_pending_orders``.  The full ``PaperOrder`` ORM row is
+    loaded from the DB inside the fill transaction — this slot only decides
+    *whether* to attempt a fill.
+    """
+    order_id:         UUID
+    portfolio_id:     UUID
+    transaction_type: str   # "BUY" | "SELL"
+    order_type:       str   # "LIMIT" | "SL" | "SL-M"
+    validity:         str   # "DAY" | "IOC" (IOC never sits in cache, but guarded)
+    price:            Decimal | None
+    trigger_price:    Decimal | None
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Worker entry-point
+# Worker entry-point (supervisor)
 # ──────────────────────────────────────────────────────────────────────────────
 
 async def run_pnl_worker(redis: Redis) -> None:
     """
-    Main worker coroutine — run with asyncio.create_task at app startup.
+    Supervisor coroutine — started with asyncio.create_task at app lifespan.
 
-    Runs forever; catches and logs exceptions with 5-second back-off.
+    Restarts the inner loop on any unhandled exception with 5 s back-off.
     """
     logger.info("PnL worker starting")
     while True:
@@ -84,94 +147,131 @@ async def run_pnl_worker(redis: Redis) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Internal — main loop
+# Inner loop — two cooperative tasks under a shared lifecycle
 # ──────────────────────────────────────────────────────────────────────────────
 
 async def _worker_loop(redis: Redis) -> None:
-    """Subscribe to market feed and spin the 500 ms recompute loop."""
+    """
+    Spin up the listener, recompute, post-close monitor, and matching engine.
+    Restarts all four if any one exits unexpectedly.
+    """
+    queue: asyncio.Queue[UUID] = asyncio.Queue(maxsize=_QUEUE_MAX_SIZE)
+
     pubsub = redis.pubsub()
     await pubsub.subscribe(RedisChannels.MARKET_FEED_LTPC)
     logger.info("PnL worker subscribed to %s", RedisChannels.MARKET_FEED_LTPC)
 
-    last_recompute = 0.0
+    listener  = asyncio.create_task(
+        _tick_listener(redis, pubsub, queue), name="pnl-tick-listener"
+    )
+    recompute = asyncio.create_task(
+        _recompute_loop(redis, queue), name="pnl-recompute-loop"
+    )
+    monitor = asyncio.create_task(
+        _post_close_monitor_loop(redis), name="pnl-post-close-monitor"
+    )
+    matcher = asyncio.create_task(
+        _pending_order_match_loop(redis), name="pnl-pending-order-matcher"
+    )
+
+    all_tasks = [listener, recompute, monitor, matcher]
 
     try:
-        while True:
-            # ── Drain all pending tick messages ───────────────────────────────
-            # get_message(timeout=0) is non-blocking; we drain the backlog.
-            while True:
-                message = await pubsub.get_message(
-                    ignore_subscribe_messages=True, timeout=0.0
+        done, _ = await asyncio.wait(
+            all_tasks,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in done:
+            if not task.cancelled() and (exc := task.exception()):
+                logger.error(
+                    "PnL worker inner task %s raised: %s", task.get_name(), exc
                 )
-                if message is None:
-                    break
-                await _handle_tick_message(redis, message)
-
-            # ── 500 ms recompute gate ─────────────────────────────────────────
-            import time
-            now = time.monotonic()
-            if now - last_recompute >= (_RECOMPUTE_INTERVAL_MS / 1000.0):
-                await _recompute_dirty_portfolios(redis)
-                last_recompute = now
-
-            # Yield to event loop for a brief moment before next drain cycle
-            await asyncio.sleep(0.05)
-
     finally:
+        for t in all_tasks:
+            t.cancel()
+        await asyncio.gather(*all_tasks, return_exceptions=True)
         await pubsub.unsubscribe(RedisChannels.MARKET_FEED_LTPC)
         await pubsub.aclose()
 
 
-async def _handle_tick_message(redis: Redis, message: dict) -> None:
+async def _tick_listener(
+    redis: Redis,
+    pubsub: Any,
+    queue: asyncio.Queue[UUID],
+) -> None:
     """
-    Process a single LTPC tick message from the market feed.
+    Forward market-feed ticks to the recompute queue.
 
-    Side-effects:
-      - Writes LTP to `cai:ltp:{instrument_key}` (TTL 5 min)
-      - Adds portfolio_ids with open positions in this instrument to dirty set
+    ``pubsub.listen()`` is a blocking async generator backed by a real socket
+    read — zero CPU overhead while idle, wakes the instant a frame arrives.
     """
-    try:
-        data = json.loads(message["data"])
-    except (json.JSONDecodeError, KeyError):
-        return
+    async for message in pubsub.listen():
+        if message["type"] != "message":
+            continue
 
-    instrument_key = data.get("instrument_key")
-    ltp = data.get("ltp")
-    if instrument_key is None or ltp is None:
-        return
+        raw = message["data"]
+        if isinstance(raw, bytes):
+            raw = raw.decode()
 
-    # Write LTP cache
-    await redis.set(f"{_LTP_KEY_PREFIX}{instrument_key}", str(ltp), ex=_LTP_TTL_SECONDS)
-
-    # Mark portfolios dirty
-    portfolio_ids = await _get_portfolios_for_instrument(redis, instrument_key)
-    if portfolio_ids:
-        await redis.sadd(_DIRTY_SET_KEY, *[str(p) for p in portfolio_ids])
-
-
-async def _recompute_dirty_portfolios(redis: Redis) -> None:
-    """
-    Drain the dirty set and recompute P&L for each portfolio.
-
-    Uses SMEMBERS + DEL (atomic enough for this use case — missed portfolio_ids
-    will be re-added on the next tick, so no correctness issue from races).
-    """
-    portfolio_ids_raw = await redis.smembers(_DIRTY_SET_KEY)
-    if not portfolio_ids_raw:
-        return
-
-    # Clear the dirty set immediately so new ticks can re-add
-    await redis.delete(_DIRTY_SET_KEY)
-
-    for raw in portfolio_ids_raw:
-        portfolio_id_str = raw if isinstance(raw, str) else raw.decode()
         try:
-            portfolio_id = UUID(portfolio_id_str)
-            await _recompute_portfolio_pnl(redis, portfolio_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "PnL recompute failed for portfolio %s: %s", portfolio_id_str, exc
-            )
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+
+        instrument_key = data.get("instrument_key")
+        ltp            = data.get("ltp")
+        if instrument_key is None or ltp is None:
+            continue
+
+        # Persist LTP for the recompute task (and any other consumers)
+        await redis.set(
+            f"{_LTP_KEY_PREFIX}{instrument_key}", str(ltp), ex=_LTP_TTL_SECONDS
+        )
+
+        # Resolve portfolios with an open position in this instrument
+        portfolio_ids = await _get_portfolios_for_instrument(redis, instrument_key)
+        for pid in portfolio_ids:
+            try:
+                queue.put_nowait(pid)
+            except asyncio.QueueFull:
+                # Queue saturated — drop the oldest stale entry to make room.
+                # The LTP cache already reflects the latest price so correctness
+                # is preserved; we never drop a portfolio, only deduplicate.
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                queue.put_nowait(pid)
+
+
+async def _recompute_loop(redis: Redis, queue: asyncio.Queue[UUID]) -> None:
+    """
+    Coalescing recompute loop — event-driven, zero artificial delay.
+
+    Blocks on the first queue item then drains all remaining without blocking,
+    deduplicating into a set.  A burst of ticks for N positions in the same
+    portfolio triggers exactly one DB round-trip.
+    """
+    while True:
+        # Block until at least one portfolio needs recomputing
+        first = await queue.get()
+        dirty: set[UUID] = {first}
+
+        # Non-blocking drain: coalesce any additional items queued concurrently
+        try:
+            while True:
+                dirty.add(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            pass
+
+        # Recompute each unique dirty portfolio immediately
+        for portfolio_id in dirty:
+            try:
+                await _recompute_portfolio_pnl(redis, portfolio_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "PnL recompute failed for portfolio %s: %s", portfolio_id, exc
+                )
 
 
 async def _recompute_portfolio_pnl(redis: Redis, portfolio_id: UUID) -> None:
@@ -259,14 +359,12 @@ async def _recompute_portfolio_pnl(redis: Redis, portfolio_id: UUID) -> None:
         await session.commit()
 
     # ── Compute total realized from cumulative outcomes ────────────────────────
-    # Simple: re-read from the outcome aggregate (cheap, single query)
-    from app.services.paper_trading.outcome_service import _ZERO as Z
     from app.models.paper_trading import PaperTradeOutcome
     from sqlalchemy import func
 
     async with WorkerSessionLocal() as session2:
         agg = await session2.execute(
-            select(func.coalesce(func.sum(PaperTradeOutcome.net_pnl), Z).label("total_net"))
+            select(func.coalesce(func.sum(PaperTradeOutcome.net_pnl), _ZERO).label("total_net"))
             .where(PaperTradeOutcome.portfolio_id == portfolio_id)
         )
         total_realized_pnl = Decimal(str(agg.scalar_one() or _ZERO))
@@ -439,7 +537,7 @@ async def _auto_close_position(
         float(exit_price), fill.fill_quantity,
     )
 
-    # Schedule ML feedback computation
+    # Schedule ML feedback computation and post-close monitoring (fire-and-forget)
     from app.models.paper_trading import PaperTradeOutcome
     outcome_stmt = (
         select(PaperTradeOutcome)
@@ -455,6 +553,26 @@ async def _auto_close_position(
                 outcome.user_id,
             ),
             name=f"ml_feedback_{outcome.id}",
+        )
+        asyncio.create_task(
+            _schedule_post_close_monitor_deferred(
+                redis=redis,
+                user_id=portfolio.user_id,
+                outcome_id=outcome.id,
+                position_id=position.id,
+                portfolio_id=portfolio.id,
+                instrument_key=position.instrument_key,
+                symbol=position.symbol,
+                direction=position.side,
+                close_reason=exit_reason,
+                close_price=exit_price,
+                entry_price=position.avg_cost_price,
+                stop_loss=position.stop_loss,
+                target_price_1=position.target_price_1,
+                target_price_2=position.target_price_2,
+                target_price_3=position.target_price_3,
+            ),
+            name=f"pcm_schedule_{position.id}",
         )
 
 
@@ -548,3 +666,570 @@ async def invalidate_symbol_cache(redis: Redis, instrument_key: str) -> None:
     next tick rebuild picks up the change.
     """
     await redis.hdel(_SYMBOL_PORTFOLIOS_KEY, instrument_key)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Post-close monitoring
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _schedule_post_close_monitor_deferred(
+    redis: Redis,
+    user_id: int,
+    outcome_id: UUID,
+    position_id: UUID,
+    portfolio_id: UUID,
+    instrument_key: str,
+    symbol: str,
+    direction: str,
+    close_reason: str,
+    close_price: Decimal,
+    entry_price: Decimal,
+    stop_loss: Decimal | None,
+    target_price_1: Decimal | None,
+    target_price_2: Decimal | None,
+    target_price_3: Decimal | None,
+) -> None:
+    """
+    Fire-and-forget wrapper: schedule a PostCloseMonitor after an auto-close.
+
+    Runs as an asyncio task so it never delays the hot auto-close path.
+    All exceptions are caught and logged — monitoring failures must never
+    surface back to the P&L worker.
+    """
+    from app.services.paper_trading.post_close_monitor_service import (
+        schedule_post_close_monitor,
+    )
+
+    try:
+        await schedule_post_close_monitor(
+            redis=redis,
+            user_id=user_id,
+            outcome_id=outcome_id,
+            position_id=position_id,
+            portfolio_id=portfolio_id,
+            instrument_key=instrument_key,
+            symbol=symbol,
+            direction=direction,
+            close_reason=close_reason,
+            close_price=close_price,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            target_price_1=target_price_1,
+            target_price_2=target_price_2,
+            target_price_3=target_price_3,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Post-close monitor scheduling failed: symbol=%s reason=%s: %s",
+            symbol, close_reason, exc,
+        )
+
+
+async def _post_close_monitor_loop(redis: Redis) -> None:
+    """
+    Third supervised task in _worker_loop.
+
+    Subscribes to the same market-feed channel as the tick listener but
+    operates completely independently.  For each tick it performs an O(1)
+    Redis SISMEMBER check; only instruments with active monitors trigger a
+    DB round-trip.
+
+    A 60-second monotonic sweep catches monitors whose window elapsed during
+    periods with no ticks (circuit breaker, post-market, etc.).
+    """
+    from app.services.paper_trading.post_close_monitor_service import (
+        PCM_ACTIVE_INSTRUMENTS_KEY,
+        evaluate_instrument_monitors,
+        sweep_expired_monitors,
+    )
+
+    pubsub = redis.pubsub()
+    await pubsub.subscribe(RedisChannels.MARKET_FEED_LTPC)
+    logger.info("Post-close monitor loop started")
+
+    # Startup sweep — recover any monitors that expired while the server was down
+    try:
+        await sweep_expired_monitors(redis)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Post-close monitor startup sweep failed: %s", exc)
+
+    _SWEEP_INTERVAL_S = 60.0
+    last_sweep_mono = monotonic()
+
+    try:
+        async for message in pubsub.listen():
+            if message["type"] != "message":
+                continue
+
+            raw = message["data"]
+            if isinstance(raw, bytes):
+                raw = raw.decode()
+
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            instrument_key = data.get("instrument_key")
+            ltp = data.get("ltp")
+            if instrument_key is None or ltp is None:
+                continue
+
+            # Fast-path: only touch DB when this instrument has active monitors
+            if await redis.sismember(PCM_ACTIVE_INSTRUMENTS_KEY, instrument_key):
+                try:
+                    await evaluate_instrument_monitors(
+                        redis=redis,
+                        instrument_key=instrument_key,
+                        ltp=Decimal(str(ltp)),
+                        now=datetime.now(timezone.utc),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Post-close monitor eval failed: instrument=%s: %s",
+                        instrument_key, exc,
+                    )
+
+            # Periodic time-based sweep
+            now_mono = monotonic()
+            if now_mono - last_sweep_mono >= _SWEEP_INTERVAL_S:
+                try:
+                    await sweep_expired_monitors(redis)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Post-close monitor expiry sweep failed: %s", exc)
+                last_sweep_mono = now_mono
+    finally:
+        await pubsub.unsubscribe(RedisChannels.MARKET_FEED_LTPC)
+        await pubsub.aclose()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pending-Order Matching Engine
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _pending_order_match_loop(redis: Redis) -> None:
+    """
+    Fourth supervised task — the LIMIT/SL/SL-M order matching engine.
+
+    Maintains an in-memory ``dict[str, list[_PendingOrderSlot]]`` keyed by
+    instrument_key.  On each market-feed tick it evaluates the price condition
+    for all cached orders for that instrument and attempts fills.
+
+    Cache invalidation is driven by ``cai:paper:pending_orders_updated``
+    messages published by the API layer whenever an order is placed, cancelled,
+    or filled.  This keeps the cache accurate without a full DB scan per tick.
+
+    A 60-second sweep expires any DAY orders past 15:30 IST (10:00 UTC).
+
+    Concurrency safety
+    ------------------
+    ``_fill_pending_order()`` uses ``SELECT PaperOrder FOR UPDATE SKIP LOCKED``
+    so that if two worker processes race, only one wins the lock; the other
+    skips the already-locked row silently.
+    """
+    # In-memory cache: instrument_key → list of pending slots
+    pending: dict[str, list[_PendingOrderSlot]] = {}
+    last_expiry_sweep_mono = monotonic()
+
+    # Two independent pub/sub subscriptions in one connection
+    pubsub = redis.pubsub()
+    await pubsub.subscribe(
+        RedisChannels.MARKET_FEED_LTPC,
+        RedisChannels.PAPER_PENDING_ORDERS_UPDATED,
+    )
+    logger.info("Pending-order matching engine started")
+
+    # Warm the cache from DB at startup
+    try:
+        pending = await _rebuild_full_pending_cache()
+        logger.info(
+            "Pending-order cache warmed: %d instrument(s) with open orders",
+            len(pending),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Pending-order cache warm failed — starting empty: %s", exc)
+
+    try:
+        async for message in pubsub.listen():
+            if message["type"] != "message":
+                continue
+
+            raw = message["data"]
+            if isinstance(raw, bytes):
+                raw = raw.decode()
+
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            channel = message.get("channel", "")
+            if isinstance(channel, bytes):
+                channel = channel.decode()
+
+            # ── Cache invalidation message ─────────────────────────────────────
+            if channel == RedisChannels.PAPER_PENDING_ORDERS_UPDATED:
+                instrument_key = data.get("instrument_key")
+                try:
+                    if instrument_key:
+                        slots = await _rebuild_cache_for_instrument(instrument_key)
+                        if slots:
+                            pending[instrument_key] = slots
+                        else:
+                            pending.pop(instrument_key, None)
+                    else:
+                        # Full rebuild requested (e.g. admin recovery)
+                        pending = await _rebuild_full_pending_cache()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Pending cache rebuild failed for instrument=%s: %s",
+                        instrument_key, exc,
+                    )
+                continue
+
+            # ── Market tick ───────────────────────────────────────────────────
+            if channel != RedisChannels.MARKET_FEED_LTPC:
+                continue
+
+            instrument_key = data.get("instrument_key")
+            ltp_raw = data.get("ltp")
+            if instrument_key is None or ltp_raw is None:
+                continue
+
+            slots = pending.get(instrument_key)
+            if not slots:
+                continue  # no pending orders for this instrument — fast path
+
+            ltp = Decimal(str(ltp_raw))
+            filled_ids, expired_ids = await _check_and_fill_pending_orders(
+                redis=redis,
+                instrument_key=instrument_key,
+                slots=slots,
+                ltp=ltp,
+            )
+
+            # Prune filled/rejected/expired slots from the in-memory cache.
+            # ``_rebuild_cache_for_instrument`` re-queries the DB; pruning
+            # the matched IDs inline avoids a DB round-trip per tick.
+            consumed = filled_ids | expired_ids
+            if consumed:
+                pending[instrument_key] = [
+                    s for s in slots if s.order_id not in consumed
+                ]
+                if not pending[instrument_key]:
+                    del pending[instrument_key]
+
+            # ── DAY expiry sweep ──────────────────────────────────────────────
+            now_mono = monotonic()
+            if now_mono - last_expiry_sweep_mono >= _DAY_EXPIRY_SWEEP_S:
+                try:
+                    expired_count = await _expire_day_orders(redis, pending)
+                    if expired_count:
+                        logger.info(
+                            "DAY order expiry sweep: %d order(s) expired", expired_count
+                        )
+                    # Rebuild cache after expiry to reflect DB state
+                    if expired_count:
+                        pending = await _rebuild_full_pending_cache()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("DAY order expiry sweep failed: %s", exc)
+                last_expiry_sweep_mono = now_mono
+
+    finally:
+        await pubsub.unsubscribe(
+            RedisChannels.MARKET_FEED_LTPC,
+            RedisChannels.PAPER_PENDING_ORDERS_UPDATED,
+        )
+        await pubsub.aclose()
+
+
+async def _rebuild_full_pending_cache() -> dict[str, list[_PendingOrderSlot]]:
+    """
+    Query all OPEN LIMIT/SL/SL-M orders from the DB and build the cache.
+
+    Called at startup and after a full-cache invalidation message.
+    """
+    from app.models.paper_trading import PaperOrder
+
+    cache: dict[str, list[_PendingOrderSlot]] = {}
+
+    async with WorkerSessionLocal() as session:
+        stmt = (
+            select(PaperOrder)
+            .where(
+                PaperOrder.status == "OPEN",
+                PaperOrder.order_type.in_(["LIMIT", "SL", "SL-M"]),
+            )
+        )
+        rows = list((await session.execute(stmt)).scalars().all())
+
+    for order in rows:
+        slot = _PendingOrderSlot(
+            order_id=order.id,
+            portfolio_id=order.portfolio_id,
+            transaction_type=order.transaction_type,
+            order_type=order.order_type,
+            validity=order.validity,
+            price=order.price,
+            trigger_price=order.trigger_price,
+        )
+        cache.setdefault(order.instrument_key, []).append(slot)
+
+    return cache
+
+
+async def _rebuild_cache_for_instrument(
+    instrument_key: str,
+) -> list[_PendingOrderSlot]:
+    """
+    Re-query OPEN pending orders for a single instrument.
+
+    Called on targeted invalidation messages (place/cancel/fill events).
+    """
+    from app.models.paper_trading import PaperOrder
+
+    async with WorkerSessionLocal() as session:
+        stmt = (
+            select(PaperOrder)
+            .where(
+                PaperOrder.instrument_key == instrument_key,
+                PaperOrder.status == "OPEN",
+                PaperOrder.order_type.in_(["LIMIT", "SL", "SL-M"]),
+            )
+        )
+        rows = list((await session.execute(stmt)).scalars().all())
+
+    return [
+        _PendingOrderSlot(
+            order_id=order.id,
+            portfolio_id=order.portfolio_id,
+            transaction_type=order.transaction_type,
+            order_type=order.order_type,
+            validity=order.validity,
+            price=order.price,
+            trigger_price=order.trigger_price,
+        )
+        for order in rows
+    ]
+
+
+def _slot_condition_met(slot: _PendingOrderSlot, ltp: Decimal) -> bool:
+    """
+    Return True when ltp satisfies the slot's price condition.
+
+    Mirrors ``order_service._limit_condition_met`` but operates on the
+    lightweight in-memory slot instead of the full ORM object.
+
+    Conditions:
+      BUY  LIMIT  : ltp <= limit_price   (market fell to our bid)
+      SELL LIMIT  : ltp >= limit_price   (market rose to our ask)
+      BUY  SL/SL-M: ltp >= trigger_price (stop triggered — market ran up)
+      SELL SL/SL-M: ltp <= trigger_price (stop triggered — market fell)
+    """
+    if slot.order_type == "LIMIT":
+        ref = slot.price
+        if ref is None:
+            return False
+        return ltp <= ref if slot.transaction_type == "BUY" else ltp >= ref
+
+    # SL or SL-M
+    ref = slot.trigger_price
+    if ref is None:
+        return False
+    return ltp >= ref if slot.transaction_type == "BUY" else ltp <= ref
+
+
+async def _check_and_fill_pending_orders(
+    redis: Redis,
+    instrument_key: str,
+    slots: list[_PendingOrderSlot],
+    ltp: Decimal,
+) -> tuple[set[UUID], set[UUID]]:
+    """
+    Evaluate all cached slots for ``instrument_key`` against the current LTP.
+
+    For each slot whose price condition is met, attempt a fill via
+    ``_fill_pending_order``.  Returns two sets:
+      - filled_ids: order_ids successfully filled (or rejected at fill time)
+      - expired_ids: order_ids that should have expired (empty here; handled by sweep)
+
+    Each fill is attempted in its own DB session so a single failure does not
+    roll back other fills in the same tick.
+    """
+    filled_ids: set[UUID] = set()
+    expired_ids: set[UUID] = set()
+
+    for slot in slots:
+        if not _slot_condition_met(slot, ltp):
+            continue
+
+        try:
+            await _fill_pending_order(redis, slot, ltp)
+            filled_ids.add(slot.order_id)
+        except Exception as exc:  # noqa: BLE001
+            # Log and record as filled (so we stop retrying) only if it's a
+            # permanent rejection (position limit, insufficient funds).
+            # Transient DB errors leave the slot in place for the next tick.
+            exc_name = type(exc).__name__
+            if exc_name in ("PositionLimitExceededError", "InsufficientFundsError"):
+                logger.info(
+                    "Pending order %s permanently rejected at fill: %s",
+                    slot.order_id, exc,
+                )
+                filled_ids.add(slot.order_id)
+            else:
+                logger.warning(
+                    "Pending order fill attempt failed (will retry): order=%s ltp=%.4f: %s",
+                    slot.order_id, float(ltp), exc,
+                )
+
+    return filled_ids, expired_ids
+
+
+async def _fill_pending_order(
+    redis: Redis,
+    slot: _PendingOrderSlot,
+    ltp: Decimal,
+) -> None:
+    """
+    Attempt to fill a single pending order under a ``SELECT FOR UPDATE SKIP LOCKED``
+    guard to prevent double-fill in multi-worker deployments.
+
+    If the row is already locked by another worker, this call returns silently
+    — the other worker will complete the fill.
+
+    On success, publishes an ``order_filled`` WS event to the portfolio's
+    ``cai:paper:pnl:{portfolio_id}`` channel so the browser updates instantly.
+    """
+    from app.models.paper_trading import PaperOrder
+    from app.services.paper_trading.order_service import (
+        _fill_price_for_order,
+        execute_pending_order_fill,
+    )
+
+    async with WorkerSessionLocal() as session:
+        # Acquire a SKIP LOCKED row lock — if another worker has this row
+        # locked, ``scalar_one_or_none`` returns None and we bail out.
+        stmt = (
+            select(PaperOrder)
+            .where(
+                PaperOrder.id == slot.order_id,
+                PaperOrder.status == "OPEN",
+            )
+            .with_for_update(skip_locked=True)
+        )
+        order = (await session.execute(stmt)).scalar_one_or_none()
+        if order is None:
+            # Already locked or filled by a concurrent worker — nothing to do.
+            return
+
+        fill_price = _fill_price_for_order(order, ltp)
+
+        try:
+            fill = await execute_pending_order_fill(
+                session=session,
+                redis=redis,
+                order=order,
+                fill_price=fill_price,
+            )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+    # ── Publish order_filled WS event ─────────────────────────────────────────
+    event = json.dumps({
+        "type": "order_filled",
+        "order_id": str(order.id),
+        "portfolio_id": str(order.portfolio_id),
+        "symbol": order.symbol,
+        "transaction_type": order.transaction_type,
+        "fill_price": float(fill_price),
+        "quantity": order.quantity,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    })
+    channel = f"{_PNL_CHANNEL_PREFIX}{order.portfolio_id}"
+    await redis.publish(channel, event)
+
+    logger.info(
+        "Pending order filled: order=%s symbol=%s tx=%s qty=%d price=%.4f",
+        order.id, order.symbol, order.transaction_type,
+        order.quantity, float(fill_price),
+    )
+
+
+async def _expire_day_orders(
+    redis: Redis,
+    pending: dict[str, list[_PendingOrderSlot]],
+) -> int:
+    """
+    Expire all OPEN DAY orders past 15:30 IST (10:00 UTC).
+
+    Iterates the in-memory cache to avoid a full table scan; only order_ids
+    present in the cache are eligible.  DB update uses ``status='CANCELLED'``
+    with a ``rejection_reason`` to preserve audit trail.
+
+    Returns the number of orders expired.
+    """
+    from app.models.paper_trading import PaperOrder
+    from app.services.paper_trading.portfolio_service import release_cash_reservation
+    from app.services.paper_trading.order_service import _compute_reservation_amount
+
+    now_utc = datetime.now(timezone.utc)
+    if now_utc.time() < _NSE_CLOSE_UTC:
+        return 0  # Market still open — nothing to expire
+
+    # Collect all DAY order IDs from the cache
+    day_order_ids: list[UUID] = [
+        slot.order_id
+        for slots in pending.values()
+        for slot in slots
+        if slot.validity == "DAY"
+    ]
+    if not day_order_ids:
+        return 0
+
+    expired_count = 0
+
+    async with WorkerSessionLocal() as session:
+        stmt = (
+            select(PaperOrder)
+            .where(
+                PaperOrder.id.in_(day_order_ids),
+                PaperOrder.status == "OPEN",
+            )
+            .with_for_update(skip_locked=True)
+        )
+        orders = list((await session.execute(stmt)).scalars().all())
+
+        for order in orders:
+            # Release cash reservation for BUY orders
+            from app.models.paper_trading import Portfolio
+            portfolio_stmt = select(Portfolio).where(Portfolio.id == order.portfolio_id)
+            portfolio = (await session.execute(portfolio_stmt)).scalar_one_or_none()
+
+            if portfolio is not None:
+                reservation = _compute_reservation_amount(order)
+                if reservation > _ZERO:
+                    await release_cash_reservation(session, portfolio, reservation)
+
+            order.status = "CANCELLED"
+            order.rejection_reason = "DAY order expired at NSE market close (15:30 IST)."
+            order.updated_at = now_utc
+            expired_count += 1
+
+            # Publish order_expired WS event
+            event = json.dumps({
+                "type": "order_expired",
+                "order_id": str(order.id),
+                "portfolio_id": str(order.portfolio_id),
+                "symbol": order.symbol,
+                "ts": now_utc.isoformat(),
+            })
+            await redis.publish(
+                f"{_PNL_CHANNEL_PREFIX}{order.portfolio_id}", event
+            )
+
+        await session.commit()
+
+    return expired_count

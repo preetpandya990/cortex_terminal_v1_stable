@@ -1,0 +1,9 @@
+{
+  "event": "break_glass",
+  "operation": "promote_to_staging",
+  "model_version": "1.1.0_xgboost",
+  "model_name": "1.1.0_xgboost",
+  "reason": "symbol_coverage 65.8% is the hard ceiling of NSE data availability \u2014 not a model deficiency. XGBoost AUC-PR=0.6734 and DSR are above all other gates. Promoting to staging for Single-Active-Member Ensemble deployment.",
+  "timestamp": "2026-05-26T13:15:11.533475+00:00",
+  "audit_sha256": "16b73047371e224843cd52288009fc006dc58865884cf1fd344d926c04880dae"
+}

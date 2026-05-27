@@ -1,0 +1,37 @@
+[Unit]
+Description=Cortex AI — Weekly ML challenger retrain (C1)
+Documentation=file:///home/preet/code/Cortex_Merge_AI-ML/deploy/README.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=preet
+Group=preet
+WorkingDirectory=/home/preet/code/Cortex_Merge_AI-ML/backend
+# Use the venv interpreter directly — no shell activation required.
+ExecStart=/home/preet/code/Cortex_Merge_AI-ML/backend/.venv/bin/python scripts/scheduled_retrain.py --once
+
+# Allow the orchestrator headroom — full training can run for many hours.
+TimeoutStartSec=24h
+
+# Be a polite citizen on a shared dev box: yield CPU + I/O to interactive work.
+Nice=10
+IOSchedulingClass=idle
+CPUSchedulingPolicy=batch
+
+# Capture wrapper + orchestrator output to the systemd journal.
+# (The wrapper also writes a per-run log to logs/scheduled_retrain/ for
+# offline review; the journal is the always-on safety net.)
+StandardOutput=journal
+StandardError=journal
+
+# Hardening — minimal but matches the dev-box reality.  Production-grade
+# sandboxing (PrivateTmp, ProtectHome, etc.) is intentionally omitted
+# because the orchestrator needs read/write access to models/, logs/,
+# and the .scheduled_retrain.lock file in the project tree.
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

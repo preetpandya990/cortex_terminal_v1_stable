@@ -62,6 +62,8 @@ from app.services.paper_trading.portfolio_service import (
     credit_cash,
     deduct_cash,
     get_active_portfolio,
+    release_cash_reservation,
+    reserve_cash,
 )
 
 logger = logging.getLogger(__name__)
@@ -187,13 +189,16 @@ async def cancel_order(
     """
     Cancel a PENDING or OPEN paper order.
 
+    For LIMIT/SL/SL-M BUY orders that held a cash reservation, the
+    reservation is released back to available cash atomically within
+    this call's transaction.
+
     Raises
     ------
     OrderNotFoundError  If the order does not exist or belongs to another user.
     ForbiddenError      If the order belongs to a different portfolio/user.
     InvalidOrderError   If the order is already terminal (COMPLETE/REJECTED/CANCELLED).
     """
-    # Load order with portfolio to verify ownership
     stmt = (
         select(PaperOrder)
         .join(Portfolio, PaperOrder.portfolio_id == Portfolio.id)
@@ -205,7 +210,6 @@ async def cancel_order(
     if order is None:
         raise OrderNotFoundError(f"Order {order_id} not found.")
 
-    # Ownership check via the portfolio's user_id
     portfolio_stmt = select(Portfolio).where(Portfolio.id == order.portfolio_id)
     portfolio = (await session.execute(portfolio_stmt)).scalar_one_or_none()
     if portfolio is None or portfolio.user_id != user_id:
@@ -219,8 +223,17 @@ async def cancel_order(
     order.status = "CANCELLED"
     order.updated_at = datetime.now(timezone.utc)
     await session.flush()
-    await session.refresh(order)
 
+    # Release cash reservation for pending LIMIT/SL/SL-M BUY orders.
+    if (
+        order.transaction_type == "BUY"
+        and order.order_type in ("LIMIT", "SL", "SL-M")
+    ):
+        reservation = _compute_reservation_amount(order)
+        if reservation > _ZERO:
+            await release_cash_reservation(session, portfolio, reservation)
+
+    await session.refresh(order)
     logger.info("Order cancelled: id=%s user_id=%d", order_id, user_id)
     return order
 
@@ -236,7 +249,18 @@ async def _place_buy_order(
     ctx: _TradeContext,
     payload: PlaceOrderRequest,
 ) -> tuple[PaperOrder, PaperFill | None]:
-    """Validate and execute a BUY order."""
+    """
+    Validate and execute a BUY order.
+
+    MARKET orders fill immediately against LTP ± slippage.
+
+    LIMIT / SL / SL-M orders are written as OPEN and a cash reservation
+    is placed (reserved_cash += price × qty).  For IOC validity, the order
+    is checked against the current LTP immediately:
+      - Fillable at LTP → fill now, release reservation.
+      - Not fillable    → cancel immediately, release reservation.
+    DAY-validity orders remain OPEN until the pnl_worker matches them.
+    """
     # ── Position limit check ──────────────────────────────────────────────────
     open_count = await _count_open_positions(session, portfolio.id)
     if open_count >= portfolio.max_open_positions:
@@ -245,15 +269,20 @@ async def _place_buy_order(
             "Close an existing position before opening a new one."
         )
 
-    # ── Funds pre-flight ──────────────────────────────────────────────────────
+    # ── Funds pre-flight (against available cash) ─────────────────────────────
+    # available_cash = current_cash − reserved_cash; this prevents placing
+    # multiple pending orders that collectively exceed the portfolio balance.
     ref_price = ctx.entry_price or _ZERO
     if ref_price <= _ZERO:
         ref_price = Decimal(str(payload.price)) if payload.price else _ZERO
     estimated_cost = ref_price * Decimal(payload.quantity)
-    if estimated_cost > portfolio.current_cash:
+    available_cash = portfolio.current_cash - portfolio.reserved_cash
+    if estimated_cost > available_cash:
         raise InsufficientFundsError(
             f"Estimated cost ₹{float(estimated_cost):,.2f} exceeds "
-            f"available cash ₹{float(portfolio.current_cash):,.2f}."
+            f"available cash ₹{float(available_cash):,.2f} "
+            f"(total: ₹{float(portfolio.current_cash):,.2f}, "
+            f"reserved: ₹{float(portfolio.reserved_cash):,.2f})."
         )
 
     order = _build_order(portfolio.id, ctx, payload)
@@ -261,11 +290,22 @@ async def _place_buy_order(
     await session.flush()
 
     fill: PaperFill | None = None
+
     if payload.order_type.value == "MARKET":
         fill = await _execute_fill(session, redis, portfolio, order, ctx, payload.quantity)
         order.status = "COMPLETE"
+
     else:
-        order.status = "OPEN"
+        # LIMIT / SL / SL-M — reserve cash and handle validity
+        reservation = _compute_reservation_amount(order)
+        if reservation > _ZERO:
+            await reserve_cash(session, portfolio, reservation)
+
+        if payload.validity.value == "IOC":
+            fill = await _handle_ioc_order(session, redis, portfolio, order, ctx, reservation)
+        else:
+            # DAY — leave as OPEN for the matching engine
+            order.status = "OPEN"
 
     order.updated_at = datetime.now(timezone.utc)
     await session.flush()
@@ -319,7 +359,14 @@ async def _place_sell_order(
             close_position=open_pos,
         )
         order.status = "COMPLETE"
+    elif payload.validity.value == "IOC":
+        # LIMIT SELL IOC: fill immediately if LTP satisfies condition, else cancel.
+        # No cash reservation for SELL orders (position shares are the collateral).
+        fill = await _handle_ioc_sell_order(
+            session, redis, portfolio, order, ctx, open_pos
+        )
     else:
+        # DAY LIMIT/SL/SL-M SELL — queued for the matching engine
         order.status = "OPEN"
 
     order.updated_at = datetime.now(timezone.utc)
@@ -613,19 +660,51 @@ async def execute_pending_order_fill(
     """
     Execute a fill for a LIMIT/SL/SL-M order whose price condition was met.
 
-    Called by the P&L recompute worker when it detects a price breach.
-    The fill_price is supplied by the worker (the tick price at which the
-    condition was breached).
+    Called by the pending-order matching engine when a live tick satisfies
+    the order's price condition.  fill_price is supplied by the caller.
 
-    This is a lighter path than place_order because the order record and all
-    upstream validations already passed at order placement time.
+    For BUY orders, acquires a row-level lock on the portfolio to serialize
+    concurrent fills and re-validates the open-position limit atomically.
+    Cash reservation is released after the deduct_cash call so accounting
+    stays consistent regardless of success or failure.
     """
-    portfolio_stmt = select(Portfolio).where(Portfolio.id == order.portfolio_id)
+    from sqlalchemy import with_for_update
+
+    # Load portfolio with a row-level lock for BUY orders to prevent concurrent
+    # fills from exceeding max_open_positions.  SELL fills don't need the lock.
+    if order.transaction_type == "BUY":
+        portfolio_stmt = (
+            select(Portfolio)
+            .where(Portfolio.id == order.portfolio_id)
+            .with_for_update()
+        )
+    else:
+        portfolio_stmt = select(Portfolio).where(Portfolio.id == order.portfolio_id)
+
     portfolio = (await session.execute(portfolio_stmt)).scalar_one_or_none()
     if portfolio is None:
         raise PortfolioNotFoundError(
             f"Portfolio {order.portfolio_id} not found while filling order {order.id}."
         )
+
+    # ── Re-validate position limit at fill time (BUY only) ────────────────────
+    # The check at placement time races against concurrent fills; re-checking
+    # under the portfolio row lock makes the constraint airtight.
+    if order.transaction_type == "BUY":
+        open_count = await _count_open_positions(session, portfolio.id)
+        if open_count >= portfolio.max_open_positions:
+            reservation = _compute_reservation_amount(order)
+            if reservation > _ZERO:
+                await release_cash_reservation(session, portfolio, reservation)
+            order.status = "REJECTED"
+            order.rejection_reason = (
+                f"Position limit ({portfolio.max_open_positions}) reached at fill time."
+            )
+            order.updated_at = datetime.now(timezone.utc)
+            await session.flush()
+            raise PositionLimitExceededError(
+                f"Order {order.id} rejected: position limit reached at fill time."
+            )
 
     # Build a _TradeContext from the order record.  For LIMIT/SL fills the
     # suggestion may have already expired; we only need symbol/instrument_key
@@ -674,16 +753,24 @@ async def execute_pending_order_fill(
 
     if order.transaction_type == "BUY":
         if charges.net_amount > portfolio.current_cash:
-            # Reject: insufficient funds at fill time (price moved against us)
+            # Price slipped against us at fill time — reject and release reservation.
+            reservation = _compute_reservation_amount(order)
+            if reservation > _ZERO:
+                await release_cash_reservation(session, portfolio, reservation)
             order.status = "REJECTED"
             order.rejection_reason = (
                 f"Insufficient cash at fill time: "
                 f"need ₹{float(charges.net_amount):,.2f}, "
                 f"have ₹{float(portfolio.current_cash):,.2f}."
             )
+            order.updated_at = datetime.now(timezone.utc)
             await session.flush()
             raise InsufficientFundsError(order.rejection_reason)
         await deduct_cash(session, portfolio, charges.net_amount)
+        # Release the cash reservation now that the actual deduction has been made.
+        reservation = _compute_reservation_amount(order)
+        if reservation > _ZERO:
+            await release_cash_reservation(session, portfolio, reservation)
     else:
         await credit_cash(session, portfolio, charges.net_amount)
 
@@ -722,3 +809,159 @@ async def execute_pending_order_fill(
         order.quantity, float(fill_price),
     )
     return fill
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Private helpers — reservation, IOC, price-condition checks
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _compute_reservation_amount(order: "PaperOrder") -> Decimal:
+    """
+    Return the cash amount to reserve for a pending LIMIT/SL/SL-M BUY order.
+
+    Uses the limit price for LIMIT orders and the trigger price for SL/SL-M
+    as the reference price; quantity converts price to total estimated cost.
+    Returns ZERO for non-BUY orders and for any order missing a price reference.
+    """
+    if order.transaction_type != "BUY":
+        return _ZERO
+    if order.order_type == "LIMIT" and order.price is not None:
+        return order.price * Decimal(order.quantity)
+    if order.order_type in ("SL", "SL-M") and order.trigger_price is not None:
+        return order.trigger_price * Decimal(order.quantity)
+    return _ZERO
+
+
+def _limit_condition_met(order: "PaperOrder", ltp: Decimal) -> bool:
+    """
+    Return True when ltp satisfies the pending order's price condition.
+
+    BUY  LIMIT  : ltp <= limit_price   (market fell to our buy price)
+    SELL LIMIT  : ltp >= limit_price   (market rose to our sell price)
+    BUY  SL/SL-M: ltp >= trigger_price (stop-buy triggered)
+    SELL SL/SL-M: ltp <= trigger_price (stop-sell triggered)
+    """
+    if order.order_type == "LIMIT":
+        if order.price is None:
+            return False
+        return (
+            (order.transaction_type == "BUY" and ltp <= order.price)
+            or (order.transaction_type == "SELL" and ltp >= order.price)
+        )
+    if order.order_type in ("SL", "SL-M"):
+        if order.trigger_price is None:
+            return False
+        return (
+            (order.transaction_type == "BUY" and ltp >= order.trigger_price)
+            or (order.transaction_type == "SELL" and ltp <= order.trigger_price)
+        )
+    return False
+
+
+def _fill_price_for_order(order: "PaperOrder", ltp: Decimal) -> Decimal:
+    """
+    Determine the fill price for a pending order given the current LTP.
+
+    LIMIT orders fill at the limit price (guaranteed price, no slippage).
+    SL orders fill at the limit price (bounded; worst case is limit price).
+    SL-M orders fill at LTP (market fill, no price guarantee).
+    """
+    if order.order_type in ("LIMIT", "SL"):
+        return order.price if order.price is not None else ltp
+    # SL-M: market fill at LTP
+    return ltp
+
+
+async def _handle_ioc_order(
+    session: AsyncSession,
+    redis: Redis,
+    portfolio: "Portfolio",
+    order: "PaperOrder",
+    ctx: _TradeContext,
+    reservation: Decimal,
+) -> "PaperFill | None":
+    """
+    Handle an IOC (Immediate Or Cancel) BUY order.
+
+    Checks current LTP:
+      - If the limit condition is satisfied → fill immediately, release reservation.
+      - Otherwise → cancel immediately, release reservation, return None.
+
+    The reservation must already have been applied before this call.
+    """
+    ltp = await _get_ltp(redis, order.instrument_key)
+
+    if ltp is not None and _limit_condition_met(order, ltp):
+        fill_price = _fill_price_for_order(order, ltp)
+        try:
+            fill = await _execute_fill(
+                session, redis, portfolio, order, ctx, order.quantity
+            )
+            # _execute_fill already calls deduct_cash + release_cash_reservation
+            # via the execute path, but for IOC placed inline we need to release here.
+            # (IOC fills go through _execute_fill → deduct_cash, then we release below)
+            if reservation > _ZERO:
+                await release_cash_reservation(session, portfolio, reservation)
+            order.status = "COMPLETE"
+            return fill
+        except Exception:
+            # Fill failed — cancel and release reservation.
+            if reservation > _ZERO:
+                await release_cash_reservation(session, portfolio, reservation)
+            order.status = "CANCELLED"
+            order.rejection_reason = "IOC fill failed at current market conditions."
+            return None
+    else:
+        # No LTP or condition not met — cancel immediately (IOC semantics).
+        if reservation > _ZERO:
+            await release_cash_reservation(session, portfolio, reservation)
+        order.status = "CANCELLED"
+        order.rejection_reason = (
+            "IOC cancelled: limit price not achievable at current LTP."
+        )
+        logger.info(
+            "IOC order cancelled (no fill): order=%s symbol=%s ltp=%s limit=%s",
+            order.id, order.symbol, ltp, order.price,
+        )
+        return None
+
+
+async def _handle_ioc_sell_order(
+    session: AsyncSession,
+    redis: Redis,
+    portfolio: "Portfolio",
+    order: "PaperOrder",
+    ctx: _TradeContext,
+    close_position: "PaperPosition",
+) -> "PaperFill | None":
+    """
+    Handle an IOC (Immediate Or Cancel) SELL order.
+
+    No cash reservation is needed for SELL orders (position shares are the
+    collateral).  Checks current LTP and fills immediately if the condition
+    is met, otherwise cancels.
+    """
+    ltp = await _get_ltp(redis, order.instrument_key)
+
+    if ltp is not None and _limit_condition_met(order, ltp):
+        try:
+            fill = await _execute_fill(
+                session, redis, portfolio, order, ctx, order.quantity,
+                close_position=close_position,
+            )
+            order.status = "COMPLETE"
+            return fill
+        except Exception:
+            order.status = "CANCELLED"
+            order.rejection_reason = "IOC sell fill failed at current market conditions."
+            return None
+    else:
+        order.status = "CANCELLED"
+        order.rejection_reason = (
+            "IOC cancelled: limit price not achievable at current LTP."
+        )
+        logger.info(
+            "IOC sell order cancelled (no fill): order=%s symbol=%s ltp=%s limit=%s",
+            order.id, order.symbol, ltp, order.price,
+        )
+        return None

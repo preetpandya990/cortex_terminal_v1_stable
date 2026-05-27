@@ -88,9 +88,15 @@ export function ClosePositionModal({ position, livePrice, onClose, onClosed }: P
     };
 
     try {
-      await closePosition({ positionId: position.id, payload });
-      onClosed?.();
-      onClose();
+      const result = await closePosition({ positionId: position.id, payload });
+      if (result.queued) {
+        // LIMIT close was queued — position remains OPEN until the market fills it.
+        // onClosed is NOT called here so the position row stays visible.
+        onClose();
+      } else {
+        onClosed?.();
+        onClose();
+      }
     } catch {
       // error surfaced via `error` from useMutation
     }

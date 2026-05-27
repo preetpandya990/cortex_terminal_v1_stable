@@ -1,0 +1,9 @@
+{
+  "event": "break_glass",
+  "operation": "promote_to_staging",
+  "model_version": "1.1.0_gru",
+  "model_name": "1.1.0_gru",
+  "reason": "GRU 1.1.0 being registered at production tier as DORMANT (is_active=False). Not serving live capital \u2014 registering for audit trail, versioning, and checksum coverage. Will be activated when performance improves with more data.",
+  "timestamp": "2026-05-26T13:15:33.807666+00:00",
+  "audit_sha256": "b434f14f5fe57c7b7a1b741a5a9aaa52eb9218f9ed62e4a50b834cac8375d946"
+}

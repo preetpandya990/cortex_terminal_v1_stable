@@ -89,6 +89,50 @@ export interface ModelFilters {
   limit?: number;
 }
 
+// ── Ensemble Status (Single-Active-Member pattern) ────────────────────────────
+
+export interface EnsembleGateCheck {
+  metric:   string;
+  required: number;
+  current:  number;
+  gap:      number;
+  pass:     boolean;
+}
+
+export interface EnsembleActivationGate {
+  checks:   EnsembleGateCheck[];
+  all_pass: boolean;
+}
+
+export interface EnsembleMemberMetrics {
+  auc_pr:          number | null;
+  deflated_sharpe: number | null;
+  ece_after:       number | null;
+  accuracy:        number | null;
+  symbol_coverage: number | null;
+}
+
+export interface EnsembleMember {
+  model_name:             string;
+  model_version:          string;
+  status:                 string;
+  is_active:              boolean;
+  role:                   "active" | "dormant";
+  effective_weight:       number;
+  /** Raw A5 optimizer recommendation from training — may differ from effective_weight. */
+  training_weight:        number | null;
+  /** False when EnsembleNotAccretiveError was raised during training (GRU solo beat every blend). */
+  is_ensemble_accretive:  boolean | null;
+  deployed_at:            string | null;
+  metrics:                EnsembleMemberMetrics;
+  activation_gate:        EnsembleActivationGate | null;
+}
+
+export interface EnsembleStatus {
+  mode:    "full_ensemble" | "xgboost_only" | "degraded";
+  members: EnsembleMember[];
+}
+
 export interface UpdateModelStateRequest {
   new_state: ModelState;
   reason:    string;

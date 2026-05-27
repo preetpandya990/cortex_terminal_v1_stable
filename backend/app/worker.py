@@ -307,7 +307,12 @@ async def expiry_loop(
     """
     logger.info("Suggestion expiry loop started")
     
-    from app.core.metrics import suggestion_expiry_total
+    from app.core.metrics import (
+        suggestion_expiry_total,
+        suggestions_active,
+        worker_loop_iterations_total,
+        worker_loop_duration_seconds,
+    )
     from app.core.redis import RedisChannels, PubSubClient
     
     pubsub = PubSubClient(redis_client._redis)
@@ -317,7 +322,8 @@ async def expiry_loop(
         while not shutdown_event.is_set():
             loop_iteration += 1
             cycle_start = datetime.now(timezone.utc)
-            
+            worker_loop_iterations_total.labels(loop_name="suggestion_expiry").inc()
+
             try:
                 async with session_factory() as session:
                     # Fetch expired suggestions in batch (LIMIT 100)
@@ -372,6 +378,10 @@ async def expiry_loop(
                                 direction=direction,
                                 confidence_level=confidence,
                             ).inc()
+                            suggestions_active.labels(
+                                direction=direction,
+                                confidence_level=confidence,
+                            ).dec()
                             
                             # Publish to Redis pub/sub (fire-and-forget)
                             try:
@@ -400,6 +410,9 @@ async def expiry_loop(
                 
                 # Log cycle performance
                 cycle_duration = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+                worker_loop_duration_seconds.labels(loop_name="suggestion_expiry").observe(
+                    cycle_duration
+                )
                 logger.debug(
                     f"[Expiry #{loop_iteration}] Cycle completed in {cycle_duration:.2f}s"
                 )

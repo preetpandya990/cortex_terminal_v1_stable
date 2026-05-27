@@ -109,54 +109,22 @@ class UnifiedModelRegistry:
         evaluation_results:  dict[str, Any] | None = None,
         bypass_gates:        bool = False,
     ) -> AIMLModel:
-        """
-        Promote (or demote) a model with governance gate enforcement.
-
-        Valid transitions:
-            shadow → paper
-            paper  → live
-            any    → shadow  (demotion)
-
-        Args:
-            bypass_gates: Skip quality thresholds.  Use only when the model
-                          has already passed an external quality gate (e.g.
-                          ml_model_registry promotion pipeline).
-        """
-        stmt = select(AIMLModel).where(AIMLModel.model_name == model_name)
-        model = (await db.execute(stmt)).scalar_one_or_none()
-        if model is None:
-            raise ValueError(f"Model '{model_name}' not found in governance registry")
-
-        from_state = model.deployment_state
-        self._assert_valid_transition(from_state, target_state)
-
-        if not bypass_gates:
-            self._check_gates(model, target_state)
-
-        model.deployment_state = target_state
-        model.updated_at       = datetime.now(timezone.utc)
-
-        if evaluation_results:
-            meta = dict(model.governance_metadata or {})
-            meta["evaluation_results"] = evaluation_results
-            meta["promoted_at"]        = datetime.now(timezone.utc).isoformat()
-            model.governance_metadata  = meta
-
-        await db.commit()
-        await db.refresh(model)
-
-        await pubsub.publish_json(RedisChannels.MODELS_STATE_CHANGES, {
-            "action":        "model_state_changed",
-            "model_name":    model_name,
-            "from_state":    from_state,
-            "to_state":      target_state,
-            "model_version": model.model_version,
-            "timeframe":     model.timeframe,
-            "timestamp":     datetime.now(timezone.utc).isoformat(),
-        })
-
-        logger.info("Model state changed: %s  %s → %s", model_name, from_state, target_state)
-        return model
+        # A8 — retired.  This method operated on ai_ml_models with old accuracy-only
+        # gates that are inconsistent with the A6 gate suite, and did NOT atomically
+        # update ml_model_metadata.  That split-brain was the root cause A8 fixes.
+        #
+        # Gated promotions:  ModelPromoter.promote_to_production() enforces all A6
+        #   gates and atomically projects state to ai_ml_models in the same transaction.
+        #   CLI: python scripts/promote_model.py production --version <ver> --model-name <name>
+        #
+        # Admin force-transitions: POST /governance/models/{id}/state directly updates
+        #   ai_ml_models.deployment_state with transition-graph validation and audit trail.
+        from app.ml.model_registry import RegistryDeprecatedError
+        raise RegistryDeprecatedError(
+            "UnifiedModelRegistry.promote_model() is deprecated (A8 — single authority). "
+            "Gated promotions use ModelPromoter.promote_to_production(). "
+            "Admin force-transitions use POST /governance/models/{id}/state."
+        )
 
     async def demote_model(
         self,
@@ -165,13 +133,12 @@ class UnifiedModelRegistry:
         model_name:  str,
         reason:      str,
     ) -> AIMLModel:
-        return await self.promote_model(
-            db=db,
-            pubsub=pubsub,
-            model_name=model_name,
-            target_state="shadow",
-            evaluation_results={"demotion_reason": reason},
-            bypass_gates=True,
+        # A8 — retired.  Advisory demotion recommendations are now written as drift
+        # flags by DriftDetector; human operators action them via promote_model.py.
+        from app.ml.model_registry import RegistryDeprecatedError
+        raise RegistryDeprecatedError(
+            "UnifiedModelRegistry.demote_model() is deprecated (A8 — single authority). "
+            "DriftDetector writes advisory flags; operators action via promote_model.py."
         )
 
     # ── queries ───────────────────────────────────────────────────────────────

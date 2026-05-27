@@ -1,9 +1,9 @@
 "use client";
 
-import { X, TrendingUp, TrendingDown, Clock, Loader2, AlertCircle, Brain, ArrowLeftRight } from "lucide-react";
-import { usePositionDetail, useConvertPosition } from "@/hooks/usePaperTrading";
+import { X, TrendingUp, TrendingDown, Clock, Loader2, AlertCircle, Brain, ArrowLeftRight, Activity } from "lucide-react";
+import { usePositionDetail, useConvertPosition, usePostCloseMonitor } from "@/hooks/usePaperTrading";
 import { useToast } from "@/components/ui/toast";
-import type { PaperFill, PaperPosition, PaperTradeOutcome } from "@/types/paper_trading";
+import type { PaperFill, PaperPosition, PaperTradeOutcome, PostCloseMonitor } from "@/types/paper_trading";
 
 // Returns true if the ISO timestamp falls on today's date in IST.
 function isOpenedTodayIST(openedAt: string): boolean {
@@ -369,6 +369,123 @@ function OutcomePanel({ outcome }: { outcome: PaperTradeOutcome }) {
   );
 }
 
+// ── Post-Close Monitor panel ──────────────────────────────────────────────────
+
+function PostClosePanel({ monitor }: { monitor: PostCloseMonitor }) {
+  const isLong = monitor.direction === "LONG";
+  const isSL = monitor.close_reason === "SL";
+
+  const hitCount = [monitor.tp1_hit_at, monitor.tp2_hit_at, monitor.tp3_hit_at].filter(Boolean).length;
+  const totalRemaining = [monitor.remaining_tp1, monitor.remaining_tp2, monitor.remaining_tp3].filter(
+    (v) => v != null
+  ).length;
+
+  const statusMeta: Record<string, { label: string; cls: string }> = {
+    ACTIVE:    { label: "Active",    cls: "bg-blue-100 text-blue-700" },
+    COMPLETED: { label: "Completed", cls: "bg-slate-100 text-slate-600" },
+    EXPIRED:   { label: "Expired",   cls: "bg-slate-100 text-slate-500" },
+  };
+  const sm = statusMeta[monitor.status] ?? statusMeta.COMPLETED;
+
+  return (
+    <div className="rounded-xl border border-violet-200 bg-violet-50/50 px-4 py-3.5 space-y-3">
+      {/* Header row */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-1.5">
+          <Activity className="h-3.5 w-3.5 text-violet-500" />
+          <span className="text-[11px] font-bold uppercase tracking-wide text-violet-700">
+            Post-Close Tracking
+          </span>
+        </div>
+        <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${sm.cls}`}>
+          {sm.label}
+        </span>
+      </div>
+
+      {/* Peak prices */}
+      <div className="grid grid-cols-2 gap-2">
+        <div className="rounded-lg border border-violet-100 bg-white px-3 py-2">
+          <div className="text-[10px] text-slate-400">
+            {isLong ? "Peak High After Close" : "Peak Low After Close"}
+          </div>
+          <div className="mt-0.5 text-sm font-bold text-emerald-600">
+            {monitor.peak_favorable_price != null
+              ? INR.format(monitor.peak_favorable_price)
+              : "—"}
+          </div>
+        </div>
+        <div className="rounded-lg border border-violet-100 bg-white px-3 py-2">
+          <div className="text-[10px] text-slate-400">
+            {isLong ? "Peak Low After Close" : "Peak High After Close"}
+          </div>
+          <div className="mt-0.5 text-sm font-bold text-rose-600">
+            {monitor.peak_adverse_price != null
+              ? INR.format(monitor.peak_adverse_price)
+              : "—"}
+          </div>
+        </div>
+      </div>
+
+      {/* SL-specific recovery data */}
+      {isSL && (
+        <div className="space-y-1.5 text-xs">
+          <div className="flex justify-between">
+            <span className="text-slate-500">Recovered above SL</span>
+            <span className={`font-semibold ${monitor.recovered_above_sl ? "text-emerald-600" : "text-rose-500"}`}>
+              {monitor.recovered_above_sl
+                ? `✓ Yes${monitor.sl_recovery_at ? ` · ${fmtIST(monitor.sl_recovery_at)}` : ""}`
+                : "✗ No"}
+            </span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-slate-500">Recovered to entry</span>
+            <span className={`font-semibold ${monitor.recovered_above_entry ? "text-emerald-600" : "text-slate-400"}`}>
+              {monitor.recovered_above_entry ? "✓ Yes" : "✗ No"}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* Remaining target hits */}
+      {totalRemaining > 0 && (
+        <div className="space-y-1.5 text-xs">
+          <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+            Targets Reached After Close ({hitCount}/{totalRemaining})
+          </div>
+          {[
+            { label: "TP1", price: monitor.remaining_tp1, hitAt: monitor.tp1_hit_at },
+            { label: "TP2", price: monitor.remaining_tp2, hitAt: monitor.tp2_hit_at },
+            { label: "TP3", price: monitor.remaining_tp3, hitAt: monitor.tp3_hit_at },
+          ]
+            .filter((t) => t.price != null)
+            .map(({ label, price, hitAt }) => (
+              <div key={label} className="flex justify-between items-center">
+                <span className="text-slate-500">
+                  {label} ({INR.format(price!)})
+                </span>
+                {hitAt ? (
+                  <span className="font-semibold text-emerald-600">
+                    ✓ Hit · {fmtIST(hitAt)}
+                  </span>
+                ) : (
+                  <span className="text-slate-400">Not reached</span>
+                )}
+              </div>
+            ))}
+        </div>
+      )}
+
+      {/* Window info */}
+      <div className="text-[10px] text-slate-400 flex justify-between">
+        <span>Monitoring window</span>
+        <span>
+          {fmtIST(monitor.created_at)} → {fmtIST(monitor.monitor_until)}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 // ── Public component ──────────────────────────────────────────────────────────
 
 export interface PositionDetailModalProps {
@@ -392,6 +509,15 @@ export function PositionDetailModal({
   const { data: detail, isLoading, isError } = usePositionDetail(position.id);
   const { mutateAsync: convertPosition, isPending: isConverting } = useConvertPosition();
   const toast = useToast();
+
+  // Post-close monitor — only for SL/TP1/TP2-closed positions (TP3 = all targets hit, no monitor)
+  const showMonitor =
+    !isOpen &&
+    detail?.outcome?.exit_reason != null &&
+    ["SL", "TP1", "TP2"].includes(detail.outcome.exit_reason);
+  const { data: monitor, isLoading: isMonitorLoading } = usePostCloseMonitor(
+    showMonitor ? detail?.outcome?.id : null
+  );
 
   const canConvert =
     isOpen &&
@@ -602,8 +728,8 @@ export function PositionDetailModal({
 
           {/* Trade Outcome — closed positions */}
           {!isOpen && (
-            <div>
-              <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-400 mb-2">
+            <div className="space-y-3">
+              <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
                 Trade Outcome
               </div>
               {isLoading ? (
@@ -617,6 +743,18 @@ export function PositionDetailModal({
                 <p className="text-xs text-slate-400 py-2">
                   No outcome record found.
                 </p>
+              )}
+
+              {/* Post-close counterfactual monitor */}
+              {showMonitor && (
+                isMonitorLoading ? (
+                  <div className="flex items-center gap-2 text-xs text-slate-500">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    Loading post-close data…
+                  </div>
+                ) : monitor ? (
+                  <PostClosePanel monitor={monitor} />
+                ) : null
               )}
             </div>
           )}

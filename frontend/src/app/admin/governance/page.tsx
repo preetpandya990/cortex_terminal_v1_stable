@@ -1,6 +1,6 @@
 "use client";
 
-import { MLModelsPanel } from "@/components/ai/MLModelsPanel";
+import { EnsembleStatusCard, MLModelsPanel } from "@/components/ai/MLModelsPanel";
 
 export default function GovernancePage() {
   return (
@@ -12,6 +12,7 @@ export default function GovernancePage() {
         </p>
       </div>
 
+      <EnsembleStatusCard />
       <MLModelsPanel isAdmin={true} />
     </div>
   );

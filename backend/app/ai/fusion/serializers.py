@@ -136,6 +136,10 @@ def serialise_signal(signal: AITradingSignal) -> dict[str, Any]:
         # these via _enrich_instrument_keys before sending the response).
         "instrument_key": (signal.extra_data or {}).get("instrument_key") or None,
         "signal_type": signal.action.lower(),
+        # confidence_score is the fused signal confidence: a weighted average of
+        # the ML model's calibrated probability, event classification confidence,
+        # and technical indicator confidence.  calibrated_confidence aliases the
+        # same value for frontend backward compatibility.
         "confidence": float(signal.confidence_score),
         "calibrated_confidence": float(signal.confidence_score),
         "time_horizon": signal.time_horizon or "swing",

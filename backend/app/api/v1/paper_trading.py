@@ -51,13 +51,21 @@ from app.core.database import get_db
 from app.core.limiter import limiter
 from app.core.redis import get_redis, get_cache_service
 from app.core.security import get_current_user_id
-from app.models.paper_trading import PaperFill, PaperOrder, PaperPnlSnapshot, PaperTradeOutcome
+from app.models.paper_trading import (
+    PaperFill,
+    PaperOrder,
+    PaperPnlSnapshot,
+    PaperTradeOutcome,
+    PostCloseMonitor,
+)
 from app.models.user import User
 from app.schemas.paper_trading import (
     ClosePositionRequest,
+    ClosePositionResponse,
     ConvertPositionRequest,
     CreatePortfolioRequest,
     ExitReason,
+    MonitoringConfigResponse,
     OrdersListResponse,
     OutcomeStatsResponse,
     OutcomesListResponse,
@@ -72,8 +80,11 @@ from app.schemas.paper_trading import (
     PortfolioResponse,
     PortfolioSummaryResponse,
     PositionsListResponse,
+    PostCloseMonitorResponse,
+    PostCloseMonitorsListResponse,
     PriceTargetsResponse,
     QtySuggestionResponse,
+    UpdateMonitoringConfigRequest,
     UpdatePortfolioSettingsRequest,
 )
 from app.services.paper_trading import portfolio_service, order_service, position_service, outcome_service
@@ -455,6 +466,15 @@ async def place_order(
                 outcome.user_id,
             )
 
+    # Notify the matching engine to rebuild its cache for this instrument
+    # so pending LIMIT/SL/SL-M orders are picked up on the next tick.
+    if paper_order.status == "OPEN" and paper_order.order_type in ("LIMIT", "SL", "SL-M"):
+        from app.core.redis import RedisChannels
+        await redis.publish(
+            RedisChannels.PAPER_PENDING_ORDERS_UPDATED,
+            json.dumps({"instrument_key": paper_order.instrument_key}),
+        )
+
     return PaperOrderResponse.model_validate(paper_order)
 
 
@@ -544,6 +564,7 @@ async def cancel_order(
     order_id: UUID = Path(..., description="Order UUID"),
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
 ) -> PaperOrderResponse:
     """Cancel a PENDING or OPEN paper order. Terminal orders cannot be cancelled."""
     order = await order_service.cancel_order(
@@ -552,6 +573,16 @@ async def cancel_order(
         user_id=_user_id(current_user),
     )
     await session.commit()
+
+    # Invalidate the matching engine cache so the cancelled order is removed
+    # from consideration on the next tick.
+    if order.order_type in ("LIMIT", "SL", "SL-M"):
+        from app.core.redis import RedisChannels
+        await redis.publish(
+            RedisChannels.PAPER_PENDING_ORDERS_UPDATED,
+            json.dumps({"instrument_key": order.instrument_key}),
+        )
+
     return PaperOrderResponse.model_validate(order)
 
 
@@ -631,7 +662,7 @@ async def get_position_detail(
 
 @router.post(
     "/positions/{position_id}/close",
-    response_model=PaperPositionResponse,
+    response_model=ClosePositionResponse,
     summary="Close a position (full or partial)",
 )
 @limiter.limit("30/minute")
@@ -643,17 +674,22 @@ async def close_position(
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
-) -> PaperPositionResponse:
+) -> ClosePositionResponse:
     """
     Close a paper position fully or partially.
 
-    MARKET close: fills at current LTP − 3 bps slippage (adverse).
-    LIMIT close: fills at the specified price when reached.
+    MARKET close: fills immediately at current LTP − 3 bps slippage (adverse).
+    Responds with ``queued: false``.
 
-    On full close, an audit outcome record is written and ML feedback
+    LIMIT close: queues a pending SELL order; the matching engine fills it when
+    the market price reaches the specified limit.  The position remains OPEN
+    until the fill occurs.  Responds with ``queued: true`` and the pending order
+    ID so the client can display it in the pending orders panel.
+
+    On a full MARKET close an audit outcome record is written and ML feedback
     is computed asynchronously.
     """
-    position = await position_service.close_position(
+    position, pending_order, queued = await position_service.close_position(
         session=session,
         redis=redis,
         position_id=position_id,
@@ -662,8 +698,17 @@ async def close_position(
     )
     await session.commit()
 
-    # Schedule ML feedback if position is now CLOSED
-    if not position.is_open:
+    # If a pending LIMIT SELL was queued, notify the matching engine to rebuild
+    # its cache for this instrument so the order is picked up on the next tick.
+    if queued and pending_order is not None:
+        from app.core.redis import RedisChannels
+        await redis.publish(
+            RedisChannels.PAPER_PENDING_ORDERS_UPDATED,
+            json.dumps({"instrument_key": pending_order.instrument_key}),
+        )
+
+    # Schedule ML feedback only if the position was fully closed immediately
+    if not queued and not position.is_open:
         outcome = await _latest_outcome_for_portfolio(
             session, position.portfolio_id
         )
@@ -676,7 +721,11 @@ async def close_position(
                 outcome.user_id,
             )
 
-    return PaperPositionResponse.model_validate(position)
+    return ClosePositionResponse(
+        position=PaperPositionResponse.model_validate(position),
+        queued=queued,
+        pending_order_id=pending_order.id if pending_order is not None else None,
+    )
 
 
 @router.post(
@@ -909,6 +958,202 @@ async def list_pnl_snapshots(
         from_date=parsed_from,
         to_date=parsed_to,
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Post-Close Monitoring Config
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/monitor-config",
+    response_model=MonitoringConfigResponse,
+    summary="Get post-close monitoring configuration",
+)
+@limiter.limit("60/minute")
+async def get_monitoring_config(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> MonitoringConfigResponse:
+    """
+    Return the account-wide post-close monitoring settings for the current user.
+
+    A default row (mode='disabled') is returned if the user has never configured
+    monitoring; no row is written until the user explicitly saves a change.
+    """
+    from app.services.paper_trading.post_close_monitor_service import get_monitor_config
+
+    prefs = await get_monitor_config(session, _user_id(current_user))
+    # Flush the upsert-created default row if it was just created
+    await session.commit()
+    return MonitoringConfigResponse(
+        mode=prefs.post_close_monitor_mode,
+        duration_hours=(
+            float(prefs.post_close_monitor_duration_hours)
+            if prefs.post_close_monitor_duration_hours is not None else None
+        ),
+        updated_at=prefs.updated_at,
+    )
+
+
+@router.put(
+    "/monitor-config",
+    response_model=MonitoringConfigResponse,
+    summary="Update post-close monitoring configuration",
+)
+@limiter.limit("30/minute")
+async def update_monitoring_config(
+    request: Request,
+    payload: UpdateMonitoringConfigRequest,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+) -> MonitoringConfigResponse:
+    """
+    Update the account-wide post-close monitoring mode.
+
+    Changes take effect for the next auto-close; in-progress monitors are
+    not affected.  The Redis user-config cache is invalidated immediately.
+    """
+    from app.services.paper_trading.post_close_monitor_service import update_monitor_config
+
+    prefs = await update_monitor_config(
+        session=session,
+        redis=redis,
+        user_id=_user_id(current_user),
+        mode=payload.mode.value,
+        duration_hours=payload.duration_hours,
+    )
+    await session.commit()
+    return MonitoringConfigResponse(
+        mode=prefs.post_close_monitor_mode,
+        duration_hours=(
+            float(prefs.post_close_monitor_duration_hours)
+            if prefs.post_close_monitor_duration_hours is not None else None
+        ),
+        updated_at=prefs.updated_at,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Post-Close Monitors
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/post-close-monitors",
+    response_model=PostCloseMonitorsListResponse,
+    summary="List post-close monitors",
+)
+@limiter.limit("60/minute")
+async def list_post_close_monitors(
+    request: Request,
+    status: str | None = Query(
+        None,
+        description="Filter by status: ACTIVE, COMPLETED, or EXPIRED",
+        pattern="^(ACTIVE|COMPLETED|EXPIRED)$",
+    ),
+    outcome_id: UUID | None = Query(None, description="Filter to the monitor for a specific outcome UUID"),
+    cursor: str | None = Query(None, description="Opaque pagination cursor"),
+    limit: int = Query(50, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> PostCloseMonitorsListResponse:
+    """
+    List post-close monitors for the current user, most recent first.
+
+    Supports cursor-based pagination using created_at + id.
+    Optionally filtered by status (ACTIVE / COMPLETED / EXPIRED) or outcome_id.
+    """
+    import base64
+
+    uid = _user_id(current_user)
+
+    stmt = (
+        select(PostCloseMonitor)
+        .where(PostCloseMonitor.user_id == uid)
+    )
+    if status:
+        stmt = stmt.where(PostCloseMonitor.status == status.upper())
+    if outcome_id:
+        stmt = stmt.where(PostCloseMonitor.outcome_id == outcome_id)
+
+    # Cursor decodes to "ISO8601_created_at:uuid"
+    if cursor:
+        try:
+            raw = base64.urlsafe_b64decode(cursor.encode()).decode()
+            ts_str, id_str = raw.rsplit(":", 1)
+            cursor_ts = datetime.fromisoformat(ts_str)
+            cursor_id = UUID(id_str)
+            stmt = stmt.where(
+                (PostCloseMonitor.created_at < cursor_ts)
+                | (
+                    (PostCloseMonitor.created_at == cursor_ts)
+                    & (PostCloseMonitor.id < cursor_id)
+                )
+            )
+        except (ValueError, Exception):
+            pass  # Invalid cursor — ignore and return from the beginning
+
+    stmt = (
+        stmt
+        .order_by(PostCloseMonitor.created_at.desc(), PostCloseMonitor.id.desc())
+        .limit(limit + 1)
+    )
+
+    rows = list((await session.execute(stmt)).scalars().all())
+
+    next_cursor: str | None = None
+    if len(rows) > limit:
+        rows = rows[:limit]
+        last = rows[-1]
+        raw_cursor = f"{last.created_at.isoformat()}:{last.id}"
+        next_cursor = base64.urlsafe_b64encode(raw_cursor.encode()).decode()
+
+    # Count query for total (status/outcome-aware)
+    from sqlalchemy import func as sa_func
+    count_stmt = (
+        select(sa_func.count())
+        .select_from(PostCloseMonitor)
+        .where(PostCloseMonitor.user_id == uid)
+    )
+    if status:
+        count_stmt = count_stmt.where(PostCloseMonitor.status == status.upper())
+    if outcome_id:
+        count_stmt = count_stmt.where(PostCloseMonitor.outcome_id == outcome_id)
+    total = (await session.execute(count_stmt)).scalar_one()
+
+    return PostCloseMonitorsListResponse(
+        monitors=[PostCloseMonitorResponse.model_validate(r) for r in rows],
+        total=total,
+        next_cursor=next_cursor,
+    )
+
+
+@router.get(
+    "/post-close-monitors/{monitor_id}",
+    response_model=PostCloseMonitorResponse,
+    summary="Get a single post-close monitor",
+)
+@limiter.limit("120/minute")
+async def get_post_close_monitor(
+    request: Request,
+    monitor_id: UUID = Path(..., description="Post-close monitor UUID"),
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> PostCloseMonitorResponse:
+    """
+    Fetch a single post-close monitor by ID.
+
+    Returns 404 if the monitor does not exist or belongs to a different user.
+    """
+    from app.exceptions import DataNotFoundError
+
+    monitor = await session.get(PostCloseMonitor, monitor_id)
+    if monitor is None or monitor.user_id != _user_id(current_user):
+        raise DataNotFoundError(f"Post-close monitor {monitor_id} not found.")
+
+    return PostCloseMonitorResponse.model_validate(monitor)
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────

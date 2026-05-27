@@ -30,7 +30,7 @@ from app.exceptions import (
     ForbiddenError,
     PortfolioNotFoundError,
 )
-from app.models.paper_trading import PaperPosition, PaperTradeOutcome, Portfolio
+from app.models.paper_trading import PaperOrder, PaperPosition, PaperTradeOutcome, Portfolio
 from app.schemas.paper_trading import (
     CreatePortfolioRequest,
     PortfolioSummaryResponse,
@@ -176,6 +176,18 @@ async def get_portfolio_summary(
     portfolio = await get_active_portfolio(session, user_id)
     portfolio_id = portfolio.id
 
+    # ── Pending-order aggregate (LIMIT/SL/SL-M BUY orders awaiting fill) ────────
+    pending_stmt = (
+        select(func.count(PaperOrder.id).label("pending_count"))
+        .where(
+            PaperOrder.portfolio_id == portfolio_id,
+            PaperOrder.status == "OPEN",
+            PaperOrder.order_type.in_(["LIMIT", "SL", "SL-M"]),
+        )
+    )
+    pending_row = (await session.execute(pending_stmt)).one()
+    pending_order_count: int = pending_row.pending_count or 0
+
     # ── Open-position aggregate ────────────────────────────────────────────────
     pos_stmt = (
         select(
@@ -235,6 +247,9 @@ async def get_portfolio_summary(
     if total_trades > 0:
         win_rate = round(float(total_winners / total_trades * 100), 2)
 
+    reserved = portfolio.reserved_cash
+    available_cash = portfolio.current_cash - reserved
+
     return PortfolioSummaryResponse(
         # Core portfolio fields
         id=portfolio.id,
@@ -243,6 +258,8 @@ async def get_portfolio_summary(
         name=portfolio.name,
         initial_capital=portfolio.initial_capital,
         current_cash=portfolio.current_cash,
+        reserved_cash=reserved,
+        available_cash=available_cash,
         currency=portfolio.currency,
         risk_per_trade_pct=portfolio.risk_per_trade_pct,
         max_open_positions=portfolio.max_open_positions,
@@ -251,6 +268,7 @@ async def get_portfolio_summary(
         updated_at=portfolio.updated_at,
         # Live aggregate stats
         open_position_count=open_count,
+        pending_order_count=pending_order_count,
         total_unrealized_pnl=float(total_unrealized_pnl),
         total_realized_pnl=float(total_net_pnl),
         portfolio_value=float(portfolio_value),
@@ -372,5 +390,49 @@ async def credit_cash(
     Increase portfolio cash by `amount` (SELL fill net_amount credit).
     """
     portfolio.current_cash += amount
+    portfolio.updated_at = datetime.now(timezone.utc)
+    await session.flush()
+
+
+async def reserve_cash(
+    session: AsyncSession,
+    portfolio: Portfolio,
+    amount: Decimal,
+) -> None:
+    """
+    Pre-commit `amount` against a pending LIMIT/SL/SL-M BUY order.
+
+    Increases reserved_cash so subsequent available_cash checks
+    (current_cash − reserved_cash) correctly reflect the pre-committed
+    funds.  Does NOT touch current_cash — the actual deduction happens
+    when the order fills via deduct_cash.
+
+    The DB CHECK constraint ck_portfolios_reserved_cash_non_negative
+    and the service-layer InsufficientFundsError guard ensure this
+    never exceeds current_cash.
+    """
+    portfolio.reserved_cash += amount
+    portfolio.updated_at = datetime.now(timezone.utc)
+    await session.flush()
+
+
+async def release_cash_reservation(
+    session: AsyncSession,
+    portfolio: Portfolio,
+    amount: Decimal,
+) -> None:
+    """
+    Release a previously reserved amount back to available cash.
+
+    Called when a pending order is:
+      - Filled:    reservation converts to a real deduct_cash call
+      - Cancelled: funds return to fully available
+      - Rejected:  same as cancelled
+      - Expired:   DAY order cancelled at market close
+
+    Clamps to zero to guard against double-release bugs — the DB CHECK
+    constraint still fires if the service layer ever dips below zero.
+    """
+    portfolio.reserved_cash = max(_ZERO, portfolio.reserved_cash - amount)
     portfolio.updated_at = datetime.now(timezone.utc)
     await session.flush()

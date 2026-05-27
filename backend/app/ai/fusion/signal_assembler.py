@@ -32,9 +32,11 @@ from app.ai.fusion.models import (
     AITradingSignal,
 )
 from app.ai.fusion.serializers import serialise_signal
+from app.core.metrics import signal_generation_total
 from app.core.redis import PubSubClient, RedisChannels
 from app.ml.inference.ensemble_predictor import EnsemblePredictor
 from app.ml.inference.feature_loader import FeatureLoader
+from app.ml.monitoring.metrics import feature_cache_hit_rate, feature_errors_total
 
 logger = logging.getLogger(__name__)
 
@@ -284,14 +286,21 @@ class SignalAssembler:
 
         cache_key = f"cortex:ml:signal:{symbol}:{timeframe}"
 
+        _cache_hits = 0
+        _cache_requests = 1
         if self._ml_cache is not None:
             try:
                 cached = await self._ml_cache.get(cache_key)
                 if cached:
                     logger.debug("ML signal cache hit — symbol=%s timeframe=%s", symbol, timeframe)
+                    _cache_hits = 1
+                    feature_cache_hit_rate.labels(cache_type="ml_signal").set(
+                        _cache_hits / _cache_requests * 100
+                    )
                     return json.loads(cached)
             except Exception as exc:
                 logger.debug("ML signal cache read failed (non-fatal): %s", exc)
+        feature_cache_hit_rate.labels(cache_type="ml_signal").set(0.0)
 
         try:
             tabular, sequence, current_price, volatility = await self.feature_loader.load_features(
@@ -314,11 +323,15 @@ class SignalAssembler:
 
             result: dict[str, Any] = {
                 "score": direction_map.get(direction, 0.0),
-                "confidence": prediction.get("conviction_scale", 0.0),
+                # Raw calibrated probability from EnsemblePredictor (0.0–1.0).
+                # conviction_scale is preserved in the prediction sub-dict for
+                # downstream position-sizing consumers.
+                "confidence": prediction.get("confidence", 0.0),
                 "model": prediction.get("metadata", {}).get("model_version"),
                 "available": True,
                 "prediction": {
                     "direction": direction,
+                    "conviction_scale": prediction.get("conviction_scale", 0.0),
                     "entry_price": prediction.get("entry_price"),
                     "stop_loss": prediction.get("stop_loss"),
                     "targets": [
@@ -344,6 +357,9 @@ class SignalAssembler:
 
         except Exception as exc:
             logger.error("ML prediction failed for %s: %s", symbol, exc, exc_info=True)
+            feature_errors_total.labels(
+                feature_name="ml_prediction", error_type=type(exc).__name__
+            ).inc()
             return {"score": 0.0, "confidence": 0.0, "model": None, "available": False, "error": str(exc)}
 
     async def gather_technical_signals(
@@ -398,6 +414,9 @@ class SignalAssembler:
             closes_raw = [float(r[0]) for r in rows.fetchall()]
         except Exception as exc:
             logger.debug("Technical signals DB query failed for %s: %s", symbol, exc)
+            feature_errors_total.labels(
+                feature_name="technical_indicators", error_type=type(exc).__name__
+            ).inc()
             return {"score": 0.0, "confidence": 0.0, "indicators": {}, "available": False}
 
         if len(closes_raw) < min_candles:
@@ -475,7 +494,10 @@ class SignalAssembler:
 
         n_available = sum(1 for _, avail in sources.values() if avail)
         if n_available == 1:
-            fused_confidence = min(fused_confidence, 0.65)
+            # Single-source cap: 0.85 allows a high-conviction calibrated
+            # probability to surface while still reflecting reduced multi-stream
+            # corroboration.
+            fused_confidence = min(fused_confidence, 0.85)
 
         if fused_score > 50:
             action = "BUY"
@@ -690,11 +712,14 @@ class SignalAssembler:
             direction = precomputed_ml.get("direction_label", "HOLD")
             ml_signals = {
                 "score": direction_map.get(direction, 0.0),
-                "confidence": precomputed_ml.get("conviction_scale", 0.0),
+                # Raw calibrated probability from batch inference (0.0–1.0).
+                # conviction_scale preserved for position-sizing consumers.
+                "confidence": precomputed_ml.get("confidence", 0.0),
                 "model": precomputed_ml.get("metadata", {}).get("model_version"),
                 "available": True,
                 "prediction": {
                     "direction": direction,
+                    "conviction_scale": precomputed_ml.get("conviction_scale", 0.0),
                     "entry_price": precomputed_ml.get("entry_price"),
                     "stop_loss": precomputed_ml.get("stop_loss"),
                     "targets": [
@@ -752,6 +777,10 @@ class SignalAssembler:
         db.add(signal)
         await db.commit()
         await db.refresh(signal)
+
+        signal_generation_total.labels(
+            signal_type="trading_signal", action=signal.action
+        ).inc()
 
         # Publish full signal payload so WebSocket subscribers and
         # useSignalsRealtime can hydrate the React Query cache directly.

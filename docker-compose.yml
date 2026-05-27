@@ -101,18 +101,63 @@ services:
 
   # ── Prometheus (Metrics) ──────────────────────────────────────────────────
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v2.53.0
     container_name: cortex-prometheus
     restart: unless-stopped
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
       - '--storage.tsdb.retention.time=30d'
+      - '--storage.tsdb.wal-compression'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
     ports:
       - "9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9090/-/healthy || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - cortex-network
+
+  # ── Grafana (Dashboards) ──────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: cortex-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-cortex_grafana}
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_SERVER_ROOT_URL: "http://localhost:3001"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/provisioning/dashboards/cortex/01-sre-overview.json
+      GF_LOG_LEVEL: warn
+      GF_LOG_MODE: console
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_USERS_ALLOW_ORG_CREATE: "false"
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     networks:
       - cortex-network
 
@@ -179,6 +224,7 @@ volumes:
   ollama_data:
   ml_models:
   prometheus_data:
+  grafana_data:
 
 networks:
   cortex-network:

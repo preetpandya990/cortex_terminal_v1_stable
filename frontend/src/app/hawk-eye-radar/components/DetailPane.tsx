@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { X, Loader2, Plus, Check } from "lucide-react";
+import { X, Loader2, Plus, Check, ArrowUpRight, ArrowDownRight } from "lucide-react";
 import { upstoxAPI, isNetworkError, isRateLimitError, getRetryAfterMs } from "@/lib/api";
 import { mergeCandles } from "@/lib/candle-transforms";
 import { useLtp } from "@/hooks/useLtp";
@@ -29,6 +29,7 @@ import { IndicatorSelector } from "@/components/charts/IndicatorSelector";
 import { AnalysisCardsSection } from "@/components/AnalysisCardsSection";
 import { FundamentalsTab } from "@/components/hawk-eye-radar/FundamentalsTab";
 import { OpenTradeModal } from "@/components/paper-trading/OpenTradeModal";
+import { usePositions } from "@/hooks/usePaperTrading";
 import { useWatchlist } from "@/hooks/useWatchlist";
 import { useAuth } from "@/contexts/AuthContext";
 import { useChartPreferences, type TimeframeOption } from "@/contexts/ChartPreferencesContext";
@@ -38,6 +39,7 @@ import type {
   UpstoxInstrument,
   UpstoxLtpTick,
 } from "@/types/upstox";
+import type { PositionSide } from "@/types/paper_trading";
 import type { TradeSuggestion } from "@/types/trade_suggestions";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -76,7 +78,34 @@ export function DetailPane({ instrument, onClose, showAnalysis = true, suggestio
   const { isAuthenticated } = useAuth();
   const { defaultTimeframe, activeIndicators } = useChartPreferences();
 
-  const [tradeModalOpen, setTradeModalOpen] = useState(false);
+  const [tradeDirection, setTradeDirection] = useState<"BUY" | "SELL" | null>(null);
+
+  // Fetch only open positions — server-filtered, no client-side over-fetch.
+  // Disabled when the user is not authenticated to avoid unnecessary 401s.
+  const { data: positionsData } = usePositions({ status: "OPEN" }, isAuthenticated);
+
+  // The open position for this specific instrument, if one exists.
+  const openSide = useMemo((): PositionSide | null => {
+    const match = positionsData?.positions.find(
+      (p) => p.instrument_key === instrument.instrument_key,
+    );
+    return match?.side ?? null;
+  }, [positionsData?.positions, instrument.instrument_key]);
+
+  const signalDirection = suggestion?.signal_direction ?? null;
+
+  // Button visibility rules:
+  // • No open position              → Buy only
+  // • Open position + SELL signal   → Sell only
+  // • Open position + BUY or none   → Both
+  const showBuyButton  = useMemo(
+    () => !(openSide !== null && signalDirection === "SELL"),
+    [openSide, signalDirection],
+  );
+  const showSellButton = useMemo(
+    () => openSide !== null,
+    [openSide],
+  );
 
   // Consume from the singleton context — no duplicate hook instance.
   const {
@@ -511,31 +540,28 @@ export function DetailPane({ instrument, onClose, showAnalysis = true, suggestio
               {/* ── Header ─────────────────────────────────────────────────── */}
               <CardHeader className="flex flex-row items-center justify-between gap-6 shrink-0">
                 {/* Identity + live price */}
-                <div className="min-w-0 flex-1 flex items-center gap-4">
-                  <div className="min-w-0">
-                    <CardTitle className="text-xl font-bold leading-tight text-slate-900">
-                      {instrument.name || "—"}
-                    </CardTitle>
-                    <div className="mt-1 flex items-center gap-2">
-                      <span className="font-mono text-sm font-medium text-slate-500">
-                        {instrument.trading_symbol}
+                <div className="min-w-0 flex-1">
+                  <CardTitle className="text-xl font-bold leading-tight text-slate-900">
+                    {instrument.name || "—"}
+                  </CardTitle>
+                  <div className="mt-2 flex items-center gap-2">
+                    <span className="font-mono text-sm font-medium text-slate-500">
+                      {instrument.trading_symbol}
+                    </span>
+                    {instrument.exchange && (
+                      <span className="rounded bg-slate-100 px-1.5 py-0.5 text-xs font-medium text-slate-500">
+                        {instrument.exchange}
                       </span>
-                      {instrument.exchange && (
-                        <span className="rounded bg-slate-100 px-1.5 py-0.5 text-xs font-medium text-slate-500">
-                          {instrument.exchange}
-                        </span>
-                      )}
-                    </div>
+                    )}
+                    <LivePriceBadge
+                      price={displayPrice ?? null}
+                      prevClose={prevClose}
+                      isLive={isLive}
+                      isConnecting={isConnecting}
+                      align="start"
+                      className="ml-[100px]"
+                    />
                   </div>
-
-                  <LivePriceBadge
-                    price={displayPrice ?? null}
-                    prevClose={prevClose}
-                    isLive={isLive}
-                    isConnecting={isConnecting}
-                    className="mt-3"
-                    align="start"
-                  />
                 </div>
 
                 <div className="flex shrink-0 items-center gap-2">
@@ -558,18 +584,6 @@ export function DetailPane({ instrument, onClose, showAnalysis = true, suggestio
                     </Button>
                   )}
 
-                  {/* Paper trade entry */}
-                  {isAuthenticated && (
-                    <button
-                      type="button"
-                      onClick={() => setTradeModalOpen(true)}
-                      className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 shadow-sm hover:bg-slate-50 transition-colors"
-                    >
-                      <span className="h-2 w-2 rounded-full bg-emerald-500" />
-                      Trade
-                    </button>
-                  )}
-
                   <Button variant="ghost" size="icon" onClick={onClose}>
                     <X className="h-5 w-5" />
                   </Button>
@@ -586,6 +600,31 @@ export function DetailPane({ instrument, onClose, showAnalysis = true, suggestio
                   />
                   <div className="mx-1.5 h-4 w-px bg-slate-200" aria-hidden="true" />
                   <IndicatorSelector />
+                  {isAuthenticated && (showBuyButton || showSellButton) && (
+                    <>
+                      <div className="mx-1.5 h-4 w-px bg-slate-200" aria-hidden="true" />
+                      {showBuyButton && (
+                        <button
+                          type="button"
+                          onClick={() => setTradeDirection("BUY")}
+                          className="inline-flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-5 py-2.5 text-sm font-semibold text-emerald-700 shadow-sm hover:bg-emerald-100 transition-colors"
+                        >
+                          <ArrowUpRight className="h-4 w-4" />
+                          Buy
+                        </button>
+                      )}
+                      {showSellButton && (
+                        <button
+                          type="button"
+                          onClick={() => setTradeDirection("SELL")}
+                          className="inline-flex items-center gap-2 rounded-xl border border-rose-200 bg-rose-50 px-5 py-2.5 text-sm font-semibold text-rose-700 shadow-sm hover:bg-rose-100 transition-colors"
+                        >
+                          <ArrowDownRight className="h-4 w-4" />
+                          Sell
+                        </button>
+                      )}
+                    </>
+                  )}
                 </div>
 
                 {/* Chart section — flex-1 so it grows to fill remaining space */}
@@ -675,7 +714,7 @@ export function DetailPane({ instrument, onClose, showAnalysis = true, suggestio
         </div>
       </div>
 
-      {tradeModalOpen && (
+      {tradeDirection !== null && (
         <OpenTradeModal
           instrument={{
             name: instrument.name || instrument.trading_symbol,
@@ -685,7 +724,8 @@ export function DetailPane({ instrument, onClose, showAnalysis = true, suggestio
           }}
           suggestion={suggestion}
           livePrice={displayPrice}
-          onClose={() => setTradeModalOpen(false)}
+          initialDirection={tradeDirection}
+          onClose={() => setTradeDirection(null)}
         />
       )}
     </div>

@@ -31,6 +31,7 @@ from app.core.redis import CacheService
 from app.ai.fusion.models import AIEventClassification
 from app.ai.fusion.signal_assembler import SignalAssembler
 from app.core.metrics import (
+    suggestions_active,
     suggestions_generated_total,
     consensus_score_distribution,
     correlation_latency_seconds,
@@ -822,7 +823,11 @@ class EventCorrelationEngine:
             confidence_level=confidence_level,
             status="active"
         ).inc()
-        
+        suggestions_active.labels(
+            direction=suggestion.signal_direction,
+            confidence_level=confidence_level,
+        ).inc()
+
         consensus_score_distribution.observe(float(consensus_score))
         
         # Track correlation latency by pathway and agent

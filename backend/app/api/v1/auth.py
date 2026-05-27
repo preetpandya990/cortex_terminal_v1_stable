@@ -21,6 +21,7 @@ from app.core.security import (
     verify_password,
     CurrentUserID,
 )
+from app.core.metrics import auth_attempts_total, auth_token_refreshes_total
 from app.exceptions import AuthError
 from app.models.user import User, RefreshToken
 
@@ -172,12 +173,14 @@ async def login(
     password_ok = verify_password(credentials.password, candidate_hash)
 
     if user is None or not password_ok:
+        auth_attempts_total.labels(method="password", status="failure").inc()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect credentials",
         )
 
     if not user.is_active:
+        auth_attempts_total.labels(method="password", status="failure").inc()
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account disabled",
@@ -201,6 +204,7 @@ async def login(
     )
     await db.commit()
 
+    auth_attempts_total.labels(method="password", status="success").inc()
     set_refresh_token_cookie(response, token_pair.refresh_token)
     return token_pair
 
@@ -317,8 +321,10 @@ async def refresh_access_token(
             await db.execute(stmt)
             await db.commit()
 
+        auth_token_refreshes_total.labels(status="success").inc()
         return token_pair
     except Exception:
+        auth_token_refreshes_total.labels(status="failure").inc()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token refresh failed",

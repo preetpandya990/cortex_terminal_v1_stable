@@ -233,16 +233,28 @@ async def close_position(
     position_id: UUID,
     user_id: int,
     payload: ClosePositionRequest,
-) -> PaperPosition:
+) -> tuple[PaperPosition, "PaperOrder | None", bool]:
     """
     Close a position (fully or partially) via the REST API.
 
-    Creates a synthetic SELL order and fill at the current LTP, then
-    delegates to apply_sell_fill_to_position.
+    MARKET close: fills immediately at LTP − 3 bps slippage.  Returns
+    (updated_position, None, False).
+
+    LIMIT close: queues a pending SELL order at the requested price.  The
+    position is NOT updated until the pnl_worker matches the order against a
+    live tick.  Returns (unchanged_position, pending_sell_order, True).
+
+    Returns
+    -------
+    (position, pending_order, queued)
+        queued=True  → LIMIT order was queued; position is still OPEN.
+        queued=False → MARKET fill completed; position status reflects close.
     """
     from app.services.paper_trading.order_service import (
-        _get_ltp,
+        _assert_t1_settlement,
         _compute_settlement_date,
+        _DEFAULT_SLIPPAGE_BPS,
+        _get_ltp,
     )
     from app.services.paper_trading.charge_calculator import calculate_charges
     from app.services.paper_trading.portfolio_service import credit_cash
@@ -252,22 +264,47 @@ async def close_position(
     portfolio = (await session.execute(portfolio_stmt)).scalar_one_or_none()
 
     if not position.is_open:
-        raise InvalidOrderError(
-            f"Position {position_id} is already CLOSED."
-        )
+        raise InvalidOrderError(f"Position {position_id} is already CLOSED.")
     if payload.quantity > position.quantity:
         raise InvalidOrderError(
             f"Close quantity {payload.quantity} exceeds open quantity {position.quantity}."
         )
 
-    # ── T+1 check for CNC ────────────────────────────────────────────────────
-    # Use position.product_type — the authoritative, mutable field that reflects
-    # any CNC↔MIS conversion that occurred after the opening fill.
-    from app.services.paper_trading.order_service import _assert_t1_settlement
+    # ── T+1 settlement check (CNC only) ──────────────────────────────────────
     if position.product_type == "CNC":
         await _assert_t1_settlement(session, position.portfolio_id, position.symbol)
 
-    # ── Resolve exit price ────────────────────────────────────────────────────
+    product_type: str = position.product_type
+
+    # ── LIMIT close — queue a pending SELL order ──────────────────────────────
+    if payload.order_type.value == "LIMIT":
+        if not payload.price:
+            raise InvalidOrderError("LIMIT close requires a price.")
+        limit_price = Decimal(str(payload.price))
+        pending_sell = PaperOrder(
+            portfolio_id=position.portfolio_id,
+            suggestion_id=position.suggestion_id,
+            symbol=position.symbol,
+            instrument_key=position.instrument_key,
+            transaction_type="SELL",
+            product_type=product_type,
+            order_type="LIMIT",
+            validity="DAY",
+            quantity=payload.quantity,
+            price=limit_price,
+            status="OPEN",
+        )
+        session.add(pending_sell)
+        await session.flush()
+        await session.refresh(pending_sell)
+        logger.info(
+            "LIMIT close queued: position=%s symbol=%s qty=%d price=%.4f order=%s",
+            position_id, position.symbol, payload.quantity,
+            float(limit_price), pending_sell.id,
+        )
+        return position, pending_sell, True
+
+    # ── MARKET close — fill immediately ──────────────────────────────────────
     ltp = await _get_ltp(redis, position.instrument_key)
     if ltp is None:
         ltp = position.last_price or position.avg_cost_price
@@ -276,16 +313,8 @@ async def close_position(
             position.instrument_key, float(ltp),
         )
 
-    exit_price: Decimal
-    if payload.order_type.value == "LIMIT" and payload.price:
-        exit_price = Decimal(str(payload.price))
-    else:
-        # MARKET close: apply adverse slippage
-        from app.services.paper_trading.order_service import _DEFAULT_SLIPPAGE_BPS
-        slippage = ltp * _DEFAULT_SLIPPAGE_BPS / Decimal("10000")
-        exit_price = (ltp - slippage).quantize(Decimal("0.0001"))
-
-    product_type: str = position.product_type
+    slippage = ltp * _DEFAULT_SLIPPAGE_BPS / Decimal("10000")
+    exit_price = (ltp - slippage).quantize(Decimal("0.0001"))
 
     charges = calculate_charges(
         transaction_type="SELL",
@@ -295,7 +324,6 @@ async def close_position(
     )
     settlement_date = _compute_settlement_date("SELL", product_type)
 
-    # ── Create synthetic SELL order and fill ──────────────────────────────────
     sell_order = PaperOrder(
         portfolio_id=position.portfolio_id,
         suggestion_id=position.suggestion_id,
@@ -303,10 +331,9 @@ async def close_position(
         instrument_key=position.instrument_key,
         transaction_type="SELL",
         product_type=product_type,
-        order_type=payload.order_type.value,
+        order_type="MARKET",
         validity="DAY",
         quantity=payload.quantity,
-        price=exit_price if payload.order_type.value == "LIMIT" else None,
         status="PENDING",
     )
     session.add(sell_order)
@@ -318,7 +345,7 @@ async def close_position(
         symbol=position.symbol,
         fill_quantity=payload.quantity,
         fill_price=exit_price,
-        slippage_bps=_ZERO if payload.order_type.value == "LIMIT" else Decimal("3"),
+        slippage_bps=_DEFAULT_SLIPPAGE_BPS,
         brokerage=_ZERO,
         stt=charges.stt,
         exchange_charges=charges.exchange_charges,
@@ -333,10 +360,8 @@ async def close_position(
     session.add(fill)
     await session.flush()
 
-    # Credit cash
     await credit_cash(session, portfolio, charges.net_amount)
 
-    # Update position
     position = await apply_sell_fill_to_position(
         session=session,
         portfolio=portfolio,
@@ -349,7 +374,7 @@ async def close_position(
     sell_order.updated_at = datetime.now(timezone.utc)
     await session.flush()
 
-    return position
+    return position, None, False
 
 
 # ──────────────────────────────────────────────────────────────────────────────

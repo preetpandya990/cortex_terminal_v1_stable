@@ -33,6 +33,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
@@ -134,6 +135,16 @@ class Portfolio(Base):
         server_default=text("10"),
     )
 
+    # Cash pre-committed by open LIMIT/SL/SL-M BUY orders awaiting fill.
+    # available_cash = current_cash − reserved_cash.
+    # Maintained by portfolio_service.reserve_cash / release_cash_reservation.
+    reserved_cash: Mapped[Decimal] = mapped_column(
+        Numeric(18, 2),
+        nullable=False,
+        default=Decimal("0"),
+        server_default=text("0"),
+    )
+
     is_active: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
@@ -183,6 +194,12 @@ class Portfolio(Base):
         back_populates="portfolio",
         cascade="all, delete-orphan",
         order_by="PaperPnlSnapshot.snapshot_date.desc()",
+        lazy="select",
+    )
+    post_close_monitors: Mapped[list["PostCloseMonitor"]] = relationship(
+        "PostCloseMonitor",
+        back_populates="portfolio",
+        cascade="all, delete-orphan",
         lazy="select",
     )
 
@@ -828,6 +845,13 @@ class PaperTradeOutcome(Base):
         "User",
         back_populates="paper_trade_outcomes",
     )
+    post_close_monitor: Mapped["PostCloseMonitor | None"] = relationship(
+        "PostCloseMonitor",
+        back_populates="outcome",
+        uselist=False,
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
 
     @property
     def is_winner(self) -> bool:
@@ -924,4 +948,193 @@ class PaperPnlSnapshot(Base):
             f"<PaperPnlSnapshot(portfolio={self.portfolio_id}, "
             f"date={self.snapshot_date}, value={self.portfolio_value}, "
             f"realized={self.total_realized_pnl})>"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PostCloseMonitor
+# ──────────────────────────────────────────────────────────────────────────────
+
+class PostCloseMonitor(Base):
+    """
+    Post-close counterfactual tracker.
+
+    Created immediately after an auto-close (SL or TP hit) when the owning
+    user has post-close monitoring enabled. Tracks price action during the
+    configured window and records what would have happened if the position
+    had been held longer.
+
+    close_reason: the exit that triggered this monitor (SL / TP1 / TP2 / TP3).
+    remaining_tp*: targets that were not yet hit at close time and are watched.
+      • SL close  → remaining_tp1/2/3 (any TPs that were defined on the position)
+      • TP1 close → remaining_tp2/3 if defined
+      • TP2 close → remaining_tp3 if defined
+      • TP3 close → no remaining targets; monitor is never created
+
+    Direction semantics:
+      LONG  — favourable = rising price; TP hit when price >= target;
+               SL recovery when price crosses back above stop_loss
+      SHORT — favourable = falling price; TP hit when price <= target;
+               SL recovery when price crosses back below stop_loss
+
+    Status lifecycle:
+      ACTIVE → COMPLETED  all remaining targets resolved, OR monitor_until
+                           reached during an active tick
+      ACTIVE → EXPIRED    monitor_until passed without a tick (swept hourly)
+
+    The updated_at column is mutated on every tick that changes an outcome
+    field; completed_at is set once when status leaves ACTIVE.
+
+    Indexes:
+      (instrument_key, status) — fast dispatch in the monitor loop
+      (user_id, status, created_at DESC) — API list queries
+      (monitor_until, status) — expiry sweep
+    """
+
+    __tablename__ = "post_close_monitors"
+
+    __table_args__ = (
+        CheckConstraint(
+            "close_reason IN ('SL', 'TP1', 'TP2', 'TP3')",
+            name="ck_pcm_close_reason",
+        ),
+        CheckConstraint(
+            "direction IN ('LONG', 'SHORT')",
+            name="ck_pcm_direction",
+        ),
+        CheckConstraint(
+            "status IN ('ACTIVE', 'COMPLETED', 'EXPIRED')",
+            name="ck_pcm_status",
+        ),
+        CheckConstraint(
+            "close_price > 0",
+            name="ck_pcm_close_price_positive",
+        ),
+        CheckConstraint(
+            "entry_price > 0",
+            name="ck_pcm_entry_price_positive",
+        ),
+        # Composite indexes for the two hot query paths
+        Index("ix_pcm_instrument_status", "instrument_key", "status"),
+        Index("ix_pcm_user_status_created", "user_id", "status", "created_at"),
+        Index("ix_pcm_monitor_until_status", "monitor_until", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    # One monitor per outcome — enforced by unique=True
+    outcome_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("paper_trade_outcomes.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    position_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("paper_positions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    portfolio_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("portfolios.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # Denormalized for fast single-table API queries without joins
+    user_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    symbol: Mapped[str] = mapped_column(String(50), nullable=False)
+    instrument_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    direction: Mapped[str] = mapped_column(String(5), nullable=False)
+    close_reason: Mapped[str] = mapped_column(String(10), nullable=False)
+
+    # Prices captured at close time — immutable reference points
+    close_price: Mapped[Decimal] = mapped_column(Numeric(12, 4), nullable=False)
+    entry_price: Mapped[Decimal] = mapped_column(Numeric(12, 4), nullable=False)
+    stop_loss: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+
+    # Targets remaining at close time (NULL = not defined / already hit)
+    remaining_tp1: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    remaining_tp2: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    remaining_tp3: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+
+    monitor_until: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(10),
+        nullable=False,
+        default="ACTIVE",
+        server_default=text("'ACTIVE'"),
+    )
+
+    # ── Outcome fields — updated as monitoring progresses ──────────────────────
+
+    # Best price reached in the favourable direction since close
+    peak_favorable_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    # Worst price reached in the adverse direction since close
+    peak_adverse_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+
+    # SL-recovery flags (only meaningful for SL-closed positions)
+    recovered_above_sl: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    recovered_above_entry: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+
+    # Wall-clock timestamps when each remaining target was first hit post-close
+    tp1_hit_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    tp2_hit_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    tp3_hit_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sl_recovery_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    # ── Relationships ──────────────────────────────────────────────────────────
+    outcome: Mapped["PaperTradeOutcome"] = relationship(
+        "PaperTradeOutcome",
+        back_populates="post_close_monitor",
+    )
+    portfolio: Mapped["Portfolio"] = relationship(
+        "Portfolio",
+        back_populates="post_close_monitors",
+    )
+
+    @property
+    def is_active(self) -> bool:
+        return self.status == "ACTIVE"
+
+    @property
+    def all_targets_resolved(self) -> bool:
+        """True when every remaining target that was set has been hit."""
+        return all(
+            getattr(self, f"tp{n}_hit_at") is not None
+            for n in (1, 2, 3)
+            if getattr(self, f"remaining_tp{n}") is not None
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"<PostCloseMonitor(id={self.id}, symbol={self.symbol}, "
+            f"close_reason={self.close_reason}, status={self.status}, "
+            f"until={self.monitor_until})>"
         )

@@ -19,6 +19,7 @@ import {
   Activity,
   AlertCircle,
   ChevronRight,
+  Clock,
   Loader2,
   Plus,
   TrendingDown,
@@ -27,13 +28,15 @@ import {
   WifiOff,
 } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
-import { usePortfolioSummary, usePositions } from "@/hooks/usePaperTrading";
+import { useToast } from "@/components/ui/toast";
+import { usePortfolioSummary, usePositions, usePendingOrders } from "@/hooks/usePaperTrading";
 import { usePnLWebSocket } from "@/hooks/usePnLWebSocket";
 import { PortfolioSummaryCard } from "./PortfolioSummaryCard";
 import { CreatePortfolioModal } from "./CreatePortfolioModal";
 import { ClosePositionModal } from "./ClosePositionModal";
 import { PositionDetailModal } from "./PositionDetailModal";
 import { PortfolioSettingsModal } from "./PortfolioSettingsModal";
+import PendingOrdersPanel from "./PendingOrdersPanel";
 import type { LivePositionPnL, PaperPosition } from "@/types/paper_trading";
 
 // ── Formatters ────────────────────────────────────────────────────────────────
@@ -296,10 +299,11 @@ function ClosedPositionRow({
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-type ActiveTab = "open" | "closed";
+type ActiveTab = "open" | "closed" | "pending";
 
 export function OpenPositionsTable() {
   const { accessToken, isAuthenticated, isAuthReady } = useAuth();
+  const toast = useToast();
 
   const [activeTab,         setActiveTab]         = useState<ActiveTab>("open");
   const [showCreate,        setShowCreate]         = useState(false);
@@ -339,6 +343,9 @@ export function OpenPositionsTable() {
   const openPositions   = allPositionsData?.positions.filter((p) => p.status === "OPEN")   ?? [];
   const closedPositions = allPositionsData?.positions.filter((p) => p.status === "CLOSED") ?? [];
 
+  const { data: pendingOrdersData } = usePendingOrders();
+  const pendingCount = pendingOrdersData?.orders?.length ?? portfolio?.pending_order_count ?? 0;
+
   // ── WebSocket live P&L ────────────────────────────────────────────────────
 
   const {
@@ -346,11 +353,29 @@ export function OpenPositionsTable() {
     connectionState: wsState,
     positionPnLMap,
     portfolioStats,
+    onOrderFilled,
+    onOrderExpired,
   } = usePnLWebSocket(
     portfolio?.id,
     accessToken,
     isAuthReady && isAuthenticated && !!portfolio?.id,
   );
+
+  // Attach WS order lifecycle callbacks — stable ref assignment, no re-render.
+  useEffect(() => {
+    onOrderFilled.current = (event) => {
+      const side = event.transaction_type === "BUY" ? "Buy" : "Sell";
+      const price = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", minimumFractionDigits: 2 }).format(event.fill_price);
+      toast.success(
+        `${side} order filled`,
+        `${event.quantity} × ${event.symbol} at ${price}`,
+      );
+    };
+    onOrderExpired.current = (event) => {
+      toast.warning(`Order expired`, `DAY order for ${event.symbol} was cancelled at market close (15:30 IST).`);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // ── Callbacks ─────────────────────────────────────────────────────────────
 
@@ -481,6 +506,14 @@ export function OpenPositionsTable() {
                 onClick={() => setActiveTab("open")}
               />
               <TabButton
+                active={activeTab === "pending"}
+                label="Pending"
+                count={pendingCount}
+                loading={false}
+                onClick={() => setActiveTab("pending")}
+                accent={pendingCount > 0}
+              />
+              <TabButton
                 active={activeTab === "closed"}
                 label="Closed"
                 count={closedPositions.length}
@@ -510,8 +543,22 @@ export function OpenPositionsTable() {
             </div>
           </div>
 
-          {/* Empty state */}
-          {!positionsLoading && activePositions.length === 0 && (
+          {/* ── Pending Orders Panel ──────────────────────────────────── */}
+          {activeTab === "pending" && (
+            <div className="p-4">
+              <PendingOrdersPanel
+                onCancelSuccess={(symbol) =>
+                  toast.success("Order cancelled", `Pending order for ${symbol} has been cancelled.`)
+                }
+                onCancelError={(err) =>
+                  toast.error(err.message ?? "Failed to cancel order.")
+                }
+              />
+            </div>
+          )}
+
+          {/* Empty state — only shown for open / closed tabs */}
+          {activeTab !== "pending" && !positionsLoading && activePositions.length === 0 && (
             <div className="flex flex-col items-center justify-center py-14 text-center">
               <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-slate-100">
                 <Activity className="h-5 w-5 text-slate-400" />
@@ -528,7 +575,7 @@ export function OpenPositionsTable() {
           )}
 
           {/* ── Open Positions Table ───────────────────────────────────── */}
-          {activeTab === "open" && openPositions.length > 0 && (
+          {activeTab === "open" && openPositions.length > 0 && !positionsLoading && (
             <div className="overflow-x-auto">
               <table className="w-full min-w-[1120px] text-sm">
                 <thead>
@@ -590,8 +637,8 @@ export function OpenPositionsTable() {
             </div>
           )}
 
-          {/* Aggregate footer */}
-          {activePositions.length > 0 && (
+          {/* Aggregate footer — only for open / closed position tabs */}
+          {activeTab !== "pending" && activePositions.length > 0 && (
             <div className="border-t border-slate-200 bg-slate-50 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 rounded-b-2xl text-xs">
               <span className="text-slate-500">
                 {activePositions.length}{" "}
@@ -678,12 +725,15 @@ function TabButton({
   count,
   loading,
   onClick,
+  accent = false,
 }: {
   active: boolean;
   label: string;
   count: number;
   loading: boolean;
   onClick: () => void;
+  /** When true, renders an amber badge to draw attention to pending orders. */
+  accent?: boolean;
 }) {
   return (
     <button
@@ -700,7 +750,13 @@ function TabButton({
       ) : (
         <span
           className={`rounded-full px-1.5 py-0.5 text-[10px] font-bold ${
-            active ? "bg-slate-100 text-slate-600" : "bg-slate-200 text-slate-500"
+            accent && count > 0
+              ? active
+                ? "bg-amber-100 text-amber-700"
+                : "bg-amber-200 text-amber-700"
+              : active
+              ? "bg-slate-100 text-slate-600"
+              : "bg-slate-200 text-slate-500"
           }`}
         >
           {count}

@@ -184,7 +184,7 @@ export function SuggestionDetailModal({
           </div>
         </DialogHeader>
 
-        <Tabs defaultValue="signal" className="mt-4">
+        <Tabs defaultValue="fundamentals" className="mt-4">
           <TabsList className="grid w-full grid-cols-2">
             <TabsTrigger value="signal">Signal Details</TabsTrigger>
             <TabsTrigger value="fundamentals">Fundamentals</TabsTrigger>

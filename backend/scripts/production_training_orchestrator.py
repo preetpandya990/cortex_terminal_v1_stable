@@ -40,9 +40,9 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Callable, Dict, List, Tuple, Optional, Any
 
 import numpy as np
 import pandas as pd
@@ -70,9 +70,21 @@ from app.ml.training.gru_trainer import GRUTrainer, CrossSectionalSequenceGenera
 from app.ml.training.ensemble_trainer import EnsembleTrainer
 from app.ml.training.evaluator import ModelEvaluator, EvaluationResults
 from app.ml.training.checkpoint_manager import CheckpointManager, find_checkpoint
-from app.ml.training.exceptions import MissingReturnsError, StaleCheckpointError
+from app.ml.training.exceptions import DataCoverageError, MissingReturnsError, StaleCheckpointError
 from app.ml.model_registry import ModelRegistry
 from app.ml.inference.onnx_converter import ONNXConverter
+
+# ── E3: MLflow lineage ─────────────────────────────────────────────────────────
+# Local file-store — operator can explore via:  mlflow ui --backend-store-uri mlruns/
+_MLRUNS_DIR     = Path(__file__).parent.parent / "mlruns"
+_MLFLOW_EXPERIMENT = "cortex_ml_training"
+
+# Step name → 1-based integer index for MLflow metric step axis.
+_STEP_INDEX: Dict[str, int] = {s: i + 1 for i, s in enumerate([
+    "step_1_symbols", "step_2_features", "step_3_targets", "step_4_splits",
+    "step_5_xgboost", "step_6_gru", "step_7_ensemble", "step_8_evaluation",
+    "step_9_onnx", "step_10_registry",
+])}
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -90,7 +102,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TrainingConfig:
     """Production training configuration."""
-    n_symbols: int = 2551
+    n_symbols: int = 2557
     lookback_years: int = 10
     sequence_length: int = 60
     n_features: int = 69  # 44 technical + 5 sentiment + 20 fundamental
@@ -125,16 +137,34 @@ class TrainingConfig:
     # Training parameters
     early_stopping_patience: int = 20
     max_epochs: int = 200
-    # 1024 amortises WSL2 PCIe transfer overhead without exceeding 1592 MB VRAM.
-    # 2048 OOM'd due to XLA scratch buffers on top of batch activations.
+    # 1024 amortises WSL2 PCIe transfer overhead; fits comfortably in 4 GB VRAM
+    # for a 69-feature GRU (226 K params, batch activations ≈ 300 MiB at float16).
     batch_size: int = 1024
 
-    # Ensemble
-    ensemble_optimization_metric: str = 'sharpe_ratio'
+    # Ensemble — A5 net-DSR weighting always operates on net Deflated Sharpe
+    # (the promotion bar) — see EnsembleTrainer.optimize_weights_on_oof.
     min_confidence_threshold: float = 0.4
+    # A7 — minimum fraction of requested symbols that must survive the
+    # data-quality audit before training is allowed to proceed.  At n_symbols
+    # = 2557 (full NSE universe), only ~1679 currently pass both gates (730+
+    # bars + 95% relative completeness); the remaining ~880 are genuine new
+    # listings (insufficient history) or have data gaps from Upstox ingestion.
+    # 0.60 admits today's universe while still catching a future severe drop
+    # (e.g. 40% would indicate a broken data pipeline). Raise once Upstox
+    # backfill / listing churn settles.
+    min_symbol_coverage: float = 0.60
+
+    # Coverage gate on the GRU-OOF ∩ XGBoost-OOF join. Below this, A5 fails
+    # loud (the panels disagree → the bar would be measured on a biased
+    # subset). 0.90 = 10 % slack for legitimate panel-edge differences.
+    a5_min_join_coverage: float = 0.90
+    # Strength of the L2 prior toward equal weights in the A5 inner objective;
+    # this is what defeats "no-info" boundary attractors at w = 0 or 1 when
+    # one member is near-random.
+    a5_l2_prior: float = 0.10
 
     # Model versioning
-    model_version: str = "1.0.0"
+    model_version: str = "1.1.0"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -179,18 +209,17 @@ class EpochCheckpointCallback:
     """
 
     @staticmethod
-    def build(cp: CheckpointManager) -> Any:
+    def build(cp: CheckpointManager, n_features: int) -> Any:
         import tensorflow as tf
 
         class _Callback(tf.keras.callbacks.Callback):
             def on_epoch_end(self, epoch: int, logs: Optional[Dict] = None) -> None:
-                # Save weights to a numbered checkpoint file.
                 weight_path = str(cp.gru_epoch_weights_dir / f"epoch_{epoch:04d}.weights.h5")
                 self.model.save_weights(weight_path)
-                # Persist state atomically — a crash here only loses this epoch's entry.
                 cp.save_gru_training_state(
                     last_epoch=epoch,
                     logs={k: float(v) for k, v in (logs or {}).items()},
+                    n_features=n_features,
                 )
 
         return _Callback()
@@ -254,6 +283,11 @@ class ProductionTrainingOrchestrator:
         self.targets_data: Dict[str, Any] = {}
         self.class_weights: Optional[Dict[int, float]] = None
         self._total_samples_count: int = 0
+        # A7 — fraction of config.n_symbols that survived the data-quality audit.
+        # Populated by _assert_symbol_coverage (fresh) or step-1 resume path.
+        # Injected into registry metrics so the A6 QualityGate coverage gate
+        # (gate 4) becomes a true hard gate instead of a provisional skip.
+        self._symbol_coverage: Optional[float] = None
 
         # Models
         self.xgboost_trainer: Optional[XGBoostTrainer] = None
@@ -261,17 +295,214 @@ class ProductionTrainingOrchestrator:
         self.ensemble_trainer: Optional[EnsembleTrainer] = None
 
         # GRU evaluation subset (kept after step 6 for steps 7-8)
-        self.gru_eval_X:       Optional[np.ndarray] = None
-        self.gru_eval_y:       Optional[np.ndarray] = None
-        self.gru_eval_returns: Optional[np.ndarray] = None  # h-bar forward returns
+        self.gru_eval_X:         Optional[np.ndarray] = None
+        self.gru_eval_y:         Optional[np.ndarray] = None
+        self.gru_eval_returns:   Optional[np.ndarray] = None  # h-bar forward returns
+        self.gru_eval_symbol:    Optional[np.ndarray] = None  # A5 join key
+        self.gru_eval_timestamp: Optional[np.ndarray] = None  # A5 join key
+
+        # CPCV OOF backtest paths from step-5 XGBoost (used by A3/A4/A5)
+        self.cpcv_oof: Optional[Dict[str, Any]] = None
 
         self.results: Optional[TrainingResults] = None
+
+        # E3 — MLflow lineage (set by _setup_mlflow at run() start; None until then)
+        self._e3_mlflow_run_id: Optional[str] = None
+        # E3 — Promotion report path cached so _finalize_mlflow can log it as artifact
+        self._e3_promotion_report_path: Optional[str] = None
 
         self._setup_logging()
         logger.info("Production Training Orchestrator initialised  run_id=%s", self.cp.run_id)
         logger.info("Checkpoint file : %s", self.cp._file.resolve())
         logger.info("Checkpoint dir  : %s", self.cp._dir.resolve())
         logger.info("Configuration: %s", json.dumps(self.config.to_dict(), indent=2))
+
+    # ── E3: MLflow lineage + structured run log ────────────────────────────────
+
+    def _setup_mlflow(self) -> None:
+        """Start (or resume) the MLflow run for this training session.
+
+        Uses a local file-store so no server is required.  The run_id is
+        persisted in the checkpoint state so a resumed run reconnects to the
+        same MLflow experiment run instead of spawning a duplicate.
+
+        Entirely non-fatal — a broken mlflow install never aborts training.
+        """
+        try:
+            import mlflow
+            _MLRUNS_DIR.mkdir(parents=True, exist_ok=True)
+            mlflow.set_tracking_uri(f"file://{_MLRUNS_DIR}")
+            mlflow.set_experiment(_MLFLOW_EXPERIMENT)
+
+            stored_mlflow_id = self.cp.mlflow_run_id
+            active = mlflow.start_run(
+                run_id=stored_mlflow_id,          # None on fresh runs → new run
+                run_name=self.cp.run_id,
+                tags={
+                    "checkpoint.run_id":    self.cp.run_id,
+                    "model.version":        self.config.model_version,
+                    "checkpoint.dir":       str(self.cp._dir),
+                    "tracking.uri":         f"file://{_MLRUNS_DIR}",
+                    "pipeline.status":      "running",
+                },
+            )
+            self._e3_mlflow_run_id = active.info.run_id
+
+            if stored_mlflow_id is None:
+                # Fresh run — persist so resumes reconnect.
+                self.cp.save_mlflow_run_id(self._e3_mlflow_run_id)
+                # Log all TrainingConfig fields as params (once per run).
+                params = {k: str(v) for k, v in self.config.to_dict().items()}
+                mlflow.log_params(params)
+                logger.info(
+                    "E3 MLflow run started  run_id=%s  experiment=%s",
+                    self._e3_mlflow_run_id, _MLFLOW_EXPERIMENT,
+                )
+            else:
+                logger.info(
+                    "E3 MLflow run resumed  run_id=%s",
+                    self._e3_mlflow_run_id,
+                )
+
+            # Write run_start event to the structured log.
+            self._write_run_log_entry({
+                "event":          "run_start",
+                "run_id":         self.cp.run_id,
+                "mlflow_run_id":  self._e3_mlflow_run_id,
+                "model_version":  self.config.model_version,
+                "resumed":        stored_mlflow_id is not None,
+            })
+        except Exception as exc:
+            logger.warning("E3 MLflow setup failed (non-fatal): %s", exc)
+
+    def _log_mlflow_step_done(self, step_name: str, duration_s: float, metrics: Optional[Dict[str, Any]] = None) -> None:
+        """Log step completion duration + optional metrics to MLflow and the structured log."""
+        step_num = _STEP_INDEX.get(step_name, 0)
+        # Structured log (always — independent of MLflow availability).
+        self._write_run_log_entry({
+            "event":       "step_complete",
+            "step":        step_name,
+            "step_num":    step_num,
+            "duration_s":  round(duration_s, 3),
+            "metrics":     {k: v for k, v in (metrics or {}).items() if v is not None},
+        })
+        try:
+            import mlflow
+            if self._e3_mlflow_run_id is None:
+                return
+            mlflow.log_metric("pipeline.step_duration_s", duration_s, step=step_num)
+            if metrics:
+                safe = {}
+                for k, v in metrics.items():
+                    if isinstance(v, (int, float)) and v == v:   # exclude NaN
+                        safe[k] = float(v)
+                    elif isinstance(v, bool):
+                        safe[k] = 1.0 if v else 0.0
+                if safe:
+                    mlflow.log_metrics(safe, step=step_num)
+        except Exception as exc:
+            logger.debug("E3 MLflow step log failed (non-fatal): %s", exc)
+
+    def _log_mlflow_eval_metrics(self, evaluation_results: Dict[str, Any]) -> None:
+        """Log step-8 evaluation metrics to MLflow after comprehensive evaluation."""
+        try:
+            import mlflow
+            if self._e3_mlflow_run_id is None:
+                return
+            metrics: Dict[str, float] = {}
+            for model_name, res in evaluation_results.items():
+                d = asdict(res) if hasattr(res, "__dataclass_fields__") else (res if isinstance(res, dict) else {})
+                prefix = model_name
+                for key in ("accuracy", "sharpe_ratio", "auc_pr", "deflated_sharpe", "pbo"):
+                    val = d.get(key)
+                    if val is not None and isinstance(val, (int, float)) and val == val:
+                        metrics[f"{prefix}.{key}"] = float(val)
+            if metrics:
+                mlflow.log_metrics(metrics, step=8)
+                logger.debug("E3 MLflow eval metrics logged: %s", list(metrics))
+        except Exception as exc:
+            logger.debug("E3 MLflow eval log failed (non-fatal): %s", exc)
+
+    def _log_mlflow_registration_metrics(
+        self,
+        xgb_metrics: Dict[str, Any],
+        gru_metrics: Dict[str, Any],
+    ) -> None:
+        """Log step-10 registered model metrics to MLflow."""
+        try:
+            import mlflow
+            if self._e3_mlflow_run_id is None:
+                return
+            metrics: Dict[str, float] = {}
+            for prefix, m in (("xgb", xgb_metrics), ("gru", gru_metrics)):
+                for key in ("auc_pr", "deflated_sharpe", "pbo", "ece_after",
+                             "symbol_coverage", "ensemble_weight",
+                             "ensemble_net_dsr", "accuracy"):
+                    val = m.get(key)
+                    if val is not None and isinstance(val, (int, float)) and val == val:
+                        metrics[f"{prefix}.{key}"] = float(val)
+                accretive = m.get("ensemble_accretive")
+                if accretive is not None:
+                    metrics[f"{prefix}.ensemble_accretive"] = 1.0 if accretive else 0.0
+            metrics["data.n_symbols"]      = float(len(self.symbols))
+            metrics["data.total_samples"]  = float(self._calculate_total_samples())
+            if self._symbol_coverage is not None:
+                metrics["data.symbol_coverage"] = float(self._symbol_coverage)
+            if metrics:
+                mlflow.log_metrics(metrics, step=10)
+        except Exception as exc:
+            logger.debug("E3 MLflow registration metrics log failed (non-fatal): %s", exc)
+
+    def _finalize_mlflow(self, status: str, promotion_report_path: Optional[str] = None) -> None:
+        """Log final artifacts, update status tag, and end the MLflow run."""
+        # Structured log (always).
+        self._write_run_log_entry({
+            "event":                  f"run_{status.lower()}",
+            "mlflow_run_id":          self._e3_mlflow_run_id,
+            "promotion_report_path":  promotion_report_path,
+        })
+        try:
+            import mlflow
+            if self._e3_mlflow_run_id is None:
+                return
+            mlflow.set_tag("pipeline.status", status.lower())
+
+            # Log the structured run log as an artifact.
+            run_log_path = self.cp._dir / "run_log.ndjson"
+            if run_log_path.exists():
+                mlflow.log_artifact(str(run_log_path), artifact_path="run_lineage")
+
+            # Log the promotion report as an artifact if available.
+            if promotion_report_path:
+                p = Path(promotion_report_path)
+                if p.exists():
+                    mlflow.log_artifact(str(p), artifact_path="promotion_report")
+
+            # Log the training config for reproducibility.
+            mlflow.log_dict(self.config.to_dict(), "run_lineage/training_config.json")
+
+            mlflow.end_run(status="FINISHED" if status == "FINISHED" else "FAILED")
+            logger.info(
+                "E3 MLflow run ended  status=%s  run_id=%s  mlruns=%s",
+                status, self._e3_mlflow_run_id, _MLRUNS_DIR,
+            )
+        except Exception as exc:
+            logger.warning("E3 MLflow finalize failed (non-fatal): %s", exc)
+
+    def _write_run_log_entry(self, entry: Dict[str, Any]) -> None:
+        """Append a JSON event record to the per-run structured log (NDJSON).
+
+        The structured log at ``{checkpoint_dir}/run_log.ndjson`` is a
+        newline-delimited JSON file (one object per line) that operators can
+        tail/parse independently of the MLflow UI for automated alerting.
+        """
+        try:
+            entry_with_ts = {"ts": datetime.now(timezone.utc).isoformat(), **entry}
+            run_log_path  = self.cp._dir / "run_log.ndjson"
+            with open(run_log_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry_with_ts, default=str) + "\n")
+        except Exception as exc:
+            logger.debug("E3 structured log write failed (non-fatal): %s", exc)
 
     # ── Logging ────────────────────────────────────────────────────────────────
 
@@ -301,6 +532,9 @@ class ProductionTrainingOrchestrator:
         start_time = datetime.now()
         cp = self.cp  # alias for brevity
 
+        # E3: Start or resume the MLflow run for this session.
+        self._setup_mlflow()
+
         logger.info("=" * 100)
         logger.info("CORTEX AI — PRODUCTION ML TRAINING PIPELINE  run_id=%s", cp.run_id)
         logger.info("Next pending step: %s", cp.next_pending() or "ALL DONE")
@@ -314,12 +548,22 @@ class ProductionTrainingOrchestrator:
 
             if cp.is_done("step_1_symbols"):
                 self.symbols = cp.load_symbols()
-                logger.info("→ Resuming: step_1 skipped  (%d symbols from checkpoint)", len(self.symbols))
+                # Re-derive coverage so step-10 can inject it into registry
+                # metrics regardless of whether this is a fresh or resumed run.
+                # The coverage gate already fired on the original fresh run, so
+                # this re-derivation is for observability and metric surfacing only.
+                self._symbol_coverage = len(self.symbols) / max(self.config.n_symbols, 1)
+                logger.info(
+                    "→ Resuming: step_1 skipped  (%d symbols from checkpoint  coverage=%.1f%%)",
+                    len(self.symbols), self._symbol_coverage * 100,
+                )
             else:
                 t0 = time.monotonic()
                 await self._select_symbols_and_assess_quality()
                 cp.save_symbols(self.symbols)
-                cp.mark_done("step_1_symbols", time.monotonic() - t0)
+                _dur1 = time.monotonic() - t0
+                cp.mark_done("step_1_symbols", _dur1)
+                self._log_mlflow_step_done("step_1_symbols", _dur1, {"n_symbols": len(self.symbols)})
 
             # ── Step 2 ────────────────────────────────────────────────────────
             logger.info("\n" + "=" * 100)
@@ -337,12 +581,23 @@ class ProductionTrainingOrchestrator:
                     self._total_samples_count = meta["total_rows"]
                     self._max_timestamps_cached = meta["max_timestamps"]
                 logger.info("→ Resuming: step_2 skipped  (checkpoint)")
+                # A7 — training_samples invariant: zero rows means the persisted
+                # feature checkpoint is corrupt or empty.  A model trained on zero
+                # samples would emit fabricated metrics and ship silently broken.
+                if self._calculate_total_samples() <= 0:
+                    raise DataCoverageError(
+                        "Resume produced training_samples=0: the step_2 feature "
+                        "checkpoint is corrupt or empty.  Run with --fresh to rebuild "
+                        "the feature data from the database."
+                    )
             else:
                 t0 = time.monotonic()
                 await self._compute_and_validate_features()
                 logger.info("Saving step_2 checkpoint (%d DataFrames)...", len(self.raw_features_data))
                 cp.save_features(self.raw_features_data)
-                cp.mark_done("step_2_features", time.monotonic() - t0)
+                _dur2 = time.monotonic() - t0
+                cp.mark_done("step_2_features", _dur2)
+                self._log_mlflow_step_done("step_2_features", _dur2, {"total_samples": self._calculate_total_samples()})
 
             # ── Step 3 ────────────────────────────────────────────────────────
             logger.info("\n" + "=" * 100)
@@ -362,7 +617,9 @@ class ProductionTrainingOrchestrator:
                 await self._generate_and_analyze_targets()
                 logger.info("Saving step_3 checkpoint (%d symbols)...", len(self.targets_data))
                 cp.save_targets(self.targets_data, self.class_weights)
-                cp.mark_done("step_3_targets", time.monotonic() - t0)
+                _dur3 = time.monotonic() - t0
+                cp.mark_done("step_3_targets", _dur3)
+                self._log_mlflow_step_done("step_3_targets", _dur3)
 
             # ── Step 4 ────────────────────────────────────────────────────────
             logger.info("\n" + "=" * 100)
@@ -385,7 +642,9 @@ class ProductionTrainingOrchestrator:
                     cv_plan.get("n_splits"), cv_plan.get("n_paths"),
                 )
                 cp.save_cv_plan(cv_plan)
-                cp.mark_done("step_4_splits", time.monotonic() - t0)
+                _dur4 = time.monotonic() - t0
+                cp.mark_done("step_4_splits", _dur4)
+                self._log_mlflow_step_done("step_4_splits", _dur4, {"n_splits": cv_plan.get("n_splits"), "n_paths": cv_plan.get("n_paths")})
 
             # ── Step 5 ────────────────────────────────────────────────────────
             logger.info("\n" + "=" * 100)
@@ -406,6 +665,34 @@ class ProductionTrainingOrchestrator:
                     'training_samples':   meta.get('training_samples', 0),
                     'validation_samples': meta.get('validation_samples', 0),
                 }
+                # Reload CPCV OOF paths (needed by A3/A4/A5); absent on runs
+                # that pre-date A2 — treat as a soft warning (not an error)
+                # so the pipeline can still proceed to registry registration.
+                if cp.has_cpcv_oof():
+                    self.cpcv_oof = cp.load_cpcv_oof()
+                    xgboost_results['cpcv_oof'] = self.cpcv_oof
+                    logger.info(
+                        "→ Resuming: CPCV OOF loaded  n_paths=%d  best_rounds=%s",
+                        self.cpcv_oof["n_paths"], self.cpcv_oof["best_rounds"],
+                    )
+                else:
+                    self.cpcv_oof = None
+                    logger.warning(
+                        "→ Resuming: CPCV OOF artifacts absent (pre-A2 checkpoint). "
+                        "A3/A4/A5 tasks require a fresh run to regenerate them."
+                    )
+                # Reload OOF-fitted calibrator (A4); absent on pre-A4 runs.
+                if cp.has_calibrator("xgboost"):
+                    self.xgboost_trainer.calibrator = cp.load_calibrator("xgboost")
+                    logger.info(
+                        "→ Resuming: XGBoost OOF calibrator loaded  ECE_after=%.4f",
+                        self.xgboost_trainer.calibrator.ece_after or 0.0,
+                    )
+                else:
+                    logger.warning(
+                        "→ Resuming: XGBoost calibrator absent (pre-A4 checkpoint). "
+                        "Inference will fall back to raw probabilities."
+                    )
                 logger.info("→ Resuming: step_5 skipped  (XGBoost model from checkpoint)")
             else:
                 # Ensure targets_data is in memory (may need lazy-load if step 3 was resumed)
@@ -413,7 +700,7 @@ class ProductionTrainingOrchestrator:
                     self.targets_data, self.class_weights = cp.load_targets()
                 t0 = time.monotonic()
                 xgboost_results = await self._train_xgboost_with_optimization(cv_plan)
-                logger.info("Saving step_5 checkpoint (XGBoost model)...")
+                logger.info("Saving step_5 checkpoint (XGBoost model + CPCV OOF)...")
                 cp.save_xgboost(
                     xgboost_results['model'],
                     xgboost_results['best_params'],
@@ -423,7 +710,30 @@ class ProductionTrainingOrchestrator:
                         'validation_samples': xgboost_results.get('validation_samples', 0),
                     },
                 )
-                cp.mark_done("step_5_xgboost", time.monotonic() - t0)
+                # Persist the φ CPCV OOF backtest paths so A3/A4/A5 can
+                # consume them on resume without re-running the 28-combo loop.
+                if 'cpcv_oof' in xgboost_results and xgboost_results['cpcv_oof']:
+                    cp.save_cpcv_oof(xgboost_results['cpcv_oof'])
+                    self.cpcv_oof = xgboost_results['cpcv_oof']
+                else:
+                    self.cpcv_oof = None
+                    logger.warning("No CPCV OOF in xgboost_results — skipping OOF persistence.")
+                # Persist the OOF-fitted calibrator (A4) — crash-resilient copy
+                # so a resume after step-5 completes does not lose the calibrator
+                # and force a full CPCV re-run.
+                if self.xgboost_trainer.calibrator is not None:
+                    cp.save_calibrator("xgboost", self.xgboost_trainer.calibrator)
+                else:
+                    logger.warning(
+                        "XGBoost calibrator is None after step-5 — OOF pool may have "
+                        "been empty. Inference will fall back to raw probabilities."
+                    )
+                _dur5 = time.monotonic() - t0
+                cp.mark_done("step_5_xgboost", _dur5)
+                self._log_mlflow_step_done("step_5_xgboost", _dur5, {
+                    "xgb_training_samples":   xgboost_results.get("training_samples"),
+                    "xgb_best_rounds":        xgboost_results.get("best_rounds"),
+                })
 
             # ── Step 6 ────────────────────────────────────────────────────────
             logger.info("\n" + "=" * 100)
@@ -441,6 +751,24 @@ class ProductionTrainingOrchestrator:
                 self.gru_eval_X       = eval_X
                 self.gru_eval_y       = eval_y
                 self.gru_eval_returns = eval_r
+                # A5 join keys + GRU calibrator survive a step-6 resume via
+                # sub-A / the calibrator checkpoint (load_gru itself omits
+                # them). Absent ⇒ pre-A5 checkpoint; the ensemble step will
+                # fail loud rather than weight on uncalibrated/unjoinable data.
+                _, _, _, _gru_meta = cp.load_gru_eval_arrays()
+                self.gru_eval_symbol    = _gru_meta["val_symbol"]
+                self.gru_eval_timestamp = _gru_meta["val_timestamp"]
+                if cp.has_calibrator("gru"):
+                    self.gru_trainer.calibrator = cp.load_calibrator("gru")
+                    logger.info(
+                        "→ Resuming: GRU calibrator loaded  ECE_after=%.4f",
+                        self.gru_trainer.calibrator.ece_after or 0.0,
+                    )
+                else:
+                    logger.warning(
+                        "→ Resuming: GRU calibrator absent (pre-A5 checkpoint). "
+                        "Step 7 (A5 net-DSR weighting) will fail loud."
+                    )
                 gru_results = {
                     'model':              gru_model,
                     'best_params':        best_params,
@@ -465,7 +793,22 @@ class ProductionTrainingOrchestrator:
                     gru_results['best_params'],
                     meta={'training_samples': gru_results.get('training_samples', 0)},
                 )
-                cp.mark_done("step_6_gru", time.monotonic() - t0)
+                # Persist the GRU calibrator (symmetry with XGBoost, A4) so a
+                # resume after step-6 can still run the A5 calibrated net-DSR
+                # weighting without retraining the GRU.
+                if self.gru_trainer.calibrator is not None:
+                    cp.save_calibrator("gru", self.gru_trainer.calibrator)
+                else:
+                    logger.warning(
+                        "GRU calibrator is None after step-6 — A5 weighting "
+                        "will fail loud (refusing to weight on raw scores)."
+                    )
+                _dur6 = time.monotonic() - t0
+                cp.mark_done("step_6_gru", _dur6)
+                self._log_mlflow_step_done("step_6_gru", _dur6, {
+                    "gru_training_samples":   gru_results.get("training_samples"),
+                    "gru_validation_samples": gru_results.get("validation_samples"),
+                })
 
             # ── Step 7 ────────────────────────────────────────────────────────
             logger.info("\n" + "=" * 100)
@@ -474,23 +817,37 @@ class ProductionTrainingOrchestrator:
 
             if cp.is_done("step_7_ensemble"):
                 weights = cp.load_ensemble_weights()
+                diagnostics = cp.load_ensemble_diagnostics()
                 self.ensemble_trainer = EnsembleTrainer(
                     xgboost_model=self.xgboost_trainer.model,
                     gru_model=self.gru_trainer.model,
                     weights=weights,
+                    xgb_calibrator=self.xgboost_trainer.calibrator,
+                    gru_calibrator=self.gru_trainer.calibrator,
                 )
+                self.ensemble_trainer.optimization_diagnostics = diagnostics or None
                 ensemble_results = {
                     'ensemble':           self.ensemble_trainer,
                     'optimized_weights':  weights,
+                    'diagnostics':        diagnostics,
                     'validation_samples': len(self.gru_eval_y),
                 }
-                logger.info("→ Resuming: step_7 skipped  (ensemble weights from checkpoint)")
+                logger.info(
+                    "→ Resuming: step_7 skipped  (weights + A5 diagnostics from checkpoint)"
+                )
             else:
                 t0 = time.monotonic()
                 ensemble_results = await self._create_and_optimize_ensemble(cv_plan)
-                logger.info("Saving step_7 checkpoint (ensemble weights)...")
-                cp.save_ensemble(ensemble_results['optimized_weights'])
-                cp.mark_done("step_7_ensemble", time.monotonic() - t0)
+                logger.info("Saving step_7 checkpoint (weights + A5 diagnostics)...")
+                cp.save_ensemble(
+                    ensemble_results['optimized_weights'],
+                    diagnostics=ensemble_results.get('diagnostics'),
+                )
+                _dur7 = time.monotonic() - t0
+                cp.mark_done("step_7_ensemble", _dur7)
+                self._log_mlflow_step_done("step_7_ensemble", _dur7, {
+                    "ensemble_accretive": ensemble_results.get("diagnostics", {}).get("accretive"),
+                })
 
             # ── Step 8 ────────────────────────────────────────────────────────
             logger.info("\n" + "=" * 100)
@@ -510,7 +867,10 @@ class ProductionTrainingOrchestrator:
                 cp.save_evaluation({
                     k: asdict(v) for k, v in evaluation_results.items()
                 })
-                cp.mark_done("step_8_evaluation", time.monotonic() - t0)
+                _dur8 = time.monotonic() - t0
+                cp.mark_done("step_8_evaluation", _dur8)
+                self._log_mlflow_step_done("step_8_evaluation", _dur8)
+                self._log_mlflow_eval_metrics(evaluation_results)
 
             # ── Step 9 ────────────────────────────────────────────────────────
             logger.info("\n" + "=" * 100)
@@ -524,7 +884,9 @@ class ProductionTrainingOrchestrator:
             else:
                 t0 = time.monotonic()
                 onnx_paths = await self._export_models_to_onnx()
-                cp.mark_done("step_9_onnx", time.monotonic() - t0)
+                _dur9 = time.monotonic() - t0
+                cp.mark_done("step_9_onnx", _dur9)
+                self._log_mlflow_step_done("step_9_onnx", _dur9, {"onnx_model_count": len(onnx_paths)})
 
             # ── Step 10 ───────────────────────────────────────────────────────
             logger.info("\n" + "=" * 100)
@@ -537,7 +899,72 @@ class ProductionTrainingOrchestrator:
             else:
                 t0 = time.monotonic()
                 model_paths = await self._register_models_in_registry(evaluation_results, onnx_paths)
-                cp.mark_done("step_10_registry", time.monotonic() - t0)
+                _dur10 = time.monotonic() - t0
+                cp.mark_done("step_10_registry", _dur10)
+                self._log_mlflow_step_done("step_10_registry", _dur10)
+
+            # ── F1 — Event-Driven Backtest Validation ─────────────────────────
+            logger.info("\n" + "=" * 100)
+            logger.info("F1: EVENT-DRIVEN BACKTEST VALIDATION")
+            logger.info("=" * 100)
+            _f1_event_backtest: Optional[Dict[str, Any]] = None
+            try:
+                _f1_event_backtest = self._run_event_backtest_f1()
+                if _f1_event_backtest:
+                    logger.info(
+                        "F1 event backtest: agreement=%s  divergence=%.1f%%  "
+                        "mean_ann_SR=%.4f  total_fills=%d  latency_bars=%d",
+                        _f1_event_backtest.get("agreement_status"),
+                        _f1_event_backtest.get("sharpe_divergence_relative_pct") or 0.0,
+                        _f1_event_backtest.get("mean_net_sharpe_annualised") or 0.0,
+                        _f1_event_backtest.get("total_fills") or 0,
+                        _f1_event_backtest.get("latency_bars") or 1,
+                    )
+                    self._write_run_log_entry({
+                        "event":            "f1_event_backtest_complete",
+                        "agreement_status": _f1_event_backtest.get("agreement_status"),
+                        "divergence_pct":   _f1_event_backtest.get("sharpe_divergence_relative_pct"),
+                        "mean_ann_sharpe":  _f1_event_backtest.get("mean_net_sharpe_annualised"),
+                        "total_fills":      _f1_event_backtest.get("total_fills"),
+                    })
+            except Exception as _f1_exc:
+                logger.error(
+                    "F1 event backtest FAILED (non-fatal — promotion report "
+                    "will have empty event_backtest section): %s", _f1_exc,
+                )
+                logger.error("F1 traceback:\n%s", traceback.format_exc())
+
+            # ── C2 — Champion/Challenger Promotion Report ─────────────────────
+            logger.info("\n" + "=" * 100)
+            logger.info("C2: GENERATING PROMOTION REPORT")
+            logger.info("=" * 100)
+            try:
+                promotion_report = await self._generate_promotion_report(
+                    onnx_paths, event_backtest=_f1_event_backtest
+                )
+                if promotion_report:
+                    self._e3_promotion_report_path = promotion_report.get("report_path")
+                    logger.info(
+                        "C2 Promotion Report: status=%s  path=%s",
+                        promotion_report.get("status"),
+                        self._e3_promotion_report_path,
+                    )
+                    self._write_run_log_entry({
+                        "event":       "c2_report_generated",
+                        "status":      promotion_report.get("status"),
+                        "report_path": self._e3_promotion_report_path,
+                        "mlflow_run_id": self._e3_mlflow_run_id,
+                    })
+            except Exception as _c2_exc:
+                # Non-fatal: models are registered; a broken report should not
+                # abort the training run, but it MUST be loudly logged so the
+                # operator knows they cannot promote without a valid report.
+                logger.error(
+                    "C2 promotion report generation FAILED (non-fatal — "
+                    "models are registered but cannot be promoted without a "
+                    "valid report): %s", _c2_exc,
+                )
+                logger.error("C2 traceback:\n%s", traceback.format_exc())
 
             # ── Finalise ──────────────────────────────────────────────────────
             end_time = datetime.now()
@@ -560,6 +987,9 @@ class ProductionTrainingOrchestrator:
 
             await self._save_training_results()
 
+            # E3: log final run metrics and end the MLflow run.
+            self._finalize_mlflow("FINISHED", self._e3_promotion_report_path)
+
             logger.info("=" * 100)
             logger.info("TRAINING PIPELINE COMPLETED SUCCESSFULLY  run_id=%s", cp.run_id)
             logger.info("Duration: %.2fs", training_duration)
@@ -571,6 +1001,8 @@ class ProductionTrainingOrchestrator:
         except Exception as e:
             logger.error("Training pipeline failed: %s", e)
             logger.error("Traceback:\n%s", traceback.format_exc())
+            # E3: end run with FAILED status (non-fatal — never masks the real exception).
+            self._finalize_mlflow("FAILED", None)
             await self._save_error_state(e)
             raise
 
@@ -664,6 +1096,7 @@ class ProductionTrainingOrchestrator:
             self.symbols = [s for s, _ in qualified_pairs][: self.config.n_symbols]
 
         logger.info("✓ Final symbol count: %d", len(self.symbols))
+        self._assert_symbol_coverage(usable=len(self.symbols), requested=self.config.n_symbols)
 
     async def _compute_and_validate_features(self) -> None:
         end_date   = datetime.now()
@@ -684,6 +1117,7 @@ class ProductionTrainingOrchestrator:
             timeframe='1D',
             db=self.db,
             include_sentiment=True,
+            include_fundamentals=self.config.include_fundamentals,
         )
 
         self._rebuild_features_meta_from_raw()
@@ -791,8 +1225,12 @@ class ProductionTrainingOrchestrator:
             # Resume robustness — mirror the step-5 lazy-load contract.
             self.targets_data, self.class_weights = self.cp.load_targets()
 
+        # .values on a datetime64[us, UTC] Series yields datetime64[us] —
+        # np.concatenate then produces a datetime64[us] array whose PanelPurgedCPCV
+        # axis_fingerprint differs from step-5's explicit datetime64[ns] cast.
+        # Cast to ns here so both steps hash the same integer representation.
         ts_parts = [
-            self.targets_data[s]['features_df']['timestamp'].values
+            self.targets_data[s]['features_df']['timestamp'].values.astype("datetime64[ns]")
             for s in self.symbols
             if s in self.targets_data
         ]
@@ -841,7 +1279,7 @@ class ProductionTrainingOrchestrator:
         # ── Panel build — features, labels, AND the per-row timestamp +
         # forward-return arrays CPCV / the OOF backtest paths need (the old
         # path tracked neither, which is why "walk-forward" was decorative).
-        X_list, y_list, ts_list, r_list = [], [], [], []
+        X_list, y_list, ts_list, r_list, sym_list = [], [], [], [], []
         for symbol in self.symbols:
             if symbol not in self.targets_data:
                 continue
@@ -862,12 +1300,16 @@ class ProductionTrainingOrchestrator:
             y_list.append(y[:n])
             r_list.append(np.asarray(r[:n], dtype=np.float32))
             ts_list.append(np.asarray(ts[:n], dtype="datetime64[ns]"))
+            # Per-row symbol — half of the (symbol, timestamp) key the A5
+            # ensemble net-DSR weighting joins the GRU purged-val OOF on.
+            sym_list.append(np.full(n, symbol, dtype="U20"))
 
-        X_all  = np.vstack(X_list)
-        y_all  = np.concatenate(y_list)
-        r_all  = np.concatenate(r_list)
-        ts_all = np.concatenate(ts_list)
-        del X_list, y_list, r_list, ts_list
+        X_all   = np.vstack(X_list)
+        y_all   = np.concatenate(y_list)
+        r_all   = np.concatenate(r_list)
+        ts_all  = np.concatenate(ts_list)
+        sym_all = np.concatenate(sym_list)
+        del X_list, y_list, r_list, ts_list, sym_list
 
         logger.info(
             "XGBoost panel prepared  samples=%d  features=%d  class_dist=%s",
@@ -980,10 +1422,31 @@ class ProductionTrainingOrchestrator:
                 "y":              y_all[idx].astype(np.int8),
                 "forward_return": r_all[idx].astype(np.float32),
                 "timestamp":      ts_all[idx],
+                "symbol":         sym_all[idx].astype("U20"),
             })
         del oof_proba, oof_idx
         gc.collect()
         logger.info("✓ CPCV OOF assembled  paths=%d  (%d combos refit)", n_paths, n_splits)
+
+        # ── A4: Leakage-free calibrator fitted on CPCV OOF pool ───────────────
+        # Each panel row appears in exactly ONE OOF path (CPCVSplit.test_path_of_row
+        # routes every test row to a single path), so concatenating all φ paths
+        # gives the full un-repeated OOF set — zero selection leakage, zero
+        # look-ahead.  Fitting on the HPO holdout val set (the old approach)
+        # would contaminate the calibrator because that set also guided
+        # Optuna trial selection and early-stopping (RC-2 companion bug).
+        all_oof_proba = np.concatenate([p["proba"] for p in cpcv_oof["paths"]])
+        all_oof_y     = np.concatenate([p["y"]     for p in cpcv_oof["paths"]])
+        xgb_calibrator = await asyncio.to_thread(
+            self.xgboost_trainer.fit_calibrator_on_oof,
+            all_oof_proba, all_oof_y,
+        )
+        del all_oof_proba, all_oof_y
+        logger.info(
+            "✓ XGBoost OOF calibrator fitted  ECE %.4f → %.4f  (n=%d)",
+            xgb_calibrator.ece_before, xgb_calibrator.ece_after,
+            xgb_calibrator.n_calibration_samples,
+        )
 
         # ── Final production model: all-data refit at the fixed tuned round
         # count (owner decision — a live trading model must see the most recent
@@ -1058,6 +1521,8 @@ class ProductionTrainingOrchestrator:
             # Skip sequence building — load eval arrays from checkpoint.
             X_val, y_val, r_val, eval_meta = cp.load_gru_eval_arrays()
             n_train_total = eval_meta["n_train_total"]
+            sym_val = eval_meta["val_symbol"]
+            ts_val  = eval_meta["val_timestamp"]
             # Reconstruct the per-symbol purged plan (symbol, y_start, n_tr,
             # n_va) so X_train is rebuilt deterministically and identically.
             gru_plan: List[Tuple[str, int, int, int]] = [
@@ -1126,6 +1591,10 @@ class ProductionTrainingOrchestrator:
             X_val = np.empty((n_val_total, seq_len, n_feat), dtype=np.float16)
             y_val = np.empty(n_val_total, dtype=np.int32)
             r_val = np.empty(n_val_total, dtype=np.float32)
+            # (symbol, timestamp) per val row — the leakage-free key the A5
+            # ensemble net-DSR weighting joins against the XGBoost CPCV OOF.
+            sym_val = np.empty(n_val_total, dtype="U20")
+            ts_val  = np.empty(n_val_total, dtype="datetime64[ns]")
             cursor = 0
             for symbol, y_start, n_tr, n_va in gru_plan:
                 df_raw = self.targets_data[symbol]['features_df']
@@ -1134,7 +1603,10 @@ class ProductionTrainingOrchestrator:
                 norm_df = normalize_features(
                     df_raw, method='rolling', window=seq_len, feature_cols=feature_names
                 )
-                X_seq, _, _ = create_sequences(norm_df, seq_len, feature_names)
+                # seq_ts[i] is the timestamp of the LAST bar of sequence i —
+                # identical to the XGBoost panel's per-row timestamp for the
+                # same (symbol, bar), so the A5 join is exact.
+                X_seq, seq_ts, _ = create_sequences(norm_df, seq_len, feature_names)
                 m       = len(X_seq)
                 take_tr = min(n_tr, m)
                 v0      = take_tr + purge_gap                  # skip the purge gap
@@ -1144,15 +1616,22 @@ class ProductionTrainingOrchestrator:
                 X_val[cursor:cursor + take_va] = X_seq[v0:v0 + take_va]
                 y_val[cursor:cursor + take_va] = y_sym[y_start + v0:y_start + v0 + take_va]
                 r_val[cursor:cursor + take_va] = r_sym[y_start + v0:y_start + v0 + take_va]
+                sym_val[cursor:cursor + take_va] = symbol
+                ts_val[cursor:cursor + take_va] = np.asarray(
+                    seq_ts[v0:v0 + take_va], dtype="datetime64[ns]"
+                )
                 cursor += take_va
 
             X_val = X_val[:cursor]
             y_val = y_val[:cursor]
             r_val = r_val[:cursor]
+            sym_val = sym_val[:cursor]
+            ts_val  = ts_val[:cursor]
 
             # Deterministic memory cap (replaces np.random.choice): the val
             # pool is already purged, so a FIXED-seed uniform sample is
-            # unbiased AND identical across resumes.
+            # unbiased AND identical across resumes. The SAME mask is applied
+            # to the join keys so they stay row-aligned with X/y/r.
             if len(X_val) > VAL_CAP:
                 keep = np.sort(
                     np.random.default_rng(42).choice(len(X_val), VAL_CAP, replace=False)
@@ -1160,10 +1639,12 @@ class ProductionTrainingOrchestrator:
                 X_val = X_val[keep].copy()
                 y_val = y_val[keep].copy()
                 r_val = r_val[keep].copy()
+                sym_val = sym_val[keep].copy()
+                ts_val  = ts_val[keep].copy()
             logger.info("✓ GRU val arrays built: %d sequences (cap=%d)", len(X_val), VAL_CAP)
 
             cp.save_gru_eval_arrays(
-                X_val, y_val, r_val,
+                X_val, y_val, r_val, sym_val, ts_val,
                 class_weights=self.class_weights or {},
                 gru_plan=gru_plan,
                 n_train_total=n_train_total,
@@ -1177,90 +1658,81 @@ class ProductionTrainingOrchestrator:
             logger.info("✓ targets_data released after GRU sequence build")
 
         # Store eval arrays for steps 7-8
-        self.gru_eval_X       = X_val
-        self.gru_eval_y       = y_val
-        self.gru_eval_returns = r_val
+        self.gru_eval_X         = X_val
+        self.gru_eval_y         = y_val
+        self.gru_eval_returns   = r_val
+        self.gru_eval_symbol    = sym_val
+        self.gru_eval_timestamp = ts_val
 
-        # ── Build X_train (always rebuilt — too large to persist) ─────────────
-        # Load targets_data if not already freed (sub-A path freed it above)
-        # On the sub-A resume path we need to reload targets_data to rebuild X_train.
+        # ── Build per-symbol training segments ────────────────────────────────
+        # tf.data.Dataset.from_tensor_slices() always copies its numpy input into
+        # a TF EagerTensor (confirmed in TF docs; TF ≥ 2.17 also attempts GPU
+        # placement — GitHub TF issue #71744).  For a 1.99 GB float16 array this
+        # creates a ~4 GB system-RAM peak (original array + TF copy) before the
+        # del/gc can reclaim the numpy side — enough to trigger the Linux OOM
+        # killer on WSL2 at 6–8 GB available.
+        #
+        # Fix: accumulate per-symbol (float16 X, int32 y) pairs — same total
+        # data, no TF tensor duplicate.  A factory function streams them via
+        # from_generator in 4 K-sample chunks so peak RAM stays ≈ 2 GB throughout
+        # both HPO and final training.  The factory is re-callable, so the
+        # existing OOM batch-halving recovery in _run_gru_fit just calls
+        # make_dataset(new_batch) instead of unbatch()+batch() on a stale object.
         n_train = n_train_total
         logger.info(
-            "Building X_train from targets_data  n_train=%d  (%.2f GB float16)...",
+            "Building GRU training segments  n_train=%d  (%.2f GB float16)...",
             n_train, n_train * seq_len * n_feat * 2 / 1e9,
         )
 
-        # Reload targets_data for the training sequence rebuild
         if not hasattr(self, 'targets_data') or not self.targets_data:
-            logger.info("  Loading targets_data from checkpoint for X_train rebuild...")
+            logger.info("  Loading targets_data from checkpoint for training data rebuild...")
             self.targets_data, _ = self.cp.load_targets()
 
-        # Per symbol: the FIRST n_tr (chronological) sequences = train. The
-        # purge gap + val tail are excluded, so no train label window overlaps
-        # that symbol's val period — identical to the persisted purged plan.
-        # float16 halves RAM; cast to float32 in the tf.data pipeline below.
-        X_train = np.empty((n_train, seq_len, n_feat), dtype=np.float16)
-        y_train = np.empty(n_train, dtype=np.int32)
-        cursor  = 0
+        # Per symbol: FIRST n_tr chronological sequences = train.
+        # Purge gap + val tail are excluded — identical split to the persisted plan.
+        gru_train_segs: list[tuple[np.ndarray, np.ndarray]] = []
+        actual_train   = 0
+        nan_sym_count  = 0
+
         for symbol, y_start, n_tr, n_va in gru_plan:
             if symbol not in self.targets_data:
                 continue
-            df_raw = self.targets_data[symbol]['features_df']
-            y_sym  = self.targets_data[symbol]['target']
+            df_raw  = self.targets_data[symbol]['features_df']
+            y_sym   = self.targets_data[symbol]['target']
             norm_df = normalize_features(
                 df_raw, method='rolling', window=seq_len, feature_cols=feature_names
             )
             X_seq, _, _ = create_sequences(norm_df, seq_len, feature_names)
-            # Clamp to actual sequences produced — NaN-drops in
-            # normalize_features can yield fewer rows than planned in pass 1.
-            take = min(n_tr, len(X_seq), n_train - cursor)
+            # NaN-drops in normalize_features can yield fewer rows than planned.
+            take = min(n_tr, len(X_seq))
             if take <= 0:
                 continue
-            X_train[cursor:cursor + take] = X_seq[:take]
-            y_train[cursor:cursor + take] = y_sym[y_start:y_start + take]
-            cursor += take
-
-        # Trim to actual filled rows (gru_plan counts may exceed actual after NaN drops)
-        X_train = X_train[:cursor]
-        y_train = y_train[:cursor]
-
-        # Free targets_data again (done with it)
-        del self.targets_data
-        gc.collect()
-        logger.info("✓ X_train built  shape=%s  (planned=%d  actual=%d)", X_train.shape, n_train, cursor)
-
-        logger.info(
-            "GRU data summary:  train=%d  (%.2f GB)  val=%d  class_dist(val)=%s",
-            len(X_train), X_train.nbytes / 1e9, len(X_val),
-            dict(zip(*np.unique(y_val, return_counts=True))),
-        )
-
-        # ── Convert X_train → tf.data before spawning thread ──────────────────
-        if np.any(np.isnan(X_train)) or np.any(np.isinf(X_train)):
-            raise ValueError("X_train contains NaN/inf values")
-
-        y_train_int = y_train.astype(np.int32)
-        n_train_samples = len(X_train)
-
-        # Pin source tensors to CPU — TF transfers one batch at a time to GPU.
-        # Cast float16→float32 per batch (cheap op; fixed parallelism=2 prevents
-        # unbounded float32 materialization that exhausted RAM with AUTOTUNE).
-        # Prefetch capped at 2 for same reason — AUTOTUNE grew the buffer each epoch.
-        with tf.device('/CPU:0'):
-            train_ds = (
-                tf.data.Dataset
-                .from_tensor_slices((X_train, y_train_int))
-                .shuffle(buffer_size=5_000, reshuffle_each_iteration=True)
-                .batch(self.config.batch_size)
-                .map(
-                    lambda x, y: (tf.cast(x, tf.float32), y),
-                    num_parallel_calls=2,
+            X_sym   = X_seq[:take].astype(np.float16)
+            y_sym_s = y_sym[y_start:y_start + take].astype(np.int32)
+            # Per-symbol NaN/inf guard — catches upstream feature computation
+            # regressions before they silently corrupt the training distribution.
+            if np.any(np.isnan(X_sym)) or np.any(np.isinf(X_sym)):
+                nan_sym_count += 1
+                logger.warning(
+                    "Symbol %s: NaN/inf in %d training sequences — skipping",
+                    symbol, take,
                 )
-                .prefetch(2)
+                continue
+            gru_train_segs.append((X_sym, y_sym_s))
+            actual_train += take
+
+        if nan_sym_count:
+            logger.warning(
+                "%d symbol(s) skipped due to NaN/inf in training sequences",
+                nan_sym_count,
+            )
+        if not gru_train_segs:
+            raise ValueError(
+                "No valid GRU training segments after NaN/inf filtering — "
+                "check normalisation pipeline"
             )
 
-        # Free numpy arrays — TF dataset retains its own reference on CPU.
-        del X_train, y_train, y_train_int
+        del self.targets_data
         gc.collect()
         try:
             import ctypes
@@ -1268,6 +1740,64 @@ class ProductionTrainingOrchestrator:
             logger.info("✓ malloc_trim: freed heap pages returned to OS")
         except Exception as trim_err:
             logger.warning("malloc_trim unavailable (%s) — RSS may stay elevated", trim_err)
+
+        seg_gb          = sum(s[0].nbytes for s in gru_train_segs) / 1e9
+        n_train_samples = actual_train
+        logger.info(
+            "✓ GRU training segments: symbols=%d  samples=%d (planned=%d)  %.2f GB float16",
+            len(gru_train_segs), actual_train, n_train, seg_gb,
+        )
+        logger.info(
+            "GRU data summary:  train=%d  (%.2f GB)  val=%d  class_dist(val)=%s",
+            actual_train, seg_gb, len(X_val),
+            dict(zip(*np.unique(y_val, return_counts=True))),
+        )
+
+        # ── tf.data streaming pipeline ─────────────────────────────────────────
+        # Yields 4 K-sample float16 chunks → unbatch → shuffle → batch → prefetch.
+        # No TF tensor holds the full dataset in memory at any point:
+        #   • segments (Python numpy, ~2 GB): kept alive as closure until method returns
+        #   • shuffle buffer (5 K float32 samples): ≈ 82 MB
+        #   • prefetch (2 × batch_size=1024 float32 batches): ≈ 34 MB
+        # GPU-bound training on RTX 3050 at ~200–500 ms/batch means the ~15 ms/
+        # batch generator overhead is fully absorbed by prefetch(2) — no GPU stall.
+        # Prefetch is capped at 2 (not AUTOTUNE) — AUTOTUNE grew unboundedly in
+        # earlier runs and exhausted RAM.
+        _GEN_CHUNK = 4_096
+        _segs      = gru_train_segs  # closure — kept alive until this method returns
+
+        def _gru_chunk_gen() -> Any:
+            """Yields (float32 chunk, int32 labels) pairs; called fresh each epoch."""
+            for X_sym, y_sym_s in _segs:
+                n = len(X_sym)
+                for start in range(0, n, _GEN_CHUNK):
+                    end = min(start + _GEN_CHUNK, n)
+                    yield X_sym[start:end].astype(np.float32), y_sym_s[start:end]
+
+        def _make_gru_dataset(batch_sz: int) -> "tf.data.Dataset":
+            """Return a fresh, re-iterable CPU-pinned tf.data pipeline at batch_sz.
+
+            Called once for HPO and once per retry attempt in _run_gru_fit so that
+            batch-halving OOM recovery gets a clean dataset (proper shuffle, no
+            stale iterator state) rather than an unbatch/rebatch chain.
+            """
+            with tf.device('/CPU:0'):
+                return (
+                    tf.data.Dataset
+                    .from_generator(
+                        _gru_chunk_gen,
+                        output_signature=(
+                            tf.TensorSpec(shape=(None, seq_len, n_feat), dtype=tf.float32),
+                            tf.TensorSpec(shape=(None,),               dtype=tf.int32),
+                        ),
+                    )
+                    .unbatch()
+                    .shuffle(buffer_size=5_000, reshuffle_each_iteration=True)
+                    .batch(batch_sz)
+                    .prefetch(2)
+                )
+
+        train_ds = _make_gru_dataset(self.config.batch_size)
 
         # ── Initialise GRU trainer ─────────────────────────────────────────────
         self.gru_trainer = GRUTrainer(
@@ -1303,19 +1833,34 @@ class ProductionTrainingOrchestrator:
 
         if cp.gru_has_training_state():
             state = cp.load_gru_training_state()
-            last_epoch = state["last_epoch"]
-            initial_epoch = last_epoch + 1
-            weight_path = str(cp.gru_epoch_weights_dir / f"epoch_{last_epoch:04d}.weights.h5")
-            # Build model so we can load weights into it
-            tmp_model = self.gru_trainer.build_model(best_params)
-            tmp_model.load_weights(weight_path)
-            self.gru_trainer.model = tmp_model
-            logger.info(
-                "→ sub-C resumed: training from epoch %d  (weights: %s)",
-                initial_epoch, weight_path,
-            )
+            ckpt_n_features = state.get("n_features")
 
-        epoch_cb = EpochCheckpointCallback.build(cp)
+            if ckpt_n_features is not None and ckpt_n_features != n_feat:
+                # Architecture mismatch: the checkpoint was written with a
+                # different feature count.  Continuing would raise a Keras
+                # variable-shape error.  Discard the stale sub-C checkpoint and
+                # retrain from epoch 0 with the current architecture.
+                logger.warning(
+                    "GRU epoch checkpoint has n_features=%d but current model "
+                    "expects n_features=%d — checkpoint is stale (features were "
+                    "added/removed between runs).  Discarding epoch weights and "
+                    "restarting from epoch 0.",
+                    ckpt_n_features, n_feat,
+                )
+                cp.invalidate_gru_epoch_checkpoint()
+            else:
+                last_epoch = state["last_epoch"]
+                initial_epoch = last_epoch + 1
+                weight_path = str(cp.gru_epoch_weights_dir / f"epoch_{last_epoch:04d}.weights.h5")
+                tmp_model = self.gru_trainer.build_model(best_params)
+                tmp_model.load_weights(weight_path)
+                self.gru_trainer.model = tmp_model
+                logger.info(
+                    "→ sub-C resumed: training from epoch %d  (weights: %s)",
+                    initial_epoch, weight_path,
+                )
+
+        epoch_cb = EpochCheckpointCallback.build(cp, n_features=n_feat)
 
         logger.info(
             "Training final GRU model  batch=%d  max_epochs=%d  initial_epoch=%d",
@@ -1324,7 +1869,7 @@ class ProductionTrainingOrchestrator:
 
         await asyncio.to_thread(
             self._run_gru_fit,
-            train_ds,
+            _make_gru_dataset,
             X_val,
             y_val,
             best_params,
@@ -1348,7 +1893,7 @@ class ProductionTrainingOrchestrator:
 
     def _run_gru_fit(
         self,
-        train_ds: Any,
+        make_dataset: Callable[[int], Any],
         X_val: np.ndarray,
         y_val: np.ndarray,
         best_params: Dict[str, Any],
@@ -1358,36 +1903,43 @@ class ProductionTrainingOrchestrator:
         """
         Run model.fit() with OOM recovery — extracted so it can run via asyncio.to_thread.
 
+        ``make_dataset`` is a factory callable ``(batch_size: int) -> tf.data.Dataset``
+        that returns a fresh, CPU-pinned, re-iterable pipeline backed by the
+        per-symbol float16 segment list built in ``_train_gru_with_optimization``.
+        Calling the factory on each OOM retry produces a clean dataset at the
+        reduced batch size without needing to unbatch/rebatch a stale iterator.
+
         OOM recovery strategy
         ---------------------
         If TF raises ``ResourceExhaustedError`` (GPU VRAM exhausted), this method:
 
         1. Clears the Keras session to release all GPU-resident model weights and
            optimizer states.
-        2. Rebatches the existing ``tf.data`` pipeline to half the current batch
-           size — no raw arrays needed since ``train_ds`` is backed by pinned CPU
-           tensors and is re-iterable.
+        2. Calls ``make_dataset(new_batch)`` to obtain a fresh pipeline at half
+           the current batch size — full shuffle is preserved and iterator state
+           is reset cleanly for the retry.
         3. Resets the GRU trainer's model to ``None`` so ``train()`` rebuilds it
            with fresh weights at the smaller batch.
         4. Repeats up to ``_MAX_OOM_RETRIES`` times, halving batch size each time.
 
         The minimum batch floor is 32 to avoid degenerate single-sample training.
         If all retries are exhausted, a ``RuntimeError`` is raised with actionable
-        guidance (reduce ``gru_n_symbols`` or ``n_features``, or increase
-        ``_GPU_VRAM_LIMIT_MB`` in ``gru_trainer.py``).
+        guidance (reduce ``gru_n_symbols`` or ``n_features`` in
+        ``TrainingConfig``, or free physical VRAM before re-running).
         """
         import tensorflow as tf
         import gc
 
-        # XLA kernel fusion: ~20 % throughput improvement on Ampere GPUs.
-        # Set here (not in configure_gpu) so it applies only when model.fit()
-        # is active, not during HPO tuner search or evaluation passes.
-        tf.config.optimizer.set_jit(True)
+        # XLA JIT is intentionally NOT enabled.
+        # cuDNN's GRU/LSTM kernels (CudnnRNNV3) have no XLA_GPU_JIT OpKernel
+        # (TF issue #100872, open as of TF 2.21) — set_jit(True) causes
+        # FAILED_PRECONDITION on the first XLA-compiled step.  cuDNN's native
+        # path already delivers near-optimal Ampere throughput without JIT.
 
         _MAX_OOM_RETRIES: int = 2
-        current_ds   = train_ds
-        batch_size   = self.config.batch_size   # tracked for logging only
-        cur_epoch    = initial_epoch
+        batch_size = self.config.batch_size
+        current_ds = make_dataset(batch_size)
+        cur_epoch  = initial_epoch
 
         for attempt in range(_MAX_OOM_RETRIES + 1):
             try:
@@ -1407,8 +1959,8 @@ class ProductionTrainingOrchestrator:
                     logger.error(
                         "GRU training exhausted GPU memory after %d attempt(s) "
                         "(last batch_size=%d).  "
-                        "Remediation: reduce gru_n_symbols / n_features, "
-                        "or increase _GPU_VRAM_LIMIT_MB in gru_trainer.py.",
+                        "Remediation: reduce gru_n_symbols / n_features "
+                        "in TrainingConfig, or free physical VRAM before re-running.",
                         attempt + 1,
                         batch_size,
                     )
@@ -1420,7 +1972,7 @@ class ProductionTrainingOrchestrator:
                 new_batch = max(batch_size // 2, 32)
                 logger.warning(
                     "GRU training OOM at batch_size=%d (attempt %d/%d) — "
-                    "clearing Keras session and rebatching to %d.",
+                    "clearing Keras session and rebuilding dataset at batch_size=%d.",
                     batch_size,
                     attempt + 1,
                     _MAX_OOM_RETRIES + 1,
@@ -1433,12 +1985,11 @@ class ProductionTrainingOrchestrator:
                 tf.keras.backend.clear_session()
                 gc.collect()
 
-                # ── Recovery step 2: rebatch existing dataset ─────────────────
-                # train_ds is backed by pinned CPU tensors (from_tensor_slices)
-                # and is re-iterable.  unbatch() peels the current batch dim;
-                # batch(new_batch) regroups at the smaller size.  The shuffle
-                # and cast-to-float32 steps are preserved in the parent pipeline.
-                current_ds = current_ds.unbatch().batch(new_batch).prefetch(2)
+                # ── Recovery step 2: fresh dataset at reduced batch size ───────
+                # make_dataset() reconstructs the full from_generator pipeline at
+                # new_batch — proper shuffle is preserved and there is no stale
+                # iterator state from the OOM'd run.
+                current_ds = make_dataset(new_batch)
                 batch_size = new_batch
 
                 # ── Recovery step 3: reset model state ───────────────────────
@@ -1455,45 +2006,208 @@ class ProductionTrainingOrchestrator:
                     _MAX_OOM_RETRIES + 1,
                 )
 
-    async def _create_and_optimize_ensemble(self, cv_plan: Dict[str, Any]) -> Dict[str, Any]:
-        logger.info("Optimizing ensemble weights on %d validation samples...", len(self.gru_eval_y))
+    async def _create_and_optimize_ensemble(
+        self, cv_plan: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """A5: accretion-gated net-DSR ensemble weighting on the leakage-free
+        joint set (GRU per-symbol purged-val rows ∩ XGBoost CPCV OOF rows,
+        keyed on ``(symbol, timestamp)``). The promotion bar (A6) and the
+        weighting bar are the *same* number: net Deflated Sharpe via the A3
+        authority. The accretion gate refuses to ship a non-accretive
+        ensemble — instead it one-hot-weights the best standalone calibrated
+        member, an audited and explicit outcome (no silent fallback).
+        """
+        import pandas as pd
+        from app.ml.training.ensemble_trainer import EnsembleNotAccretiveError
 
-        xgboost_model = self.xgboost_trainer.model
-        gru_model     = self.gru_trainer.model
-
-        self.ensemble_trainer = EnsembleTrainer(
-            xgboost_model=xgboost_model,
-            gru_model=gru_model,
-            weights={'xgboost': 0.6, 'gru': 0.4},
-        )
-
-        X_val_seq = self.gru_eval_X
-        X_val_tab = self.gru_eval_X[:, -1, :]
-        y_val     = self.gru_eval_y
-
-        eff_metric = self.config.ensemble_optimization_metric
+        # ── Fail-loud preconditions (no silent fallback; A1 rule) ─────────────
         if self.gru_eval_returns is None:
             raise MissingReturnsError(
-                "Forward returns (gru_eval_returns) are unavailable at ensemble "
-                "weight optimisation. Refusing to fall back to an accuracy "
-                "objective — silently changing the model-selection metric is "
-                "exactly the RC-1 failure that shipped an unvalidated model. "
-                "Re-run with --fresh so forward returns are regenerated."
+                "Forward returns unavailable at A5 weighting. Refusing to "
+                "weight on a non-financial objective (RC-1). --fresh."
+            )
+        if self.gru_eval_symbol is None or self.gru_eval_timestamp is None:
+            raise StaleCheckpointError(
+                "GRU per-row (symbol, timestamp) join keys are missing — this "
+                "is a pre-A5 (schema < 4) checkpoint. The A5 leakage-free join "
+                "cannot be reconstructed. Start a clean run with --fresh."
+            )
+        if self.cpcv_oof is None or not self.cpcv_oof.get("paths"):
+            raise StaleCheckpointError(
+                "XGBoost CPCV OOF bundle is missing — A5 requires it for the "
+                "leakage-free joint set. --fresh."
+            )
+        xgb_cal = self.xgboost_trainer.calibrator
+        gru_cal = self.gru_trainer.calibrator
+        if xgb_cal is None or gru_cal is None:
+            raise RuntimeError(
+                "A5 refuses to weight on raw (uncalibrated) probabilities. "
+                f"Calibrators present: xgboost={xgb_cal is not None}  "
+                f"gru={gru_cal is not None}. Re-run with --fresh so A4 fits "
+                "both."
             )
 
-        optimized_weights = await asyncio.to_thread(
-            self.ensemble_trainer.optimize_weights,
-            X_val_tab, X_val_seq, y_val,
-            returns=self.gru_eval_returns,
-            metric=eff_metric,
-        )
-        self.ensemble_trainer.weights = optimized_weights
+        # ── XGBoost OOF: assert per-path uniqueness, then calibrate-then-average
+        #
+        # CPCV with n_test=2 puts every panel row in ALL φ paths by construction
+        # (each group is tested in C(n_groups-1, n_test-1) combos).  Concatenating
+        # all paths and checking cross-path uniqueness is therefore always False —
+        # the former check was based on a false invariant.  The correct structural
+        # guarantee is: within each individual path, (symbol, timestamp) is unique.
+        # Averaging calibrated probabilities across paths = prediction bagging
+        # (calibrate-then-average, not average-then-calibrate).
+        xgb_paths    = self.cpcv_oof["paths"]
+        n_cpcv_paths = len(xgb_paths)
 
-        logger.info("✓ Ensemble optimised  weights=%s", optimized_weights)
+        for pi, _pd in enumerate(xgb_paths):
+            _sym_p = np.asarray(_pd["symbol"], dtype="U20")
+            _ts_p  = np.asarray(_pd["timestamp"], dtype="datetime64[ns]")
+            _midx  = pd.MultiIndex.from_arrays(
+                [_sym_p, _ts_p.view(np.int64)], names=["symbol", "ts"]
+            )
+            if not _midx.is_unique:
+                raise StaleCheckpointError(
+                    f"CPCV OOF path {pi} has within-path duplicate "
+                    "(symbol, timestamp) rows — the path itself is corrupt; --fresh."
+                )
+
+        # Path 0 defines the canonical (sym, ts) universe; all φ paths are
+        # guaranteed to cover the same rows (CPCV property).
+        xgb_sym_canonical = np.asarray(xgb_paths[0]["symbol"],    dtype="U20")
+        xgb_ts_canonical  = np.asarray(xgb_paths[0]["timestamp"], dtype="datetime64[ns]")
+        n_unique_rows      = len(xgb_sym_canonical)
+
+        # Build calibrated probability matrix: shape (n_rows, n_cpcv_paths).
+        # Each column is one path calibrated independently (correct order:
+        # calibrate first, then average — averaging raw logits and calibrating
+        # the mean would underestimate uncertainty).
+        xgb_cal_matrix = np.empty((n_unique_rows, n_cpcv_paths), dtype=np.float64)
+        for pi, _pd in enumerate(xgb_paths):
+            _raw = np.asarray(_pd["proba"], dtype=np.float64)
+            xgb_cal_matrix[:, pi] = xgb_cal.calibrate(
+                np.column_stack([1.0 - _raw, _raw])
+            )[:, 1]
+        # Bagged consensus: mean of φ independently calibrated probabilities.
+        xgb_consensus_p = xgb_cal_matrix.mean(axis=1)
+
+        # ── GRU side: predict on the persisted purged-val rows, calibrate ─────
+        gru_raw = self.gru_trainer.model.predict(
+            self.gru_eval_X, verbose=0, batch_size=512
+        )
+        gru_cal_p = gru_cal.calibrate(gru_raw)[:, 1].astype(np.float64)
+
+        # ── Join on (symbol, timestamp) — canonical XGBoost path-0 index is
+        # guaranteed unique; O(n) pandas hash join. ────────────────────────────
+        xgb_unique_idx = pd.MultiIndex.from_arrays(
+            [xgb_sym_canonical, xgb_ts_canonical.view(np.int64)],
+            names=["symbol", "ts"],
+        )
+        gru_idx = pd.MultiIndex.from_arrays(
+            [self.gru_eval_symbol.astype("U20"),
+             self.gru_eval_timestamp.view(np.int64)],
+            names=["symbol", "ts"],
+        )
+        match        = xgb_unique_idx.get_indexer(gru_idx)
+        matched_mask = match >= 0
+        coverage     = float(matched_mask.mean()) if len(match) else 0.0
+        if coverage < self.config.a5_min_join_coverage:
+            raise RuntimeError(
+                f"A5 join coverage {coverage:.4f} < threshold "
+                f"{self.config.a5_min_join_coverage:.2f}. "
+                f"{(~matched_mask).sum()} of {len(match)} GRU val rows have "
+                "no XGBoost OOF counterpart — the panels are inconsistent. "
+                "Refusing to weight on a biased subset."
+            )
+        if not matched_mask.any():
+            raise RuntimeError("A5 join is empty — cannot weight.")
+
+        xgb_match_idx    = match[matched_mask]
+        joint_sym        = xgb_sym_canonical[xgb_match_idx]
+        joint_r          = self.gru_eval_returns[matched_mask].astype(np.float64)
+        joint_p_xgb      = xgb_consensus_p[xgb_match_idx]
+        joint_p_gru      = gru_cal_p[matched_mask]
+        joint_cal_matrix = xgb_cal_matrix[xgb_match_idx]     # (n_joint, n_cpcv_paths)
+        # Deterministic per-symbol path id — one path per symbol (purged
+        # window). pd.factorize returns codes in first-appearance order.
+        path_id, path_labels = pd.factorize(joint_sym, sort=True)
+
+        logger.info(
+            "A5 joint set: %d rows across %d symbols (coverage %.4f, "
+            "%d CPCV paths → bagged consensus) — weighting on net Deflated Sharpe.",
+            len(joint_p_xgb), len(path_labels), coverage, n_cpcv_paths,
+        )
+
+        # ── Instantiate calibration-aware EnsembleTrainer and optimise ────────
+        self.ensemble_trainer = EnsembleTrainer(
+            xgboost_model=self.xgboost_trainer.model,
+            gru_model=self.gru_trainer.model,
+            weights={"xgboost": 0.5, "gru": 0.5},
+            xgb_calibrator=xgb_cal,
+            gru_calibrator=gru_cal,
+        )
+
+        try:
+            diagnostics = await asyncio.to_thread(
+                self.ensemble_trainer.optimize_weights_on_oof,
+                p_xgb=joint_p_xgb,
+                p_gru=joint_p_gru,
+                fwd_ret=joint_r,
+                path_id=path_id,
+                l2=self.config.a5_l2_prior,
+            )
+            optimized_weights = diagnostics["weights"]
+            accretive = True
+        except EnsembleNotAccretiveError as err:
+            # Designed outcome: ship best standalone, record the decision.
+            optimized_weights = err.recommended_weights
+            self.ensemble_trainer.weights = optimized_weights
+            diagnostics = self.ensemble_trainer.optimization_diagnostics or {}
+            accretive = False
+            logger.warning(
+                "A5: shipping standalone '%s' (one-hot) — ensemble not "
+                "accretive on net DSR. xgboost_solo=%.6f gru_solo=%.6f "
+                "ensemble=%.6f",
+                err.best_standalone,
+                diagnostics.get("standalone_net_dsr", {}).get("xgboost", float("nan")),
+                diagnostics.get("standalone_net_dsr", {}).get("gru", float("nan")),
+                err.ensemble_net_dsr,
+            )
+
+        # ── Per-CPCV-path robustness diagnostic (informational, not a gate) ──
+        # Apply the optimized weight to each individual CPCV combo-model path to
+        # confirm the weight is stable across the full CPCV path distribution.
+        # This is López de Prado's intended use of CPCV paths: robustness testing
+        # after parameter selection.  The A6 DSR gate on the consensus is unchanged.
+        from app.ml.evaluation.backtest import compute_cpcv_path_net_sharpes
+        cpcv_sharpes = compute_cpcv_path_net_sharpes(
+            w_xgb          = float(optimized_weights.get("xgboost", 0.5)),
+            xgb_cal_matrix = joint_cal_matrix,
+            p_gru          = joint_p_gru,
+            fwd_ret        = joint_r,
+        )
+        positive_cpcv = sum(1 for s in cpcv_sharpes if not np.isnan(s) and s > 0)
+        logger.info(
+            "A5 CPCV robustness: %d/%d paths positive net Sharpe  distribution=%s",
+            positive_cpcv, n_cpcv_paths,
+            [f"{s:.4f}" if not np.isnan(s) else "nan" for s in cpcv_sharpes],
+        )
+        diagnostics["cpcv_path_net_sharpes"] = cpcv_sharpes
+        diagnostics["cpcv_n_paths"]          = n_cpcv_paths
+        diagnostics["cpcv_positive_paths"]   = positive_cpcv
+        diagnostics["coverage"]              = coverage
+        diagnostics["path_labels"]           = [str(s) for s in path_labels]
+        diagnostics["accretive"]             = accretive
+
+        logger.info(
+            "✓ A5 complete  weights=%s  accretive=%s  ensemble_net_dsr=%.6f",
+            optimized_weights, accretive,
+            float(diagnostics.get("ensemble_net_dsr", float("nan"))),
+        )
         return {
-            'ensemble':           self.ensemble_trainer,
-            'optimized_weights':  optimized_weights,
-            'validation_samples': len(y_val),
+            "ensemble":           self.ensemble_trainer,
+            "optimized_weights":  optimized_weights,
+            "diagnostics":        diagnostics,
+            "validation_samples": int(matched_mask.sum()),
         }
 
     async def _evaluate_all_models(self, cv_plan: Dict[str, Any]) -> Dict[str, EvaluationResults]:
@@ -1599,6 +2313,20 @@ class ProductionTrainingOrchestrator:
             
             onnx_paths['xgboost'] = str(lib_path)
             logger.info("  ✓ XGBoost → %s (Treelite)", lib_path)
+
+            # Copy OOF-fitted calibrator alongside the Treelite artifact so
+            # RegistryModelLoader._try_load_calibrator finds it at load time.
+            # RegistryModelLoader looks for: Path(onnx_path).parent / "calibrator_xgb.pkl"
+            # = treelite_dir / "calibrator_xgb.pkl"
+            if self.xgboost_trainer.calibrator is not None:
+                cal_serving_path = treelite_dir / "calibrator_xgb.pkl"
+                self.xgboost_trainer.calibrator.save(cal_serving_path)
+                logger.info("  ✓ XGBoost calibrator → %s", cal_serving_path)
+            else:
+                logger.warning(
+                    "  ⚠ XGBoost calibrator not available — inference will use "
+                    "raw probabilities (re-run with --fresh to fix)."
+                )
         except Exception as e:
             logger.error("XGBoost Treelite compilation failed: %s", e)
 
@@ -1618,6 +2346,19 @@ class ProductionTrainingOrchestrator:
             )
             onnx_paths['gru'] = opt_str
             logger.info("  ✓ GRU → %s (optimized)", opt_path)
+
+            # Save GRU calibrator alongside the ONNX artifact so that
+            # RegistryModelLoader._try_load_calibrator and _register_models_in_registry
+            # both find it at: Path(gru_inference).parent / "calibrator_gru.pkl"
+            if self.gru_trainer.calibrator is not None:
+                gru_cal_path = self.onnx_dir / "calibrator_gru.pkl"
+                self.gru_trainer.calibrator.save(gru_cal_path)
+                logger.info("  ✓ GRU calibrator → %s", gru_cal_path)
+            else:
+                logger.warning(
+                    "  ⚠ GRU calibrator not available — inference will use "
+                    "raw probabilities (re-run with --fresh to fix)."
+                )
         except Exception as e:
             logger.error("GRU ONNX export failed: %s", e)
 
@@ -1695,6 +2436,33 @@ class ProductionTrainingOrchestrator:
         xgb_inference = onnx_paths.get("xgboost")
         gru_inference  = onnx_paths.get("gru")
 
+        # E2 — derive calibrator paths from the inference artifact directories.
+        # Convention mirrors _calibrator_path_for() in evaluation.promotion_report
+        # and RegistryModelLoader._try_load_calibrator() so all three callers
+        # agree on the exact file location.
+        xgb_calibrator = (
+            Path(xgb_inference).parent / "calibrator_xgb.pkl"
+            if xgb_inference else None
+        )
+        gru_calibrator = (
+            Path(gru_inference).parent / "calibrator_gru.pkl"
+            if gru_inference else None
+        )
+
+        # Defensive materialisation: if Step 9 was checkpointed (skipped on
+        # resume) the calibrator file may not exist on disk yet even though the
+        # trainer still holds it in memory.  Write it now so the registry
+        # copy-into-storage succeeds whether this is a first run or a resume.
+        if (
+            gru_calibrator is not None
+            and not gru_calibrator.exists()
+            and getattr(self.gru_trainer, "calibrator", None) is not None
+        ):
+            self.gru_trainer.calibrator.save(gru_calibrator)
+            logger.info(
+                "  ✓ GRU calibrator materialised (resume path) → %s", gru_calibrator
+            )
+
         if not xgb_inference:
             logger.warning(
                 "No XGBoost inference artifact in onnx_paths — "
@@ -1712,8 +2480,28 @@ class ProductionTrainingOrchestrator:
             xgb_weight = self.ensemble_trainer.weights.get("xgboost", 0.75)
             gru_weight  = self.ensemble_trainer.weights.get("gru", 0.25)
 
+            # A5 diagnostics → per-model registry metrics so the A6 promotion
+            # gate hard-checks the *honest* net Deflated Sharpe (cost-aware,
+            # calibrated, leakage-free) rather than the informational
+            # step-8 in-sample Sharpe. The diagnostics block is the single
+            # source of truth produced by EnsembleTrainer.optimize_weights_on_oof.
+            ens_diag = getattr(self.ensemble_trainer, "optimization_diagnostics", None) or {}
+            standalone_dsr = ens_diag.get("standalone_net_dsr", {}) or {}
+            standalone_pbo = ens_diag.get("standalone_pbo", {}) or {}
+
             xgb_metrics = asdict(evaluation_results["xgboost"])
-            xgb_metrics["ensemble_weight"] = xgb_weight
+            xgb_metrics["ensemble_weight"]    = xgb_weight
+            xgb_metrics["deflated_sharpe"]    = standalone_dsr.get("xgboost")
+            xgb_metrics["pbo"]                = standalone_pbo.get("xgboost")
+            xgb_metrics["ensemble_net_dsr"]   = ens_diag.get("ensemble_net_dsr")
+            xgb_metrics["ensemble_accretive"] = ens_diag.get("accretive")
+            # A6 calibration gate — ECE lives on the calibrator object, not in
+            # EvaluationResults; surface it here so QualityGate can enforce the
+            # ece_after ≤ 0.05 hard gate without a DB join to the calibrator.
+            xgb_cal = getattr(self.xgboost_trainer, "calibrator", None)
+            xgb_metrics["ece_after"]        = xgb_cal.ece_after if xgb_cal is not None else None
+            # A7 — surface symbol coverage so QualityGate gate-4 is a hard gate.
+            xgb_metrics["symbol_coverage"]  = self._symbol_coverage
 
             # The feature manifest is the ordered list of feature names used
             # during training.  Storing it in training_features makes every
@@ -1737,6 +2525,7 @@ class ProductionTrainingOrchestrator:
                 model_type              = "xgboost",
                 artifact_path           = model_paths["xgboost"],
                 inference_artifact_path = xgb_inference,
+                calibrator_path         = xgb_calibrator,
                 metrics                 = xgb_metrics,
                 metadata                = {
                     "features":         feature_names,   # → training_features column
@@ -1753,13 +2542,22 @@ class ProductionTrainingOrchestrator:
                         len(feature_names))
 
             gru_metrics = asdict(evaluation_results["gru"])
-            gru_metrics["ensemble_weight"] = gru_weight
+            gru_metrics["ensemble_weight"]    = gru_weight
+            gru_metrics["deflated_sharpe"]    = standalone_dsr.get("gru")
+            gru_metrics["pbo"]                = standalone_pbo.get("gru")
+            gru_metrics["ensemble_net_dsr"]   = ens_diag.get("ensemble_net_dsr")
+            gru_metrics["ensemble_accretive"] = ens_diag.get("accretive")
+            gru_cal = getattr(self.gru_trainer, "calibrator", None)
+            gru_metrics["ece_after"]        = gru_cal.ece_after if gru_cal is not None else None
+            # A7 — same coverage key as xgboost so the gate fires for both models.
+            gru_metrics["symbol_coverage"]  = self._symbol_coverage
 
             gru_meta = await registry.register_model(
                 version                 = f"{self.config.model_version}_gru",
                 model_type              = "gru",
                 artifact_path           = model_paths["gru"],
                 inference_artifact_path = gru_inference,
+                calibrator_path         = gru_calibrator,
                 metrics                 = gru_metrics,
                 metadata                = {
                     "features":         feature_names,   # → training_features column
@@ -1774,6 +2572,9 @@ class ProductionTrainingOrchestrator:
             logger.info("  ✓ GRU registered  id=%s  inference=%s  n_features=%d",
                         gru_meta.id, Path(gru_inference).suffix if gru_inference else "none",
                         len(feature_names))
+
+            # E3: log the final registered metrics to MLflow.
+            self._log_mlflow_registration_metrics(xgb_metrics, gru_metrics)
 
         except Exception as e:
             logger.error("Model registry registration failed: %s", e)
@@ -1816,8 +2617,42 @@ class ProductionTrainingOrchestrator:
 
     # ── Utility methods ────────────────────────────────────────────────────────
 
+    def _assert_symbol_coverage(self, *, usable: int, requested: int) -> None:
+        """Enforce the A7 symbol-coverage hard gate.
+
+        Computes coverage = usable / requested, stores it on self._symbol_coverage
+        for downstream metric injection (A6 QualityGate gate 4 + registry metadata),
+        then raises DataCoverageError if coverage < min_symbol_coverage.
+
+        Called at the end of _select_symbols_and_assess_quality (fresh path); the
+        resume path re-derives and stores coverage without re-checking the gate
+        (it already fired on the original run).
+        """
+        coverage = usable / max(requested, 1)
+        self._symbol_coverage = coverage
+        logger.info(
+            "A7 coverage gate: %d / %d = %.2f%%  (threshold=%.2f%%)",
+            usable, requested, coverage * 100, self.config.min_symbol_coverage * 100,
+        )
+        if coverage < self.config.min_symbol_coverage:
+            raise DataCoverageError(
+                f"Symbol coverage {coverage:.1%} is below the minimum threshold "
+                f"{self.config.min_symbol_coverage:.1%} "
+                f"({usable} usable of {requested} requested). "
+                f"Training on a severely degraded symbol universe produces unreliable "
+                f"models with biased evaluation metrics. "
+                f"Investigate data pipeline health; if coverage reduction is intentional, "
+                f"lower TrainingConfig.min_symbol_coverage with caution."
+            )
+
     def _generate_data_quality_report(self) -> Dict[str, Any]:
-        return {"status": "complete", "n_symbols": len(self.symbols)}
+        return {
+            "status":              "complete",
+            "n_symbols":           len(self.symbols),
+            "n_symbols_requested": self.config.n_symbols,
+            "symbol_coverage":     self._symbol_coverage,
+            "coverage_threshold":  self.config.min_symbol_coverage,
+        }
 
     def _calculate_total_samples(self) -> int:
         if self._total_samples_count:
@@ -1834,6 +2669,186 @@ class ProductionTrainingOrchestrator:
             'vms_mb':  mi.vms / 1024 / 1024,
             'percent': psutil.Process().memory_percent(),
         }
+
+    async def _generate_promotion_report(
+        self,
+        onnx_paths: Dict[str, str],
+        *,
+        event_backtest: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Generate the C2 Champion/Challenger Promotion Report after step 10.
+
+        Queries the DB for the just-registered challenger records and the
+        current production champions, then delegates to
+        ``build_promotion_report``.  The resulting JSON is written to
+        ``backend/incident_reports/`` and its path is returned.
+
+        Non-fatal: caller catches and logs any exception so a broken report
+        never aborts the training run (models are already registered by step 10).
+        """
+        from sqlalchemy import select as _sa_select, and_ as _sa_and
+        from app.ml.evaluation.promotion_report import build_promotion_report
+        from app.models.ml_data import MLModelMetadata
+        from app.ai.fusion.models import AIMLModel as _GovernanceModel, AIDriftReport as _DriftReport
+
+        model_names: list[str] = ["xgboost", "gru"]
+
+        # ── Load just-registered challenger records from the DB ────────────────
+        challengers: Dict[str, Any] = {}
+        for model_name in model_names:
+            version = f"{self.config.model_version}_{model_name}"
+            meta = (await self.db.execute(
+                _sa_select(MLModelMetadata).where(
+                    MLModelMetadata.model_version == version
+                )
+            )).scalar_one_or_none()
+            if meta is not None:
+                challengers[model_name] = meta
+
+        if not challengers:
+            logger.warning(
+                "C2: no challenger records found in the DB for version=%s — "
+                "skipping promotion report",
+                self.config.model_version,
+            )
+            return None
+
+        # ── Fetch current production champions (may be None for first deploy) ──
+        champions: Dict[str, Any] = {}
+        for model_name in challengers:
+            champ = (await self.db.execute(
+                _sa_select(MLModelMetadata).where(
+                    _sa_and(
+                        MLModelMetadata.model_name == model_name,
+                        MLModelMetadata.status    == "production",
+                        MLModelMetadata.is_active == True,  # noqa: E712
+                    )
+                ).order_by(MLModelMetadata.deployed_at.desc()).limit(1)
+            )).scalar_one_or_none()
+            champions[model_name] = champ
+
+        # ── D1: Build drift advisory from governance metadata + latest drift reports ──
+        # For each champion, read the advisory flag from ai_ml_models.governance_metadata
+        # and the most recent AIDriftReport to surface live metrics in the C2 report.
+        # This is a read-only snapshot — no state mutation happens here.
+        drift_advisory: Dict[str, Any] = {}
+        for model_name, champ in champions.items():
+            if champ is None:
+                # First deployment — no champion, no drift history.
+                drift_advisory[model_name] = None
+                continue
+
+            # Resolve the governance row for this champion model type.
+            # AIMLModel.model_type maps to MLModelMetadata.model_name (e.g. "xgboost").
+            gov_row = (await self.db.execute(
+                _sa_select(_GovernanceModel).where(
+                    _sa_and(
+                        _GovernanceModel.model_type      == model_name,
+                        _GovernanceModel.deployment_state == "live",
+                    )
+                ).order_by(_GovernanceModel.updated_at.desc()).limit(1)
+            )).scalar_one_or_none()
+
+            if gov_row is None:
+                drift_advisory[model_name] = {"challenger_recommended": False, "last_check": None}
+                continue
+
+            gov_meta = gov_row.governance_metadata or {}
+
+            # Latest drift report for this governance model — provides the full
+            # live-metrics snapshot computed by DriftDetector.check_drift().
+            latest_drift = (await self.db.execute(
+                _sa_select(_DriftReport).where(
+                    _DriftReport.model_id == gov_row.id
+                ).order_by(_DriftReport.report_timestamp.desc()).limit(1)
+            )).scalar_one_or_none()
+
+            drift_advisory[model_name] = {
+                "challenger_recommended": gov_meta.get("challenger_recommended", False),
+                "drift_recommendation":  gov_meta.get("drift_recommendation"),
+                "last_check":            (
+                    latest_drift.report_timestamp.isoformat()
+                    if latest_drift else None
+                ),
+                "last_drift_score": (
+                    float(latest_drift.drift_score)
+                    if latest_drift and latest_drift.drift_score is not None
+                    else None
+                ),
+                "live_metrics": (
+                    latest_drift.distribution_metrics
+                    if latest_drift else {}
+                ),
+            }
+
+        # Promotion reports live alongside C3 incident reports.
+        report_dir = Path(__file__).parent.parent / "incident_reports"
+
+        return build_promotion_report(
+            challengers=challengers,
+            champions=champions,
+            report_dir=report_dir,
+            run_id=self.cp.run_id,
+            drift_advisory=drift_advisory,
+            mlflow_run_id=self._e3_mlflow_run_id,
+            event_backtest=event_backtest,
+        )
+
+    def _run_event_backtest_f1(self) -> Optional[Dict[str, Any]]:
+        """Run the F1 event-driven backtest on the XGBoost CPCV OOF paths.
+
+        Loads the CPCV OOF from the checkpoint, re-derives the vectorized
+        per-period Sharpe reference via ``compute_dsr_and_pbo`` (fast — pure
+        NumPy), runs the event-driven engine with the production defaults
+        (1-bar latency, long_only, CNC, 100K notional, 5 bps slippage), and
+        returns ``EventBacktestReport.as_dict()`` for inclusion in the C2
+        Promotion Report.
+
+        Returns ``None`` when no CPCV OOF is available (e.g. first run with
+        a pre-A5 checkpoint that has no OOF bundle).
+
+        Non-fatal: caller wraps in try/except.
+        """
+        from app.ml.evaluation.event_backtest import run_event_backtest
+        from app.ml.evaluation.deflated_sharpe import compute_dsr_and_pbo
+
+        if self.cpcv_oof is None or not self.cpcv_oof.get("paths"):
+            logger.warning(
+                "F1: CPCV OOF not available (pre-A5 checkpoint or step-5 "
+                "not yet complete) — skipping event-driven backtest."
+            )
+            return None
+
+        paths = self.cpcv_oof["paths"]
+        if not paths:
+            return None
+
+        # Re-derive vectorized per-period Sharpes so we have a fresh reference
+        # for the agreement check.  compute_dsr_and_pbo is fast (NumPy only).
+        try:
+            vec_result = compute_dsr_and_pbo(paths, mode="long_only", entry_price=1_000.0)
+            vec_pp_sharpes: List[float] = vec_result["path_sharpes_per_period"]
+        except Exception as _vec_exc:
+            logger.warning(
+                "F1: vectorized DSR reference failed (%s) — "
+                "agreement check will report INSUFFICIENT_DATA.", _vec_exc,
+            )
+            vec_pp_sharpes = []
+
+        report = run_event_backtest(
+            paths,
+            vectorized_path_sharpes_per_period=vec_pp_sharpes or None,
+            latency_bars=1,
+            mode="long_only",
+            notional=100_000.0,
+            product_type="CNC",
+            entry_price=1_000.0,
+            slippage_bps=5.0,
+            periods_per_year=252,
+            risk_free_rate_annual=0.05,
+            agreement_tolerance=0.20,
+        )
+        return report.as_dict()
 
     async def _save_training_results(self) -> None:
         if self.results:
@@ -1907,7 +2922,6 @@ async def main() -> None:
         xgboost_trials=100,
         gru_trials=5,
         gru_n_symbols=200,
-        model_version="1.0.0",
     )
 
     async with async_session() as session:

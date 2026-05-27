@@ -37,6 +37,11 @@ interface OpenTradeModalProps {
   suggestion?: TradeSuggestion;
   /** Current live price from market feed. */
   livePrice?: number | null;
+  /**
+   * When provided, pre-selects this direction and replaces the interactive
+   * BUY/SELL toggle with a static non-editable badge.
+   */
+  initialDirection?: TransactionType;
   onClose: () => void;
   onPlaced?: () => void;
 }
@@ -61,6 +66,7 @@ export function OpenTradeModal({
   instrument,
   suggestion,
   livePrice,
+  initialDirection,
   onClose,
   onPlaced,
 }: OpenTradeModalProps) {
@@ -74,7 +80,7 @@ export function OpenTradeModal({
   const suggestedSide: TransactionType =
     suggestion?.signal_direction === "SELL" ? "SELL" : "BUY";
 
-  const [side, setSide]             = useState<TransactionType>(suggestedSide);
+  const [side, setSide]             = useState<TransactionType>(initialDirection ?? suggestedSide);
   const [orderType, setOrderType]   = useState<OrderType>("MARKET");
   const [productType, setProductType] = useState<ProductType>("CNC");
   const [quantity, setQuantity]     = useState<string>("1");
@@ -220,10 +226,17 @@ export function OpenTradeModal({
 
     try {
       await placeOrder(payload);
-      toast.success(
-        `${side === "BUY" ? "Buy" : "Sell"} order placed`,
-        `${qty} × ${instrument.trading_symbol} · ${orderType}`,
-      );
+      if (orderType === "LIMIT") {
+        toast.success(
+          `Limit order queued`,
+          `${qty} × ${instrument.trading_symbol} · will fill when price reaches ₹${parseFloat(limitPrice).toLocaleString("en-IN")}`,
+        );
+      } else {
+        toast.success(
+          `${side === "BUY" ? "Buy" : "Sell"} order placed`,
+          `${qty} × ${instrument.trading_symbol} · ${orderType}`,
+        );
+      }
       onPlaced?.();
       onClose();
     } catch {
@@ -356,32 +369,53 @@ export function OpenTradeModal({
               </span>
             </div>
 
-            {/* BUY / SELL toggle */}
+            {/* Direction — static badge when pre-set externally, interactive toggle otherwise */}
             <div className="space-y-1.5">
               <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
                 Direction
               </label>
-              <div className="flex gap-2">
-                {(["BUY", "SELL"] as TransactionType[]).map((dir) => (
-                  <button
-                    key={dir}
-                    type="button"
-                    onClick={() => setSide(dir)}
-                    className={`flex flex-1 items-center justify-center gap-1.5 rounded-xl border py-2.5 text-sm font-semibold transition ${
-                      side === dir
-                        ? dir === "BUY"
-                          ? "border-emerald-500 bg-emerald-600 text-white shadow-sm"
-                          : "border-rose-500 bg-rose-600 text-white shadow-sm"
-                        : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+              {initialDirection ? (
+                <div
+                  className={`flex items-center gap-2.5 rounded-xl border px-4 py-2.5 ${
+                    initialDirection === "BUY"
+                      ? "border-emerald-200 bg-emerald-50"
+                      : "border-rose-200 bg-rose-50"
+                  }`}
+                >
+                  {initialDirection === "BUY"
+                    ? <ArrowUpRight   className="h-4 w-4 text-emerald-600" />
+                    : <ArrowDownRight className="h-4 w-4 text-rose-600" />}
+                  <span
+                    className={`text-sm font-semibold ${
+                      initialDirection === "BUY" ? "text-emerald-700" : "text-rose-700"
                     }`}
                   >
-                    {dir === "BUY"
-                      ? <ArrowUpRight   className="h-4 w-4" />
-                      : <ArrowDownRight className="h-4 w-4" />}
-                    {dir}
-                  </button>
-                ))}
-              </div>
+                    {initialDirection}
+                  </span>
+                </div>
+              ) : (
+                <div className="flex gap-2">
+                  {(["BUY", "SELL"] as TransactionType[]).map((dir) => (
+                    <button
+                      key={dir}
+                      type="button"
+                      onClick={() => setSide(dir)}
+                      className={`flex flex-1 items-center justify-center gap-1.5 rounded-xl border py-2.5 text-sm font-semibold transition ${
+                        side === dir
+                          ? dir === "BUY"
+                            ? "border-emerald-500 bg-emerald-600 text-white shadow-sm"
+                            : "border-rose-500 bg-rose-600 text-white shadow-sm"
+                          : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                      }`}
+                    >
+                      {dir === "BUY"
+                        ? <ArrowUpRight   className="h-4 w-4" />
+                        : <ArrowDownRight className="h-4 w-4" />}
+                      {dir}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
 
             {/* Order type */}

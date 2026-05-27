@@ -1,0 +1,9 @@
+{
+  "event": "break_glass",
+  "operation": "promote_to_production",
+  "model_version": "1.1.0_xgboost",
+  "model_name": "xgboost",
+  "reason": "symbol_coverage 65.8% is the NSE data availability ceiling, not model deficiency. XGBoost 1.1.0 has AUC-PR=0.6765, DSR=0.642, ECE=0.0022 \u2014 all non-coverage gates pass. Deploying as live single-active-member with GRU dormant.",
+  "timestamp": "2026-05-26T13:15:22.619323+00:00",
+  "audit_sha256": "950450539fe8e15b0550596bfb27ebb64cc48948f71bf5ad829e85bdfc930f5d"
+}

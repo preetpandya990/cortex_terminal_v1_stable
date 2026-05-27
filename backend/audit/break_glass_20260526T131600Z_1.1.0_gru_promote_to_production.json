@@ -1,0 +1,9 @@
+{
+  "event": "break_glass",
+  "operation": "promote_to_production",
+  "model_version": "1.1.0_gru",
+  "model_name": "gru",
+  "reason": "GRU 1.1.0 AUC-PR=0.49 below gate and symbol_coverage 65.8% below gate. Registering DORMANT at production tier for audit trail, versioning, checksum coverage. GRU champion 1.0.0 stays active. Activate when performance improves.",
+  "timestamp": "2026-05-26T13:16:00.215456+00:00",
+  "audit_sha256": "cf9c60ddbc34d685857aa07373063998dd1cd3be42c20a2b37a549ef2b6eedf4"
+}

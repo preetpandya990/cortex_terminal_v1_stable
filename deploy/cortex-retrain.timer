@@ -1,0 +1,23 @@
+[Unit]
+Description=Weekly trigger for Cortex AI ML challenger retrain (C1)
+Documentation=file:///home/preet/code/Cortex_Merge_AI-ML/deploy/README.md
+Requires=cortex-retrain.service
+
+[Timer]
+# Saturday 20:00 Asia/Kolkata — well after Friday market close on NSE.
+# Must stay in sync with backend/app/ml/config.py SCHEDULED_RETRAIN.
+OnCalendar=Sat *-*-* 20:00:00 Asia/Kolkata
+
+# If the host was off when the timer should have fired, run on next boot.
+# Without this, a missed weekend = a missed retrain.
+Persistent=true
+
+# Jitter up to 5 minutes — avoids stampedes if multiple timers share this slot.
+RandomizedDelaySec=300
+
+# Belt-and-braces: even if the service is mistakenly invoked twice (e.g.
+# manual `systemctl start cortex-retrain.service` while the timer fires),
+# the wrapper's fcntl.flock lock makes parallel orchestrator runs impossible.
+
+[Install]
+WantedBy=timers.target

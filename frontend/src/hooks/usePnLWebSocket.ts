@@ -28,8 +28,10 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { WS_BASE_URL } from '@/lib/api';
-import type { LivePnLUpdate, LivePositionPnL } from '@/types/paper_trading';
+import type { LivePnLUpdate, LivePositionPnL, OrderFilledEvent, OrderExpiredEvent } from '@/types/paper_trading';
+import { paperTradingKeys } from './usePaperTrading';
 
 // ── Fatal close codes — do NOT retry ─────────────────────────────────────────
 const FATAL_CLOSE_CODES = new Set([
@@ -38,9 +40,11 @@ const FATAL_CLOSE_CODES = new Set([
 ]);
 
 // ── Reconnect strategy ────────────────────────────────────────────────────────
-const MAX_RECONNECT_ATTEMPTS = 10;
-const BASE_RECONNECT_MS      = 1_000;
-const MAX_RECONNECT_MS       = 30_000;
+// No hard attempt cap — retry indefinitely so a backend restart doesn't leave
+// the chip stuck "Offline" forever. The interval ceiling (60 s) means at most
+// one connection attempt per minute during a prolonged outage.
+const BASE_RECONNECT_MS = 1_000;
+const MAX_RECONNECT_MS  = 60_000;
 
 // ── Client heartbeat (independent of server heartbeat) ───────────────────────
 const CLIENT_HEARTBEAT_MS = 25_000;
@@ -69,6 +73,10 @@ export interface UsePnLWebSocketReturn {
   disconnect: () => void;
   /** Reset attempt counter and immediately reconnect (e.g. after token refresh) */
   reconnect: () => void;
+  /** Attach a callback invoked on every `order_filled` WS event (e.g. for toast notifications) */
+  onOrderFilled: React.MutableRefObject<((event: OrderFilledEvent) => void) | null>;
+  /** Attach a callback invoked on every `order_expired` WS event */
+  onOrderExpired: React.MutableRefObject<((event: OrderExpiredEvent) => void) | null>;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -95,10 +103,15 @@ export function usePnLWebSocket(
   token:       string | null | undefined,
   enabled = true,
 ): UsePnLWebSocketReturn {
+  const queryClient = useQueryClient();
   const [connectionState, setConnectionState] = useState<PnLConnectionState>('disconnected');
   const [portfolioStats,  setPortfolioStats]  = useState<PnLPortfolioStats>(INITIAL_STATS);
 
   const positionPnLMap = useRef<Map<string, LivePositionPnL>>(new Map());
+
+  // Caller-supplied callbacks for order lifecycle events (stable refs, never in deps).
+  const onOrderFilled  = useRef<((e: OrderFilledEvent)  => void) | null>(null);
+  const onOrderExpired = useRef<((e: OrderExpiredEvent) => void) | null>(null);
 
   const wsRef             = useRef<WebSocket | null>(null);
   const heartbeatRef      = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -205,6 +218,30 @@ export function usePnLWebSocket(
 
         if (frame.type === 'pong' || frame.type === 'reauthed') return;
 
+        // ── Order lifecycle events ────────────────────────────────────────────
+        // Fired by the matching engine when a LIMIT/SL/SL-M order is filled or
+        // expires.  Invalidate relevant React Query caches so the UI refreshes
+        // without requiring a manual page reload.
+        if (frame.type === 'order_filled') {
+          const filledEvent = frame as unknown as OrderFilledEvent;
+          // Invalidate positions (a fill may open/close a position), orders
+          // (OPEN → COMPLETE), and portfolio (reserved_cash released).
+          queryClient.invalidateQueries({ queryKey: paperTradingKeys.positions() });
+          queryClient.invalidateQueries({ queryKey: paperTradingKeys.orders() });
+          queryClient.invalidateQueries({ queryKey: paperTradingKeys.portfolio() });
+          onOrderFilled.current?.(filledEvent);
+          return;
+        }
+
+        if (frame.type === 'order_expired') {
+          const expiredEvent = frame as unknown as OrderExpiredEvent;
+          // Invalidate orders (OPEN → CANCELLED) and portfolio (reserved_cash released).
+          queryClient.invalidateQueries({ queryKey: paperTradingKeys.orders() });
+          queryClient.invalidateQueries({ queryKey: paperTradingKeys.portfolio() });
+          onOrderExpired.current?.(expiredEvent);
+          return;
+        }
+
         // ── P&L data frame ────────────────────────────────────────────────────
         if (!Array.isArray(frame.positions)) return;
 
@@ -256,15 +293,9 @@ export function usePnLWebSocket(
           return;
         }
 
-        if (attemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
-          console.error('[PnLWS] Max reconnection attempts reached');
-          setConnectionState('error');
-          return;
-        }
-
         attemptsRef.current += 1;
         const delay = backoffDelay(attemptsRef.current);
-        console.log(`[PnLWS] Reconnecting in ${delay} ms (attempt ${attemptsRef.current}/${MAX_RECONNECT_ATTEMPTS})`);
+        console.log(`[PnLWS] Reconnecting in ${delay} ms (attempt ${attemptsRef.current})`);
         setConnectionState('disconnected');
         reconnectRef.current = setTimeout(connect, delay);
       };
@@ -273,7 +304,24 @@ export function usePnLWebSocket(
     connectRef.current = connect;
     connect();
 
+    // When the user returns to the tab, reset the backoff counter and reconnect
+    // immediately if the connection is not already open. This ensures a backend
+    // restart that happened while the tab was backgrounded is recovered the
+    // instant the user looks at the screen — without waiting for the next
+    // scheduled retry (which could be up to 60 s away).
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (wsRef.current?.readyState === WebSocket.OPEN) return;
+      attemptsRef.current = 0;
+      clearTimers();
+      wsRef.current?.close();
+      wsRef.current = null;
+      connect();
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
     return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       shouldReconnectRef.current = false;
       clearTimers();
       wsRef.current?.close(1000, 'Component unmount');
@@ -322,5 +370,7 @@ export function usePnLWebSocket(
     portfolioStats,
     disconnect,
     reconnect,
+    onOrderFilled,
+    onOrderExpired,
   };
 }

@@ -1,0 +1,17 @@
+# Grafana Dashboard Provisioning — Cortex AI
+# ============================================
+# GitOps-managed. Dashboards are loaded from disk and cannot be saved back via UI.
+apiVersion: 1
+
+providers:
+  - name: cortex-ai
+    orgId: 1
+    folder: Cortex AI
+    folderUid: cortex-ai
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/provisioning/dashboards/cortex
+      foldersFromFilesStructure: false

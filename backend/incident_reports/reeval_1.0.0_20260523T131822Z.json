@@ -1,0 +1,174 @@
+{
+  "report_kind": "c3_honest_reeval",
+  "generated_at": "2026-05-23T13:18:22.944609+00:00",
+  "report_only": true,
+  "audited_models": [
+    {
+      "model_id": "xgboost_1.0.0_xgboost",
+      "model_name": "xgboost",
+      "model_version": "1.0.0_xgboost",
+      "status": "production",
+      "is_active": true,
+      "trained_at": "2026-05-10T14:24:35.656328+00:00",
+      "deployed_at": "2026-05-10T14:26:56.241993+00:00",
+      "training_samples": 2950200,
+      "n_features_stored": 49,
+      "stored_metrics": {
+        "accuracy": 0.6538333333333334,
+        "precision": {
+          "down": 0.6437480012791813,
+          "up": 0.6648103028193526
+        },
+        "recall": {
+          "down": 0.6764112903225806,
+          "up": 0.6316137566137566
+        },
+        "f1_score": {
+          "down": 0.6596755693921023,
+          "up": 0.6477870103442428
+        },
+        "confusion_matrix": [
+          [
+            10065,
+            4815
+          ],
+          [
+            5570,
+            9550
+          ]
+        ],
+        "log_loss": 0.633321278670584,
+        "sharpe_ratio": 0.0,
+        "sortino_ratio": 0.0,
+        "max_drawdown": 0.0,
+        "win_rate": 0.0,
+        "profit_factor": 0.0,
+        "total_return": 0.0,
+        "n_samples": 30000,
+        "n_trades": 0,
+        "avg_return_per_trade": 0.0,
+        "ensemble_weight": 0.7499999999999999
+      },
+      "a6_gate": {
+        "passed": false,
+        "failed_gates": {
+          "auc_pr": "auc_pr 0.0000 < 0.5500 for model type 'xgboost'",
+          "deflated_sharpe": "deflated_sharpe -1.0000 must be strictly positive (> 0.0000) \u2014 net-of-cost alpha required",
+          "calibration_ece": "ece_after 1.0000 > 0.0500 \u2014 calibration too poor for reliable position sizing"
+        },
+        "n_failed": 3
+      },
+      "structural_findings": [
+        {
+          "kind": "obsolete_feature_schema",
+          "stored": 49,
+          "current": 69,
+          "missing_count": 20,
+          "note": "Trained on 49 features; current pipeline produces 69.  Re-inference would require a legacy feature-subset extractor \u2014 the model cannot honestly consume the current feature stream."
+        },
+        {
+          "kind": "calibrator_missing",
+          "expected_path": "models/production/models/calibrator_xgb.pkl",
+          "note": "No calibrator file at the expected serving path.  Model predates A4; ECE cannot be evaluated and serving probabilities are uncalibrated."
+        },
+        {
+          "kind": "fabricated_zero_sharpe",
+          "stored_sharpe": 0.0,
+          "stored_n_trades": 0,
+          "note": "sharpe_ratio=0.0 with n_trades=0 matches the A1-fixed silent Sharpe\u2192accuracy downgrade pattern.  This is the fabricated zero, not a real measurement."
+        }
+      ]
+    },
+    {
+      "model_id": "gru_1.0.0_gru",
+      "model_name": "gru",
+      "model_version": "1.0.0_gru",
+      "status": "production",
+      "is_active": true,
+      "trained_at": "2026-05-10T14:24:35.697078+00:00",
+      "deployed_at": "2026-05-10T14:27:02.485025+00:00",
+      "training_samples": 2950200,
+      "n_features_stored": 49,
+      "stored_metrics": {
+        "accuracy": 0.5312333333333333,
+        "precision": {
+          "down": 0.5465951864948101,
+          "up": 0.5248905006358028
+        },
+        "recall": {
+          "down": 0.32204301075268815,
+          "up": 0.7371031746031746
+        },
+        "f1_score": {
+          "down": 0.4052945405336829,
+          "up": 0.6131543476466866
+        },
+        "confusion_matrix": [
+          [
+            4792,
+            10088
+          ],
+          [
+            3975,
+            11145
+          ]
+        ],
+        "log_loss": 0.6891653464942036,
+        "sharpe_ratio": 0.0,
+        "sortino_ratio": 0.0,
+        "max_drawdown": 0.0,
+        "win_rate": 0.0,
+        "profit_factor": 0.0,
+        "total_return": 0.0,
+        "n_samples": 30000,
+        "n_trades": 0,
+        "avg_return_per_trade": 0.0,
+        "ensemble_weight": 0.2500000000000001
+      },
+      "a6_gate": {
+        "passed": false,
+        "failed_gates": {
+          "auc_pr": "auc_pr 0.0000 < 0.5000 for model type 'gru'",
+          "deflated_sharpe": "deflated_sharpe -1.0000 must be strictly positive (> 0.0000) \u2014 net-of-cost alpha required",
+          "calibration_ece": "ece_after 1.0000 > 0.0500 \u2014 calibration too poor for reliable position sizing"
+        },
+        "n_failed": 3
+      },
+      "structural_findings": [
+        {
+          "kind": "obsolete_feature_schema",
+          "stored": 49,
+          "current": 69,
+          "missing_count": 20,
+          "note": "Trained on 49 features; current pipeline produces 69.  Re-inference would require a legacy feature-subset extractor \u2014 the model cannot honestly consume the current feature stream."
+        },
+        {
+          "kind": "calibrator_missing",
+          "expected_path": "models/production/models/calibrator_gru.pkl",
+          "note": "No calibrator file at the expected serving path.  Model predates A4; ECE cannot be evaluated and serving probabilities are uncalibrated."
+        },
+        {
+          "kind": "fabricated_zero_sharpe",
+          "stored_sharpe": 0.0,
+          "stored_n_trades": 0,
+          "note": "sharpe_ratio=0.0 with n_trades=0 matches the A1-fixed silent Sharpe\u2192accuracy downgrade pattern.  This is the fabricated zero, not a real measurement."
+        }
+      ]
+    }
+  ],
+  "verdict": "DEMOTE_RECOMMENDED",
+  "recommended_action": "One or more production models fail the current A6 hard-gate spec.\nEach must be demoted (production \u2192 staging, live \u2192 paper) until a qualified successor exists.\n\nFailing models:\n  -  xgboost  v=1.0.0_xgboost  failed_gates=3  structural_findings=3\n  -      gru  v=1.0.0_gru  failed_gates=3  structural_findings=3\n\nApply the demotion via (each model demoted independently, atomically):\n\n  source .venv/bin/activate\n  python scripts/promote_model.py demote --version 1.0.0_xgboost --reason 'C3 honest re-eval \u2014 fails A6 hard gates: auc_pr, deflated_sharpe, calibration_ece'\n  python scripts/promote_model.py demote --version 1.0.0_gru --reason 'C3 honest re-eval \u2014 fails A6 hard gates: auc_pr, deflated_sharpe, calibration_ece'\n\nEach `demote` command:\n  * is atomic across ml_model_metadata + ai_ml_models (A8 invariant)\n  * is audited at WARNING via the dedicated audit logger\n  * preserves the model artefact + registry row for future re-promotion\n\nRestoration path: train a qualified successor + `promote_model.py production`.  The demoted model can be re-activated only via the audited break-glass path (--skip-gates --reason).",
+  "audit_basis": {
+    "a6_quality_gate_class": "app.ml.model_registry.QualityGate",
+    "a6_hard_gates_checked": [
+      "auc_pr",
+      "deflated_sharpe",
+      "calibration_ece",
+      "symbol_coverage",
+      "training_samples",
+      "accuracy",
+      "metadata_completeness"
+    ],
+    "current_feature_schema_baseline": 69
+  }
+}
