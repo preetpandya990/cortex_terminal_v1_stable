@@ -106,10 +106,10 @@ export function ClosePositionModal({ position, livePrice, onClose, onClosed }: P
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm"
       onClick={(e) => e.target === e.currentTarget && onClose()}
     >
-      <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white shadow-2xl">
+      <div className="w-full max-w-md max-h-full flex flex-col rounded-2xl border border-slate-200 bg-white shadow-2xl overflow-hidden">
         {/* Header */}
         <div className="flex items-center justify-between border-b border-slate-200 px-6 py-4">
           <div className="flex items-center gap-2.5">
@@ -143,7 +143,7 @@ export function ClosePositionModal({ position, livePrice, onClose, onClosed }: P
         </div>
 
         {/* Form */}
-        <form onSubmit={handleSubmit} className="px-6 py-5 space-y-4">
+        <form onSubmit={handleSubmit} className="overflow-y-auto px-6 py-5 space-y-4">
           {errorMessage && (
             <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2.5 text-sm text-rose-700">
               <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />

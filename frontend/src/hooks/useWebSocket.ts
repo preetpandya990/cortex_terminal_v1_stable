@@ -46,15 +46,43 @@
 
 import { useEffect, useRef, useMemo, useCallback, useReducer } from 'react';
 
+export type TriggerType = 'SCANNER_ANOMALY' | 'NEWS_EVENT';
+
 export type WebSocketMessage =
   | {
+      /** ML pipeline started processing a symbol. Powers the ML Activity feed. */
+      type: 'correlation_started';
+      correlation_id: string;
+      symbol: string;
+      trading_symbol: string | null;
+      trigger_type: TriggerType;
+      started_at: string;
+    }
+  | {
+      /**
+       * New trade suggestion committed — full payload, no refetch needed.
+       * `correlation_id` links back to the corresponding correlation_started event
+       * so the ML Activity feed can transition the row from processing → completed.
+       */
       type: 'new_suggestion';
+      correlation_id: string;
       suggestion_id: string;
       symbol: string;
+      trading_symbol: string | null;
+      company_name: string | null;
       signal_direction: 'BUY' | 'SELL';
-      consensus_score: number;
       confidence_level: 'HIGH' | 'MEDIUM' | 'LOW';
-      timestamp: string;
+      consensus_score: number;
+      trigger_pathway: string;
+      entry_price: number | null;
+      stop_loss: number | null;
+      take_profit_1: number | null;
+      take_profit_2: number | null;
+      take_profit_3: number | null;
+      risk_reward_ratio: number | null;
+      generated_at: string;
+      expires_at: string;
+      status: string;
     }
   | {
       type: 'suggestion_expired';
@@ -64,15 +92,24 @@ export type WebSocketMessage =
       reason: string;
     }
   | {
+      /** Consensus reached — accompanies new_suggestion for latency telemetry. */
       type: 'correlation_completed';
       correlation_id: string;
       suggestion_id: string;
+      symbol: string;
+      trading_symbol: string | null;
+      trigger_type: TriggerType;
       consensus_score: number;
+      latencies: { scanner_ms?: number; ai_ms?: number; ml_ms?: number } | null;
       completed_at: string;
     }
   | {
+      /** Consensus not reached — reason surfaced in ML Activity feed. */
       type: 'correlation_rejected';
       correlation_id: string;
+      symbol: string;
+      trading_symbol: string | null;
+      trigger_type: TriggerType;
       rejection_reason: string;
       consensus_score: number;
       rejected_at: string;

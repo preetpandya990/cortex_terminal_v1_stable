@@ -259,10 +259,10 @@ export function OpenTradeModal({
   // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div
-      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 backdrop-blur-sm"
+      className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm"
       onClick={(e) => e.target === e.currentTarget && onClose()}
     >
-      <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white shadow-2xl">
+      <div className="w-full max-w-md max-h-full flex flex-col rounded-2xl border border-slate-200 bg-white shadow-2xl overflow-hidden">
 
         {/* ── Header ─────────────────────────────────────────────────────── */}
         <div className="flex items-center justify-between border-b border-slate-100 px-6 py-4">
@@ -318,7 +318,7 @@ export function OpenTradeModal({
 
         {/* ── Form ─────────────────────────────────────────────────────────── */}
         {!noPortfolio && (
-          <form onSubmit={handleSubmit} className="space-y-4 px-6 py-5">
+          <form onSubmit={handleSubmit} className="overflow-y-auto space-y-4 px-6 py-5">
 
             {/* Signal context banner */}
             {suggestion && (

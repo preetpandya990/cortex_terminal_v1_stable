@@ -249,6 +249,7 @@ class ProductionTrainingOrchestrator:
         output_dir: Optional[Path] = None,
         *,
         fresh: bool = False,
+        feedback_weights_path: Optional[str] = None,
     ) -> None:
         self.db = db_session
         self.config = config or TrainingConfig()
@@ -305,6 +306,14 @@ class ProductionTrainingOrchestrator:
         self.cpcv_oof: Optional[Dict[str, Any]] = None
 
         self.results: Optional[TrainingResults] = None
+
+        # Phase 2 — Feedback bundle path + pre-loaded lookup dict.
+        # Set via --feedback-weights CLI flag or the training console API.
+        # The lookup is loaded once during step-3 (target generation) and reused
+        # by steps 5 (XGBoost) and 6 (GRU) without re-reading the parquet.
+        self._feedback_weights_path: Optional[str] = feedback_weights_path
+        self._feedback_weight_lookup: Optional[Dict] = None   # populated at step-3
+        self._feedback_bundle_stats: Optional[Any]   = None   # FeedbackBundleStats
 
         # E3 — MLflow lineage (set by _setup_mlflow at run() start; None until then)
         self._e3_mlflow_run_id: Optional[str] = None
@@ -1191,6 +1200,36 @@ class ProductionTrainingOrchestrator:
             logger.info("    %s (%d): %8d  (%.1f%%)", name, cls, n, 100 * n / total)
         logger.info("  class_weights: %s", {k: round(v, 4) for k, v in self.class_weights.items()})
 
+        # Phase 2 — pre-load the feedback bundle so steps 5 & 6 can skip the
+        # parquet open/parse cost (amortised once across all CPCV combos).
+        if self._feedback_weights_path:
+            try:
+                from app.ml.training.feedback_loader import load_bundle_lookup
+                lookup, stats = load_bundle_lookup(self._feedback_weights_path)
+                self._feedback_weight_lookup = lookup
+                self._feedback_bundle_stats  = stats
+                logger.info(
+                    "Feedback bundle loaded  rows=%d  window=[%s, %s]  sha256=%s…",
+                    len(lookup),
+                    stats.window_start if stats else "?",
+                    stats.window_end   if stats else "?",
+                    (stats.sha256[:12] if stats and stats.sha256 else "?"),
+                )
+                self._write_run_log_entry({
+                    "event":              "feedback_bundle_loaded",
+                    "bundle_path":        self._feedback_weights_path,
+                    "bundle_row_count":   len(lookup),
+                    "bundle_sha256":      stats.sha256 if stats else None,
+                    "bundle_window":      [stats.window_start, stats.window_end] if stats else None,
+                })
+            except Exception as exc:
+                logger.error(
+                    "Failed to load feedback bundle '%s': %s  — training continues "
+                    "WITHOUT feedback weights (all sample weights will be 1.0).",
+                    self._feedback_weights_path, exc,
+                )
+                self._feedback_weight_lookup = None
+
     def _validate_targets_data(self) -> None:
         if not self.targets_data:
             raise ValueError("No targets data generated")
@@ -1317,6 +1356,27 @@ class ProductionTrainingOrchestrator:
             dict(zip(*np.unique(y_all, return_counts=True))),
         )
 
+        # Phase 2 — per-sample feedback weights (indexed parallel to X_all).
+        # Built once here, sliced per CPCV combo and reused for the final refit.
+        # Defaults to None when no feedback bundle is loaded.
+        _xgb_sw: Optional[np.ndarray] = None
+        if self._feedback_weight_lookup:
+            try:
+                import pandas as _pd
+                _xgb_sw = np.ones(len(X_all), dtype=np.float32)
+                for _i in range(len(X_all)):
+                    _sym = str(sym_all[_i])
+                    _d   = _pd.Timestamp(ts_all[_i]).tz_localize("UTC").date()
+                    _xgb_sw[_i] = float(self._feedback_weight_lookup.get((_sym, _d), 1.0))
+                _matched = int(np.sum(_xgb_sw != 1.0))
+                logger.info(
+                    "XGBoost feedback weights: %d / %d rows matched (%.1f%%)",
+                    _matched, len(X_all), 100.0 * _matched / max(len(X_all), 1),
+                )
+            except Exception as _exc:
+                logger.warning("XGBoost feedback weight build failed (continuing without): %s", _exc)
+                _xgb_sw = None
+
         self.xgboost_trainer = XGBoostTrainer(
             objective='binary:logistic', num_class=2, random_state=42
         )
@@ -1399,6 +1459,7 @@ class ProductionTrainingOrchestrator:
                 params=best_params,
                 num_boost_round=best_rounds,
                 class_weights=None,  # XGBoost path is class-weight-free (ATR dead-zone ⇒ ~balanced)
+                sample_weight=_xgb_sw[sp.train_idx] if _xgb_sw is not None else None,
             )
             proba_up = XGBoostTrainer.proba_up(booster, X_all[sp.test_idx])
             for p in np.unique(sp.test_path_of_row):
@@ -1457,6 +1518,7 @@ class ProductionTrainingOrchestrator:
             params=best_params,
             num_boost_round=best_rounds,
             class_weights=None,
+            sample_weight=_xgb_sw,  # None when no feedback bundle
         )
         self.xgboost_trainer.model = prod
         feature_importance = prod.get_score(importance_type='weight')
@@ -1691,8 +1753,14 @@ class ProductionTrainingOrchestrator:
         # Per symbol: FIRST n_tr chronological sequences = train.
         # Purge gap + val tail are excluded — identical split to the persisted plan.
         gru_train_segs: list[tuple[np.ndarray, np.ndarray]] = []
+        # Phase 2: parallel per-symbol weight arrays; None when no bundle loaded.
+        gru_weight_segs: Optional[list[np.ndarray]] = (
+            [] if self._feedback_weight_lookup else None
+        )
         actual_train   = 0
         nan_sym_count  = 0
+
+        from app.ml.training.feedback_loader import build_sequence_weights_for_symbol
 
         for symbol, y_start, n_tr, n_va in gru_plan:
             if symbol not in self.targets_data:
@@ -1702,7 +1770,8 @@ class ProductionTrainingOrchestrator:
             norm_df = normalize_features(
                 df_raw, method='rolling', window=seq_len, feature_cols=feature_names
             )
-            X_seq, _, _ = create_sequences(norm_df, seq_len, feature_names)
+            # Keep seq_ts (last-bar timestamp per sequence) for feedback weight lookup.
+            X_seq, seq_ts, _ = create_sequences(norm_df, seq_len, feature_names)
             # NaN-drops in normalize_features can yield fewer rows than planned.
             take = min(n_tr, len(X_seq))
             if take <= 0:
@@ -1720,6 +1789,28 @@ class ProductionTrainingOrchestrator:
                 continue
             gru_train_segs.append((X_sym, y_sym_s))
             actual_train += take
+
+            # Phase 2 — per-sequence combined weight (class × feedback).
+            # When feedback is absent the weight array is not built (gru_weight_segs is None).
+            if gru_weight_segs is not None:
+                try:
+                    w_sym = build_sequence_weights_for_symbol(
+                        bundle_path=None,               # lookup already loaded
+                        weight_lookup=self._feedback_weight_lookup,
+                        symbol=symbol,
+                        seq_timestamps=seq_ts[:take],
+                        n_take=take,
+                        class_weights=self.class_weights,
+                        y_sym=y_sym,
+                        y_start=y_start,
+                    )
+                    gru_weight_segs.append(w_sym)
+                except Exception as _exc:
+                    logger.warning(
+                        "GRU feedback weight build for symbol %s failed (using 1.0): %s",
+                        symbol, _exc,
+                    )
+                    gru_weight_segs.append(np.ones(take, dtype=np.float32))
 
         if nan_sym_count:
             logger.warning(
@@ -1763,16 +1854,33 @@ class ProductionTrainingOrchestrator:
         # batch generator overhead is fully absorbed by prefetch(2) — no GPU stall.
         # Prefetch is capped at 2 (not AUTOTUNE) — AUTOTUNE grew unboundedly in
         # earlier runs and exhausted RAM.
-        _GEN_CHUNK = 4_096
-        _segs      = gru_train_segs  # closure — kept alive until this method returns
+        _GEN_CHUNK    = 4_096
+        _segs         = gru_train_segs   # closure — kept alive until this method returns
+        _weight_segs  = gru_weight_segs  # None when no feedback bundle
 
         def _gru_chunk_gen() -> Any:
-            """Yields (float32 chunk, int32 labels) pairs; called fresh each epoch."""
-            for X_sym, y_sym_s in _segs:
-                n = len(X_sym)
-                for start in range(0, n, _GEN_CHUNK):
-                    end = min(start + _GEN_CHUNK, n)
-                    yield X_sym[start:end].astype(np.float32), y_sym_s[start:end]
+            """Yields (float32 chunk, int32 labels[, float32 weights]) tuples.
+
+            When ``_weight_segs`` is not None, yields 3-element tuples so Keras
+            reads per-sample weights from the dataset directly (class_weight must
+            be None in that case — Keras forbids both simultaneously).
+            """
+            if _weight_segs is not None:
+                for (X_sym, y_sym_s), w_sym in zip(_segs, _weight_segs):
+                    n = len(X_sym)
+                    for start in range(0, n, _GEN_CHUNK):
+                        end = min(start + _GEN_CHUNK, n)
+                        yield (
+                            X_sym[start:end].astype(np.float32),
+                            y_sym_s[start:end],
+                            w_sym[start:end],
+                        )
+            else:
+                for X_sym, y_sym_s in _segs:
+                    n = len(X_sym)
+                    for start in range(0, n, _GEN_CHUNK):
+                        end = min(start + _GEN_CHUNK, n)
+                        yield X_sym[start:end].astype(np.float32), y_sym_s[start:end]
 
         def _make_gru_dataset(batch_sz: int) -> "tf.data.Dataset":
             """Return a fresh, re-iterable CPU-pinned tf.data pipeline at batch_sz.
@@ -1780,17 +1888,25 @@ class ProductionTrainingOrchestrator:
             Called once for HPO and once per retry attempt in _run_gru_fit so that
             batch-halving OOM recovery gets a clean dataset (proper shuffle, no
             stale iterator state) rather than an unbatch/rebatch chain.
+
+            When feedback weights are loaded the dataset yields (X, y, w) 3-tuples;
+            Keras extracts the sample_weight column automatically.
             """
             with tf.device('/CPU:0'):
+                if _weight_segs is not None:
+                    sig = (
+                        tf.TensorSpec(shape=(None, seq_len, n_feat), dtype=tf.float32),
+                        tf.TensorSpec(shape=(None,),                 dtype=tf.int32),
+                        tf.TensorSpec(shape=(None,),                 dtype=tf.float32),
+                    )
+                else:
+                    sig = (
+                        tf.TensorSpec(shape=(None, seq_len, n_feat), dtype=tf.float32),
+                        tf.TensorSpec(shape=(None,),                 dtype=tf.int32),
+                    )
                 return (
                     tf.data.Dataset
-                    .from_generator(
-                        _gru_chunk_gen,
-                        output_signature=(
-                            tf.TensorSpec(shape=(None, seq_len, n_feat), dtype=tf.float32),
-                            tf.TensorSpec(shape=(None,),               dtype=tf.int32),
-                        ),
-                    )
+                    .from_generator(_gru_chunk_gen, output_signature=sig)
                     .unbatch()
                     .shuffle(buffer_size=5_000, reshuffle_each_iteration=True)
                     .batch(batch_sz)
@@ -1875,6 +1991,7 @@ class ProductionTrainingOrchestrator:
             best_params,
             initial_epoch,
             epoch_cb,
+            _weight_segs is not None,   # use_sample_weights
         )
 
         gru_model = self.gru_trainer.model
@@ -1899,6 +2016,7 @@ class ProductionTrainingOrchestrator:
         best_params: Dict[str, Any],
         initial_epoch: int,
         epoch_cb: Any,
+        use_sample_weights: bool = False,
     ) -> None:
         """
         Run model.fit() with OOM recovery — extracted so it can run via asyncio.to_thread.
@@ -1943,10 +2061,13 @@ class ProductionTrainingOrchestrator:
 
         for attempt in range(_MAX_OOM_RETRIES + 1):
             try:
+                # When the dataset already carries per-sample weights (3-tuples),
+                # class_weight must be None — Keras rejects both simultaneously.
+                _cw = None if use_sample_weights else self.class_weights
                 self.gru_trainer.train(
                     params=best_params,
                     epochs=self.config.max_epochs,
-                    class_weight=self.class_weights,
+                    class_weight=_cw,
                     train_generator=current_ds,
                     val_data=(X_val, y_val),
                     initial_epoch=cur_epoch,
@@ -2520,6 +2641,22 @@ class ProductionTrainingOrchestrator:
                 len(feature_names), include_sentiment, include_fundamentals,
             )
 
+            _fb_meta = None
+            if self._feedback_bundle_stats is not None:
+                _fb_meta = {
+                    "bundle_path":  self._feedback_bundle_stats.bundle_path,
+                    "sha256":       self._feedback_bundle_stats.sha256,
+                    "row_count":    self._feedback_bundle_stats.row_count,
+                    "window_start": self._feedback_bundle_stats.window_start,
+                    "window_end":   self._feedback_bundle_stats.window_end,
+                    "created_at":   self._feedback_bundle_stats.created_at,
+                }
+                logger.info(
+                    "Lineage: feedback_bundle  sha256=%s…  rows=%d  window=[%s, %s]",
+                    _fb_meta["sha256"][:12], _fb_meta["row_count"],
+                    _fb_meta["window_start"], _fb_meta["window_end"],
+                )
+
             xgb_meta = await registry.register_model(
                 version                 = f"{self.config.model_version}_xgboost",
                 model_type              = "xgboost",
@@ -2533,9 +2670,10 @@ class ProductionTrainingOrchestrator:
                     "n_features":       len(feature_names),
                     "training_samples": self._calculate_total_samples(),
                 },
-                feature_version = "1.0.0",
-                status          = "development",
-                overwrite       = True,
+                feature_version      = "1.0.0",
+                status               = "development",
+                overwrite            = True,
+                feedback_bundle_meta = _fb_meta,
             )
             logger.info("  ✓ XGBoost registered  id=%s  inference=%s  n_features=%d",
                         xgb_meta.id, Path(xgb_inference).suffix if xgb_inference else "none",
@@ -2565,9 +2703,10 @@ class ProductionTrainingOrchestrator:
                     "n_features":       len(feature_names),
                     "training_samples": self._calculate_total_samples(),
                 },
-                feature_version = "1.0.0",
-                status          = "development",
-                overwrite       = True,
+                feature_version      = "1.0.0",
+                status               = "development",
+                overwrite            = True,
+                feedback_bundle_meta = _fb_meta,
             )
             logger.info("  ✓ GRU registered  id=%s  inference=%s  n_features=%d",
                         gru_meta.id, Path(gru_inference).suffix if gru_inference else "none",
@@ -2889,6 +3028,17 @@ async def main() -> None:
             "Existing checkpoint artifacts are NOT deleted."
         ),
     )
+    parser.add_argument(
+        "--feedback-weights",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Path to a feedback_weights_*.parquet bundle produced by "
+            "scripts/build_feedback_weights.py.  When provided, the per-sample "
+            "B1+B2 weights are merged into XGBoost (CPCV + final refit) and "
+            "GRU (tf.data pipeline) training.  Omit for unweighted training."
+        ),
+    )
     args = parser.parse_args()
 
     output_dir = Path("models/production")
@@ -2930,6 +3080,7 @@ async def main() -> None:
             config=config,
             output_dir=output_dir,
             fresh=fresh,
+            feedback_weights_path=args.feedback_weights,
         )
 
         try:

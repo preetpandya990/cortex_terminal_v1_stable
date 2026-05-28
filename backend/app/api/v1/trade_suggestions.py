@@ -29,6 +29,9 @@ from app.models.trade_suggestions import EventCorrelation, TradeSuggestion, User
 from app.models.upstox_data import InstrumentMaster
 from app.schemas.trade_suggestions import (
     ConfidenceLevel,
+    CorrelationActivityItem,
+    CorrelationActivityResponse,
+    CorrelationActivityStatus,
     EventCorrelationResponse,
     SignalDirection,
     StrategyComplianceInfo,
@@ -37,6 +40,7 @@ from app.schemas.trade_suggestions import (
     SuggestionStatsResponse,
     TradeSuggestionResponse,
     TradeSuggestionsListResponse,
+    TriggerType,
 )
 
 logger = logging.getLogger(__name__)
@@ -395,6 +399,117 @@ async def list_suggestions(
         )
 
 
+@router.get("/correlations/recent", response_model=CorrelationActivityResponse)
+@limiter.limit("60/minute")
+async def get_recent_correlation_activity(
+    request: Request,
+    limit: int = Query(default=30, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    _user_id: str = Depends(get_current_user_id),
+) -> CorrelationActivityResponse:
+    """
+    Return the most recent resolved correlation attempts for the ML Activity feed.
+
+    Only completed and rejected items are returned — in-flight correlations have
+    no EventCorrelation record yet.  Completed items are enriched with direction,
+    consensus score, and confidence level from the linked TradeSuggestion row.
+    Symbol is resolved from scanner_output for rejected items.
+    """
+    from sqlalchemy.orm import selectinload
+
+    # ── Two targeted queries so completions are never crowded out by a flood
+    # of pre-fix rejected rows that have no scanner_output. ──────────────────
+
+    # 1. Completed correlations — always have a linked suggestion (symbol resolvable).
+    completed_stmt = (
+        select(EventCorrelation)
+        .options(selectinload(EventCorrelation.suggestion))
+        .where(EventCorrelation.consensus_reached.is_(True))
+        .order_by(EventCorrelation.trigger_timestamp.desc())
+        .limit(limit)
+    )
+
+    # 2. Rejected correlations that have scanner_output stored (post-fix rows).
+    rejected_stmt = (
+        select(EventCorrelation)
+        .where(
+            EventCorrelation.consensus_reached.is_(False),
+            EventCorrelation.scanner_output.isnot(None),
+        )
+        .order_by(EventCorrelation.trigger_timestamp.desc())
+        .limit(limit)
+    )
+
+    completed_rows, rejected_rows = await asyncio.gather(
+        db.execute(completed_stmt),
+        db.execute(rejected_stmt),
+    )
+    correlations = [
+        *completed_rows.scalars().all(),
+        *rejected_rows.scalars().all(),
+    ]
+
+    def _build_item(corr: EventCorrelation) -> CorrelationActivityItem | None:
+        suggestion  = getattr(corr, "suggestion", None)
+        scanner_out = corr.scanner_output or {}
+
+        if suggestion is not None:
+            symbol      = suggestion.symbol
+            trading_sym = suggestion.trading_symbol or suggestion.symbol
+            direction   = SignalDirection(suggestion.signal_direction)
+            score       = float(suggestion.consensus_score)
+            confidence  = ConfidenceLevel(suggestion.confidence_level)
+        else:
+            symbol = (
+                scanner_out.get("instrument_key")
+                or scanner_out.get("trading_symbol")
+            )
+            if not symbol:
+                return None
+            trading_sym = scanner_out.get("trading_symbol") or symbol
+            direction   = None
+            score       = None
+            confidence  = None
+
+        raw_reason = corr.rejection_reason
+        rejection_reason: str | None = None
+        if raw_reason:
+            rejection_reason = raw_reason.split(":")[0].split(" ")[0].strip()
+
+        return CorrelationActivityItem(
+            correlation_id   = corr.correlation_id,
+            symbol           = symbol,
+            trading_symbol   = trading_sym,
+            trigger_type     = TriggerType(corr.trigger_type),
+            status           = (
+                CorrelationActivityStatus.COMPLETED
+                if corr.consensus_reached
+                else CorrelationActivityStatus.REJECTED
+            ),
+            started_at       = corr.trigger_timestamp,
+            resolved_at      = corr.created_at,
+            direction        = direction,
+            consensus_score  = score,
+            confidence_level = confidence,
+            rejection_reason = rejection_reason,
+        )
+
+    seen: set[str] = set()
+    items: list[CorrelationActivityItem] = []
+    for corr in sorted(correlations, key=lambda c: c.trigger_timestamp, reverse=True):
+        cid = str(corr.correlation_id)
+        if cid in seen:
+            continue
+        seen.add(cid)
+        item = _build_item(corr)
+        if item is not None:
+            items.append(item)
+        if len(items) >= limit:
+            break
+
+    return CorrelationActivityResponse(items=items, total=len(items))
+
+
 @router.get("/{suggestion_id}", response_model=SuggestionDetailResponse)
 @limiter.limit("60/minute")
 async def get_suggestion(
@@ -633,6 +748,7 @@ from app.core.redis import RedisChannels
 
 # Channels this listener subscribes to
 _SUGGESTION_CHANNELS = (
+    RedisChannels.CORRELATIONS_STARTED,
     RedisChannels.SUGGESTIONS_NEW,
     RedisChannels.SUGGESTIONS_EXPIRED,
     RedisChannels.CORRELATIONS_COMPLETED,
@@ -692,35 +808,53 @@ async def suggestions_redis_listener() -> None:
                 suggestion_id = data.get("suggestion_id")
                 symbol = data.get("symbol")
 
-                if channel == RedisChannels.SUGGESTIONS_NEW:
+                if channel == RedisChannels.CORRELATIONS_STARTED:
+                    ws_message = {
+                        "type":           "correlation_started",
+                        "correlation_id": data.get("correlation_id"),
+                        "symbol":         data.get("symbol"),
+                        "trading_symbol": data.get("trading_symbol"),
+                        "trigger_type":   data.get("trigger_type"),
+                        "started_at":     data.get("started_at"),
+                    }
+                elif channel == RedisChannels.SUGGESTIONS_NEW:
                     ws_message = {
                         "type": "new_suggestion",
-                        # Full suggestion payload — no round-trip fetch needed
+                        # Full suggestion payload — no round-trip fetch needed.
+                        # correlation_id is included so the ML Activity feed can
+                        # resolve the in-flight processing row to completed state.
                         **data,
                     }
                 elif channel == RedisChannels.SUGGESTIONS_EXPIRED:
                     ws_message = {
-                        "type": "suggestion_expired",
+                        "type":          "suggestion_expired",
                         "suggestion_id": suggestion_id,
-                        "symbol": symbol,
-                        "expired_at": data.get("expired_at"),
-                        "reason": data.get("reason"),
+                        "symbol":        symbol,
+                        "expired_at":    data.get("expired_at"),
+                        "reason":        data.get("reason"),
                     }
                 elif channel == RedisChannels.CORRELATIONS_COMPLETED:
                     ws_message = {
-                        "type": "correlation_completed",
-                        "correlation_id": data.get("correlation_id"),
-                        "suggestion_id": suggestion_id,
+                        "type":            "correlation_completed",
+                        "correlation_id":  data.get("correlation_id"),
+                        "suggestion_id":   suggestion_id,
+                        "symbol":          data.get("symbol"),
+                        "trading_symbol":  data.get("trading_symbol"),
+                        "trigger_type":    data.get("trigger_type"),
                         "consensus_score": data.get("consensus_score"),
-                        "completed_at": data.get("completed_at"),
+                        "latencies":       data.get("latencies"),
+                        "completed_at":    data.get("completed_at"),
                     }
                 elif channel == RedisChannels.CORRELATIONS_REJECTED:
                     ws_message = {
-                        "type": "correlation_rejected",
-                        "correlation_id": data.get("correlation_id"),
+                        "type":             "correlation_rejected",
+                        "correlation_id":   data.get("correlation_id"),
+                        "symbol":           data.get("symbol"),
+                        "trading_symbol":   data.get("trading_symbol"),
+                        "trigger_type":     data.get("trigger_type"),
                         "rejection_reason": data.get("rejection_reason"),
-                        "consensus_score": data.get("consensus_score"),
-                        "rejected_at": data.get("rejected_at"),
+                        "consensus_score":  data.get("consensus_score"),
+                        "rejected_at":      data.get("rejected_at"),
                     }
                 else:
                     continue

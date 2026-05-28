@@ -162,32 +162,54 @@ class RedisChannels:
     """
 
     # ── Correlation Events ─────────────────────────────────────────────────────
-    CORRELATIONS_COMPLETED = "cai:correlations:completed"
+    CORRELATIONS_STARTED = "cai:correlations:started"
     """
-    Correlation analysis completed successfully.
-    
-    Payload:
-        {
-            "correlation_id": "uuid",
-            "trigger_type": "SCANNER_ANOMALY" | "NEWS_EVENT",
-            "suggestion_id": "uuid",
-            "consensus_score": 85.5,
-            "latencies": {"scanner_ms": 45, "ai_ms": 120, "ml_ms": 230},
-            "completed_at": "2026-04-22T12:00:00Z"
-        }
-    """
-    
-    CORRELATIONS_REJECTED = "cai:correlations:rejected"
-    """
-    Correlation analysis rejected (low consensus).
+    ML correlation pipeline started for a symbol.
+    Published immediately when the engine picks up a scanner anomaly or news
+    event, before any signal gathering begins.  Powers the ML Activity live feed.
 
     Payload:
         {
-            "correlation_id": "uuid",
-            "trigger_type": "SCANNER_ANOMALY" | "NEWS_EVENT",
-            "rejection_reason": "LOW_CONSENSUS" | "CONFLICTING_SIGNALS" | "TIMEOUT",
-            "consensus_score": 45.2,
-            "rejected_at": "2026-04-22T12:00:00Z"
+            "correlation_id": "<uuid>",
+            "symbol":         "<instrument_key>",
+            "trading_symbol": "<nse_ticker>",
+            "trigger_type":   "SCANNER_ANOMALY" | "NEWS_EVENT",
+            "started_at":     "<iso8601>"
+        }
+    """
+
+    CORRELATIONS_COMPLETED = "cai:correlations:completed"
+    """
+    Correlation analysis completed — consensus reached, suggestion committed.
+
+    Payload:
+        {
+            "correlation_id":  "<uuid>",
+            "suggestion_id":   "<uuid>",
+            "symbol":          "<instrument_key>",
+            "trading_symbol":  "<nse_ticker>",
+            "trigger_type":    "SCANNER_ANOMALY" | "NEWS_EVENT",
+            "consensus_score": <float 0-100>,
+            "latencies":       {"scanner_ms": <int>, "ai_ms": <int>, "ml_ms": <int>},
+            "completed_at":    "<iso8601>"
+        }
+    """
+
+    CORRELATIONS_REJECTED = "cai:correlations:rejected"
+    """
+    Correlation analysis rejected — consensus not reached.
+
+    Payload:
+        {
+            "correlation_id":   "<uuid>",
+            "symbol":           "<instrument_key>",
+            "trading_symbol":   "<nse_ticker>",
+            "trigger_type":     "SCANNER_ANOMALY" | "NEWS_EVENT",
+            "rejection_reason": "NEUTRAL_SIGNAL" | "ML_NEUTRAL" | "DIRECTION_MISMATCH"
+                                | "LOW_CONFIDENCE" | "DUPLICATE_SUPPRESSED"
+                                | "TIMEOUT" | "PROCESSING_ERROR",
+            "consensus_score":  <float 0-100>,
+            "rejected_at":      "<iso8601>"
         }
     """
 

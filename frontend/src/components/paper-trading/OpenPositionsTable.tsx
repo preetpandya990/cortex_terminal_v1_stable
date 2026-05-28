@@ -302,7 +302,7 @@ function ClosedPositionRow({
 type ActiveTab = "open" | "closed" | "pending";
 
 export function OpenPositionsTable() {
-  const { accessToken, isAuthenticated, isAuthReady } = useAuth();
+  const { accessToken, isAuthenticated, isAuthReady, refreshToken } = useAuth();
   const toast = useToast();
 
   const [activeTab,         setActiveTab]         = useState<ActiveTab>("open");
@@ -355,11 +355,28 @@ export function OpenPositionsTable() {
     portfolioStats,
     onOrderFilled,
     onOrderExpired,
+    reconnect: wsReconnect,
   } = usePnLWebSocket(
     portfolio?.id,
     accessToken,
     isAuthReady && isAuthenticated && !!portfolio?.id,
   );
+
+  // Single recovery attempt on auth failure (4001).
+  // Refreshes the access token once and reconnects. If the refresh itself
+  // fails the feed stays "Offline" — the user's session has genuinely expired.
+  // The flag resets on every successful connection so future auth errors
+  // (e.g. after a very long idle period) can also self-heal once.
+  const wsAuthRecoveredRef = useRef(false);
+  useEffect(() => {
+    if (wsState === 'connected') {
+      wsAuthRecoveredRef.current = false;
+      return;
+    }
+    if (wsState !== 'error' || wsAuthRecoveredRef.current) return;
+    wsAuthRecoveredRef.current = true;
+    void refreshToken().then((ok) => { if (ok) wsReconnect(); });
+  }, [wsState, refreshToken, wsReconnect]);
 
   // Attach WS order lifecycle callbacks — stable ref assignment, no re-render.
   useEffect(() => {

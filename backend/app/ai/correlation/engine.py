@@ -160,6 +160,24 @@ class EventCorrelationEngine:
             "ml": CircuitBreaker(failure_threshold=5, timeout_seconds=60),
         }
 
+    async def _publish_correlation_event(
+        self,
+        channel: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """
+        Non-fatal Redis publish wrapper for correlation lifecycle events.
+
+        Telemetry must never interrupt the signal pipeline — any publish failure
+        is logged at DEBUG and swallowed so that the caller can continue normally.
+        """
+        try:
+            await self.redis.publish(channel, json.dumps(payload, default=str))
+        except Exception as exc:
+            logger.debug(
+                "Non-fatal: failed to publish to %s: %s", channel, exc
+            )
+
     async def on_scanner_anomaly(
         self,
         db: AsyncSession,
@@ -191,6 +209,17 @@ class EventCorrelationEngine:
             extra={"pipeline_stage": "trigger", "correlation_id": str(correlation_id)},
         )
 
+        await self._publish_correlation_event(
+            RedisChannels.CORRELATIONS_STARTED,
+            {
+                "correlation_id": str(correlation_id),
+                "symbol":         symbol,
+                "trading_symbol": scanner_signal.get("trading_symbol"),
+                "trigger_type":   "SCANNER_ANOMALY",
+                "started_at":     trigger_timestamp.isoformat(),
+            },
+        )
+
         # Gather signals with timeout
         t_gather_start = datetime.now(timezone.utc)
         try:
@@ -207,6 +236,18 @@ class EventCorrelationEngine:
                 db, correlation_id, "SCANNER_ANOMALY", trigger_timestamp,
                 None, "TIMEOUT", None
             )
+            await self._publish_correlation_event(
+                RedisChannels.CORRELATIONS_REJECTED,
+                {
+                    "correlation_id":   str(correlation_id),
+                    "symbol":           symbol,
+                    "trading_symbol":   scanner_signal.get("trading_symbol"),
+                    "trigger_type":     "SCANNER_ANOMALY",
+                    "rejection_reason": "TIMEOUT",
+                    "consensus_score":  0.0,
+                    "rejected_at":      datetime.now(timezone.utc).isoformat(),
+                },
+            )
             return None
         except Exception as e:
             logger.error(
@@ -216,6 +257,18 @@ class EventCorrelationEngine:
             await self._record_correlation(
                 db, correlation_id, "SCANNER_ANOMALY", trigger_timestamp,
                 None, f"ERROR: {str(e)}", None
+            )
+            await self._publish_correlation_event(
+                RedisChannels.CORRELATIONS_REJECTED,
+                {
+                    "correlation_id":   str(correlation_id),
+                    "symbol":           symbol,
+                    "trading_symbol":   scanner_signal.get("trading_symbol"),
+                    "trigger_type":     "SCANNER_ANOMALY",
+                    "rejection_reason": "PROCESSING_ERROR",
+                    "consensus_score":  0.0,
+                    "rejected_at":      datetime.now(timezone.utc).isoformat(),
+                },
             )
             return None
 
@@ -294,6 +347,20 @@ class EventCorrelationEngine:
         suggestions = []
 
         for symbol in affected_symbols:
+            per_symbol_correlation_id = uuid4()
+            per_symbol_started_at = datetime.now(timezone.utc)
+
+            await self._publish_correlation_event(
+                RedisChannels.CORRELATIONS_STARTED,
+                {
+                    "correlation_id": str(per_symbol_correlation_id),
+                    "symbol":         symbol,
+                    "trading_symbol": symbol,
+                    "trigger_type":   "NEWS_EVENT",
+                    "started_at":     per_symbol_started_at.isoformat(),
+                },
+            )
+
             try:
                 scanner_signal, ml_signal, latencies = await asyncio.wait_for(
                     self._gather_signals_pathway2(db, symbol, event),
@@ -307,6 +374,7 @@ class EventCorrelationEngine:
                     "sentiment": "positive" if event.impact_score > 0 else "negative",
                     "event_type": event.event_type,
                     "event_count": 1,
+                    "available": True,
                     "events": [{
                         "id": event.id,
                         "type": event.event_type,
@@ -316,9 +384,9 @@ class EventCorrelationEngine:
 
                 suggestion = await self._compute_consensus(
                     db=db,
-                    correlation_id=uuid4(),  # Unique per symbol
+                    correlation_id=per_symbol_correlation_id,
                     trigger_type="NEWS_EVENT",
-                    trigger_timestamp=trigger_timestamp,
+                    trigger_timestamp=per_symbol_started_at,
                     scanner_signal=scanner_signal,
                     ai_signal=ai_signal,
                     ml_signal=ml_signal,
@@ -330,7 +398,20 @@ class EventCorrelationEngine:
 
             except Exception as e:
                 logger.error(
-                    f"[{correlation_id}] Error processing {symbol}: {e}"
+                    "[%s] Error processing symbol %s: %s",
+                    correlation_id, symbol, e,
+                )
+                await self._publish_correlation_event(
+                    RedisChannels.CORRELATIONS_REJECTED,
+                    {
+                        "correlation_id":   str(per_symbol_correlation_id),
+                        "symbol":           symbol,
+                        "trading_symbol":   symbol,
+                        "trigger_type":     "NEWS_EVENT",
+                        "rejection_reason": "PROCESSING_ERROR",
+                        "consensus_score":  0.0,
+                        "rejected_at":      datetime.now(timezone.utc).isoformat(),
+                    },
                 )
                 continue
 
@@ -530,6 +611,15 @@ class EventCorrelationEngine:
         Returns:
             TradeSuggestion if consensus reached, None otherwise
         """
+        # Derive symbol identifiers early — needed for rejection event payloads
+        # before the full instrument resolution block runs later in the method.
+        _act_symbol: str = (
+            scanner_signal.get("instrument_key")
+            or scanner_signal.get("trading_symbol")
+            or ml_signal.get("symbol", "UNKNOWN")
+        )
+        _act_trading_sym: str | None = scanner_signal.get("trading_symbol") or _act_symbol
+
         # Map to unified direction.
         # Scanner output uses "signal" key ("buy"/"sell"); "direction" is the
         # legacy / Pathway-2-synthetic key.  Accept both.
@@ -548,6 +638,19 @@ class EventCorrelationEngine:
                 None,
                 f"NEUTRAL_SIGNAL: scanner={_scanner_signal_raw!r}",
                 latencies,
+                scanner_output={"instrument_key": _act_symbol, "trading_symbol": _act_trading_sym},
+            )
+            await self._publish_correlation_event(
+                RedisChannels.CORRELATIONS_REJECTED,
+                {
+                    "correlation_id":   str(correlation_id),
+                    "symbol":           _act_symbol,
+                    "trading_symbol":   _act_trading_sym,
+                    "trigger_type":     trigger_type,
+                    "rejection_reason": "NEUTRAL_SIGNAL",
+                    "consensus_score":  0.0,
+                    "rejected_at":      datetime.now(timezone.utc).isoformat(),
+                },
             )
             return None
 
@@ -569,7 +672,20 @@ class EventCorrelationEngine:
         if ml_dir == "HOLD":
             await self._record_correlation(
                 db, correlation_id, trigger_type, trigger_timestamp,
-                None, "ML_NEUTRAL", latencies
+                None, "ML_NEUTRAL", latencies,
+                scanner_output={"instrument_key": _act_symbol, "trading_symbol": _act_trading_sym},
+            )
+            await self._publish_correlation_event(
+                RedisChannels.CORRELATIONS_REJECTED,
+                {
+                    "correlation_id":   str(correlation_id),
+                    "symbol":           _act_symbol,
+                    "trading_symbol":   _act_trading_sym,
+                    "trigger_type":     trigger_type,
+                    "rejection_reason": "ML_NEUTRAL",
+                    "consensus_score":  0.0,
+                    "rejected_at":      datetime.now(timezone.utc).isoformat(),
+                },
             )
             return None
 
@@ -582,7 +698,20 @@ class EventCorrelationEngine:
                 db, correlation_id, trigger_type, trigger_timestamp,
                 None,
                 f"DIRECTION_MISMATCH: Scanner={scanner_dir}, AI={ai_dir}, ML={ml_dir}",
-                latencies
+                latencies,
+                scanner_output={"instrument_key": _act_symbol, "trading_symbol": _act_trading_sym},
+            )
+            await self._publish_correlation_event(
+                RedisChannels.CORRELATIONS_REJECTED,
+                {
+                    "correlation_id":   str(correlation_id),
+                    "symbol":           _act_symbol,
+                    "trading_symbol":   _act_trading_sym,
+                    "trigger_type":     trigger_type,
+                    "rejection_reason": "DIRECTION_MISMATCH",
+                    "consensus_score":  0.0,
+                    "rejected_at":      datetime.now(timezone.utc).isoformat(),
+                },
             )
             return None
 
@@ -628,7 +757,20 @@ class EventCorrelationEngine:
         else:
             await self._record_correlation(
                 db, correlation_id, trigger_type, trigger_timestamp,
-                None, f"LOW_CONFIDENCE: {consensus_score:.2f}", latencies
+                None, f"LOW_CONFIDENCE: {consensus_score:.2f}", latencies,
+                scanner_output={"instrument_key": _act_symbol, "trading_symbol": _act_trading_sym},
+            )
+            await self._publish_correlation_event(
+                RedisChannels.CORRELATIONS_REJECTED,
+                {
+                    "correlation_id":   str(correlation_id),
+                    "symbol":           _act_symbol,
+                    "trading_symbol":   _act_trading_sym,
+                    "trigger_type":     trigger_type,
+                    "rejection_reason": "LOW_CONFIDENCE",
+                    "consensus_score":  round(consensus_score, 2),
+                    "rejected_at":      datetime.now(timezone.utc).isoformat(),
+                },
             )
             return None
 
@@ -712,12 +854,25 @@ class EventCorrelationEngine:
                         f"price_delta_pct={price_delta_pct:.3f}"
                     ),
                     latencies,
+                    scanner_output={"instrument_key": _act_symbol, "trading_symbol": _act_trading_sym},
                 )
                 logger.debug(
                     "Pipeline stage=duplicate_suppressed correlation_id=%s "
                     "symbol=%s direction=%s existing_id=%s score_delta=%.2f",
                     correlation_id, symbol, direction,
                     existing.suggestion_id, score_delta,
+                )
+                await self._publish_correlation_event(
+                    RedisChannels.CORRELATIONS_REJECTED,
+                    {
+                        "correlation_id":   str(correlation_id),
+                        "symbol":           _act_symbol,
+                        "trading_symbol":   _act_trading_sym,
+                        "trigger_type":     trigger_type,
+                        "rejection_reason": "DUPLICATE_SUPPRESSED",
+                        "consensus_score":  round(consensus_score, 2),
+                        "rejected_at":      datetime.now(timezone.utc).isoformat(),
+                    },
                 )
                 return None
 
@@ -860,6 +1015,7 @@ class EventCorrelationEngine:
         try:
             t_publish_start = datetime.now(timezone.utc)
             payload = json.dumps({
+                "correlation_id":    str(correlation_id),
                 "suggestion_id":     str(suggestion.suggestion_id),
                 "symbol":            suggestion.symbol,
                 "instrument_key":    suggestion.instrument_key,
@@ -894,6 +1050,23 @@ class EventCorrelationEngine:
             )
         except Exception as e:
             logger.error("Failed to publish suggestion %s to Redis: %s", suggestion.suggestion_id, e)
+
+        # Publish correlation completion — powers the ML Activity live feed.
+        # Sent after SUGGESTIONS_NEW so the frontend card arrives before the
+        # activity row transitions to "completed".
+        await self._publish_correlation_event(
+            RedisChannels.CORRELATIONS_COMPLETED,
+            {
+                "correlation_id":  str(correlation_id),
+                "suggestion_id":   str(suggestion.suggestion_id),
+                "symbol":          suggestion.symbol,
+                "trading_symbol":  suggestion.trading_symbol,
+                "trigger_type":    trigger_type,
+                "consensus_score": float(suggestion.consensus_score),
+                "latencies":       latencies or {},
+                "completed_at":    datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
         # Notify WebSocket clients that the superseded suggestion is gone.
         # Published after the new suggestion so the frontend replaces rather

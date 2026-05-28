@@ -20,9 +20,9 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from app.api.v1 import (
-    admin_strategies, admin_users, auth, cai, fusion, fundamentals, governance, hawk_eye,
-    ingestion, intelligence, market_data, ml_drift, ml_patterns, ml_predictions, paper_trading,
-    safety, scanner, strategies, strategy, trade_suggestions, upstox, health,
+    admin_strategies, admin_training, admin_users, auth, cai, fusion, fundamentals, governance,
+    hawk_eye, ingestion, intelligence, market_data, ml_drift, ml_patterns, ml_predictions,
+    paper_trading, safety, scanner, strategies, strategy, trade_suggestions, upstox, health,
     users, watchlist, ai_sentiment, ai_stream,
 )
 from app.core.config import get_settings
@@ -268,6 +268,8 @@ def create_app() -> FastAPI:
     app.include_router(auth.router, prefix=f"{settings.API_V1_PREFIX}/auth", tags=["Authentication"])
     app.include_router(admin_users.router, prefix=f"{settings.API_V1_PREFIX}/admin", tags=["Admin — User Management"])
     app.include_router(admin_strategies.router, prefix=f"{settings.API_V1_PREFIX}/admin/strategies", tags=["Admin — Strategy Governance"])
+    app.include_router(admin_training.router,    prefix=f"{settings.API_V1_PREFIX}/admin/training",   tags=["Admin — ML Training Console"])
+    app.include_router(admin_training.ws_router, prefix=f"{settings.API_V1_PREFIX}/admin/training",   tags=["Admin — ML Training WebSocket"])
     app.include_router(watchlist.router, prefix=f"{settings.API_V1_PREFIX}/watchlist", tags=["Watchlist"])
     app.include_router(market_data.router, prefix=f"{settings.API_V1_PREFIX}/market-data", tags=["Market Data"])
     app.include_router(scanner.router, prefix=f"{settings.API_V1_PREFIX}/scanner", tags=["Scanner"])

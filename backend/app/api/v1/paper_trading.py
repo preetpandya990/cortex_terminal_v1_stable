@@ -1197,7 +1197,7 @@ async def pnl_websocket(
         if frame.get("type") != "auth" or not frame.get("token"):
             raise ValueError("expected {type: 'auth', token: '...'}")
         payload_data = decode_token(frame["token"])
-        uid = int(payload_data.get("sub", 0))
+        uid = int(payload_data.sub)
         if not uid:
             raise ValueError("token missing sub claim")
     except asyncio.TimeoutError:
@@ -1257,7 +1257,7 @@ async def pnl_websocket(
                 # Proactive in-band token rotation — validate that it belongs to the same user.
                 try:
                     new_payload = decode_token(msg.get("token", ""))
-                    new_uid = int(new_payload.get("sub", 0))
+                    new_uid = int(new_payload.sub)
                     if new_uid != uid:
                         raise ValueError("reauth token belongs to a different user")
                     await queue.put({"type": "reauthed"})

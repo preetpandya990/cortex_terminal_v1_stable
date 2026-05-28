@@ -280,17 +280,271 @@ function TransitionButtons({
   );
 }
 
+// ── Metric explanations ───────────────────────────────────────────────────────
+// Every entry drives both the ensemble-card chips and the table-row tooltip.
+
+interface MetricInfo {
+  fullName:        string;
+  what:            string;   // one sentence: what it measures
+  interpret:       string;   // how to read the number
+  ideal:           string;   // target values for this system
+  baseline?:       string;   // random/null baseline
+  formula?:        string;   // optional: symbolic description
+  thresholds: { warn: number; good: number; direction: "higher" | "lower" };
+}
+
+const METRIC_INFO: Record<string, MetricInfo> = {
+  "AUC-PR": {
+    fullName:  "Area Under the Precision-Recall Curve",
+    what:      "Measures overall signal quality across every possible confidence threshold — how well the model separates genuine UP moves from noise.",
+    interpret: "Unlike AUC-ROC, this curve is not flattered by the large number of 'no strong move' days. A random classifier scores ≈ 0.50 on a balanced dataset.",
+    ideal:     "≥ 0.60 (development)  ·  ≥ 0.65 (paper trading)  ·  ≥ 0.70 (live)",
+    baseline:  "≈ 0.50 for a random classifier on a balanced UP/DOWN split",
+    formula:   "∫ Precision(τ) d Recall(τ) as decision threshold τ varies 0 → 1",
+    thresholds: { warn: 0.60, good: 0.65, direction: "higher" },
+  },
+  "DSR": {
+    fullName:  "Deflated Sharpe Ratio",
+    what:      "The out-of-sample Sharpe Ratio from the CPCV backtest, adjusted downward to account for the multiple-testing bias inherent in any hyperparameter search.",
+    interpret: "A positive DSR means there is a statistically significant trading edge even after correcting for the fact that we tried many configurations. Negative DSR = the backtested performance is likely noise.",
+    ideal:     "> 0.5 (meaningful edge after bias correction)  ·  > 1.0 (strong edge)",
+    baseline:  "0.0 — no edge after adjusting for selection bias",
+    formula:   "SR_oos × (1 − PBO) / σ(SR_paths)",
+    thresholds: { warn: 0.3, good: 0.5, direction: "higher" },
+  },
+  "ECE": {
+    fullName:  "Expected Calibration Error",
+    what:      "Measures how accurately the model's confidence scores reflect real win rates. If the model outputs 70% confidence, it should be right approximately 70% of the time.",
+    interpret: "0 = perfect calibration. High ECE means the raw probabilities are misleading for risk sizing. This system applies Beta calibration fitted on the CPCV OOF pool to minimise ECE before deployment.",
+    ideal:     "< 0.05 (well-calibrated)  ·  < 0.03 (excellent)",
+    baseline:  "Uncalibrated models typically score 0.10–0.20",
+    formula:   "Σ |mean_confidence_bin − mean_accuracy_bin| × (n_bin / n_total)",
+    thresholds: { warn: 0.05, good: 0.03, direction: "lower" },
+  },
+  "PBO": {
+    fullName:  "Probability of Backtest Overfitting",
+    what:      "Estimated probability that the strategy chosen during model selection was picked by chance rather than genuine predictive power, computed from the CPCV path distribution.",
+    interpret: "0% = zero overfitting risk (unrealistic). 50% = strategy selection was no better than random. Values below 50% indicate the selection process found real signal. This is a structural property of the training methodology, not just model quality.",
+    ideal:     "< 50% (better than random selection)  ·  < 25% (low overfitting risk)",
+    baseline:  "50% (random strategy selection)",
+    formula:   "P(rank of best in-sample path < median rank out-of-sample across all CPCV paths)",
+    thresholds: { warn: 0.5, good: 0.25, direction: "lower" },
+  },
+  "Accuracy": {
+    fullName:  "Directional Accuracy",
+    what:      "Fraction of 5-day forward UP/DOWN predictions that matched the realised direction. Samples within the ATR dead-zone (price moves too small to be meaningful) are excluded before measurement.",
+    interpret: "A coin flip gives 50%. Each point above 50% reflects genuine signal — the direction filter and dead-zone exclusion make this harder to inflate than raw accuracy on every bar.",
+    ideal:     "> 55% (development gate)  ·  > 58% (paper/live gate)",
+    baseline:  "≈ 50% for a random classifier",
+    thresholds: { warn: 0.55, good: 0.58, direction: "higher" },
+  },
+  "Precision": {
+    fullName:  "Precision (Positive Predictive Value)",
+    what:      "Of all BUY signals the model generated, the fraction where price actually moved up over the 5-day horizon.",
+    interpret: "High precision = low false-alarm rate. A precision-focused model avoids noisy signals but may miss real moves. Gate ≥ 53% for paper trading.",
+    ideal:     "≥ 0.53 (paper gate)  ·  ≥ 0.55 (live gate)",
+    baseline:  "≈ 0.50 for a random classifier on a balanced dataset",
+    thresholds: { warn: 0.53, good: 0.58, direction: "higher" },
+  },
+  "Recall": {
+    fullName:  "Recall (True Positive Rate / Sensitivity)",
+    what:      "Of all 5-day UP moves that actually occurred, the fraction the model correctly flagged as a BUY signal.",
+    interpret: "High recall = fewer missed opportunities. There is an inherent precision-recall tradeoff — maximising recall usually reduces precision. Gate ≥ 50% ensures the model is not ignoring most real moves.",
+    ideal:     "≥ 0.50 (paper gate)  ·  ≥ 0.53 (live gate)",
+    baseline:  "≈ 0.50 for a random classifier",
+    thresholds: { warn: 0.50, good: 0.55, direction: "higher" },
+  },
+  "F1 Score": {
+    fullName:  "F1 Score (Harmonic Mean of Precision and Recall)",
+    what:      "Single-number balance between precision and recall. Punishes models that sacrifice one for the other — a model with 90% precision and 10% recall scores F1 = 0.18.",
+    interpret: "The harmonic mean is more sensitive to the lower of the two values than the arithmetic mean. An F1 above 0.55 indicates genuinely balanced, useful predictions.",
+    ideal:     "> 0.55 (development)  ·  > 0.58 (live target)",
+    baseline:  "≈ 0.50 for a random classifier on a balanced dataset",
+    formula:   "2 × (Precision × Recall) / (Precision + Recall)",
+    thresholds: { warn: 0.53, good: 0.58, direction: "higher" },
+  },
+  "Symbol Coverage": {
+    fullName:  "Symbol Coverage",
+    what:      "Fraction of the full NSE universe (2,557 symbols) that passed the data-quality audit and were included in this training run.",
+    interpret: "Low coverage indicates new listings with insufficient history or upstream data pipeline gaps. The training gate requires ≥ 60% to proceed. Coverage ≈ 66% is typical for the current NSE universe.",
+    ideal:     "> 0.60 (training gate)  ·  > 0.70 (healthy pipeline)",
+    baseline:  "0.60 (minimum acceptable coverage)",
+    thresholds: { warn: 0.60, good: 0.70, direction: "higher" },
+  },
+};
+
+// ── Shared metric-info tooltip (portal-rendered to escape clipping) ────────────
+
+interface MetricInfoPortalProps {
+  metricKey: string;
+  value:     number | null;
+  anchor:    { top: number; left: number; width: number };
+}
+
+function MetricInfoPortal({ metricKey, value, anchor }: MetricInfoPortalProps) {
+  const [mounted, setMounted] = React.useState(false);
+  React.useEffect(() => { setMounted(true); }, []);
+  if (!mounted) return null;
+
+  const info = METRIC_INFO[metricKey];
+  if (!info) return null;
+
+  const TOOLTIP_WIDTH = 300;
+  const left = Math.min(
+    Math.max(8, anchor.left + anchor.width / 2 - TOOLTIP_WIDTH / 2),
+    (typeof window !== "undefined" ? window.innerWidth : 1200) - TOOLTIP_WIDTH - 8,
+  );
+  const top = anchor.top + 6;
+
+  // Value quality assessment
+  let quality: "good" | "warn" | "bad" | "neutral" = "neutral";
+  if (value != null && info.thresholds) {
+    const { warn, good, direction } = info.thresholds;
+    if (direction === "higher") {
+      quality = value >= good ? "good" : value >= warn ? "warn" : "bad";
+    } else {
+      quality = value <= good ? "good" : value <= warn ? "warn" : "bad";
+    }
+  }
+
+  const qualityConfig = {
+    good:    { label: "Good",    color: "text-emerald-700 bg-emerald-50 border-emerald-200" },
+    warn:    { label: "Fair",    color: "text-amber-700 bg-amber-50 border-amber-200"       },
+    bad:     { label: "Low",     color: "text-rose-700 bg-rose-50 border-rose-200"          },
+    neutral: { label: "—",       color: "text-slate-500 bg-slate-50 border-slate-200"       },
+  }[quality];
+
+  return createPortal(
+    <div
+      role="tooltip"
+      style={{ position: "fixed", top, left, width: TOOLTIP_WIDTH, zIndex: 9999 }}
+      className="rounded-xl border border-slate-200 bg-white shadow-2xl"
+    >
+      {/* Header */}
+      <div className="border-b border-slate-100 px-4 py-3">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400">
+              {metricKey}
+            </p>
+            <p className="mt-0.5 text-[13px] font-semibold text-slate-800 leading-snug">
+              {info.fullName}
+            </p>
+          </div>
+          {value != null && (
+            <span className={`mt-0.5 flex-shrink-0 rounded-full border px-2.5 py-0.5 text-[11px] font-bold ${qualityConfig.color}`}>
+              {qualityConfig.label}
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div className="space-y-3 px-4 py-3">
+        {/* What it measures */}
+        <p className="text-[12px] leading-relaxed text-slate-600">{info.what}</p>
+
+        {/* How to interpret */}
+        <p className="text-[12px] leading-relaxed text-slate-500">{info.interpret}</p>
+
+        {/* Formula */}
+        {info.formula && (
+          <div className="rounded-lg bg-slate-50 px-3 py-1.5">
+            <p className="font-mono text-[11px] text-slate-500">{info.formula}</p>
+          </div>
+        )}
+
+        {/* Baseline + Ideal target */}
+        <div className="space-y-1.5">
+          {info.baseline && (
+            <div className="flex items-start gap-1.5 text-[11px]">
+              <span className="mt-px h-1.5 w-1.5 flex-shrink-0 rounded-full bg-slate-300 mt-1" />
+              <span>
+                <span className="font-semibold text-slate-500">Baseline: </span>
+                <span className="text-slate-400">{info.baseline}</span>
+              </span>
+            </div>
+          )}
+          <div className="flex items-start gap-1.5 text-[11px]">
+            <span className="mt-px h-1.5 w-1.5 flex-shrink-0 rounded-full bg-emerald-400 mt-1" />
+            <span>
+              <span className="font-semibold text-emerald-700">Target: </span>
+              <span className="text-slate-500">{info.ideal}</span>
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+// ── Hoverable metric chip (used in EnsembleStatusCard) ────────────────────────
+
+interface MetricChipProps {
+  metricKey: string;
+  value:     number | null;
+  display:   string;
+}
+
+function MetricChip({ metricKey, value, display }: MetricChipProps) {
+  const ref = React.useRef<HTMLDivElement>(null);
+  const [hovered, setHovered] = React.useState(false);
+  const [anchor,  setAnchor]  = React.useState({ top: 0, left: 0, width: 0 });
+
+  const handleMouseEnter = () => {
+    if (ref.current) {
+      const r = ref.current.getBoundingClientRect();
+      setAnchor({ top: r.bottom, left: r.left, width: r.width });
+    }
+    setHovered(true);
+  };
+
+  return (
+    <div
+      ref={ref}
+      className="rounded-lg bg-white/70 px-2.5 py-1.5 text-center shadow-sm cursor-default transition-colors hover:bg-white"
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={() => setHovered(false)}
+    >
+      <div className="flex items-center justify-center gap-1">
+        <div className="text-[10px] font-medium uppercase tracking-wide text-slate-400">
+          {metricKey}
+        </div>
+        {METRIC_INFO[metricKey] && (
+          <svg
+            className="h-2.5 w-2.5 flex-shrink-0 text-slate-300"
+            fill="currentColor"
+            viewBox="0 0 20 20"
+            aria-hidden="true"
+          >
+            <path
+              fillRule="evenodd"
+              d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-8-3a1 1 0 00-.867.5 1 1 0 11-1.731-1A3 3 0 0113 8a3.001 3.001 0 01-2 2.83V11a1 1 0 11-2 0v-1a1 1 0 011-1 1 1 0 100-2zm0 8a1 1 0 100-2 1 1 0 000 2z"
+              clipRule="evenodd"
+            />
+          </svg>
+        )}
+      </div>
+      <div className="mt-0.5 text-sm font-bold tabular-nums text-slate-800">{display}</div>
+      {hovered && (
+        <MetricInfoPortal metricKey={metricKey} value={value} anchor={anchor} />
+      )}
+    </div>
+  );
+}
+
 // ── Metrics tooltip (portal-rendered to escape overflow-x-auto clipping) ──────
 
 const METRIC_ROWS: Array<{
   key:       keyof ModelMetrics;
+  metricKey: string;
   fullName:  string;
   gate:      number | null;
 }> = [
-  { key: "accuracy",  fullName: "Accuracy",  gate: null },
-  { key: "precision", fullName: "Precision", gate: 0.53 },
-  { key: "recall",    fullName: "Recall",    gate: 0.50 },
-  { key: "f1_score",  fullName: "F1 Score",  gate: null },
+  { key: "accuracy",  metricKey: "Accuracy",  fullName: "Accuracy",  gate: null },
+  { key: "precision", metricKey: "Precision", fullName: "Precision", gate: 0.53 },
+  { key: "recall",    metricKey: "Recall",    fullName: "Recall",    gate: 0.50 },
+  { key: "f1_score",  metricKey: "F1 Score",  fullName: "F1 Score",  gate: null },
 ];
 
 interface MetricsTooltipPortalProps {
@@ -303,12 +557,11 @@ function MetricsTooltipPortal({ metrics, anchor }: MetricsTooltipPortalProps) {
   React.useEffect(() => { setMounted(true); }, []);
   if (!mounted) return null;
 
-  const TOOLTIP_WIDTH = 240;
+  const TOOLTIP_WIDTH = 300;
 
-  // Position below the cell, centered, clamped to viewport
   const left = Math.min(
     Math.max(8, anchor.left + anchor.width / 2 - TOOLTIP_WIDTH / 2),
-    window.innerWidth - TOOLTIP_WIDTH - 8,
+    (typeof window !== "undefined" ? window.innerWidth : 1200) - TOOLTIP_WIDTH - 8,
   );
   const top = anchor.top + 4;
 
@@ -316,7 +569,7 @@ function MetricsTooltipPortal({ metrics, anchor }: MetricsTooltipPortalProps) {
     <div
       role="tooltip"
       style={{ position: "fixed", top, left, width: TOOLTIP_WIDTH, zIndex: 9999 }}
-      className="rounded-xl border border-slate-200 bg-white shadow-xl"
+      className="rounded-xl border border-slate-200 bg-white shadow-2xl"
     >
       {/* Header */}
       <div className="border-b border-slate-100 px-4 py-2.5">
@@ -326,17 +579,25 @@ function MetricsTooltipPortal({ metrics, anchor }: MetricsTooltipPortalProps) {
       </div>
 
       {/* Metric rows */}
-      <div className="flex flex-col gap-3 px-4 py-3">
-        {METRIC_ROWS.map(({ key, fullName, gate }) => {
+      <div className="flex flex-col gap-3.5 px-4 py-3">
+        {METRIC_ROWS.map(({ key, metricKey, fullName, gate }) => {
           const value = metrics[key];
           const pct   = value != null ? value * 100 : null;
           const pass  = gate != null && value != null ? value >= gate : null;
+          const info  = METRIC_INFO[metricKey];
 
           return (
             <div key={key}>
               <div className="mb-1 flex items-center justify-between">
-                <span className="text-xs font-medium text-slate-600">{fullName}</span>
-                <div className="flex items-center gap-1.5">
+                <div>
+                  <span className="text-xs font-semibold text-slate-700">{fullName}</span>
+                  {info && (
+                    <p className="mt-0.5 text-[10px] leading-snug text-slate-400 pr-2">
+                      {info.what.split(".")[0].trim()}.
+                    </p>
+                  )}
+                </div>
+                <div className="flex flex-shrink-0 flex-col items-end gap-0.5">
                   <span className="text-sm font-bold tabular-nums text-slate-900">
                     {pct != null ? `${pct.toFixed(1)}%` : "—"}
                   </span>
@@ -359,7 +620,6 @@ function MetricsTooltipPortal({ metrics, anchor }: MetricsTooltipPortalProps) {
                     style={{ width: `${Math.min(pct, 100)}%` }}
                   />
                 )}
-                {/* Gate threshold marker */}
                 {gate != null && (
                   <div
                     className="absolute top-0 h-full w-px bg-slate-400"
@@ -376,6 +636,13 @@ function MetricsTooltipPortal({ metrics, anchor }: MetricsTooltipPortalProps) {
             </div>
           );
         })}
+      </div>
+
+      {/* Footer: baseline reminder */}
+      <div className="border-t border-slate-100 px-4 py-2">
+        <p className="text-[10px] text-slate-400">
+          Random classifier baseline ≈ 50% on a balanced UP/DOWN dataset.
+        </p>
       </div>
     </div>,
     document.body,
@@ -609,21 +876,28 @@ function MemberRow({ m }: { m: EnsembleMember }) {
         </div>
       </div>
 
-      {/* Metrics row */}
+      {/* Metrics row — each chip is hoverable with an explanation tooltip */}
       <div className="grid grid-cols-4 gap-2">
-        {(
-          [
-            { label: "AUC-PR",   value: auc  != null ? auc.toFixed(4)             : "—" },
-            { label: "DSR",      value: dsr  != null ? dsr.toFixed(4)             : "—" },
-            { label: "ECE",      value: ece  != null ? ece.toFixed(4)             : "—" },
-            { label: "Accuracy", value: acc  != null ? `${(acc * 100).toFixed(1)}%` : "—" },
-          ] as const
-        ).map(({ label, value }) => (
-          <div key={label} className="rounded-lg bg-white/70 px-2.5 py-1.5 text-center shadow-sm">
-            <div className="text-[10px] font-medium uppercase tracking-wide text-slate-400">{label}</div>
-            <div className="mt-0.5 text-sm font-bold tabular-nums text-slate-800">{value}</div>
-          </div>
-        ))}
+        <MetricChip
+          metricKey="AUC-PR"
+          value={auc}
+          display={auc != null ? auc.toFixed(4) : "—"}
+        />
+        <MetricChip
+          metricKey="DSR"
+          value={dsr}
+          display={dsr != null ? dsr.toFixed(4) : "—"}
+        />
+        <MetricChip
+          metricKey="ECE"
+          value={ece}
+          display={ece != null ? ece.toFixed(4) : "—"}
+        />
+        <MetricChip
+          metricKey="Accuracy"
+          value={acc}
+          display={acc != null ? `${(acc * 100).toFixed(1)}%` : "—"}
+        />
       </div>
 
       {/* Dormant: activation gate progress */}

@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback, useMemo } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams, useRouter } from "next/navigation";
 import { Radar, Loader2, AlertCircle, Star } from "lucide-react";
-import { tradeSuggestionsAPI, isNetworkError } from "@/lib/api";
+import { tradeSuggestionsAPI, isNetworkError, type CorrelationActivityItem } from "@/lib/api";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { InstrumentSearchCombobox } from "@/components/market/InstrumentSearchCombobox";
 import { TradeSuggestionCard } from "./components/TradeSuggestionCard";
@@ -12,7 +12,9 @@ import { WatchlistCard } from "./components/WatchlistCard";
 import { DetailPane } from "./components/DetailPane";
 import { SuggestionFilters } from "./components/SuggestionFilters";
 import { SuggestionStats } from "./components/SuggestionStats";
+import { MLActivityCard } from "./components/MLActivityCard";
 import { useWebSocket, type WebSocketMessage } from "@/hooks/useWebSocket";
+import { useMLActivity } from "@/hooks/useMLActivity";
 import { useWatchlist } from "@/hooks/useWatchlist";
 import { useDragReorder } from "@/hooks/useDragReorder";
 import { useAuth } from "@/contexts/AuthContext";
@@ -29,6 +31,23 @@ export default function HawkEyeRadarPage() {
   const [detailSuggestion, setDetailSuggestion] = useState<TradeSuggestion | null>(null);
   const [filters, setFilters] = useState<Filters>({ status: "active", page: 1, page_size: 50 });
   const queryClient = useQueryClient();
+
+  // Seed ML Activity feed with recent history from the DB on first load.
+  const { data: activitySeed } = useQuery<CorrelationActivityItem[]>({
+    queryKey: ["ml-activity-seed"],
+    queryFn: async () => {
+      const res = await tradeSuggestionsAPI.getRecentActivity(50);
+      return res.items;
+    },
+    enabled: isAuthenticated && !authLoading,
+    staleTime: Infinity, // Seed data is one-shot — WS handles subsequent updates.
+    gcTime: Infinity,
+  });
+
+  // ML Activity feed — seeded from DB history, then driven by WebSocket messages.
+  const { items: activityItems, handleMessage: handleActivityMessage } = useMLActivity({
+    seedItems: activitySeed,
+  });
 
   // Watchlist hook
   const {
@@ -69,8 +88,11 @@ export default function HawkEyeRadarPage() {
     token: accessToken ?? undefined,
     enabled: isAuthReady && isAuthenticated,
     onMessage: (data: WebSocketMessage) => {
+      // Route every message through the ML Activity state machine first so the
+      // live feed updates before the suggestions grid re-fetches.
+      handleActivityMessage(data);
+
       if (data.type === 'new_suggestion') {
-        console.log('[Hawk-Eye] New suggestion received:', data.suggestion_id);
         queryClient.invalidateQueries({ queryKey: ["trade-suggestions"] });
       }
     },
@@ -280,8 +302,9 @@ export default function HawkEyeRadarPage() {
         </div>
       )}
 
-      {/* Trade Suggestions Grid */}
+      {/* Active Trade Suggestions + ML Activity sidebar */}
       <div>
+        {/* Section header */}
         <div className="mb-4 flex items-center justify-between gap-4">
           <div>
             <h2 className="text-lg font-semibold text-slate-900">Active Trade Suggestions</h2>
@@ -291,85 +314,102 @@ export default function HawkEyeRadarPage() {
           </div>
         </div>
 
-        {/* Filters */}
-        <div className="mb-6">
-          <SuggestionFilters filters={filters} onFiltersChange={setFilters} />
-        </div>
+        {/*
+          Two-column layout on lg+: suggestions grid (flex-1) + ML Activity sidebar (w-72).
+          On smaller screens the columns stack — ML Activity sits above the grid.
+          CSS `order` controls stacking order without rendering the card twice.
+        */}
+        <div className="flex flex-col lg:flex-row lg:items-start gap-6">
 
-        {/* Loading State */}
-        {isLoading && (
-          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-            {[...Array(6)].map((_, i) => (
-              <Card key={i} className="border-slate-200 bg-white animate-pulse">
-                <CardHeader className="pb-3">
-                  <div className="h-6 w-32 bg-slate-200 rounded" />
-                  <div className="h-4 w-48 bg-slate-100 rounded mt-2" />
-                </CardHeader>
-                <CardContent className="space-y-4">
-                  <div className="h-2 w-full bg-slate-100 rounded" />
-                  <div className="flex gap-2">
-                    <div className="h-6 w-20 bg-slate-100 rounded-full" />
-                    <div className="h-6 w-20 bg-slate-100 rounded-full" />
-                    <div className="h-6 w-20 bg-slate-100 rounded-full" />
-                  </div>
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="h-12 bg-slate-100 rounded" />
-                    <div className="h-12 bg-slate-100 rounded" />
+          {/* ── ML Activity sidebar ── */}
+          <div className="order-first lg:order-last lg:w-72 lg:shrink-0 lg:sticky lg:top-6 lg:self-start">
+            <MLActivityCard items={activityItems} isConnected={isConnected} />
+          </div>
+
+          {/* ── Suggestions main column ── */}
+          <div className="flex-1 min-w-0 order-last lg:order-first">
+            {/* Filters */}
+            <div className="mb-6">
+              <SuggestionFilters filters={filters} onFiltersChange={setFilters} />
+            </div>
+
+            {/* Loading State */}
+            {isLoading && (
+              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                {[...Array(6)].map((_, i) => (
+                  <Card key={i} className="border-slate-200 bg-white animate-pulse">
+                    <CardHeader className="pb-3">
+                      <div className="h-6 w-32 bg-slate-200 rounded" />
+                      <div className="h-4 w-48 bg-slate-100 rounded mt-2" />
+                    </CardHeader>
+                    <CardContent className="space-y-4">
+                      <div className="h-2 w-full bg-slate-100 rounded" />
+                      <div className="flex gap-2">
+                        <div className="h-6 w-20 bg-slate-100 rounded-full" />
+                        <div className="h-6 w-20 bg-slate-100 rounded-full" />
+                        <div className="h-6 w-20 bg-slate-100 rounded-full" />
+                      </div>
+                      <div className="grid grid-cols-2 gap-3">
+                        <div className="h-12 bg-slate-100 rounded" />
+                        <div className="h-12 bg-slate-100 rounded" />
+                      </div>
+                    </CardContent>
+                  </Card>
+                ))}
+              </div>
+            )}
+
+            {/* Error State */}
+            {isError && (
+              <Card className="border-red-200 bg-red-50">
+                <CardContent className="flex items-center gap-3 py-6">
+                  <AlertCircle className="h-5 w-5 text-red-600" />
+                  <div>
+                    <p className="font-medium text-red-900">Failed to load trade suggestions</p>
+                    <p className="text-sm text-red-700">
+                      {error instanceof Error ? error.message : "Please try again later"}
+                    </p>
                   </div>
                 </CardContent>
               </Card>
-            ))}
-          </div>
-        )}
+            )}
 
-        {/* Error State */}
-        {isError && (
-          <Card className="border-red-200 bg-red-50">
-            <CardContent className="flex items-center gap-3 py-6">
-              <AlertCircle className="h-5 w-5 text-red-600" />
-              <div>
-                <p className="font-medium text-red-900">Failed to load trade suggestions</p>
-                <p className="text-sm text-red-700">
-                  {error instanceof Error ? error.message : "Please try again later"}
-                </p>
+            {/* Empty State */}
+            {!isLoading && !isError && suggestionsData?.suggestions.length === 0 && (
+              <Card className="border-slate-200 bg-slate-50">
+                <CardContent className="flex flex-col items-center justify-center py-12 text-center">
+                  <Radar className="h-12 w-12 text-slate-400 mb-4" />
+                  <h3 className="text-lg font-semibold text-slate-900 mb-2">No Active Suggestions</h3>
+                  <p className="text-sm text-slate-500 max-w-md">
+                    The correlation engine is analyzing market conditions. New trade suggestions
+                    will appear here when multi-agent consensus is reached.
+                  </p>
+                </CardContent>
+              </Card>
+            )}
+
+            {/* Suggestions Grid */}
+            {!isLoading && !isError && suggestionsData && suggestionsData.suggestions.length > 0 && (
+              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                {suggestionsData.suggestions.map((suggestion) => (
+                  <TradeSuggestionCard
+                    key={suggestion.suggestion_id}
+                    suggestion={suggestion}
+                    onViewDetails={handleViewDetails}
+                  />
+                ))}
               </div>
-            </CardContent>
-          </Card>
-        )}
+            )}
 
-        {/* Empty State */}
-        {!isLoading && !isError && suggestionsData?.suggestions.length === 0 && (
-          <Card className="border-slate-200 bg-slate-50">
-            <CardContent className="flex flex-col items-center justify-center py-12 text-center">
-              <Radar className="h-12 w-12 text-slate-400 mb-4" />
-              <h3 className="text-lg font-semibold text-slate-900 mb-2">No Active Suggestions</h3>
-              <p className="text-sm text-slate-500 max-w-md">
-                The correlation engine is analyzing market conditions. New trade suggestions will appear here when
-                multi-agent consensus is reached.
-              </p>
-            </CardContent>
-          </Card>
-        )}
-
-        {/* Suggestions Grid */}
-        {!isLoading && !isError && suggestionsData && suggestionsData.suggestions.length > 0 && (
-          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-            {suggestionsData.suggestions.map((suggestion) => (
-              <TradeSuggestionCard
-                key={suggestion.suggestion_id}
-                suggestion={suggestion}
-                onViewDetails={handleViewDetails}
-              />
-            ))}
+            {/* Pagination Info */}
+            {suggestionsData && suggestionsData.total > 0 && (
+              <div className="mt-6 text-center text-sm text-slate-500">
+                Showing {suggestionsData.suggestions.length} of {suggestionsData.total} suggestions
+              </div>
+            )}
           </div>
-        )}
 
-        {/* Pagination Info */}
-        {suggestionsData && suggestionsData.total > 0 && (
-          <div className="mt-6 text-center text-sm text-slate-500">
-            Showing {suggestionsData.suggestions.length} of {suggestionsData.total} suggestions
-          </div>
-        )}
+        </div>
       </div>
 
       {/* Detail Pane Overlay */}

@@ -378,3 +378,44 @@ class SuggestionStatsResponse(BaseModel):
     # Performance metrics
     avg_latency_ms: float = Field(ge=0, description="Average correlation latency")
     consensus_rate: float = Field(ge=0.0, le=1.0, description="Consensus success rate")
+
+
+# ============================================================================
+# ML Activity Feed
+# ============================================================================
+
+class CorrelationActivityStatus(str, Enum):
+    """Resolved lifecycle state of a correlation attempt."""
+    COMPLETED = "completed"
+    REJECTED  = "rejected"
+
+
+class CorrelationActivityItem(BaseModel):
+    """
+    A single resolved correlation event for the ML Activity feed.
+
+    Hydrates the frontend feed on initial page load; subsequent events arrive
+    via WebSocket.  Only completed and rejected items are returned — in-flight
+    correlations have no DB record yet.
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    correlation_id:   UUID
+    symbol:           str
+    trading_symbol:   str | None
+    trigger_type:     TriggerType
+    status:           CorrelationActivityStatus
+    started_at:       datetime
+    resolved_at:      datetime
+    # ── completed ────────────────────────────────────────────────────────────
+    direction:        SignalDirection | None = None
+    consensus_score:  float | None          = None
+    confidence_level: ConfidenceLevel | None = None
+    # ── rejected ─────────────────────────────────────────────────────────────
+    rejection_reason: str | None            = None
+
+
+class CorrelationActivityResponse(BaseModel):
+    """Paginated recent correlation activity for the ML Activity feed."""
+    items:  list[CorrelationActivityItem]
+    total:  int

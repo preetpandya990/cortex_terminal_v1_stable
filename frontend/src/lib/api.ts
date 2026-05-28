@@ -642,6 +642,25 @@ export const safetyAPI = {
 // AI Ingestion API (RSS Sources)
 
 // Trade Suggestions API
+export interface CorrelationActivityItem {
+  correlation_id:   string;
+  symbol:           string;
+  trading_symbol:   string | null;
+  trigger_type:     'SCANNER_ANOMALY' | 'NEWS_EVENT';
+  status:           'completed' | 'rejected';
+  started_at:       string;
+  resolved_at:      string;
+  direction?:       'BUY' | 'SELL' | null;
+  consensus_score?: number | null;
+  confidence_level?: 'HIGH' | 'MEDIUM' | 'LOW' | null;
+  rejection_reason?: string | null;
+}
+
+export interface CorrelationActivityResponse {
+  items: CorrelationActivityItem[];
+  total: number;
+}
+
 export const tradeSuggestionsAPI = {
   getSuggestions: async (filters?: SuggestionFilters): Promise<SuggestionsListResponse> => {
     return requestData(
@@ -654,6 +673,13 @@ export const tradeSuggestionsAPI = {
     return requestData(
       api.get('/trade-suggestions/stats/summary'),
       'Failed to fetch trade suggestion stats'
+    );
+  },
+
+  getRecentActivity: async (limit = 30): Promise<CorrelationActivityResponse> => {
+    return requestData(
+      api.get('/trade-suggestions/correlations/recent', { params: { limit } }),
+      'Failed to fetch recent ML activity'
     );
   },
 };
@@ -1199,4 +1225,45 @@ export const adminStrategiesAPI = {
       'Failed to fetch audit log',
     );
   },
+};
+
+// ML Training Operator Console API
+import type {
+  FeedbackBundleInfo,
+  FeedbackBundlesListResponse,
+  PreflightReport,
+  LaunchRequest,
+  LaunchResponse,
+  RunsListResponse,
+  ActiveRunResponse,
+} from '@/types/admin_training';
+
+export const adminTrainingAPI = {
+  preflight: (): Promise<PreflightReport> =>
+    requestData(api.get<PreflightReport>('/admin/training/preflight'), 'Failed to run preflight'),
+
+  launch: (body: LaunchRequest): Promise<LaunchResponse> =>
+    requestData(api.post<LaunchResponse>('/admin/training/launch', body), 'Failed to launch training'),
+
+  getRuns: (limit = 20): Promise<RunsListResponse> =>
+    requestData(api.get<RunsListResponse>('/admin/training/runs', { params: { limit } }), 'Failed to fetch runs'),
+
+  getActiveRun: (): Promise<ActiveRunResponse> =>
+    requestData(api.get<ActiveRunResponse>('/admin/training/runs/active'), 'Failed to fetch active run'),
+
+  cancelRun: (runId: string): Promise<{ run_id: string; status: string; message: string }> =>
+    requestData(
+      api.post(`/admin/training/runs/${runId}/cancel`),
+      'Failed to cancel training run',
+    ),
+
+  // Phase 2 — feedback bundle endpoints
+  buildFeedbackBundle: (): Promise<FeedbackBundleInfo> =>
+    requestData(api.post<FeedbackBundleInfo>('/admin/training/feedback/build'), 'Failed to build feedback bundle'),
+
+  listFeedbackBundles: (): Promise<FeedbackBundlesListResponse> =>
+    requestData(api.get<FeedbackBundlesListResponse>('/admin/training/feedback/bundles'), 'Failed to fetch bundles'),
+
+  getLatestFeedbackBundle: (): Promise<FeedbackBundleInfo> =>
+    requestData(api.get<FeedbackBundleInfo>('/admin/training/feedback/bundles/latest'), 'Failed to fetch latest bundle'),
 };

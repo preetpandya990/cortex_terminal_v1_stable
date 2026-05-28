@@ -11,9 +11,10 @@ import app.api.v1.ml_patterns as ml_patterns
 import app.api.v1.trade_suggestions as trade_suggestions
 import app.api.v1.ai_sentiment as ai_sentiment
 import app.api.v1.ai_stream as ai_stream
+import app.api.v1.admin_training as admin_training
 
 __all__ = [
     "auth", "hawk_eye", "health", "market_data", "scanner", "upstox",
     "ml_predictions", "ml_patterns", "trade_suggestions",
-    "ai_sentiment", "ai_stream",
+    "ai_sentiment", "ai_stream", "admin_training",
 ]
