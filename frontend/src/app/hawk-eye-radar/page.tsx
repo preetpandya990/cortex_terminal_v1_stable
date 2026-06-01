@@ -219,13 +219,25 @@ export default function HawkEyeRadarPage() {
     }
   };
 
-  // Determine which instrument to show in detail pane
-  const detailInstrument = selectedInstrument || (detailSuggestion ? {
-    instrument_key: detailSuggestion.instrument_key,
-    trading_symbol: detailSuggestion.trading_symbol || detailSuggestion.symbol,
-    name: detailSuggestion.symbol,
-    exchange: "NSE",
-  } as UpstoxInstrument : null);
+  // Determine which instrument to show in detail pane.
+  // When opening from a trade suggestion, derive name and exchange properly so
+  // the DetailPane header is identical in structure to the watchlist path.
+  const detailInstrument = selectedInstrument ?? (detailSuggestion
+    ? ({
+        instrument_key: detailSuggestion.instrument_key,
+        trading_symbol: detailSuggestion.trading_symbol ?? detailSuggestion.symbol,
+        // Use proper company name with title-case; fall back to trading symbol.
+        name: detailSuggestion.company_name
+          ? detailSuggestion.company_name
+              .toLowerCase()
+              .split(" ")
+              .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+              .join(" ")
+          : (detailSuggestion.trading_symbol ?? detailSuggestion.symbol),
+        // instrument_key encodes the exchange as its first segment (e.g. "NSE_EQ|…").
+        exchange: detailSuggestion.instrument_key.split("_")[0] ?? "NSE",
+      } as UpstoxInstrument)
+    : null);
 
   if (!isAuthReady || !isAuthenticated) return null;
 

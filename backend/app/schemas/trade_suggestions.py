@@ -385,9 +385,10 @@ class SuggestionStatsResponse(BaseModel):
 # ============================================================================
 
 class CorrelationActivityStatus(str, Enum):
-    """Resolved lifecycle state of a correlation attempt."""
-    COMPLETED = "completed"
-    REJECTED  = "rejected"
+    """Lifecycle state of a correlation attempt."""
+    PROCESSING = "processing"
+    COMPLETED  = "completed"
+    REJECTED   = "rejected"
 
 
 class CorrelationActivityItem(BaseModel):
@@ -406,7 +407,7 @@ class CorrelationActivityItem(BaseModel):
     trigger_type:     TriggerType
     status:           CorrelationActivityStatus
     started_at:       datetime
-    resolved_at:      datetime
+    resolved_at:      datetime | None = None
     # ── completed ────────────────────────────────────────────────────────────
     direction:        SignalDirection | None = None
     consensus_score:  float | None          = None

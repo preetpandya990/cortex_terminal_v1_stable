@@ -201,7 +201,7 @@ function fromRestItem(item: CorrelationActivityItem): MLActivityItem {
     trigger_type:     item.trigger_type,
     status:           item.status,
     started_at:       new Date(item.started_at).getTime(),
-    resolved_at:      new Date(item.resolved_at).getTime(),
+    resolved_at:      item.resolved_at ? new Date(item.resolved_at).getTime() : undefined,
     direction:        item.direction ?? undefined,
     consensus_score:  item.consensus_score ?? undefined,
     confidence_level: (item.confidence_level ?? undefined) as MLActivityItem['confidence_level'],

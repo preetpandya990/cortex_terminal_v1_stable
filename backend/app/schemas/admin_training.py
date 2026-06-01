@@ -42,11 +42,37 @@ class TrainingConfigOverride(BaseModel):
     gru_trials: int | None = Field(None, ge=1, le=100)
 
 
+class LaunchMode(str, Enum):
+    FRESH  = "fresh"   # --fresh: discard any existing checkpoint, start from scratch
+    RESUME = "resume"  # no --fresh: auto-resume from the existing checkpoint
+
+
 class LaunchRequest(BaseModel):
     reason: str = Field(min_length=5, max_length=500)
+    mode: LaunchMode = LaunchMode.FRESH
     override_schedule_warning: bool = False
+    # config overrides and feedback_weights_path are only honoured in FRESH mode;
+    # RESUME ignores them — the checkpoint's locked config governs the resumed run.
     config: TrainingConfigOverride = Field(default_factory=TrainingConfigOverride)
     feedback_weights_path: str | None = None
+
+
+class CheckpointStatus(BaseModel):
+    """Current on-disk checkpoint state — used by the Launch form to decide mode."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    exists: bool
+    resumable: bool            # exists AND incomplete AND schema-compatible
+    run_id: str | None = None
+    started_at: str | None = None
+    model_version: str | None = None
+    schema_version: int | None = None
+    completed_steps: list[str] = Field(default_factory=list)
+    next_step: str | None = None
+    # GRU sub-C state — populated when step_6_gru is the next step and a
+    # per-epoch training_state.json exists (i.e. GRU was interrupted mid-run).
+    gru_last_epoch: int | None = None
 
 
 class LaunchResponse(BaseModel):

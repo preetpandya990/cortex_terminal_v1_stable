@@ -57,23 +57,81 @@ def normalise_events(raw: Any) -> list[dict]:
     return result
 
 
+_MODEL_DISPLAY_NAMES: dict[str, str] = {
+    "xgboost": "XGBoost",
+    "gru":     "GRU",
+}
+
+# Canonical ordering: higher-weight models surface first.
+_MODEL_ORDER = ["xgboost", "gru"]
+
+
+def _clean_version(version: str) -> str:
+    """Extract semver prefix from a registry version string.
+
+    '1.1.1_xgboost' → '1.1.1'
+    '1.1.1'         → '1.1.1'
+    ''              → ''
+    """
+    if not version:
+        return ""
+    return version.split("_")[0]
+
+
+def _direction_to_sentiment(direction: str) -> str:
+    if direction == "BUY":
+        return "bullish"
+    if direction == "SELL":
+        return "bearish"
+    return "neutral"
+
+
 def normalise_ml_predictions(raw: Any) -> list[dict]:
     """
     Translate ai_trading_signals.ml_predictions JSONB to ContributingMLPrediction[].
 
-    DB shape: {score, confidence, model, prediction: {...}}
-    Frontend:  [{model_id, model_name, prediction, confidence}, ...]
+    New format (signals generated after per-model breakdown was introduced):
+      DB: { ..., "models": { "xgboost": { direction, confidence, version, weight, ... },
+                              "gru":     { ... } } }
+      → [{model_id, model_name, prediction, confidence}, ...]  (one entry per model)
+
+    Legacy format (signals generated before the breakdown):
+      DB: { score, confidence, model, ... }   (no "models" key)
+      → single entry for the ensemble result  (backward compatibility)
     """
     if not raw or not isinstance(raw, dict):
         return []
-    confidence = float(raw.get("confidence", 0))
-    score = float(raw.get("score", 0))
-    model = raw.get("model") or "ensemble"
+
+    models = raw.get("models")
+    if models and isinstance(models, dict):
+        result: list[dict] = []
+        for key in _MODEL_ORDER:
+            data = models.get(key)
+            if not isinstance(data, dict):
+                continue
+            confidence = float(data.get("confidence", 0.0))
+            direction  = str(data.get("direction", "HOLD"))
+            version    = _clean_version(str(data.get("version", "")))
+            base_name  = _MODEL_DISPLAY_NAMES.get(key, key.upper())
+            model_name = f"{base_name} v{version}" if version else base_name
+            result.append({
+                "model_id":   key,
+                "model_name": model_name,
+                "prediction": _direction_to_sentiment(direction),
+                "confidence": confidence,
+            })
+        if result:
+            return result
+
+    # ── Legacy fallback ────────────────────────────────────────────────────────
+    confidence = float(raw.get("confidence", 0.0))
+    score      = float(raw.get("score", 0.0))
+    model      = raw.get("model") or "ensemble"
     if confidence == 0.0 and score == 0.0:
         return []
     return [{
-        "model_id": str(model),
-        "model_name": str(model).capitalize(),
+        "model_id":   str(model),
+        "model_name": str(model).replace("_", " ").title(),
         "prediction": "bullish" if score > 0.0 else "bearish" if score < 0.0 else "neutral",
         "confidence": confidence,
     }]

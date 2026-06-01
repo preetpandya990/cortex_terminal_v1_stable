@@ -213,3 +213,148 @@ async def admin_reload(
         "gru_version":     new_ensemble.gru_version,
         "loaded_at":       new_ensemble.loaded_at.isoformat(),
     }
+
+
+# ── Prediction Card endpoint ───────────────────────────────────────────────────
+
+def serialize_prediction_card(raw: dict[str, Any], timeframe: str = "1d") -> dict[str, Any]:
+    """
+    Serialize raw EnsemblePredictor.predict() output into the ML Analysis Card
+    payload format.  Pure function — no I/O.  Used by both the REST endpoint
+    and the SSE stream so both sources emit an identical shape.
+    """
+    meta      = raw.get("metadata", {})
+    models_raw = raw.get("models", {})
+    probs     = raw.get("probabilities", {})
+
+    def _model_view(m: dict[str, Any]) -> dict[str, Any]:
+        mp = m.get("probabilities", {})
+        return {
+            "direction":        m.get("direction", "HOLD"),
+            "confidence":       round(float(m.get("confidence",       0.0)), 4),
+            "conviction_scale": round(float(m.get("conviction_scale", 0.0)), 4),
+            "threshold":        round(float(m.get("threshold",        0.6)), 4),
+            "probabilities": {
+                "buy":  round(float(mp.get("buy",  0.0)), 4),
+                "sell": round(float(mp.get("sell", 0.0)), 4),
+                "hold": round(float(mp.get("hold", 0.0)), 4),
+            },
+            "weight":  round(float(m.get("weight",  0.0)), 4),
+            "version": m.get("version", ""),
+        }
+
+    models: dict[str, Any] = {
+        "xgboost": _model_view(models_raw["xgboost"]) if "xgboost" in models_raw else None,
+        "gru":     _model_view(models_raw["gru"])     if "gru"     in models_raw else None,
+    }
+
+    effective_timeframe = meta.get("timeframe", timeframe)
+
+    return {
+        "available":         True,
+        "unavailable_reason": None,
+        "direction":          raw.get("direction_label", "HOLD"),
+        "confidence":         round(float(raw.get("confidence",       0.0)), 4),
+        "conviction_scale":   round(float(raw.get("conviction_scale", 0.0)), 4),
+        "threshold":          round(float(raw.get("threshold",        0.6)), 4),
+        "probabilities": {
+            "buy":  round(float(probs.get("buy",  0.0)), 4),
+            "sell": round(float(probs.get("sell", 0.0)), 4),
+            "hold": round(float(probs.get("hold", 0.0)), 4),
+        },
+        "entry_price": round(float(raw.get("entry_price", 0.0)), 2),
+        "stop_loss":   round(float(raw.get("stop_loss",   0.0)), 2),
+        "tp1":         round(float(raw.get("tp1",         0.0)), 2),
+        "tp2":         round(float(raw.get("tp2",         0.0)), 2),
+        "tp3":         round(float(raw.get("tp3",         0.0)), 2),
+        "volatility":  round(float(raw.get("volatility",  0.0)), 4),
+        "models": models,
+        "xgboost_version": meta.get("xgboost_version", ""),
+        "gru_version":     meta.get("gru_version"),
+        "xgboost_weight":  round(float(meta.get("xgboost_weight", 0.75)), 4),
+        "gru_weight":      round(float(meta.get("gru_weight",     0.25)), 4),
+        "timeframe":       effective_timeframe,
+        "predicted_at":    meta.get("predicted_at", ""),
+    }
+
+
+@router.get(
+    "/prediction-card",
+    status_code=status.HTTP_200_OK,
+    summary="Full ensemble prediction payload for the ML Analysis Card",
+    description="""
+    Returns the complete ensemble prediction in the ML Analysis Card format,
+    including per-model breakdown (XGBoost / GRU), conviction scale, volatility
+    regime, and price levels.
+
+    When no production model is deployed or when there is insufficient price
+    history, returns `{"available": false, "unavailable_reason": "..."}` with
+    HTTP 200 so the frontend can render a graceful empty state rather than
+    treating this as an error.
+
+    Rate limit: 30 requests/minute per user (predictions are Redis-cached).
+    """,
+)
+@limiter.limit("30/minute")
+async def get_prediction_card(
+    request: Request,
+    instrument_key: str,
+    timeframe: str = "1d",
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    user_id = current_user.get("user_id", "unknown")
+
+    predictor = getattr(request.app.state, "ml_predictor", None)
+    if predictor is None:
+        return {"available": False, "unavailable_reason": "no_model"}
+
+    try:
+        redis = get_redis()
+        feature_loader = FeatureLoader(
+            db=db,
+            redis=redis,
+            sequence_length=predictor.sequence_length,
+            n_features=predictor.n_features,
+            feature_names=predictor.feature_names,
+        )
+
+        try:
+            tabular, sequence, current_price, volatility = await feature_loader.load_features(
+                symbol=instrument_key,
+                timeframe=timeframe,
+            )
+        except ValueError as exc:
+            logger.info(
+                "Prediction card — insufficient data: user=%s instrument=%s error=%s",
+                user_id, instrument_key, exc,
+            )
+            return {"available": False, "unavailable_reason": "insufficient_data"}
+
+        raw = await predictor.predict(
+            features_tabular=tabular,
+            features_sequence=sequence,
+            symbol=instrument_key,
+            current_price=current_price,
+            volatility=volatility,
+            timeframe=timeframe,
+            use_cache=True,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Prediction card failed: user=%s instrument=%s error=%s",
+            user_id, instrument_key, exc, exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "prediction_failed", "message": "Ensemble prediction failed"},
+        )
+
+    logger.info(
+        "Prediction card: user=%s instrument=%s direction=%s confidence=%.4f",
+        user_id, instrument_key, raw.get("direction_label"), raw.get("confidence"),
+    )
+    return serialize_prediction_card(raw, timeframe=timeframe)

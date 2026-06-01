@@ -7,10 +7,19 @@ import {
 import {
   Zap, RefreshCw, Loader2, PackagePlus, CheckCircle2,
   AlertTriangle, Calendar, Hash, TrendingUp, ChevronDown, ChevronUp,
+  Trash2,
 } from "lucide-react";
 import type { FeedbackBundleInfo } from "@/types/admin_training";
 import { adminTrainingAPI, apiErrorMessage } from "@/lib/api";
 import { useToast } from "@/components/ui/toast";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogFooter,
+  DialogTitle,
+  DialogDescription,
+} from "@/components/ui/dialog";
 
 // ── Histogram chart ───────────────────────────────────────────────────────────
 
@@ -92,16 +101,108 @@ function TopSymbols({ symbols }: { symbols: FeedbackBundleInfo["top_symbols"] })
   );
 }
 
+// ── Delete confirmation dialog ────────────────────────────────────────────────
+
+interface DeleteConfirmDialogProps {
+  bundle: FeedbackBundleInfo | null;
+  isDeleting: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}
+
+function DeleteConfirmDialog({ bundle, isDeleting, onConfirm, onCancel }: DeleteConfirmDialogProps) {
+  if (!bundle) return null;
+  const filename = bundle.bundle_path.split("/").pop() ?? bundle.bundle_path;
+
+  return (
+    <Dialog open={!!bundle} onOpenChange={(open) => { if (!open && !isDeleting) onCancel(); }}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full bg-rose-100">
+              <Trash2 className="h-5 w-5 text-rose-600" />
+            </div>
+            <DialogTitle className="text-left text-base">Delete Feedback Bundle</DialogTitle>
+          </div>
+          <DialogDescription className="mt-3 text-left text-sm text-slate-500">
+            This will permanently delete the bundle and its metadata sidecar from disk. This action
+            cannot be undone.
+          </DialogDescription>
+        </DialogHeader>
+
+        {/* Bundle summary */}
+        <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 space-y-1.5 text-[12px]">
+          <div className="flex items-start gap-2">
+            <span className="w-16 flex-shrink-0 font-medium text-slate-400">File</span>
+            <span className="font-mono text-slate-700 break-all">{filename}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="w-16 flex-shrink-0 font-medium text-slate-400">SHA-256</span>
+            <span className="font-mono text-slate-500">{bundle.sha256.slice(0, 16)}…</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="w-16 flex-shrink-0 font-medium text-slate-400">Coverage</span>
+            <span className="text-slate-600">
+              {bundle.total_raw_outcomes.toLocaleString()} trades →{" "}
+              {bundle.row_count.toLocaleString()} bars
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="w-16 flex-shrink-0 font-medium text-slate-400">Window</span>
+            <span className="text-slate-600">{bundle.window_start} → {bundle.window_end}</span>
+          </div>
+        </div>
+
+        <div className="flex items-start gap-2 rounded-xl border border-rose-100 bg-rose-50 px-3 py-2.5 text-[12px] text-rose-700">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
+          <span>
+            If this bundle is set as the active bundle in the Launch tab, it will be deselected
+            automatically. Any training run already using it will not be affected.
+          </span>
+        </div>
+
+        <DialogFooter className="gap-2 pt-1">
+          <button
+            onClick={onCancel}
+            disabled={isDeleting}
+            className="flex-1 rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-600 shadow-sm transition hover:bg-slate-50 disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={isDeleting}
+            className="flex-1 rounded-lg bg-rose-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-rose-700 disabled:opacity-60"
+          >
+            {isDeleting ? (
+              <span className="flex items-center justify-center gap-1.5">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                Deleting…
+              </span>
+            ) : (
+              "Delete Bundle"
+            )}
+          </button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 // ── Bundle card ───────────────────────────────────────────────────────────────
 
 function BundleCard({
   bundle,
   isSelected,
+  isDeleting,
   onSelect,
+  onDeleteRequest,
 }: {
   bundle: FeedbackBundleInfo;
   isSelected: boolean;
+  isDeleting: boolean;
   onSelect: (path: string | null) => void;
+  onDeleteRequest: (bundle: FeedbackBundleInfo) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const filename = bundle.bundle_path.split("/").pop() ?? bundle.bundle_path;
@@ -109,11 +210,12 @@ function BundleCard({
   return (
     <div className={`rounded-xl border transition-colors ${
       isSelected ? "border-blue-300 bg-blue-50/40" : "border-slate-200 bg-white"
-    }`}>
+    } ${isDeleting ? "opacity-50" : ""}`}>
       <div className="flex items-center gap-3 px-4 py-3">
         <input
           type="radio"
           checked={isSelected}
+          disabled={isDeleting}
           onChange={() => onSelect(isSelected ? null : bundle.bundle_path)}
           className="h-4 w-4 accent-blue-600"
         />
@@ -141,9 +243,26 @@ function BundleCard({
             </span>
           </div>
         </div>
+
+        {/* Delete button */}
+        <button
+          onClick={() => onDeleteRequest(bundle)}
+          disabled={isDeleting}
+          title="Delete bundle"
+          className="flex-shrink-0 rounded-lg p-1.5 text-slate-300 transition hover:bg-rose-50 hover:text-rose-500 disabled:pointer-events-none disabled:opacity-40"
+        >
+          {isDeleting ? (
+            <Loader2 className="h-4 w-4 animate-spin text-rose-400" />
+          ) : (
+            <Trash2 className="h-4 w-4" />
+          )}
+        </button>
+
+        {/* Expand / collapse */}
         <button
           onClick={() => setExpanded(v => !v)}
-          className="flex-shrink-0 rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+          disabled={isDeleting}
+          className="flex-shrink-0 rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-600 disabled:opacity-40"
         >
           {expanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
         </button>
@@ -192,9 +311,11 @@ interface FeedbackPreviewProps {
 
 export function FeedbackPreview({ selectedBundlePath, onBundleSelect }: FeedbackPreviewProps) {
   const { success: toastOk, error: toastErr } = useToast();
-  const [bundles,   setBundles]   = useState<FeedbackBundleInfo[]>([]);
-  const [loading,   setLoading]   = useState(false);
-  const [building,  setBuilding]  = useState(false);
+  const [bundles,       setBundles]       = useState<FeedbackBundleInfo[]>([]);
+  const [loading,       setLoading]       = useState(false);
+  const [building,      setBuilding]      = useState(false);
+  const [confirmBundle, setConfirmBundle] = useState<FeedbackBundleInfo | null>(null);
+  const [deletingPath,  setDeletingPath]  = useState<string | null>(null);
 
   const fetchBundles = useCallback(async () => {
     setLoading(true);
@@ -216,12 +337,38 @@ export function FeedbackPreview({ selectedBundlePath, onBundleSelect }: Feedback
       const bundle = await adminTrainingAPI.buildFeedbackBundle();
       toastOk(`Bundle built: ${bundle.row_count.toLocaleString()} outcomes weighted`);
       await fetchBundles();
-      // Auto-select the newly built bundle
       onBundleSelect(bundle.bundle_path);
     } catch (err) {
       toastErr(apiErrorMessage(err));
     } finally {
       setBuilding(false);
+    }
+  };
+
+  const handleDeleteConfirm = async () => {
+    if (!confirmBundle) return;
+
+    // Extract the stem name from the full path.
+    const filename = confirmBundle.bundle_path.split("/").pop() ?? "";
+    const bundleName = filename.replace(/\.parquet$/, "");
+
+    setDeletingPath(confirmBundle.bundle_path);
+    setConfirmBundle(null);
+
+    try {
+      await adminTrainingAPI.deleteFeedbackBundle(bundleName);
+
+      // Auto-clear selection if the deleted bundle was active.
+      if (selectedBundlePath === confirmBundle.bundle_path) {
+        onBundleSelect(null);
+      }
+
+      setBundles(prev => prev.filter(b => b.bundle_path !== confirmBundle.bundle_path));
+      toastOk(`Bundle deleted: ${filename}`);
+    } catch (err) {
+      toastErr(apiErrorMessage(err));
+    } finally {
+      setDeletingPath(null);
     }
   };
 
@@ -332,11 +479,21 @@ export function FeedbackPreview({ selectedBundlePath, onBundleSelect }: Feedback
               key={bundle.bundle_path}
               bundle={bundle}
               isSelected={selectedBundlePath === bundle.bundle_path}
+              isDeleting={deletingPath === bundle.bundle_path}
               onSelect={onBundleSelect}
+              onDeleteRequest={setConfirmBundle}
             />
           ))}
         </div>
       )}
+
+      {/* Delete confirmation dialog */}
+      <DeleteConfirmDialog
+        bundle={confirmBundle}
+        isDeleting={deletingPath !== null}
+        onConfirm={handleDeleteConfirm}
+        onCancel={() => setConfirmBundle(null)}
+      />
     </div>
   );
 }

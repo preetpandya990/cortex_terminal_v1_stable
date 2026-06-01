@@ -24,6 +24,7 @@ from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from redis.asyncio import Redis
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.redis import CacheService
@@ -178,6 +179,44 @@ class EventCorrelationEngine:
                 "Non-fatal: failed to publish to %s: %s", channel, exc
             )
 
+    async def _mark_inflight(
+        self,
+        correlation_id: UUID,
+        symbol: str,
+        trading_symbol: str | None,
+        trigger_type: str,
+        started_at: datetime,
+    ) -> None:
+        """Checkpoint an in-flight correlation to Redis so the seed endpoint can surface it."""
+        try:
+            started_at_ms = int(started_at.timestamp() * 1000)
+            payload = json.dumps({
+                "correlation_id": str(correlation_id),
+                "symbol":         symbol,
+                "trading_symbol": trading_symbol,
+                "trigger_type":   trigger_type,
+                "started_at":     started_at.isoformat(),
+                "started_at_ms":  started_at_ms,
+            }, default=str)
+            key = f"cortex:correlation:inflight:{correlation_id}"
+            pipe = self.redis.pipeline()
+            pipe.setex(key, 60, payload)
+            pipe.zadd("cortex:correlations:inflight", {str(correlation_id): started_at_ms})
+            pipe.expire("cortex:correlations:inflight", 3600)
+            await pipe.execute()
+        except Exception as exc:
+            logger.debug("Non-fatal: failed to mark inflight %s: %s", correlation_id, exc)
+
+    async def _clear_inflight(self, correlation_id: UUID) -> None:
+        """Remove a correlation from the in-flight Redis checkpoint on resolution."""
+        try:
+            pipe = self.redis.pipeline()
+            pipe.delete(f"cortex:correlation:inflight:{correlation_id}")
+            pipe.zrem("cortex:correlations:inflight", str(correlation_id))
+            await pipe.execute()
+        except Exception as exc:
+            logger.debug("Non-fatal: failed to clear inflight %s: %s", correlation_id, exc)
+
     async def on_scanner_anomaly(
         self,
         db: AsyncSession,
@@ -209,110 +248,118 @@ class EventCorrelationEngine:
             extra={"pipeline_stage": "trigger", "correlation_id": str(correlation_id)},
         )
 
-        await self._publish_correlation_event(
-            RedisChannels.CORRELATIONS_STARTED,
-            {
-                "correlation_id": str(correlation_id),
-                "symbol":         symbol,
-                "trading_symbol": scanner_signal.get("trading_symbol"),
-                "trigger_type":   "SCANNER_ANOMALY",
-                "started_at":     trigger_timestamp.isoformat(),
-            },
-        )
-
-        # Gather signals with timeout
-        t_gather_start = datetime.now(timezone.utc)
-        try:
-            ai_signal, ml_signal, latencies = await asyncio.wait_for(
-                self._gather_signals_pathway1(db, scanner_signal),
-                timeout=5.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Pipeline stage=signal_gather status=timeout correlation_id=%s symbol=%s",
-                correlation_id, symbol,
-            )
-            await self._record_correlation(
-                db, correlation_id, "SCANNER_ANOMALY", trigger_timestamp,
-                None, "TIMEOUT", None
-            )
-            await self._publish_correlation_event(
-                RedisChannels.CORRELATIONS_REJECTED,
-                {
-                    "correlation_id":   str(correlation_id),
-                    "symbol":           symbol,
-                    "trading_symbol":   scanner_signal.get("trading_symbol"),
-                    "trigger_type":     "SCANNER_ANOMALY",
-                    "rejection_reason": "TIMEOUT",
-                    "consensus_score":  0.0,
-                    "rejected_at":      datetime.now(timezone.utc).isoformat(),
-                },
-            )
-            return None
-        except Exception as e:
-            logger.error(
-                "Pipeline stage=signal_gather status=error correlation_id=%s symbol=%s error=%s",
-                correlation_id, symbol, e, exc_info=True,
-            )
-            await self._record_correlation(
-                db, correlation_id, "SCANNER_ANOMALY", trigger_timestamp,
-                None, f"ERROR: {str(e)}", None
-            )
-            await self._publish_correlation_event(
-                RedisChannels.CORRELATIONS_REJECTED,
-                {
-                    "correlation_id":   str(correlation_id),
-                    "symbol":           symbol,
-                    "trading_symbol":   scanner_signal.get("trading_symbol"),
-                    "trigger_type":     "SCANNER_ANOMALY",
-                    "rejection_reason": "PROCESSING_ERROR",
-                    "consensus_score":  0.0,
-                    "rejected_at":      datetime.now(timezone.utc).isoformat(),
-                },
-            )
-            return None
-
-        t_gather_ms = int((datetime.now(timezone.utc) - t_gather_start).total_seconds() * 1000)
-        logger.debug(
-            "Pipeline stage=signal_gather status=ok correlation_id=%s symbol=%s "
-            "scanner_ms=%s ai_ms=%s ml_ms=%s gather_total_ms=%d",
+        await self._mark_inflight(
             correlation_id, symbol,
-            latencies.get("scanner_ms"), latencies.get("ai_ms"), latencies.get("ml_ms"),
-            t_gather_ms,
+            scanner_signal.get("trading_symbol"),
+            "SCANNER_ANOMALY", trigger_timestamp,
         )
-
-        # Compute consensus
-        suggestion = await self._compute_consensus(
-            db=db,
-            correlation_id=correlation_id,
-            trigger_type="SCANNER_ANOMALY",
-            trigger_timestamp=trigger_timestamp,
-            scanner_signal=scanner_signal,
-            ai_signal=ai_signal,
-            ml_signal=ml_signal,
-            latencies=latencies,
-        )
-
-        if suggestion:
-            total_ms = int(
-                (datetime.now(timezone.utc) - trigger_timestamp).total_seconds() * 1000
-            )
-            logger.info(
-                "Pipeline stage=suggestion_committed correlation_id=%s "
-                "suggestion_id=%s symbol=%s direction=%s confidence=%s "
-                "consensus_score=%.2f total_pipeline_ms=%d",
-                correlation_id, suggestion.suggestion_id, suggestion.symbol,
-                suggestion.signal_direction, suggestion.confidence_level,
-                float(suggestion.consensus_score), total_ms,
-                extra={
-                    "pipeline_stage": "suggestion_committed",
+        try:
+            await self._publish_correlation_event(
+                RedisChannels.CORRELATIONS_STARTED,
+                {
                     "correlation_id": str(correlation_id),
-                    "suggestion_id": str(suggestion.suggestion_id),
-                    "total_pipeline_ms": total_ms,
+                    "symbol":         symbol,
+                    "trading_symbol": scanner_signal.get("trading_symbol"),
+                    "trigger_type":   "SCANNER_ANOMALY",
+                    "started_at":     trigger_timestamp.isoformat(),
                 },
             )
 
-        return suggestion
+            # Gather signals with timeout
+            t_gather_start = datetime.now(timezone.utc)
+            try:
+                ai_signal, ml_signal, latencies = await asyncio.wait_for(
+                    self._gather_signals_pathway1(db, scanner_signal),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Pipeline stage=signal_gather status=timeout correlation_id=%s symbol=%s",
+                    correlation_id, symbol,
+                )
+                await self._record_correlation(
+                    db, correlation_id, "SCANNER_ANOMALY", trigger_timestamp,
+                    None, "TIMEOUT", None
+                )
+                await self._publish_correlation_event(
+                    RedisChannels.CORRELATIONS_REJECTED,
+                    {
+                        "correlation_id":   str(correlation_id),
+                        "symbol":           symbol,
+                        "trading_symbol":   scanner_signal.get("trading_symbol"),
+                        "trigger_type":     "SCANNER_ANOMALY",
+                        "rejection_reason": "TIMEOUT",
+                        "consensus_score":  0.0,
+                        "rejected_at":      datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+                return None
+            except Exception as e:
+                logger.error(
+                    "Pipeline stage=signal_gather status=error correlation_id=%s symbol=%s error=%s",
+                    correlation_id, symbol, e, exc_info=True,
+                )
+                await self._record_correlation(
+                    db, correlation_id, "SCANNER_ANOMALY", trigger_timestamp,
+                    None, f"ERROR: {str(e)}", None
+                )
+                await self._publish_correlation_event(
+                    RedisChannels.CORRELATIONS_REJECTED,
+                    {
+                        "correlation_id":   str(correlation_id),
+                        "symbol":           symbol,
+                        "trading_symbol":   scanner_signal.get("trading_symbol"),
+                        "trigger_type":     "SCANNER_ANOMALY",
+                        "rejection_reason": "PROCESSING_ERROR",
+                        "consensus_score":  0.0,
+                        "rejected_at":      datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+                return None
+
+            t_gather_ms = int((datetime.now(timezone.utc) - t_gather_start).total_seconds() * 1000)
+            logger.debug(
+                "Pipeline stage=signal_gather status=ok correlation_id=%s symbol=%s "
+                "scanner_ms=%s ai_ms=%s ml_ms=%s gather_total_ms=%d",
+                correlation_id, symbol,
+                latencies.get("scanner_ms"), latencies.get("ai_ms"), latencies.get("ml_ms"),
+                t_gather_ms,
+            )
+
+            # Compute consensus
+            suggestion = await self._compute_consensus(
+                db=db,
+                correlation_id=correlation_id,
+                trigger_type="SCANNER_ANOMALY",
+                trigger_timestamp=trigger_timestamp,
+                scanner_signal=scanner_signal,
+                ai_signal=ai_signal,
+                ml_signal=ml_signal,
+                latencies=latencies,
+            )
+
+            if suggestion:
+                total_ms = int(
+                    (datetime.now(timezone.utc) - trigger_timestamp).total_seconds() * 1000
+                )
+                logger.info(
+                    "Pipeline stage=suggestion_committed correlation_id=%s "
+                    "suggestion_id=%s symbol=%s direction=%s confidence=%s "
+                    "consensus_score=%.2f total_pipeline_ms=%d",
+                    correlation_id, suggestion.suggestion_id, suggestion.symbol,
+                    suggestion.signal_direction, suggestion.confidence_level,
+                    float(suggestion.consensus_score), total_ms,
+                    extra={
+                        "pipeline_stage": "suggestion_committed",
+                        "correlation_id": str(correlation_id),
+                        "suggestion_id": str(suggestion.suggestion_id),
+                        "total_pipeline_ms": total_ms,
+                    },
+                )
+
+            return suggestion
+        finally:
+            await self._clear_inflight(correlation_id)
 
     async def on_news_event(
         self,
@@ -350,18 +397,22 @@ class EventCorrelationEngine:
             per_symbol_correlation_id = uuid4()
             per_symbol_started_at = datetime.now(timezone.utc)
 
-            await self._publish_correlation_event(
-                RedisChannels.CORRELATIONS_STARTED,
-                {
-                    "correlation_id": str(per_symbol_correlation_id),
-                    "symbol":         symbol,
-                    "trading_symbol": symbol,
-                    "trigger_type":   "NEWS_EVENT",
-                    "started_at":     per_symbol_started_at.isoformat(),
-                },
+            await self._mark_inflight(
+                per_symbol_correlation_id, symbol, symbol,
+                "NEWS_EVENT", per_symbol_started_at,
             )
-
             try:
+                await self._publish_correlation_event(
+                    RedisChannels.CORRELATIONS_STARTED,
+                    {
+                        "correlation_id": str(per_symbol_correlation_id),
+                        "symbol":         symbol,
+                        "trading_symbol": symbol,
+                        "trigger_type":   "NEWS_EVENT",
+                        "started_at":     per_symbol_started_at.isoformat(),
+                    },
+                )
+
                 scanner_signal, ml_signal, latencies = await asyncio.wait_for(
                     self._gather_signals_pathway2(db, symbol, event),
                     timeout=5.0,
@@ -413,7 +464,8 @@ class EventCorrelationEngine:
                         "rejected_at":      datetime.now(timezone.utc).isoformat(),
                     },
                 )
-                continue
+            finally:
+                await self._clear_inflight(per_symbol_correlation_id)
 
         return suggestions
 

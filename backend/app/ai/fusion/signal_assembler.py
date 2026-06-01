@@ -321,19 +321,23 @@ class SignalAssembler:
             direction_map = {"BUY": 100.0, "SELL": -100.0, "HOLD": 0.0}
             direction = prediction.get("direction_label", "HOLD")
 
+            meta = prediction.get("metadata", {})
             result: dict[str, Any] = {
                 "score": direction_map.get(direction, 0.0),
                 # Raw calibrated probability from EnsemblePredictor (0.0–1.0).
                 # conviction_scale is preserved in the prediction sub-dict for
                 # downstream position-sizing consumers.
                 "confidence": prediction.get("confidence", 0.0),
-                "model": prediction.get("metadata", {}).get("model_version"),
+                "model": (
+                    f"xgb_{meta.get('xgboost_version', '')}+"
+                    f"gru_{meta.get('gru_version', '')}"
+                ).strip("+"),
                 "available": True,
                 "prediction": {
-                    "direction": direction,
+                    "direction":       direction,
                     "conviction_scale": prediction.get("conviction_scale", 0.0),
-                    "entry_price": prediction.get("entry_price"),
-                    "stop_loss": prediction.get("stop_loss"),
+                    "entry_price":     prediction.get("entry_price"),
+                    "stop_loss":       prediction.get("stop_loss"),
                     "targets": [
                         prediction.get("tp1"),
                         prediction.get("tp2"),
@@ -341,6 +345,10 @@ class SignalAssembler:
                     ],
                     "probabilities": prediction.get("probabilities"),
                 },
+                # Per-model breakdown — each constituent model's calibrated view
+                # before the weighted blend. Passed through to JSONB for the
+                # serialiser to surface individually in contributing_factors.
+                "models": prediction.get("models", {}),
             }
 
             if self._ml_cache is not None:
@@ -710,18 +718,22 @@ class SignalAssembler:
             # Re-wrap the prediction dict into the same shape gather_ml_signals returns.
             direction_map = {"BUY": 100.0, "SELL": -100.0, "HOLD": 0.0}
             direction = precomputed_ml.get("direction_label", "HOLD")
+            meta = precomputed_ml.get("metadata", {})
             ml_signals = {
                 "score": direction_map.get(direction, 0.0),
                 # Raw calibrated probability from batch inference (0.0–1.0).
                 # conviction_scale preserved for position-sizing consumers.
                 "confidence": precomputed_ml.get("confidence", 0.0),
-                "model": precomputed_ml.get("metadata", {}).get("model_version"),
+                "model": (
+                    f"xgb_{meta.get('xgboost_version', '')}+"
+                    f"gru_{meta.get('gru_version', '')}"
+                ).strip("+"),
                 "available": True,
                 "prediction": {
-                    "direction": direction,
+                    "direction":       direction,
                     "conviction_scale": precomputed_ml.get("conviction_scale", 0.0),
-                    "entry_price": precomputed_ml.get("entry_price"),
-                    "stop_loss": precomputed_ml.get("stop_loss"),
+                    "entry_price":     precomputed_ml.get("entry_price"),
+                    "stop_loss":       precomputed_ml.get("stop_loss"),
                     "targets": [
                         precomputed_ml.get("tp1"),
                         precomputed_ml.get("tp2"),
@@ -729,6 +741,7 @@ class SignalAssembler:
                     ],
                     "probabilities": precomputed_ml.get("probabilities"),
                 },
+                "models": precomputed_ml.get("models", {}),
             }
         else:
             ml_signals = await self.gather_ml_signals(db, symbol, timeframe)

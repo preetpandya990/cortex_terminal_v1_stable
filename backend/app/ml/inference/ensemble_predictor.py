@@ -144,6 +144,8 @@ class EnsemblePredictor:
         feature_names:    tuple[str, ...] = (),
         xgb_calibrator:   ConfidenceCalibrator | None = None,
         gru_calibrator:   ConfidenceCalibrator | None = None,
+        xgboost_version:  str = "",
+        gru_version:      str = "",
     ):
         """
         Initialize ensemble predictor with pre-loaded backends.
@@ -165,15 +167,19 @@ class EnsemblePredictor:
                               Empty tuple when the manifest is not yet stored (old models).
             xgb_calibrator:   Beta calibrator for XGBoost (None = passthrough).
             gru_calibrator:   Temperature-scaling calibrator for GRU (None = passthrough).
+            xgboost_version:  Registry version string for the XGBoost model artifact.
+            gru_version:      Registry version string for the GRU model artifact.
         """
-        self.xgboost_backend = xgboost_backend
-        self.gru_backend     = gru_backend
-        self.cache           = cache
-        self.n_features      = n_features
-        self.sequence_length = sequence_length
-        self.feature_names   = feature_names
-        self.xgb_calibrator  = xgb_calibrator
-        self.gru_calibrator  = gru_calibrator
+        self.xgboost_backend  = xgboost_backend
+        self.gru_backend      = gru_backend
+        self.cache            = cache
+        self.n_features       = n_features
+        self.sequence_length  = sequence_length
+        self.feature_names    = feature_names
+        self.xgb_calibrator   = xgb_calibrator
+        self.gru_calibrator   = gru_calibrator
+        self.xgboost_version  = xgboost_version
+        self.gru_version      = gru_version
 
         if gru_backend is None:
             # XGBoost-only mode — normalise weights regardless of what was passed in.
@@ -235,16 +241,18 @@ class EnsemblePredictor:
             )
 
         return cls(
-            xgboost_backend = xgb_backend,
-            gru_backend     = gru_backend,
-            cache           = cache,
-            xgboost_weight  = loaded_ensemble.xgboost_weight,
-            gru_weight      = loaded_ensemble.gru_weight,
-            n_features      = loaded_ensemble.n_features,
-            sequence_length = loaded_ensemble.sequence_length,
-            feature_names   = loaded_ensemble.feature_names,
-            xgb_calibrator  = loaded_ensemble.xgb_calibrator,
-            gru_calibrator  = loaded_ensemble.gru_calibrator,
+            xgboost_backend  = xgb_backend,
+            gru_backend      = gru_backend,
+            cache            = cache,
+            xgboost_weight   = loaded_ensemble.xgboost_weight,
+            gru_weight       = loaded_ensemble.gru_weight,
+            n_features       = loaded_ensemble.n_features,
+            sequence_length  = loaded_ensemble.sequence_length,
+            feature_names    = loaded_ensemble.feature_names,
+            xgb_calibrator   = loaded_ensemble.xgb_calibrator,
+            gru_calibrator   = loaded_ensemble.gru_calibrator,
+            xgboost_version  = loaded_ensemble.xgboost_version or "",
+            gru_version      = loaded_ensemble.gru_version or "",
         )
 
     async def predict(
@@ -353,20 +361,111 @@ class EnsemblePredictor:
             logger.error("Inference failed: symbol=%s error=%s", symbol, exc, exc_info=True)
             raise RuntimeError(f"Model inference failed: {exc}") from exc
 
-        # Post-process prediction
+        resolved_vol = volatility or self._estimate_volatility(features_tabular)
+
+        # Per-model breakdown — each model's raw calibrated view before blending.
+        # No HOLD override applied here: the override is an ensemble-level trading
+        # gate, not a per-model observation. Showing raw views gives operators
+        # full signal transparency (e.g. XGBoost: BUY 58%, GRU: BUY 62%).
+        per_model: dict[str, Any] = {
+            "xgboost": {
+                **self._classify_probabilities(xgb_proba, resolved_vol),
+                "weight":  self.xgboost_weight,
+                "version": self.xgboost_version,
+            },
+        }
+        if self.gru_backend is not None:
+            per_model["gru"] = {
+                **self._classify_probabilities(gru_proba, resolved_vol),
+                "weight":  self.gru_weight,
+                "version": self.gru_version,
+            }
+
+        # Ensemble post-processing (with HOLD override and price levels)
         prediction = self._post_process(
             probabilities=ensemble_proba,
             current_price=current_price,
-            volatility=volatility or self._estimate_volatility(features_tabular),
+            volatility=resolved_vol,
             symbol=symbol,
             timeframe=timeframe,
         )
+        prediction["models"] = per_model
 
         # Cache prediction
         if use_cache and self.cache:
             await self._cache_prediction(symbol, timeframe, prediction)
 
         return prediction
+
+    @staticmethod
+    def _safe(v: float) -> float:
+        """Return 0.0 for NaN, preserving all other values."""
+        return 0.0 if (v != v) else v
+
+    @staticmethod
+    def _classify_probabilities(
+        probabilities: np.ndarray,
+        volatility: float,
+    ) -> dict[str, Any]:
+        """
+        Classify calibrated probabilities into direction + confidence metrics.
+
+        Executes steps 1–3 of _post_process (direction, adaptive threshold,
+        conviction scale) without computing price levels or applying the
+        ensemble HOLD override.  Used to surface each constituent model's
+        independent view before the weighted blend is applied.
+
+        Args:
+            probabilities: Calibrated class probabilities — [DOWN, UP] for
+                           binary or [SELL, HOLD, BUY] for 3-class models.
+            volatility:    Annualised historical volatility — used to select
+                           the same regime-adaptive threshold as _post_process
+                           so the per-model conviction scale is comparable.
+
+        Returns:
+            dict with direction, confidence, conviction_scale, and probabilities.
+        """
+        s = EnsemblePredictor._safe
+
+        if len(probabilities) == 2:
+            prob_down, prob_up = float(probabilities[0]), float(probabilities[1])
+            prob_hold = 0.0
+            if prob_up > prob_down:
+                direction_label, confidence = "BUY",  prob_up
+            else:
+                direction_label, confidence = "SELL", prob_down
+        else:
+            idx            = int(np.argmax(probabilities))
+            direction_label = ["SELL", "HOLD", "BUY"][idx]
+            confidence      = float(np.max(probabilities))
+            prob_down       = float(probabilities[0])
+            prob_hold       = float(probabilities[1])
+            prob_up         = float(probabilities[2])
+
+        # Mirror the same volatility-regime threshold used in _post_process.
+        if volatility > 0.35:
+            threshold = 0.70
+        elif volatility < 0.20:
+            threshold = 0.55
+        else:
+            threshold = 0.60
+
+        conviction_scale = max(
+            0.0,
+            (confidence - threshold) / max(1.0 - threshold, 1e-6),
+        )
+
+        return {
+            "direction":       direction_label,
+            "confidence":      s(confidence),
+            "conviction_scale": s(conviction_scale),
+            "threshold":       threshold,
+            "probabilities": {
+                "sell": s(prob_down),
+                "hold": s(prob_hold),
+                "buy":  s(prob_up),
+            },
+        }
 
     def _post_process(
         self,
@@ -468,20 +567,17 @@ class EnsemblePredictor:
             direction       = 1
             direction_label = "HOLD"
 
-        # ── Sanitize NaN values for safe JSON serialization ───────────────────
-        def _safe(v: float) -> float:
-            return 0.0 if (v != v) else v   # NaN check without importing math
-
+        s = self._safe
         return {
-            "direction":       direction,
-            "direction_label": direction_label,
-            "confidence":      _safe(confidence),
-            "conviction_scale": _safe(conviction_scale),
-            "threshold":       threshold,
+            "direction":        direction,
+            "direction_label":  direction_label,
+            "confidence":       s(confidence),
+            "conviction_scale": s(conviction_scale),
+            "threshold":        threshold,
             "probabilities": {
-                "sell": _safe(prob_down),
-                "hold": _safe(prob_hold),
-                "buy":  _safe(prob_up),
+                "sell": s(prob_down),
+                "hold": s(prob_hold),
+                "buy":  s(prob_up),
             },
             "entry_price": float(entry_price),
             "stop_loss":   float(stop_loss),
@@ -490,12 +586,13 @@ class EnsemblePredictor:
             "tp3":         float(tp3),
             "volatility":  float(volatility),
             "metadata": {
-                "symbol":          symbol,
-                "timeframe":       timeframe,
-                "model_version":   "ensemble_v1.0",
-                "xgboost_weight":  self.xgboost_weight,
-                "gru_weight":      self.gru_weight,
-                "predicted_at":    datetime.now(timezone.utc).isoformat(),
+                "symbol":           symbol,
+                "timeframe":        timeframe,
+                "xgboost_version":  self.xgboost_version,
+                "gru_version":      self.gru_version,
+                "xgboost_weight":   self.xgboost_weight,
+                "gru_weight":       self.gru_weight,
+                "predicted_at":     datetime.now(timezone.utc).isoformat(),
             },
         }
 
@@ -629,18 +726,32 @@ class EnsemblePredictor:
         # ── Step 3: post-process and cache ──────────────────────────────────
         for idx, orig_i in enumerate(uncached_indices):
             item = batch[orig_i]
-            symbol = item["symbol"]
-            timeframe = item.get("timeframe", "1d")
+            symbol        = item["symbol"]
+            timeframe     = item.get("timeframe", "1d")
             current_price = item.get("current_price", 0.0)
-            volatility = item.get("volatility") or self._estimate_volatility(item["tabular"])
+            volatility    = item.get("volatility") or self._estimate_volatility(item["tabular"])
 
+            xgb_proba_i = xgb_probas[idx]
             if gru_probas is not None:
-                ensemble_proba = (
-                    self.xgboost_weight * xgb_probas[idx]
-                    + self.gru_weight * gru_probas[idx]
-                )
+                gru_proba_i    = gru_probas[idx]
+                ensemble_proba = self.xgboost_weight * xgb_proba_i + self.gru_weight * gru_proba_i
             else:
-                ensemble_proba = xgb_probas[idx]
+                gru_proba_i    = None
+                ensemble_proba = xgb_proba_i
+
+            per_model: dict[str, Any] = {
+                "xgboost": {
+                    **self._classify_probabilities(xgb_proba_i, volatility),
+                    "weight":  self.xgboost_weight,
+                    "version": self.xgboost_version,
+                },
+            }
+            if gru_proba_i is not None:
+                per_model["gru"] = {
+                    **self._classify_probabilities(gru_proba_i, volatility),
+                    "weight":  self.gru_weight,
+                    "version": self.gru_version,
+                }
 
             prediction = self._post_process(
                 probabilities=ensemble_proba,
@@ -649,6 +760,7 @@ class EnsemblePredictor:
                 symbol=symbol,
                 timeframe=timeframe,
             )
+            prediction["models"] = per_model
 
             if self.cache:
                 await self._cache_prediction(symbol, timeframe, prediction)
@@ -673,13 +785,15 @@ class EnsemblePredictor:
             "tp2":              current_price,
             "tp3":              current_price,
             "volatility":       0.20,
+            "models":           {},
             "metadata": {
-                "symbol":         symbol,
-                "timeframe":      timeframe,
-                "model_version":  "ensemble_v1.0_degraded",
-                "xgboost_weight": 0.0,
-                "gru_weight":     0.0,
-                "predicted_at":   datetime.now(timezone.utc).isoformat(),
+                "symbol":           symbol,
+                "timeframe":        timeframe,
+                "xgboost_version":  "",
+                "gru_version":      "",
+                "xgboost_weight":   0.0,
+                "gru_weight":       0.0,
+                "predicted_at":     datetime.now(timezone.utc).isoformat(),
             },
         }
 

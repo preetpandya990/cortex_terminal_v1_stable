@@ -16,6 +16,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { WS_BASE_URL } from '@/lib/api';
 import type { RunLogEntry, TrainingWsFrame } from '@/types/admin_training';
+import { PIPELINE_STEPS } from '@/types/admin_training';
 
 // ── Fatal close codes ─────────────────────────────────────────────────────────
 const FATAL_CLOSE_CODES = new Set([
@@ -38,6 +39,10 @@ export interface UseTrainingRunStreamReturn {
   events: RunLogEntry[];
   completedSteps: Set<string>;
   currentStep: string | null;
+  /** Actual elapsed seconds for each completed step (step_key → duration_s). */
+  stepDurations: Map<string, number>;
+  /** Server-side start timestamp (ms) for each step that has begun (step_key → Date.parse(ts)). */
+  stepStartTimes: Map<string, number>;
   exitCode: number | null;
   disconnect: () => void;
   reconnect: () => void;
@@ -62,6 +67,8 @@ export function useTrainingRunStream(
   const [events,          setEvents]          = useState<RunLogEntry[]>([]);
   const [completedSteps,  setCompletedSteps]  = useState<Set<string>>(new Set());
   const [currentStep,     setCurrentStep]     = useState<string | null>(null);
+  const [stepDurations,   setStepDurations]   = useState<Map<string, number>>(new Map());
+  const [stepStartTimes,  setStepStartTimes]  = useState<Map<string, number>>(new Map());
   const [exitCode,        setExitCode]        = useState<number | null>(null);
 
   const wsRef             = useRef<WebSocket | null>(null);
@@ -163,26 +170,37 @@ export function useTrainingRunStream(
           const entry = frame.data;
           setEvents(prev => [...prev, entry]);
 
-          if (entry.event === 'step_complete' && entry.step) {
-            setCompletedSteps(prev => {
-              const next = new Set(prev);
-              next.add(entry.step!);
-              return next;
-            });
-          }
-
-          // Infer current step from latest run_event
-          if (entry.event === 'step_complete' && entry.step_num !== undefined) {
-            const next_step_num = entry.step_num + 1;
-            if (next_step_num <= 10) {
-              setCurrentStep(`step_${next_step_num}`);
-            } else {
-              setCurrentStep(null);
-            }
-          }
-
           if (entry.event === 'run_start') {
-            setCurrentStep('step_1_symbols');
+            if (!entry.resumed) {
+              // Fresh run — initialise from step 1.
+              setCurrentStep('step_1_symbols');
+              setStepStartTimes(new Map([['step_1_symbols', Date.parse(entry.ts)]]));
+            }
+            // Resumed run: currentStep and stepStartTimes are already correctly
+            // set by the synthetic step_complete replay frames the backend emits
+            // immediately after the `connected` frame.  Resetting here would
+            // undo that state and revert the progress bar to 0.
+          }
+
+          if (entry.event === 'step_complete' && entry.step) {
+            // Mark step done.
+            setCompletedSteps(prev => { const n = new Set(prev); n.add(entry.step!); return n; });
+
+            // Record actual step duration.
+            if (entry.duration_s !== undefined) {
+              setStepDurations(prev => new Map(prev).set(entry.step!, entry.duration_s!));
+            }
+
+            // Advance currentStep.
+            // step_num is 1-indexed; PIPELINE_STEPS[step_num] is the NEXT step (0-indexed).
+            if (entry.step_num !== undefined) {
+              const nextStep = PIPELINE_STEPS[entry.step_num] ?? null;
+              setCurrentStep(nextStep?.key ?? null);
+              if (nextStep) {
+                // Record the server timestamp at which the next step began.
+                setStepStartTimes(prev => new Map(prev).set(nextStep.key, Date.parse(entry.ts)));
+              }
+            }
           }
         }
       };
@@ -278,6 +296,8 @@ export function useTrainingRunStream(
     events,
     completedSteps,
     currentStep,
+    stepDurations,
+    stepStartTimes,
     exitCode,
     disconnect,
     reconnect,

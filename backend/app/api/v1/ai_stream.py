@@ -41,8 +41,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
 from app.api.deps import get_db
+from app.api.v1.ml_predictions import serialize_prediction_card
 from app.core.redis import get_redis
 from app.core.security import CortexInvalidTokenError, decode_token
+from app.ml.inference.feature_loader import FeatureLoader
 from app.services.pattern_detection_service import PatternDetectionService
 from app.services.sentiment_analysis_service import SentimentAnalysisService
 
@@ -51,6 +53,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ai", tags=["AI Analysis Stream"])
 
 # How often the server re-fetches and emits updated analysis (seconds)
+_PREDICTION_REFRESH_SECS = 60  # 1 minute — price-level sensitive; Redis-cached so cheap
 _PATTERN_REFRESH_SECS = 300    # 5 minutes (matches Redis L2 TTL)
 _SENTIMENT_REFRESH_SECS = 120  # 2 minutes
 _HEARTBEAT_SECS = 15           # Keeps proxy/load-balancer connections alive
@@ -124,8 +127,10 @@ async def analysis_stream(
         )
 
         # Track when we last refreshed each data source
+        last_prediction_refresh = 0.0
         last_pattern_refresh = 0.0
         last_sentiment_refresh = 0.0
+        prediction_data: dict[str, Any] | None = None
         pattern_data: dict[str, Any] | None = None
         sentiment_data: dict[str, Any] | None = None
         heartbeat_counter = 0
@@ -146,6 +151,59 @@ async def analysis_stream(
 
             now = asyncio.get_event_loop().time()
             refresh_needed = False
+
+            # ── Ensemble prediction refresh ────────────────────────────────────
+            if (now - last_prediction_refresh) >= _PREDICTION_REFRESH_SECS:
+                try:
+                    predictor = getattr(request.app.state, "ml_predictor", None)
+                    if predictor is not None:
+                        feat_loader = FeatureLoader(
+                            db=db,
+                            redis=redis,
+                            sequence_length=predictor.sequence_length,
+                            n_features=predictor.n_features,
+                            feature_names=predictor.feature_names,
+                        )
+                        try:
+                            tabular, sequence, current_price, vol = await feat_loader.load_features(
+                                symbol=instrument_key,
+                                timeframe="1d",
+                            )
+                            raw_pred = await predictor.predict(
+                                features_tabular=tabular,
+                                features_sequence=sequence,
+                                symbol=instrument_key,
+                                current_price=current_price,
+                                volatility=vol,
+                                timeframe="1d",
+                                use_cache=True,
+                            )
+                            prediction_data = serialize_prediction_card(raw_pred, timeframe="1d")
+                        except ValueError:
+                            prediction_data = {
+                                "available": False,
+                                "unavailable_reason": "insufficient_data",
+                            }
+                    else:
+                        prediction_data = {
+                            "available": False,
+                            "unavailable_reason": "no_model",
+                        }
+                    last_prediction_refresh = now
+                    refresh_needed = True
+                except Exception as exc:
+                    logger.warning(
+                        "SSE prediction refresh failed: instrument=%s error=%s",
+                        instrument_key, exc,
+                    )
+                    yield ServerSentEvent(
+                        data=json.dumps({
+                            "type": "error",
+                            "component": "prediction",
+                            "message": "Ensemble prediction temporarily unavailable",
+                        }),
+                        event="error",
+                    )
 
             # ── Pattern refresh ────────────────────────────────────────────────
             if (now - last_pattern_refresh) >= _PATTERN_REFRESH_SECS:
@@ -198,10 +256,11 @@ async def analysis_stream(
                     )
 
             # ── Emit combined update if anything changed ───────────────────────
-            if refresh_needed and (pattern_data is not None or sentiment_data is not None):
+            if refresh_needed and (prediction_data is not None or pattern_data is not None or sentiment_data is not None):
                 payload_dict = {
-                    "pattern": pattern_data,
-                    "sentiment": sentiment_data,
+                    "prediction": prediction_data,
+                    "pattern":    pattern_data,
+                    "sentiment":  sentiment_data,
                     "instrument_key": instrument_key,
                     "emitted_at": datetime.now(timezone.utc).isoformat(),
                 }

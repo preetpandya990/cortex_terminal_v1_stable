@@ -163,30 +163,32 @@ class PatternDetectionService:
         lookback_days: int = 365,
     ) -> dict[str, Any]:
         """
-        Scan all ingested timeframes sequentially and return the single strongest
-        pattern found across AUTO_DETECT_TIMEFRAMES.
+        Scan all ingested timeframes sequentially and return the best pattern,
+        giving strict priority to the timeframe ordering defined in
+        AUTO_DETECT_TIMEFRAMES (1D first, then 1hour as fallback).
+
+        Selection criteria (in priority order):
+          1. Timeframe priority — 1D always beats 1hour regardless of confidence.
+             A lower-priority timeframe is only considered when all higher-priority
+             timeframes have zero detected patterns.
+          2. Within a timeframe, the highest TA-Lib confidence value (200 > 100).
+          3. Most recent timestamp to break within-timeframe confidence ties.
+
+        Rationale: TA-Lib only emits confidence=100 or confidence=200, and 1H
+        candles greatly outnumber 1D candles so confidence=200 hits are far more
+        common on 1H.  Using raw confidence as the cross-timeframe comparator
+        causes 1H to almost always override 1D, which conflicts with the
+        expectation that daily signals carry more weight in a swing-trading context.
 
         Sequential (not concurrent) because all timeframes share the same
         SQLAlchemy AsyncSession, which forbids concurrent operations on a single
         connection. Cache hits (L1/L2) are still O(1) so the sequential overhead
         is negligible in the warm path.
 
-        Selection criteria (in priority order):
-          1. Highest TA-Lib confidence value (200 > 100)
-          2. Most recent timestamp (latest signal wins among equal confidence)
-          3. Timeframe list order (1D wins over 1hour when all else is equal)
-
-        Short-circuits as soon as a confidence=200 pattern is found on 1D, since
-        200 is the TA-Lib maximum and 1D is already the preferred timeframe.
-
         Returns the result dict from detect_patterns() for the winning timeframe,
         augmented with a "best_pattern" key, or an empty result when no patterns
         are found on any timeframe.
         """
-        best_result: dict[str, Any] | None = None
-        best_confidence = -1
-        best_timestamp = ""
-
         for tf in AUTO_DETECT_TIMEFRAMES:
             try:
                 res = await self.detect_patterns(instrument_key, tf, lookback_days)
@@ -196,42 +198,28 @@ class PatternDetectionService:
 
             if res.get("error"):
                 continue
+
             patterns = res.get("patterns", [])
             if not patterns:
+                # No patterns on this timeframe — try the next (lower-priority) one.
                 continue
 
-            # Select the highest-confidence pattern on this timeframe; break ties
-            # by recency. patterns is already sorted (timestamp, confidence) desc,
-            # so max() is consistent but makes the selection criterion explicit.
+            # Within the winning timeframe, pick the strongest individual pattern
+            # by TA-Lib confidence then recency.
             top = max(patterns, key=lambda p: (p["confidence"], p["timestamp"]))
+            result = dict(res)
+            result["best_pattern"] = top
+            return result
 
-            # Update best if this pattern has strictly higher confidence, or equal
-            # confidence with a more recent signal.
-            if top["confidence"] > best_confidence or (
-                top["confidence"] == best_confidence and top["timestamp"] > best_timestamp
-            ):
-                best_confidence = top["confidence"]
-                best_timestamp = top["timestamp"]
-                best_result = dict(res)
-                best_result["best_pattern"] = top
-
-            # TA-Lib max confidence is 200. If we've found a 200-confidence pattern
-            # on the highest-priority timeframe (1D, first in the list), no further
-            # timeframe can improve the result.
-            if best_confidence == 200 and tf == AUTO_DETECT_TIMEFRAMES[0]:
-                break
-
-        if best_result is None:
-            return {
-                "patterns": [],
-                "total_detected": 0,
-                "timeframe": "NONE",
-                "analyzed_candles": 0,
-                "best_pattern": None,
-                "cache_tier": "MISS",
-            }
-
-        return best_result
+        # No patterns found on any timeframe.
+        return {
+            "patterns": [],
+            "total_detected": 0,
+            "timeframe": "NONE",
+            "analyzed_candles": 0,
+            "best_pattern": None,
+            "cache_tier": "MISS",
+        }
 
     # ── Internal computation ───────────────────────────────────────────────────
 

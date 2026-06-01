@@ -647,9 +647,9 @@ export interface CorrelationActivityItem {
   symbol:           string;
   trading_symbol:   string | null;
   trigger_type:     'SCANNER_ANOMALY' | 'NEWS_EVENT';
-  status:           'completed' | 'rejected';
+  status:           'processing' | 'completed' | 'rejected';
   started_at:       string;
-  resolved_at:      string;
+  resolved_at?:     string | null;
   direction?:       'BUY' | 'SELL' | null;
   consensus_score?: number | null;
   confidence_level?: 'HIGH' | 'MEDIUM' | 'LOW' | null;
@@ -1229,6 +1229,7 @@ export const adminStrategiesAPI = {
 
 // ML Training Operator Console API
 import type {
+  CheckpointStatus,
   FeedbackBundleInfo,
   FeedbackBundlesListResponse,
   PreflightReport,
@@ -1241,6 +1242,9 @@ import type {
 export const adminTrainingAPI = {
   preflight: (): Promise<PreflightReport> =>
     requestData(api.get<PreflightReport>('/admin/training/preflight'), 'Failed to run preflight'),
+
+  getCheckpointStatus: (): Promise<CheckpointStatus> =>
+    requestData(api.get<CheckpointStatus>('/admin/training/checkpoint'), 'Failed to fetch checkpoint status'),
 
   launch: (body: LaunchRequest): Promise<LaunchResponse> =>
     requestData(api.post<LaunchResponse>('/admin/training/launch', body), 'Failed to launch training'),
@@ -1266,4 +1270,7 @@ export const adminTrainingAPI = {
 
   getLatestFeedbackBundle: (): Promise<FeedbackBundleInfo> =>
     requestData(api.get<FeedbackBundleInfo>('/admin/training/feedback/bundles/latest'), 'Failed to fetch latest bundle'),
+
+  deleteFeedbackBundle: (bundleName: string): Promise<void> =>
+    requestData(api.delete(`/admin/training/feedback/bundles/${encodeURIComponent(bundleName)}`), 'Failed to delete feedback bundle'),
 };

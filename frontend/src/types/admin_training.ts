@@ -25,11 +25,27 @@ export interface TrainingConfigOverride {
   gru_trials?: number | null;
 }
 
+export type LaunchMode = 'fresh' | 'resume';
+
 export interface LaunchRequest {
   reason: string;
+  mode?: LaunchMode;
   override_schedule_warning?: boolean;
   config?: TrainingConfigOverride;
   feedback_weights_path?: string | null;
+}
+
+export interface CheckpointStatus {
+  exists: boolean;
+  resumable: boolean;
+  run_id: string | null;
+  started_at: string | null;
+  model_version: string | null;
+  schema_version: number | null;
+  completed_steps: string[];
+  next_step: string | null;
+  /** Last completed GRU epoch when step_6_gru is the next pending step. */
+  gru_last_epoch: number | null;
 }
 
 export interface FeedbackBundleInfo {
@@ -159,14 +175,36 @@ export interface RunLogEntry {
 export type TrainingTab = 'preflight' | 'launch' | 'live' | 'history' | 'feedback';
 
 export const PIPELINE_STEPS: Array<{ key: string; label: string }> = [
-  { key: 'step_1_symbols',   label: 'Symbol Selection'       },
-  { key: 'step_2_features',  label: 'Feature Computation'    },
-  { key: 'step_3_targets',   label: 'Target Generation'      },
-  { key: 'step_4_splits',    label: 'CV Plan (CPCV)'         },
-  { key: 'step_5_xgboost',   label: 'XGBoost Training'       },
-  { key: 'step_6_gru',       label: 'GRU Training'           },
-  { key: 'step_7_ensemble',  label: 'Ensemble Optimisation'  },
-  { key: 'step_8_evaluation','label': 'Evaluation'           },
-  { key: 'step_9_onnx',      label: 'ONNX Export'            },
-  { key: 'step_10_registry', label: 'Model Registry'         },
+  { key: 'step_1_symbols',    label: 'Symbol Selection'      },
+  { key: 'step_2_features',   label: 'Feature Computation'   },
+  { key: 'step_3_targets',    label: 'Target Generation'     },
+  { key: 'step_4_splits',     label: 'CV Plan (CPCV)'        },
+  { key: 'step_5_xgboost',    label: 'XGBoost Training'      },
+  { key: 'step_6_gru',        label: 'GRU Training'          },
+  { key: 'step_7_ensemble',   label: 'Ensemble Optimisation' },
+  { key: 'step_8_evaluation', label: 'Evaluation'            },
+  { key: 'step_9_onnx',       label: 'ONNX Export'           },
+  { key: 'step_10_registry',  label: 'Model Registry'        },
 ];
+
+/**
+ * Historical median step durations in seconds, derived from production run history.
+ * Used as ETA baselines; actual completed durations override these progressively.
+ * Step 6 (GRU) carries high variance (4h–16h) — treat its ETA as approximate.
+ */
+export const STEP_MEDIAN_DURATIONS_S: Readonly<Record<string, number>> = {
+  step_1_symbols:    116,
+  step_2_features:   1583,
+  step_3_targets:    49,
+  step_4_splits:     1,
+  step_5_xgboost:    3445,
+  step_6_gru:        36467,
+  step_7_ensemble:   112,
+  step_8_evaluation: 307,
+  step_9_onnx:       28,
+  step_10_registry:  1,
+} as const;
+
+/** Sum of all step medians ≈ 11.7 h. Denominator for overall time-weighted ETA. */
+export const TOTAL_EXPECTED_DURATION_S: number =
+  Object.values(STEP_MEDIAN_DURATIONS_S).reduce((a, b) => a + b, 0);

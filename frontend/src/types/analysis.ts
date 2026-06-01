@@ -123,20 +123,79 @@ export interface SentimentAnalysisCard {
   error_message: string | null;
 }
 
-/** Client-side synthesis of pattern + sentiment into a trading recommendation */
+/** Client-side synthesis of ensemble + pattern + sentiment into a trading recommendation */
 export interface PredictionSynthesis {
-  recommendation: 'BUY' | 'SELL' | 'HOLD';
-  confidence: number;           // 0.0 to 1.0
-  ml_insight: string;
-  ai_insight: string;
-  action_text: string;
+  recommendation:  'BUY' | 'SELL' | 'HOLD';
+  confidence:      number;                          // 0.0 to 1.0
   signal_strength: 'strong' | 'moderate' | 'weak';
+  confirmed_count: number;                          // 0–3 sources that confirm direction
+  synthesis_text:  string;                          // generated reasoning paragraph
 }
+
+// ─── ML Ensemble Prediction ───────────────────────────────────────────────────
+
+/** Per-model view before ensemble blending (XGBoost or GRU). */
+export interface ModelPrediction {
+  direction: 'BUY' | 'SELL' | 'HOLD';
+  confidence: number;         // 0–1
+  conviction_scale: number;   // 0–1 (0 = at regime threshold, 1 = max confidence)
+  threshold: number;          // regime-adaptive gate: 0.55 | 0.60 | 0.70
+  probabilities: {
+    buy:  number;
+    sell: number;
+    hold: number;
+  };
+  weight:  number;  // ensemble weight, e.g. 0.75
+  version: string;  // model artefact version string
+}
+
+/** Ensemble prediction when models are loaded and data is available. */
+export interface MLEnsemblePredictionData {
+  available: true;
+  unavailable_reason: null;
+  direction: 'BUY' | 'SELL' | 'HOLD';
+  confidence:       number;  // 0–1
+  conviction_scale: number;  // 0–1
+  threshold:        number;  // regime-adaptive threshold
+  probabilities: {
+    buy:  number;
+    sell: number;
+    hold: number;
+  };
+  entry_price: number;
+  stop_loss:   number;
+  tp1: number;
+  tp2: number;
+  tp3: number;
+  volatility: number;  // annualised
+  models: {
+    xgboost: ModelPrediction | null;
+    gru:     ModelPrediction | null;
+  };
+  xgboost_version: string;
+  gru_version:     string | null;
+  xgboost_weight:  number;
+  gru_weight:      number;
+  timeframe:    string;
+  predicted_at: string;  // ISO 8601
+}
+
+/** Returned when no model is deployed or data is insufficient. */
+export interface MLEnsemblePredictionUnavailable {
+  available: false;
+  unavailable_reason: 'no_model' | 'insufficient_data' | string;
+}
+
+/** Discriminated union — narrow with `if (pred.available)` */
+export type MLEnsemblePrediction =
+  | MLEnsemblePredictionData
+  | MLEnsemblePredictionUnavailable;
 
 /** SSE `analysis_update` event payload */
 export interface AnalysisStreamEvent {
-  pattern: PatternAnalysisCard | null;
-  sentiment: SentimentAnalysisCard | null;
+  prediction: MLEnsemblePrediction | null;
+  pattern:    PatternAnalysisCard   | null;
+  sentiment:  SentimentAnalysisCard | null;
   instrument_key: string;
   emitted_at: string;
 }

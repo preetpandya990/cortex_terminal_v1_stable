@@ -1,0 +1,14 @@
+artifact_uri: file:///home/preet/code/Cortex_Merge_AI-ML/backend/mlruns/305792069560569380/f4c1055fd5304d4fbdc8ed5a0aa043a7/artifacts
+end_time: null
+entry_point_name: ''
+experiment_id: '305792069560569380'
+lifecycle_stage: active
+run_id: f4c1055fd5304d4fbdc8ed5a0aa043a7
+run_name: '20260530_140623'
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1780130185090
+status: 1
+tags: []
+user_id: preet

@@ -24,11 +24,12 @@ import fcntl
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import IO, Any, Dict, List, Optional, Set
 
@@ -42,8 +43,10 @@ from app.core.auth import AdminUserID
 from app.core.limiter import limiter
 from app.schemas.admin_training import (
     ActiveRunResponse,
+    CheckpointStatus,
     FeedbackBundleInfo,
     FeedbackBundlesListResponse,
+    LaunchMode,
     LaunchRequest,
     LaunchResponse,
     PreflightReport,
@@ -108,17 +111,38 @@ _WS_AUTH_TIMEOUT = 10.0
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _probe_gpu() -> ProbeResult:
-    """nvidia-smi free VRAM check. Warn < 2500 MiB, fail < 1500 MiB."""
+    """
+    VRAM availability check with stale-context-aware severity classification.
+
+    Severity logic
+    --------------
+    PASS  — free VRAM ≥ 2500 MiB.
+    WARN  — free VRAM < 2500 MiB but zero active CUDA compute processes.
+              No competing workload; low VRAM is caused by a stale driver
+              context (WSL2/WDDM residue from a previously killed process)
+              or by the display subsystem.  The CUDA runtime reclaims stale
+              allocations on its next context initialisation.  GRU training
+              falls back to CPU automatically if VRAM remains insufficient.
+    WARN  — free VRAM 1500–2499 MiB with active compute processes present.
+    FAIL  — free VRAM < 1500 MiB AND active CUDA compute processes exist.
+              A live GPU workload is actively competing for VRAM; operator
+              action is required before launching.
+
+    Rationale: conflating "stale driver context" with "competing ML job"
+    produces false-positive FAIL gates that block training unnecessarily.
+    The compute-process check is the correct discriminator.
+    """
     try:
-        proc = await asyncio.create_subprocess_exec(
+        # ── 1. VRAM totals ─────────────────────────────────────────────────────
+        vram_proc = await asyncio.create_subprocess_exec(
             "nvidia-smi",
             "--query-gpu=memory.free,memory.total",
             "--format=csv,noheader,nounits",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-        lines = stdout.decode().strip().splitlines()
+        vram_out, _ = await asyncio.wait_for(vram_proc.communicate(), timeout=10.0)
+        lines = vram_out.decode().strip().splitlines()
         if not lines:
             raise RuntimeError("No GPU output")
 
@@ -126,19 +150,62 @@ async def _probe_gpu() -> ProbeResult:
         free_pct = 100.0 * free_mib / total_mib if total_mib else 0.0
         msg = f"{free_mib} MiB free of {total_mib} MiB ({free_pct:.0f}%)"
 
-        if free_mib < 1500:
+        if free_mib >= 2500:
+            return ProbeResult(
+                name="gpu", label="GPU Memory", status=ProbeStatus.PASS,
+                message=msg, value=free_mib,
+            )
+
+        # ── 2. Active CUDA compute processes ───────────────────────────────────
+        # This query excludes the Windows display driver; it only returns
+        # processes with live CUDA contexts (ML jobs, CUDA benchmarks, etc.).
+        compute_proc = await asyncio.create_subprocess_exec(
+            "nvidia-smi",
+            "--query-compute-apps=pid,used_memory",
+            "--format=csv,noheader,nounits",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        compute_out, _ = await asyncio.wait_for(compute_proc.communicate(), timeout=10.0)
+        compute_lines = [
+            ln.strip() for ln in compute_out.decode().strip().splitlines() if ln.strip()
+        ]
+        has_compute_processes = len(compute_lines) > 0
+
+        # ── 3. Severity classification ─────────────────────────────────────────
+        if free_mib < 1500 and has_compute_processes:
             return ProbeResult(
                 name="gpu", label="GPU Memory", status=ProbeStatus.FAIL,
-                message=msg, value=free_mib,
-                remediation="Stop other GPU processes or restart to free VRAM before launching.",
+                message=(
+                    f"Low VRAM with active GPU workload — {msg} "
+                    f"({len(compute_lines)} active CUDA process(es))"
+                ),
+                value=free_mib,
+                remediation=(
+                    "Stop the competing GPU process(es) before launching. "
+                    f"Active processes: {compute_lines[:5]}"
+                ),
             )
-        if free_mib < 2500:
-            return ProbeResult(
-                name="gpu", label="GPU Memory", status=ProbeStatus.WARN,
-                message=f"Low VRAM — {msg}", value=free_mib,
-                remediation="Training will proceed but may be slower than usual. Consider freeing VRAM.",
-            )
-        return ProbeResult(name="gpu", label="GPU Memory", status=ProbeStatus.PASS, message=msg, value=free_mib)
+
+        # Low VRAM but no active compute processes — stale driver context
+        # or display driver.  Not a real blocker; training proceeds normally.
+        context = (
+            "Stale CUDA context (WSL2/WDDM residue from a previous run) — "
+            "the CUDA runtime will reclaim this memory on context initialisation. "
+            "GRU will use CPU fallback if VRAM remains insufficient after reclaim."
+        ) if not has_compute_processes else (
+            "Low VRAM with active compute processes — training may be slower."
+        )
+        return ProbeResult(
+            name="gpu", label="GPU Memory", status=ProbeStatus.WARN,
+            message=f"Low VRAM — {msg}. {context}",
+            value=free_mib,
+            remediation=(
+                "No action required. Training will launch normally; the GRU "
+                "trainer falls back to CPU when GPU VRAM is insufficient. "
+                "XGBoost training is GPU-independent."
+            ),
+        )
 
     except FileNotFoundError:
         return ProbeResult(
@@ -468,15 +535,88 @@ async def get_preflight(
     )
 
 
+@router.get(
+    "/checkpoint",
+    response_model=CheckpointStatus,
+    summary="Get current checkpoint state",
+    description=(
+        "Read the on-disk checkpoint.json and return its state so the Launch form "
+        "can decide whether to default to Resume or Fresh mode.  "
+        "Returns exists=False when no checkpoint is present."
+    ),
+)
+@limiter.limit("60/minute")
+async def get_checkpoint_status(
+    request: Request,
+    user_id: AdminUserID,
+) -> CheckpointStatus:
+    _ALL_STEPS = [
+        "step_1_symbols", "step_2_features", "step_3_targets", "step_4_splits",
+        "step_5_xgboost", "step_6_gru", "step_7_ensemble", "step_8_evaluation",
+        "step_9_onnx", "step_10_registry",
+    ]
+
+    if not _CHECKPOINT_FILE.exists():
+        return CheckpointStatus(exists=False, resumable=False)
+
+    try:
+        state = json.loads(_CHECKPOINT_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return CheckpointStatus(exists=True, resumable=False)
+
+    completed: list[str] = state.get("completed_steps", [])
+    schema_version: int | None = state.get("schema_version")
+    run_id: str | None = state.get("run_id")
+    started_at: str | None = state.get("started_at")
+    model_version: str | None = state.get("config", {}).get("model_version")
+
+    # A checkpoint is resumable when it is incomplete and the schema version
+    # matches what the current code expects (schema drift → incompatible resume).
+    # Import lazily to avoid startup cost.
+    try:
+        from app.ml.training.checkpoint_manager import SCHEMA_VERSION
+        schema_ok = (schema_version == SCHEMA_VERSION)
+    except Exception:
+        schema_ok = True  # unknown version — let the orchestrator decide
+
+    is_complete  = set(completed) >= set(_ALL_STEPS)
+    is_resumable = bool(completed) and not is_complete and schema_ok
+
+    next_step = next((s for s in _ALL_STEPS if s not in completed), None)
+
+    # GRU sub-C state: last completed epoch from training_state.json
+    gru_last_epoch: int | None = None
+    gru_training_state = _CHECKPOINT_DIR / "step_6_gru" / "training_state.json"
+    if next_step == "step_6_gru" and gru_training_state.exists():
+        try:
+            gru_state = json.loads(gru_training_state.read_text())
+            gru_last_epoch = gru_state.get("last_epoch")
+        except Exception:
+            pass
+
+    return CheckpointStatus(
+        exists=True,
+        resumable=is_resumable,
+        run_id=run_id,
+        started_at=started_at,
+        model_version=model_version,
+        schema_version=schema_version,
+        completed_steps=completed,
+        next_step=next_step,
+        gru_last_epoch=gru_last_epoch,
+    )
+
+
 @router.post(
     "/launch",
     response_model=LaunchResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Launch a new training run",
     description=(
-        "Acquire the shared retrain lock and launch the production orchestrator "
-        "as a subprocess with --fresh. Returns immediately with an API-level run_id "
-        "that can be used for WS streaming and cancellation."
+        "Acquire the shared retrain lock and launch the production orchestrator. "
+        "When mode=fresh (default) the orchestrator runs with --fresh, discarding any "
+        "existing checkpoint.  When mode=resume the checkpoint is preserved and the "
+        "orchestrator resumes from the furthest completed step."
     ),
 )
 @limiter.limit("5/minute")
@@ -486,6 +626,34 @@ async def launch_training(
     user_id: AdminUserID,
 ) -> LaunchResponse:
     import uuid
+
+    # ── Guard: resume requires an existing resumable checkpoint ──────────────
+    if body.mode == LaunchMode.RESUME:
+        if not _CHECKPOINT_FILE.exists():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="No checkpoint found to resume. Use mode=fresh to start a new run.",
+            )
+        try:
+            cp_state = json.loads(_CHECKPOINT_FILE.read_text())
+            completed = set(cp_state.get("completed_steps", []))
+            _ALL_STEPS = {
+                "step_1_symbols", "step_2_features", "step_3_targets", "step_4_splits",
+                "step_5_xgboost", "step_6_gru", "step_7_ensemble", "step_8_evaluation",
+                "step_9_onnx", "step_10_registry",
+            }
+            if completed >= _ALL_STEPS:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Checkpoint is already complete. Use mode=fresh to start a new run.",
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Checkpoint file is corrupt or unreadable. Use mode=fresh.",
+            )
 
     # ── Guard: check if schedule warning needs override ───────────────────────
     if not body.override_schedule_warning:
@@ -538,18 +706,23 @@ async def launch_training(
     lock_fh.flush()
 
     # ── Build command ─────────────────────────────────────────────────────────
-    cmd = [sys.executable, "scripts/production_training_orchestrator.py", "--fresh"]
-    if body.feedback_weights_path:
-        # Validate the path exists before handing off to the subprocess.
-        from pathlib import Path as _Path
-        _fb_path = _Path(body.feedback_weights_path)
-        if not _fb_path.exists():
-            lock_fh.close()
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"Feedback bundle not found: {body.feedback_weights_path}",
-            )
-        cmd += ["--feedback-weights", str(_fb_path.resolve())]
+    # FRESH:  --fresh forces a clean slate, discarding any existing checkpoint.
+    # RESUME: no --fresh — the orchestrator detects the checkpoint and resumes.
+    #         config overrides and feedback_weights are intentionally ignored on
+    #         resume; the checkpoint's locked config governs the continued run.
+    cmd = [sys.executable, "scripts/production_training_orchestrator.py"]
+    if body.mode == LaunchMode.FRESH:
+        cmd.append("--fresh")
+        if body.feedback_weights_path:
+            from pathlib import Path as _Path
+            _fb_path = _Path(body.feedback_weights_path)
+            if not _fb_path.exists():
+                lock_fh.close()
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Feedback bundle not found: {body.feedback_weights_path}",
+                )
+            cmd += ["--feedback-weights", str(_fb_path.resolve())]
 
     # ── Prepare per-run log file for stdout/stderr capture ───────────────────
     _LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -605,8 +778,8 @@ async def launch_training(
     )
 
     logger.info(
-        "Training run launched  api_run_id=%s  pid=%d  user_id=%s  reason=%.60s",
-        api_run_id, proc.pid, user_id, body.reason,
+        "Training run launched  api_run_id=%s  pid=%d  user_id=%s  mode=%s  reason=%.60s",
+        api_run_id, proc.pid, user_id, body.mode.value, body.reason,
     )
 
     return LaunchResponse(
@@ -889,6 +1062,11 @@ async def stream_run_log(websocket: WebSocket, run_id: str) -> None:
     await websocket.send_json({"type": "connected", "run_id": run_id})
     logger.info("Training WS connected: run_id=%s uid=%s", run_id, uid)
 
+    # ── Replay checkpoint events for resume runs ──────────────────────────────
+    # Emits synthetic step_complete frames for steps that completed before
+    # launched_at (i.e. in a previous session).  No-op for fresh runs.
+    await _replay_checkpoint_events(websocket, run_id, launched_at)
+
     # ── Stream existing + new events from run_log.ndjson ─────────────────────
     try:
         await _stream_run_log(websocket, run_id, launched_at, record)
@@ -1053,6 +1231,101 @@ def _seek_to_launch(fh: Any, launched_at: datetime) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Checkpoint replay helper
+# ══════════════════════════════════════════════════════════════════════════════
+
+_PIPELINE_STEP_KEYS: list[str] = [
+    "step_1_symbols", "step_2_features", "step_3_targets", "step_4_splits",
+    "step_5_xgboost", "step_6_gru", "step_7_ensemble", "step_8_evaluation",
+    "step_9_onnx", "step_10_registry",
+]
+
+
+async def _replay_checkpoint_events(
+    websocket: WebSocket,
+    api_run_id: str,
+    launched_at: datetime,
+) -> None:
+    """
+    Emit synthetic ``step_complete`` frames for all steps that completed before
+    ``launched_at`` (i.e. in a prior session of the same training run).
+
+    This makes the frontend's progress state immediately correct on resume:
+    ``completedSteps``, ``stepDurations``, and ``currentStep`` are all populated
+    from real checkpoint data without waiting for those events to arrive from the
+    live log stream (they never would — ``_seek_to_launch`` skips them).
+
+    Guard: if the checkpoint's ``started_at`` is within 5 minutes of
+    ``launched_at`` the run is fresh and no replay is needed.  This prevents
+    double-firing events that the live stream will deliver naturally.
+
+    The final completed step's timestamp is set to ``launched_at`` so the
+    frontend correctly computes elapsed time for the *current* (resumed) step
+    from the start of this session rather than from the end of the previous one.
+    """
+    if not _CHECKPOINT_FILE.exists():
+        return
+
+    try:
+        state = json.loads(_CHECKPOINT_FILE.read_text())
+    except Exception:
+        return
+
+    completed: list[str] = state.get("completed_steps", [])
+    if not completed:
+        return
+
+    # Fresh-run guard: skip replay if checkpoint is from this same launch session.
+    started_at_str: str = state.get("started_at", "")
+    try:
+        cp_started = datetime.fromisoformat(started_at_str.replace("Z", "+00:00"))
+        if (launched_at - cp_started).total_seconds() < 300:
+            return
+    except Exception:
+        return  # unparseable started_at — don't risk double-firing
+
+    durations: dict[str, float] = state.get("step_durations_s", {})
+
+    # Reconstruct historical timestamps using cumulative step durations.
+    try:
+        run_start_dt = datetime.fromisoformat(started_at_str.replace("Z", "+00:00"))
+    except Exception:
+        run_start_dt = launched_at
+
+    cumulative_s = 0.0
+    n_completed   = len(completed)
+
+    for idx, step_key in enumerate(_PIPELINE_STEP_KEYS, start=1):
+        if step_key not in completed:
+            break
+
+        duration_s = durations.get(step_key) or 0.0
+        cumulative_s += duration_s
+
+        # Use launched_at for the final completed step so the frontend derives
+        # the resumed step's start time from the current session, not from hours ago.
+        is_last = (idx == n_completed)
+        ts = launched_at if is_last else (run_start_dt + timedelta(seconds=cumulative_s))
+
+        try:
+            await websocket.send_json({"type": "run_event", "data": {
+                "ts":         ts.isoformat(),
+                "event":      "step_complete",
+                "step":       step_key,
+                "step_num":   idx,
+                "duration_s": round(duration_s, 3) if duration_s else None,
+            }})
+        except Exception:
+            logger.warning("Checkpoint replay interrupted at step %s", step_key)
+            return
+
+    logger.info(
+        "Checkpoint replay: %d step_complete events sent  api_run_id=%s",
+        n_completed, api_run_id,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Background monitoring task
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1165,6 +1438,71 @@ async def list_feedback_bundles(
         bundles=[_stats_to_bundle_info(s) for s in bundles],
         total=len(bundles),
     )
+
+
+@router.delete(
+    "/feedback/bundles/{bundle_name}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a feedback weight bundle",
+    description=(
+        "Permanently delete a feedback bundle (parquet + meta sidecar). "
+        "The bundle_name is the filename stem without extension, e.g. "
+        "'feedback_weights_20260528T160638Z'. "
+        "Returns 409 if a training run is currently active."
+    ),
+)
+@limiter.limit("10/minute")
+async def delete_feedback_bundle(
+    bundle_name: str,
+    request: Request,
+    user_id: AdminUserID,
+) -> None:
+    # ── Validate name — reject anything that could escape the bundles directory ──
+    _SAFE_NAME_RE = re.compile(r"^feedback_weights_\d{8}T\d{6}Z$")
+    if not _SAFE_NAME_RE.match(bundle_name):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Invalid bundle name {bundle_name!r}. "
+                "Expected pattern: feedback_weights_YYYYMMDDTHHMMSSz"
+            ),
+        )
+
+    # ── Block if a training run is active — conservative safety guard ──────────
+    async with _registry_lock:
+        active_runs = [r for r in _registry.values() if r.proc.returncode is None]
+
+    if active_runs:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Cannot delete a feedback bundle while a training run is active. "
+                "Wait for the run to complete or cancel it first."
+            ),
+        )
+
+    # ── Delete ─────────────────────────────────────────────────────────────────
+    try:
+        from app.ml.training.feedback_loader import delete_bundle
+
+        deleted = await asyncio.to_thread(delete_bundle, bundle_name)
+        logger.info(
+            "Feedback bundle deleted  name=%s  sha256=%s…  rows=%d  user=%s",
+            bundle_name,
+            deleted.sha256[:12] if deleted.sha256 else "n/a",
+            deleted.row_count,
+            user_id,
+        )
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Feedback bundle not found: {bundle_name}",
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        )
 
 
 @router.get(

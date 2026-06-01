@@ -3,13 +3,14 @@
 /**
  * Analysis Cards Section
  * ======================
- * World-class financial intelligence dashboard displaying three cards:
- *  1. ML Pattern Analysis  — auto-detected candlestick pattern (TA-Lib, 61 patterns)
- *  2. AI Sentiment         — FinBERT ONNX news sentiment from RSS + NSE/BSE feeds
- *  3. Prediction Summary   — client-side synthesis → BUY / SELL / HOLD
+ * Three-card financial intelligence panel:
+ *  1. ML Ensemble Analysis — XGBoost + GRU prediction with per-model breakdown
+ *  2. AI Sentiment         — FinBERT ONNX news sentiment (RSS + NSE/BSE feeds)
+ *  3. Prediction Summary   — synthesis of ensemble + sentiment → BUY/SELL/HOLD
  *
- * Real-time updates via Server-Sent Events (SSE).
- * Falls back to parallel React Query polling if SSE is unavailable.
+ * Data flow: SSE stream is the primary source (real-time, 60s–5min refresh per
+ * component).  React Query polling is the always-active fallback — it activates
+ * immediately on mount and keeps data fresh when SSE is down or retrying.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -21,19 +22,20 @@ import { AISentimentCard } from './AISentimentCard';
 import { PredictionSummaryCard } from './PredictionSummaryCard';
 import type {
   AnalysisStreamEvent,
+  MLEnsemblePrediction,
   PatternAnalysisCard,
   SentimentAnalysisCard,
 } from '@/types/analysis';
 
 interface AnalysisCardsSectionProps {
   instrumentKey: string | null;
-  symbol?: string | null;  // Optional NSE ticker for news filtering (e.g. "RELIANCE")
+  symbol?: string | null;
   className?: string;
 }
 
 // ── SSE connection hook ────────────────────────────────────────────────────────
 
-const SSE_MAX_RETRIES = 3;
+const SSE_MAX_RETRIES   = 3;
 const SSE_RETRY_DELAY_MS = 5_000;
 
 function useAnalysisStream(
@@ -42,14 +44,15 @@ function useAnalysisStream(
   accessToken: string | null,
   enabled: boolean,
 ) {
-  const [patternData, setPatternData] = useState<PatternAnalysisCard | null>(null);
-  const [sentimentData, setSentimentData] = useState<SentimentAnalysisCard | null>(null);
-  const [isConnected, setIsConnected] = useState(false);
-  const [isInitialLoad, setIsInitialLoad] = useState(true);
+  const [predictionData, setPredictionData] = useState<MLEnsemblePrediction | null>(null);
+  const [patternData,    setPatternData]    = useState<PatternAnalysisCard   | null>(null);
+  const [sentimentData,  setSentimentData]  = useState<SentimentAnalysisCard | null>(null);
+  const [isConnected,    setIsConnected]    = useState(false);
+  const [isInitialLoad,  setIsInitialLoad]  = useState(true);
 
-  const esRef = useRef<EventSource | null>(null);
-  const retryCountRef = useRef(0);
-  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const esRef           = useRef<EventSource | null>(null);
+  const retryCountRef   = useRef(0);
+  const retryTimerRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const connect = useCallback(() => {
     if (!enabled || !instrumentKey || !accessToken) return;
@@ -67,37 +70,35 @@ function useAnalysisStream(
     es.addEventListener('analysis_update', (e: MessageEvent) => {
       try {
         const payload: AnalysisStreamEvent = JSON.parse(e.data);
-        if (payload.pattern)   setPatternData(payload.pattern);
-        if (payload.sentiment) setSentimentData(payload.sentiment);
+        if (payload.prediction) setPredictionData(payload.prediction);
+        if (payload.pattern)    setPatternData(payload.pattern);
+        if (payload.sentiment)  setSentimentData(payload.sentiment);
         setIsInitialLoad(false);
         setIsConnected(true);
         retryCountRef.current = 0;
       } catch {
-        // malformed payload — ignore
+        // malformed payload — ignore silently
       }
     });
 
-    es.addEventListener('error', (e: MessageEvent) => {
-      // Non-fatal error from server — keep connection open
-      // (distinct from es.onerror which fires on connection loss)
+    es.addEventListener('error', (_e: MessageEvent) => {
+      // Non-fatal server-side error — keep connection open
     });
 
     es.onerror = () => {
       setIsConnected(false);
       es.close();
-
       if (retryCountRef.current < SSE_MAX_RETRIES) {
         retryCountRef.current += 1;
         retryTimerRef.current = setTimeout(connect, SSE_RETRY_DELAY_MS);
       }
-      // After max retries, fall back to React Query polling (queries are always enabled)
     };
   }, [enabled, instrumentKey, symbol, accessToken]);
 
-  // Connect / reconnect when key deps change
   useEffect(() => {
     if (!enabled) return;
     setIsInitialLoad(true);
+    setPredictionData(null);
     setPatternData(null);
     setSentimentData(null);
     retryCountRef.current = 0;
@@ -109,7 +110,7 @@ function useAnalysisStream(
     };
   }, [connect, enabled, instrumentKey]);
 
-  return { patternData, sentimentData, isConnected, isInitialLoad };
+  return { predictionData, patternData, sentimentData, isConnected, isInitialLoad };
 }
 
 // ── Main component ─────────────────────────────────────────────────────────────
@@ -124,14 +125,30 @@ export function AnalysisCardsSection({
 
   // ── SSE real-time stream ───────────────────────────────────────────────────
   const {
-    patternData: ssePattern,
-    sentimentData: sseSentiment,
-    isConnected: sseConnected,
-    isInitialLoad: sseLoading,
+    predictionData: ssePrediction,
+    patternData:    ssePattern,
+    sentimentData:  sseSentiment,
+    isConnected:    sseConnected,
+    isInitialLoad:  sseLoading,
   } = useAnalysisStream(instrumentKey, symbol, accessToken, canQuery);
 
   // ── Polling fallback (React Query) ─────────────────────────────────────────
-  // Always active — provides data when SSE hasn't fired yet or after max retries.
+  // All three queries run immediately on mount so the cards are never blank
+  // longer than necessary.  refetchInterval is disabled when SSE is healthy.
+
+  const predictionQuery = useQuery({
+    queryKey: ['ml-ensemble-prediction', instrumentKey],
+    queryFn: async () => {
+      const res = await api.get('/ml/prediction-card', {
+        params: { instrument_key: instrumentKey, timeframe: '1d' },
+      });
+      return res.data as MLEnsemblePrediction;
+    },
+    enabled: canQuery,
+    staleTime:       60_000,
+    refetchInterval: sseConnected ? false : 60_000,
+  });
+
   const patternQuery = useQuery({
     queryKey: ['ml-pattern-strongest', instrumentKey],
     queryFn: async () => {
@@ -141,8 +158,8 @@ export function AnalysisCardsSection({
       return res.data as PatternAnalysisCard;
     },
     enabled: canQuery,
-    staleTime: 300_000,   // 5 minutes
-    refetchInterval: sseConnected ? false : 300_000,  // poll only when SSE is down
+    staleTime:       300_000,
+    refetchInterval: sseConnected ? false : 300_000,
   });
 
   const sentimentQuery = useQuery({
@@ -158,27 +175,36 @@ export function AnalysisCardsSection({
       return res.data as SentimentAnalysisCard;
     },
     enabled: canQuery,
-    staleTime: 120_000,   // 2 minutes
+    staleTime:       120_000,
     refetchInterval: sseConnected ? false : 120_000,
   });
 
   if (!instrumentKey) return null;
 
-  // SSE data takes priority; fall back to React Query data
-  const patternData = ssePattern ?? patternQuery.data ?? null;
-  const sentimentData = sseSentiment ?? sentimentQuery.data ?? null;
+  // SSE data takes priority; React Query fills in until SSE fires
+  const predictionData = ssePrediction ?? predictionQuery.data ?? null;
+  const patternData    = ssePattern    ?? patternQuery.data    ?? null;
+  const sentimentData  = sseSentiment  ?? sentimentQuery.data  ?? null;
 
-  const isPatternLoading = sseLoading && !patternData && patternQuery.isLoading;
-  const isSentimentLoading = sseLoading && !sentimentData && sentimentQuery.isLoading;
-  const isSummaryLoading = isPatternLoading && isSentimentLoading;
+  const isPredictionLoading = sseLoading && !predictionData && predictionQuery.isLoading;
+  const isPatternLoading    = sseLoading && !patternData    && patternQuery.isLoading;
+  const isSentimentLoading  = sseLoading && !sentimentData  && sentimentQuery.isLoading;
+  const isSummaryLoading    = isPredictionLoading && isPatternLoading && isSentimentLoading;
 
   return (
     <div className={className}>
       <div className="grid gap-4 md:grid-cols-3">
         <MLPatternCard
           data={patternData}
-          isLoading={isPatternLoading}
-          error={!isPatternLoading && !patternData && !!patternQuery.error}
+          prediction={predictionData}
+          isLoading={isPredictionLoading && isPatternLoading}
+          error={
+            !isPredictionLoading &&
+            !isPatternLoading &&
+            !predictionData &&
+            !patternData &&
+            !!(predictionQuery.error && patternQuery.error)
+          }
         />
 
         <AISentimentCard
@@ -190,6 +216,7 @@ export function AnalysisCardsSection({
         <PredictionSummaryCard
           patternData={patternData}
           sentimentData={sentimentData}
+          prediction={predictionData}
           isLoading={isSummaryLoading}
         />
       </div>

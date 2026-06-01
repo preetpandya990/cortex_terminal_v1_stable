@@ -399,6 +399,41 @@ async def list_suggestions(
         )
 
 
+async def _fetch_inflight_correlations(redis_client) -> list[CorrelationActivityItem]:
+    """
+    Read in-flight correlation checkpoints from Redis.
+
+    The engine writes a sorted-set entry + per-key JSON blob at correlation start
+    and removes both on resolution (or they expire after 60s).  This gives the
+    seed endpoint a live view of what the pipeline is currently processing.
+    Returns [] on any Redis error so callers degrade gracefully.
+    """
+    try:
+        ids = await redis_client.zrangebyscore("cortex:correlations:inflight", "-inf", "+inf")
+        if not ids:
+            return []
+        keys = [f"cortex:correlation:inflight:{cid}" for cid in ids]
+        payloads = await redis_client.mget(*keys)
+        result: list[CorrelationActivityItem] = []
+        for raw in payloads:
+            if raw is None:
+                continue
+            d = json.loads(raw)
+            result.append(CorrelationActivityItem(
+                correlation_id = d["correlation_id"],
+                symbol         = d["symbol"],
+                trading_symbol = d.get("trading_symbol"),
+                trigger_type   = TriggerType(d["trigger_type"]),
+                status         = CorrelationActivityStatus.PROCESSING,
+                started_at     = datetime.fromisoformat(d["started_at"]),
+                resolved_at    = None,
+            ))
+        return result
+    except Exception as exc:
+        logger.debug("Non-fatal: failed to fetch inflight correlations: %s", exc)
+        return []
+
+
 @router.get("/correlations/recent", response_model=CorrelationActivityResponse)
 @limiter.limit("60/minute")
 async def get_recent_correlation_activity(
@@ -408,19 +443,19 @@ async def get_recent_correlation_activity(
     _user_id: str = Depends(get_current_user_id),
 ) -> CorrelationActivityResponse:
     """
-    Return the most recent resolved correlation attempts for the ML Activity feed.
+    Return recent correlation attempts for the ML Activity feed.
 
-    Only completed and rejected items are returned — in-flight correlations have
-    no EventCorrelation record yet.  Completed items are enriched with direction,
-    consensus score, and confidence level from the linked TradeSuggestion row.
-    Symbol is resolved from scanner_output for rejected items.
+    Merges three sources:
+      1. Completed correlations from DB (enriched with suggestion data)
+      2. Rejected correlations from DB (symbol from scanner_output)
+      3. In-flight correlations from Redis (processing, not yet in DB)
+    DB rows win over Redis for the same correlation_id (de-dup by seen set).
     """
     from sqlalchemy.orm import selectinload
+    from app.core.redis import get_redis
 
-    # ── Two targeted queries so completions are never crowded out by a flood
-    # of pre-fix rejected rows that have no scanner_output. ──────────────────
+    # ── Two targeted DB queries ───────────────────────────────────────────────
 
-    # 1. Completed correlations — always have a linked suggestion (symbol resolvable).
     completed_stmt = (
         select(EventCorrelation)
         .options(selectinload(EventCorrelation.suggestion))
@@ -429,7 +464,6 @@ async def get_recent_correlation_activity(
         .limit(limit)
     )
 
-    # 2. Rejected correlations that have scanner_output stored (post-fix rows).
     rejected_stmt = (
         select(EventCorrelation)
         .where(
@@ -440,9 +474,9 @@ async def get_recent_correlation_activity(
         .limit(limit)
     )
 
-    completed_rows, rejected_rows = await asyncio.gather(
-        db.execute(completed_stmt),
-        db.execute(rejected_stmt),
+    (completed_rows, rejected_rows), inflight_items = await asyncio.gather(
+        asyncio.gather(db.execute(completed_stmt), db.execute(rejected_stmt)),
+        _fetch_inflight_correlations(get_redis()),
     )
     correlations = [
         *completed_rows.scalars().all(),
@@ -494,6 +528,7 @@ async def get_recent_correlation_activity(
             rejection_reason = rejection_reason,
         )
 
+    # DB rows first so the seen-set de-dup prefers resolved state over in-flight.
     seen: set[str] = set()
     items: list[CorrelationActivityItem] = []
     for corr in sorted(correlations, key=lambda c: c.trigger_timestamp, reverse=True):
@@ -504,8 +539,17 @@ async def get_recent_correlation_activity(
         item = _build_item(corr)
         if item is not None:
             items.append(item)
-        if len(items) >= limit:
-            break
+
+    # Append in-flight items — skip any already resolved (seen by DB queries above).
+    for inflight in inflight_items:
+        cid = str(inflight.correlation_id)
+        if cid not in seen:
+            seen.add(cid)
+            items.append(inflight)
+
+    # Sort combined list newest-first and enforce limit.
+    items.sort(key=lambda i: i.started_at, reverse=True)
+    items = items[:limit]
 
     return CorrelationActivityResponse(items=items, total=len(items))
 

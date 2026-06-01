@@ -36,6 +36,7 @@ import argparse
 import asyncio
 import gc
 import logging
+import re
 import sys
 import time
 import traceback
@@ -58,8 +59,11 @@ from sqlalchemy import text
 from app.core.config import get_settings
 from app.ml.features.symbol_selector import (
     get_top_liquid_symbols,
+    get_recently_listed_symbols,
     analyze_symbol_data_quality,
     MIN_BARS_FOR_TRAINING,
+    MIN_BARS_SHORT_HISTORY,
+    MIN_IPO_QUARANTINE_DAYS,
     MIN_RELATIVE_COMPLETENESS_PCT,
 )
 from app.ml.features.feature_pipeline import prepare_training_data  # noqa: F401
@@ -144,14 +148,20 @@ class TrainingConfig:
     # Ensemble — A5 net-DSR weighting always operates on net Deflated Sharpe
     # (the promotion bar) — see EnsembleTrainer.optimize_weights_on_oof.
     min_confidence_threshold: float = 0.4
+    # ── Short-history track (recently listed symbols) ─────────────────────────
+    # When enabled, a second selection pass adds symbols with 252–729 bars that
+    # have cleared the IPO quarantine window.  These contribute only to the most
+    # recent CPCV folds; the Panel Purged CV handles unbalanced panels naturally.
+    # See symbol_selector.py for the full design rationale.
+    include_short_history_symbols: bool = True
+    min_bars_short_history: int = MIN_BARS_SHORT_HISTORY      # 252 ≈ 1 year
+    ipo_quarantine_days: int = MIN_IPO_QUARANTINE_DAYS         # 180 calendar days
+
     # A7 — minimum fraction of requested symbols that must survive the
-    # data-quality audit before training is allowed to proceed.  At n_symbols
-    # = 2557 (full NSE universe), only ~1679 currently pass both gates (730+
-    # bars + 95% relative completeness); the remaining ~880 are genuine new
-    # listings (insufficient history) or have data gaps from Upstox ingestion.
+    # data-quality audit before training is allowed to proceed.  Coverage now
+    # counts both established and short-history symbols against n_symbols.
     # 0.60 admits today's universe while still catching a future severe drop
-    # (e.g. 40% would indicate a broken data pipeline). Raise once Upstox
-    # backfill / listing churn settles.
+    # (e.g. 40% would indicate a broken data pipeline).
     min_symbol_coverage: float = 0.60
 
     # Coverage gate on the GRU-OOF ∩ XGBoost-OOF join. Below this, A5 fails
@@ -163,7 +173,10 @@ class TrainingConfig:
     # one member is near-random.
     a5_l2_prior: float = 0.10
 
-    # Model versioning
+    # Bootstrap seed — used only when the registry is empty (first ever run).
+    # Every subsequent fresh run auto-increments the patch component by querying
+    # the registry for the highest registered semver.  Resume runs always read
+    # the version locked in the existing checkpoint.json and ignore this value.
     model_version: str = "1.1.0"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -289,6 +302,10 @@ class ProductionTrainingOrchestrator:
         # Injected into registry metrics so the A6 QualityGate coverage gate
         # (gate 4) becomes a true hard gate instead of a provisional skip.
         self._symbol_coverage: Optional[float] = None
+        # Per-tier symbol counts — set by _select_symbols_and_assess_quality;
+        # injected into MLflow step-10 metrics for observability.
+        self._n_symbols_established:   int = 0
+        self._n_symbols_short_history: int = 0
 
         # Models
         self.xgboost_trainer: Optional[XGBoostTrainer] = None
@@ -453,8 +470,10 @@ class ProductionTrainingOrchestrator:
                 accretive = m.get("ensemble_accretive")
                 if accretive is not None:
                     metrics[f"{prefix}.ensemble_accretive"] = 1.0 if accretive else 0.0
-            metrics["data.n_symbols"]      = float(len(self.symbols))
-            metrics["data.total_samples"]  = float(self._calculate_total_samples())
+            metrics["data.n_symbols"]              = float(len(self.symbols))
+            metrics["data.n_symbols_established"]  = float(self._n_symbols_established)
+            metrics["data.n_symbols_short_history"]= float(self._n_symbols_short_history)
+            metrics["data.total_samples"]          = float(self._calculate_total_samples())
             if self._symbol_coverage is not None:
                 metrics["data.symbol_coverage"] = float(self._symbol_coverage)
             if metrics:
@@ -562,9 +581,18 @@ class ProductionTrainingOrchestrator:
                 # The coverage gate already fired on the original fresh run, so
                 # this re-derivation is for observability and metric surfacing only.
                 self._symbol_coverage = len(self.symbols) / max(self.config.n_symbols, 1)
+                # Per-tier counts are not separately persisted in the checkpoint.
+                # On resume, approximate: assume all are established (conservative).
+                # Accurate counts are only available on a fresh run.
+                self._n_symbols_established   = len(self.symbols)
+                self._n_symbols_short_history = 0
                 logger.info(
-                    "→ Resuming: step_1 skipped  (%d symbols from checkpoint  coverage=%.1f%%)",
-                    len(self.symbols), self._symbol_coverage * 100,
+                    "→ Resuming: step_1 skipped  "
+                    "(%d symbols from checkpoint  established=%d  short_history=%d  coverage=%.1f%%)",
+                    len(self.symbols),
+                    self._n_symbols_established,
+                    self._n_symbols_short_history,
+                    self._symbol_coverage * 100,
                 )
             else:
                 t0 = time.monotonic()
@@ -572,7 +600,11 @@ class ProductionTrainingOrchestrator:
                 cp.save_symbols(self.symbols)
                 _dur1 = time.monotonic() - t0
                 cp.mark_done("step_1_symbols", _dur1)
-                self._log_mlflow_step_done("step_1_symbols", _dur1, {"n_symbols": len(self.symbols)})
+                self._log_mlflow_step_done("step_1_symbols", _dur1, {
+                    "n_symbols":               len(self.symbols),
+                    "n_symbols_established":   self._n_symbols_established,
+                    "n_symbols_short_history": self._n_symbols_short_history,
+                })
 
             # ── Step 2 ────────────────────────────────────────────────────────
             logger.info("\n" + "=" * 100)
@@ -1020,92 +1052,211 @@ class ProductionTrainingOrchestrator:
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _select_symbols_and_assess_quality(self) -> None:
+        """
+        Two-pass symbol selection with independent quality audits per track.
+
+        Pass 1 — Established track (≥ MIN_BARS_FOR_TRAINING = 730 bars):
+            Selects up to n_symbols liquid symbols with sufficient history to
+            fill at least one full initial training fold in the CPCV.
+
+        Pass 2 — Short-history track (252–729 bars, ≥ ipo_quarantine_days):
+            Selects recently listed symbols that have cleared the post-IPO
+            stabilisation window.  Enabled by config.include_short_history_symbols.
+            These symbols contribute only to the most recent CPCV folds; the
+            Panel Purged CV handles unbalanced panels naturally.
+
+        Both passes apply the same relative-completeness gate (≥ 95%) and the
+        same data-integrity checks (zero prices, invalid OHLC, zero-volume bars).
+        The short-history pass uses min_bars_override=config.min_bars_short_history
+        (252) so the insufficient_history gate reflects the correct floor.
+
+        Established symbols always precede short-history symbols in self.symbols
+        so that if a hard cap is needed they are prioritised.
+        """
         logger.info(
-            "Selecting top %d liquid symbols  "
-            "(min_bars=%d  min_relative_completeness=%.0f%%)",
+            "Selecting symbols  (n_symbols=%d  "
+            "established_min_bars=%d  completeness=%.0f%%  "
+            "short_history=%s  short_history_min_bars=%d  ipo_quarantine=%d days)",
             self.config.n_symbols,
             MIN_BARS_FOR_TRAINING,
             MIN_RELATIVE_COMPLETENESS_PCT,
+            self.config.include_short_history_symbols,
+            self.config.min_bars_short_history,
+            self.config.ipo_quarantine_days,
         )
 
-        # DB-level pre-filter: only symbols with ≥ MIN_BARS_FOR_TRAINING candles
-        # in the lookback window are returned.
-        self.symbols = await get_top_liquid_symbols(
+        lookback_days = self.config.lookback_years * 365
+
+        # ── Pass 1: Established track ─────────────────────────────────────────
+        logger.info("─ Pass 1/2: Established track (≥ %d bars) ─", MIN_BARS_FOR_TRAINING)
+
+        established_candidates = await get_top_liquid_symbols(
             db=self.db,
             n=self.config.n_symbols,
             timeframe='1D',
-            lookback_days=self.config.lookback_years * 365,
+            lookback_days=lookback_days,
             min_data_points=MIN_BARS_FOR_TRAINING,
         )
 
-        if not self.symbols:
-            raise ValueError("No symbols selected. Check database data availability.")
+        if not established_candidates:
+            raise ValueError("No established symbols found. Check database data availability.")
 
-        logger.info("✓ Pre-selected %d symbols  top_10=%s", len(self.symbols), self.symbols[:10])
+        logger.info(
+            "✓ Established candidates: %d  top_10=%s",
+            len(established_candidates), established_candidates[:10],
+        )
 
-        # Per-symbol quality audit: relative completeness + data-integrity gates
-        logger.info("Auditing data quality for %d symbols...", len(self.symbols))
+        established_qualified = await self._audit_symbol_quality(
+            candidates=established_candidates,
+            track_label="established",
+            lookback_days=lookback_days,
+            min_bars_override=None,          # uses MIN_BARS_FOR_TRAINING (730)
+        )
+
+        # ── Pass 2: Short-history track ───────────────────────────────────────
+        short_history_qualified: list[str] = []
+
+        if self.config.include_short_history_symbols:
+            logger.info(
+                "─ Pass 2/2: Short-history track (%d–%d bars  ipo_quarantine=%d days) ─",
+                self.config.min_bars_short_history,
+                MIN_BARS_FOR_TRAINING - 1,
+                self.config.ipo_quarantine_days,
+            )
+
+            # Exclude symbols already qualified in Pass 1 to prevent duplication.
+            established_set: set[str] = set(established_qualified)
+
+            short_history_candidates = await get_recently_listed_symbols(
+                db=self.db,
+                n=self.config.n_symbols,
+                timeframe='1D',
+                lookback_days=lookback_days,
+                min_bars=self.config.min_bars_short_history,
+                max_bars=MIN_BARS_FOR_TRAINING - 1,
+                ipo_quarantine_days=self.config.ipo_quarantine_days,
+            )
+
+            # Filter out any accidental overlap (should not occur given the bar
+            # range [min_bars, MIN_BARS_FOR_TRAINING-1] is disjoint from Pass 1,
+            # but guard defensively).
+            short_history_candidates = [
+                s for s in short_history_candidates if s not in established_set
+            ]
+
+            if short_history_candidates:
+                short_history_qualified = await self._audit_symbol_quality(
+                    candidates=short_history_candidates,
+                    track_label="short-history",
+                    lookback_days=lookback_days,
+                    min_bars_override=self.config.min_bars_short_history,
+                )
+            else:
+                logger.info("  Short-history track: no candidates found.")
+        else:
+            logger.info("─ Pass 2/2: Short-history track DISABLED (include_short_history_symbols=False)")
+
+        # ── Merge: established first, then short-history ──────────────────────
+        self.symbols = established_qualified + short_history_qualified
+
+        logger.info(
+            "✓ Symbol selection complete  "
+            "established=%d  short_history=%d  total=%d",
+            len(established_qualified),
+            len(short_history_qualified),
+            len(self.symbols),
+        )
+
+        # Store per-tier counts for MLflow metrics (accessed in step-10 logger).
+        self._n_symbols_established   = len(established_qualified)
+        self._n_symbols_short_history = len(short_history_qualified)
+
+        self._assert_symbol_coverage(usable=len(self.symbols), requested=self.config.n_symbols)
+
+    async def _audit_symbol_quality(
+        self,
+        candidates: list[str],
+        track_label: str,
+        lookback_days: int,
+        min_bars_override: int | None,
+    ) -> list[str]:
+        """
+        Run the per-symbol quality audit for one selection track.
+
+        Returns the list of symbols that passed all gates, in their original
+        volume-descending order.  Logs disqualifications and audit errors.
+        """
+        logger.info(
+            "  Auditing quality for %d %s-track candidates  (min_bars=%s)",
+            len(candidates), track_label,
+            min_bars_override if min_bars_override is not None else MIN_BARS_FOR_TRAINING,
+        )
+
         quality_reports: list[dict] = []
-        analysis_failed: list[str] = []
+        audit_errors:    list[str]  = []
+        working_candidates = list(candidates)  # copy — we mutate on error
 
-        for symbol in list(self.symbols):  # iterate a copy so we can mutate self.symbols
+        for symbol in list(working_candidates):
             try:
                 report = await analyze_symbol_data_quality(
                     symbol=symbol,
                     timeframe='1D',
-                    lookback_days=self.config.lookback_years * 365,
+                    lookback_days=lookback_days,
                     db=self.db,
+                    min_bars_override=min_bars_override,
                 )
                 quality_reports.append(report)
             except Exception as exc:
-                logger.warning("  Quality audit failed for %s: %s", symbol, exc)
-                analysis_failed.append(symbol)
-                self.symbols.remove(symbol)
+                logger.warning("  Audit error [%s] %s: %s", track_label, symbol, exc)
+                audit_errors.append(symbol)
+                working_candidates.remove(symbol)
 
-        if analysis_failed:
+        if audit_errors:
             logger.warning(
-                "  Removed %d symbol(s) due to audit errors: %s",
-                len(analysis_failed), analysis_failed[:20],
+                "  Removed %d %s-track symbol(s) due to audit errors  (first 20): %s",
+                len(audit_errors), track_label, audit_errors[:20],
             )
 
-        if len(self.symbols) < 10:
-            raise ValueError(f"Insufficient symbols after quality audit: {len(self.symbols)}")
+        if not working_candidates:
+            logger.warning("  %s track: all candidates removed during audit.", track_label.capitalize())
+            return []
 
-        # Apply quality gates using the is_qualified flag (combines all sub-gates)
-        if quality_reports:
-            qualified_pairs  = [(s, r) for s, r in zip(self.symbols, quality_reports) if r["is_qualified"]]
-            disqualified     = [(s, r) for s, r in zip(self.symbols, quality_reports) if not r["is_qualified"]]
+        qualified_pairs  = [
+            (s, r) for s, r in zip(working_candidates, quality_reports)
+            if r.get("is_qualified")
+        ]
+        disqualified = [
+            (s, r) for s, r in zip(working_candidates, quality_reports)
+            if not r.get("is_qualified")
+        ]
 
-            if disqualified:
+        if disqualified:
+            logger.warning(
+                "  [%s] Disqualified %d symbol(s)  (first 20 shown):",
+                track_label, len(disqualified),
+            )
+            for sym, rep in disqualified[:20]:
                 logger.warning(
-                    "  Disqualified %d symbol(s)  (first 20 shown):",
-                    len(disqualified),
+                    "    ✗ %s — %s  (bars=%d  completeness=%.1f%%)",
+                    sym,
+                    rep.get("disqualification_reason", "unknown"),
+                    rep.get("data_points", 0),
+                    rep.get("completeness_pct", 0.0),
                 )
-                for sym, rep in disqualified[:20]:
-                    logger.warning(
-                        "    ✗ %s — %s  (bars=%d  completeness=%.1f%%)",
-                        sym,
-                        rep.get("disqualification_reason", "unknown"),
-                        rep.get("actual_bars", 0),
-                        rep.get("completeness_pct", 0.0),
-                    )
 
+        if qualified_pairs:
             completeness_vals = [r["completeness_pct"] for _, r in qualified_pairs]
             logger.info(
-                "✓ Quality gate passed  qualified=%d  disqualified=%d  "
-                "avg_completeness=%.1f%%  min_completeness=%.1f%%  "
-                "method=%s",
+                "  ✓ [%s] Quality gate  qualified=%d  disqualified=%d  "
+                "avg_completeness=%.1f%%  min_completeness=%.1f%%",
+                track_label,
                 len(qualified_pairs),
                 len(disqualified),
-                float(np.mean(completeness_vals)) if completeness_vals else 0.0,
-                float(np.min(completeness_vals))  if completeness_vals else 0.0,
-                quality_reports[0].get("completeness_method", "relative_to_own_listing_period"),
+                float(np.mean(completeness_vals)),
+                float(np.min(completeness_vals)),
             )
 
-            self.symbols = [s for s, _ in qualified_pairs][: self.config.n_symbols]
-
-        logger.info("✓ Final symbol count: %d", len(self.symbols))
-        self._assert_symbol_coverage(usable=len(self.symbols), requested=self.config.n_symbols)
+        return [s for s, _ in qualified_pairs]
 
     async def _compute_and_validate_features(self) -> None:
         end_date   = datetime.now()
@@ -3014,6 +3165,101 @@ class ProductionTrainingOrchestrator:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Version resolution
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Matches the semver prefix of any stored model_version string.
+# Registry stores values like "1.1.0_xgboost" — we parse the leading semver
+# and discard the model-type suffix.
+_SEMVER_PREFIX_RE: re.Pattern[str] = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
+
+
+async def _resolve_model_version(
+    db_session: AsyncSession,
+    output_dir: Path,
+    fresh: bool,
+) -> str:
+    """Return the model version that this training run should use.
+
+    Resume path (``fresh=False`` with an existing checkpoint):
+        Read the version locked in ``checkpoint.json``.  This guarantees the
+        value matches what ``CheckpointManager._enforce_compat`` expects — a
+        mismatch would abort the run as a model-affecting config change.
+
+    Fresh path (``fresh=True`` or no checkpoint on disk):
+        Query ``ml_model_metadata`` for every registered ``model_version``,
+        parse the semver prefix, find the maximum, and bump the patch component.
+        Falls back gracefully to ``TrainingConfig.model_version`` (the bootstrap
+        seed) when the registry is empty (first ever run) or if the DB query
+        fails for any reason.
+
+    Args:
+        db_session:  Live async SQLAlchemy session (read-only use here).
+        output_dir:  The orchestrator's output directory; ``checkpoints/`` is
+                     expected directly inside it.
+        fresh:       Mirrors the ``--fresh`` CLI flag / auto-detection result.
+
+    Returns:
+        A semver string, e.g. ``"1.1.2"``.
+    """
+    if not fresh:
+        cp_file = output_dir / "checkpoints" / "checkpoint.json"
+        if cp_file.exists():
+            try:
+                with open(cp_file) as fh:
+                    state = json.load(fh)
+                version: str | None = state.get("config", {}).get("model_version")
+                if version:
+                    logger.info(
+                        "Version resolution — resume: locked version=%s (from %s)",
+                        version, cp_file,
+                    )
+                    return version
+            except (json.JSONDecodeError, KeyError, OSError) as exc:
+                logger.warning(
+                    "Version resolution — could not read checkpoint (non-fatal, "
+                    "will query registry instead): %s", exc,
+                )
+
+    # Fresh run (or checkpoint unreadable) — derive the next version from the DB.
+    seed = TrainingConfig().model_version
+    try:
+        result = await db_session.execute(
+            text("SELECT model_version FROM ml_model_metadata")
+        )
+        rows: list[str] = [r for r in result.scalars().all() if r]
+
+        highest: tuple[int, int, int] = (0, 0, 0)
+        for raw in rows:
+            m = _SEMVER_PREFIX_RE.match(raw)
+            if m:
+                candidate = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                if candidate > highest:
+                    highest = candidate
+
+        if highest == (0, 0, 0):
+            logger.info(
+                "Version resolution — registry empty: using bootstrap seed %s", seed,
+            )
+            return seed
+
+        major, minor, patch = highest
+        next_version = f"{major}.{minor}.{patch + 1}"
+        logger.info(
+            "Version resolution — fresh run: %d.%d.%d → %s",
+            major, minor, patch, next_version,
+        )
+        return next_version
+
+    except Exception as exc:
+        logger.warning(
+            "Version resolution — DB query failed (%s), falling back to seed %s",
+            exc, seed,
+        )
+        return seed
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Entry point
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -3066,12 +3312,16 @@ async def main() -> None:
     )
     async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
+    async with async_session() as session:
+        model_version = await _resolve_model_version(session, output_dir, fresh)
+
     config = TrainingConfig(
         n_symbols=2551,
         lookback_years=10,
         xgboost_trials=100,
         gru_trials=5,
         gru_n_symbols=200,
+        model_version=model_version,
     )
 
     async with async_session() as session:

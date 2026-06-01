@@ -6,6 +6,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { useAuth } from "@/contexts/AuthContext";
 import { adminTrainingAPI, apiErrorMessage } from "@/lib/api";
 import type {
+  CheckpointStatus,
   LaunchRequest,
   PreflightReport,
   RunSummary,
@@ -22,13 +23,14 @@ export default function MLTrainingPage() {
   const { accessToken }             = useAuth();
   const { success: toastOk, error: toastErr } = useToast();
 
-  const [activeTab,        setActiveTab]        = useState<TrainingTab>("preflight");
-  const [preflight,        setPreflight]        = useState<PreflightReport | null>(null);
-  const [preflightLoading, setPreflightLoading] = useState(false);
-  const [runs,             setRuns]             = useState<RunSummary[]>([]);
-  const [runsLoading,      setRunsLoading]      = useState(false);
-  const [isLaunching,      setIsLaunching]      = useState(false);
-  const [isCancelling,     setIsCancelling]     = useState(false);
+  const [activeTab,          setActiveTab]          = useState<TrainingTab>("preflight");
+  const [preflight,          setPreflight]          = useState<PreflightReport | null>(null);
+  const [preflightLoading,   setPreflightLoading]   = useState(false);
+  const [checkpoint,         setCheckpoint]         = useState<CheckpointStatus | null>(null);
+  const [runs,               setRuns]               = useState<RunSummary[]>([]);
+  const [runsLoading,        setRunsLoading]        = useState(false);
+  const [isLaunching,        setIsLaunching]        = useState(false);
+  const [isCancelling,       setIsCancelling]       = useState(false);
 
   // Active run tracking
   const [activeRunId,            setActiveRunId]           = useState<string | null>(null);
@@ -41,6 +43,8 @@ export default function MLTrainingPage() {
     events,
     completedSteps,
     currentStep,
+    stepDurations,
+    stepStartTimes,
     exitCode,
     disconnect: wsDisconnect,
   } = useTrainingRunStream(activeRunId, accessToken, !!activeRunId);
@@ -71,6 +75,16 @@ export default function MLTrainingPage() {
     }
   }, []);
 
+  // ── Checkpoint status ─────────────────────────────────────────────────────
+  const fetchCheckpoint = useCallback(async () => {
+    try {
+      const cp = await adminTrainingAPI.getCheckpointStatus();
+      setCheckpoint(cp);
+    } catch {
+      // Non-fatal — form will default to fresh mode
+    }
+  }, []);
+
   // ── Check for existing active run on mount ────────────────────────────────
   useEffect(() => {
     adminTrainingAPI.getActiveRun().then(res => {
@@ -80,12 +94,15 @@ export default function MLTrainingPage() {
       }
     }).catch(() => {});
     fetchPreflight();
+    fetchCheckpoint();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Tab change side effects ────────────────────────────────────────────────
   useEffect(() => {
     if (activeTab === "preflight") fetchPreflight();
     if (activeTab === "history")   fetchRuns();
+    // Re-read checkpoint state when navigating to launch tab
+    if (activeTab === "launch")    fetchCheckpoint();
   }, [activeTab]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Launch ────────────────────────────────────────────────────────────────
@@ -198,6 +215,7 @@ export default function MLTrainingPage() {
           <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
             <LaunchForm
               preflight={preflight}
+              checkpoint={checkpoint}
               isLaunching={isLaunching}
               onLaunch={handleLaunch}
               activeFeedbackBundlePath={activeFeedbackBundlePath}
@@ -213,6 +231,8 @@ export default function MLTrainingPage() {
               events={events}
               completedSteps={completedSteps}
               currentStep={currentStep}
+              stepDurations={stepDurations}
+              stepStartTimes={stepStartTimes}
               exitCode={exitCode}
               onCancel={handleCancel}
               isCancelling={isCancelling}
