@@ -298,46 +298,27 @@ wsl.localhost/
 # ============================================
 # Local WIP / Untracked (Excluded From Commits)
 # ============================================
+# Temporary task-completion and planning docs (not source code)
 BACKEND_RESTART_SUCCESS.md
 PURE_ASGI_MIDDLEWARE_IMPLEMENTATION.md
 TASK_3.8_COMPLETION.md
 TASK_3_PURE_ASGI_COMPLETION.md
 WINDOWS_WSL_NETWORKING_SOLUTION.md
 issues_found.md
+# One-off debug/verification scripts (not application source)
 test_cors_config.py
 verify_cors.py
-backend/CONFIGURATION.md
-backend/alembic.ini
-backend/alembic/
-backend/app/api/v1/ml.py
-backend/app/middleware/
-backend/app/ml/
-backend/app/models/ml_data.py
-backend/app/schemas/ml.py
-backend/app/services/ml_*.py
 backend/fix_test.py
-backend/run_ml_backfill.py
-backend/run_ml_prune.py
-backend/run_ml_training.py
 backend/test_middleware_quick.py
-backend/tests/
-docs/
+# Temporary frontend task docs
 frontend/HEALTH_CHECK_INTEGRATION.md
 frontend/TASK_3.6_COMPLETION.md
 frontend/TASK_3.7_COMPLETION.md
-frontend/src/components/HealthCheckWrapper.tsx
 frontend/src/lib/AXIOS_INTERCEPTORS.md
 frontend/src/lib/ERROR_HANDLER.md
 frontend/src/lib/ERROR_HANDLER_INTEGRATION.md
 frontend/src/lib/HEALTH_CHECK.md
 frontend/src/lib/HEALTH_CHECK_IMPLEMENTATION.md
-frontend/src/lib/errorHandler.example.tsx
-frontend/src/lib/errorHandler.test.ts
-frontend/src/lib/errorHandler.ts
-frontend/src/lib/healthCheck.example.tsx
-frontend/src/lib/healthCheck.manual-test.ts
-frontend/src/lib/healthCheck.test.ts
-frontend/src/lib/healthCheck.ts
 *.lnk
 
 # Linux

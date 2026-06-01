@@ -1,0 +1,4 @@
+# Prometheus metrics dependencies for ML monitoring
+# Add these to your main requirements.txt
+
+prometheus-client>=0.19.0  # Prometheus metrics client library
