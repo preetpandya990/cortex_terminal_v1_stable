@@ -16,7 +16,10 @@ mypy==1.13.0
 types-redis==4.6.0.20241004
 
 # ── Dependency management ──────────────────────────────────────────────────────
-pip-tools==7.4.1             # pip-compile generates hashed lockfile
+pip-tools==7.5.3             # pip-compile generates hashed lockfile (upgraded for pip 26.x compat)
+
+# ── Security scanning ─────────────────────────────────────────────────────────
+pip-audit==2.10.0            # CVE scanner via OSV database; run: make audit
 
 # ── Code quality ──────────────────────────────────────────────────────────────
 ruff==0.8.0                  # Linting + formatting (replaces flake8, isort, black)

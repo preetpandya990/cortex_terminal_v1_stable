@@ -1,13 +1,30 @@
 """
-Cortex AI — Unified Model Registry
-=====================================
-Manages ML model lifecycle with governance gates and state machine.
+Cortex AI — Unified Model Registry  [TOMBSTONE — do not use in new code]
+=========================================================================
+This module is retained only so that tests can assert its deprecated mutation
+methods (``promote_model``, ``demote_model``) raise ``RegistryDeprecatedError``.
+No production code should import or instantiate ``UnifiedModelRegistry``.
 
-State machine:  shadow → paper → live
-                any    → shadow  (demotion / rollback)
+Architecture note (R6 — 2026-06-02)
+-------------------------------------
+The "three-table ambiguity" flagged by the 2026-06-01 audit was resolved by A8
+(2026-05-23) and formalised by migration 0040 (2026-06-02):
 
-Promotion gates are calibrated for financial binary-classification on
-noisy equity data — not generic ML benchmarks.
+  * ``ml_model_metadata`` — artifact authority: training artifacts, SHA-256
+    checksums, CPCV lineage, calibrator manifests, and the ML lifecycle state
+    machine (development → staging → production → archived).
+
+  * ``ai_ml_models`` — governance projection: deployment state
+    (shadow/paper/live/retired), drift advisory flags, admin override audit
+    trail, and a typed FK (``ml_model_metadata_id``) pointing at the
+    authoritative ml_model_metadata record for the current serving version.
+
+  * ``unified_model_registry`` (DB table) — DROPPED in migration 0040.
+    It was created in 0007 but was never populated by any application code.
+
+``ModelPromoter`` (``app.ml.model_registry``) is the sole promotion authority.
+Every lifecycle transition atomically updates both live tables via
+``_project_to_ai_ml_models()``, making structural divergence impossible.
 """
 from __future__ import annotations
 

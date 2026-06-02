@@ -118,7 +118,9 @@ class Settings(BaseSettings):
     BULK_INSERT_BATCH_SIZE: int = Field(1000, ge=100, le=10000, description="Database bulk insert batch size")
 
     # ── ML System ──────────────────────────────────────────────────────────────
-    ML_MODEL_ENCRYPTION_KEY: str | None = Field(None, description="Fernet key for model encryption")
+    # Model storage: plaintext binary artifacts with SHA-256 integrity verification
+    # at load time (see registry_loader._sha256_file). No encryption-at-rest is
+    # applied; access control is enforced at the filesystem and infrastructure level.
     ML_MODEL_STORAGE_PATH: str = "backend/ml_models"
     ML_FEATURE_VERSION: str = "1.0.0"
     ML_EVALUATION_THRESHOLD: float = Field(0.85, ge=0.0, le=1.0)

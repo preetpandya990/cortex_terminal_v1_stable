@@ -25,10 +25,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.fusion.models import AIDriftReport, AIMLModel
 from app.ai.governance.drift_detector import DriftDetector
-from app.ai.governance.unified_model_registry import UnifiedModelRegistry  # read-only queries only
 from app.api.deps import get_db
 from app.core.auth import require_role
-from app.core.redis import PubSubClient
+from app.core.redis import PubSubClient, RedisChannels
 
 router = APIRouter()
 

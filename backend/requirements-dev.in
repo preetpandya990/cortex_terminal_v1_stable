@@ -1,0 +1,29 @@
+# Cortex AI — Development & Test Dependencies (Abstract Spec)
+# ============================================================
+# NOT installed in production.  Install alongside the main stack:
+#   pip install --require-hashes -r requirements.lock \
+#               --require-hashes -r requirements-dev.lock
+
+# ── Testing ────────────────────────────────────────────────────────────────────
+pytest==8.3.3
+pytest-asyncio==0.24.0
+pytest-cov==6.0.0
+pytest-timeout==2.3.1
+hypothesis==6.151.12
+respx==0.21.1
+aiosqlite==0.20.0
+
+# ── Type checking ──────────────────────────────────────────────────────────────
+mypy==1.13.0
+types-redis==4.6.0.20241004
+
+# ── Dependency management ──────────────────────────────────────────────────────
+pip-tools==7.5.3
+
+# ── Security scanning ─────────────────────────────────────────────────────────
+# pip-audit queries the OSV database for known CVEs in installed packages.
+# Run: make audit  (blocks on any unfixed CRITICAL/HIGH findings)
+pip-audit==2.10.0
+
+# ── Code quality ──────────────────────────────────────────────────────────────
+ruff==0.8.0

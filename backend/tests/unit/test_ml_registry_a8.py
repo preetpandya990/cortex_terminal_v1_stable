@@ -736,3 +736,142 @@ class TestDemoteToStaging:
         args, _ = mock_audit.warning.call_args
         assert "DEMOTE" in args[0]
         assert "C3 honest re-eval" in str(args)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# R6 — Registry consolidation (migration 0040)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Verifies the three deliverables of the 2026-06-02 R6 consolidation:
+#
+#   R6-1  Migration 0040 exists and targets the correct tables.
+#   R6-2  _project_to_ai_ml_models() passes ml_model_metadata_id in the
+#         UPDATE so ai_ml_models.ml_model_metadata_id tracks the live FK on
+#         every lifecycle transition.
+#   R6-3  governance.py no longer imports UnifiedModelRegistry (the import was
+#         dead — the class was never instantiated there — and has been removed).
+#   R6-4  AIMLModel ORM has the ml_model_metadata_id column mapped.
+#   R6-5  unified_model_registry.py has a tombstone docstring so future
+#         maintainers know the module is deprecated.
+
+class TestR6RegistryConsolidation:
+    _BACKEND_ROOT = Path(__file__).parent.parent.parent
+
+    # ── R6-1: Migration 0040 targets the correct tables ───────────────────────
+
+    def test_migration_0040_exists(self) -> None:
+        migration = self._BACKEND_ROOT / "alembic" / "versions" / "0040_registry_consolidation.py"
+        assert migration.exists(), "Migration 0040 not found — run the R6 schema work"
+
+    def test_migration_0040_adds_fk_column(self) -> None:
+        migration = self._BACKEND_ROOT / "alembic" / "versions" / "0040_registry_consolidation.py"
+        text = migration.read_text()
+        assert "ml_model_metadata_id" in text, "Migration must add ml_model_metadata_id to ai_ml_models"
+        assert "ai_ml_models" in text
+
+    def test_migration_0040_drops_dead_table(self) -> None:
+        migration = self._BACKEND_ROOT / "alembic" / "versions" / "0040_registry_consolidation.py"
+        text = migration.read_text()
+        assert "drop_table" in text
+        assert "unified_model_registry" in text
+
+    def test_migration_0040_revises_0039(self) -> None:
+        migration = self._BACKEND_ROOT / "alembic" / "versions" / "0040_registry_consolidation.py"
+        text = migration.read_text()
+        assert 'down_revision' in text and '"0039"' in text, (
+            "Migration 0040 must chain from 0039"
+        )
+
+    # ── R6-2: _project_to_ai_ml_models sets ml_model_metadata_id ─────────────
+
+    @pytest.mark.asyncio
+    async def test_project_sets_ml_model_metadata_id(self) -> None:
+        """_project_to_ai_ml_models must include ml_model_metadata_id in .values()."""
+        from unittest.mock import AsyncMock, MagicMock, call
+        from app.ml.model_registry import _project_to_ai_ml_models
+
+        session = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.rowcount = 1
+        session.execute.return_value = mock_result
+
+        model = MagicMock()
+        model.model_name = "xgboost"
+        model.id = 42
+        model.model_version = "1.1.0_xgboost"
+
+        rows = await _project_to_ai_ml_models(session, model, "production")
+
+        assert rows == 1
+        # Inspect the UPDATE statement that was executed.
+        session.execute.assert_awaited_once()
+        update_stmt = session.execute.call_args[0][0]
+        # The compiled _values dict on the ClauseElement carries the column names.
+        # We extract it via the internal _values structure on the Update object.
+        compiled_values = {
+            str(col.key): val
+            for col, val in update_stmt._values.items()
+        }
+        assert "ml_model_metadata_id" in compiled_values, (
+            "_project_to_ai_ml_models must include ml_model_metadata_id in the UPDATE "
+            "so ai_ml_models always reflects the current ml_model_metadata FK"
+        )
+        # SQLAlchemy wraps bound values in BindParameter; unwrap for comparison.
+        raw = compiled_values["ml_model_metadata_id"]
+        actual = raw.value if hasattr(raw, "value") else raw
+        assert actual == 42
+
+    # ── R6-3: governance.py no longer imports UnifiedModelRegistry ─────────────
+
+    def test_governance_api_no_longer_imports_unified_model_registry(self) -> None:
+        """The dead UnifiedModelRegistry import must be removed from governance.py."""
+        gov_path = (
+            self._BACKEND_ROOT / "app" / "api" / "v1" / "governance.py"
+        )
+        text = gov_path.read_text()
+        try:
+            tree = ast.parse(text, filename=str(gov_path))
+        except SyntaxError:
+            pytest.fail("governance.py has a syntax error — fix before running R6 tests")
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                if "unified_model_registry" in module:
+                    names = [alias.name for alias in node.names]
+                    if "UnifiedModelRegistry" in names:
+                        pytest.fail(
+                            "governance.py still imports UnifiedModelRegistry — "
+                            "this import was dead (never instantiated) and must be removed"
+                        )
+
+    # ── R6-4: AIMLModel ORM has the FK column ─────────────────────────────────
+
+    def test_ai_ml_model_orm_has_fk_column(self) -> None:
+        from app.ai.fusion.models import AIMLModel
+        assert hasattr(AIMLModel, "ml_model_metadata_id"), (
+            "AIMLModel must have ml_model_metadata_id mapped column (migration 0040)"
+        )
+
+    def test_ai_ml_model_fk_column_is_nullable(self) -> None:
+        """FK must be nullable — a governance row must survive ml_model_metadata deletion."""
+        from app.ai.fusion.models import AIMLModel
+        from sqlalchemy import inspect as sa_inspect
+        mapper = sa_inspect(AIMLModel)
+        col = mapper.columns["ml_model_metadata_id"]
+        assert col.nullable is True, (
+            "ml_model_metadata_id must be nullable (ON DELETE SET NULL semantics)"
+        )
+
+    # ── R6-5: unified_model_registry.py has a tombstone ───────────────────────
+
+    def test_unified_model_registry_module_has_tombstone(self) -> None:
+        umr_path = (
+            self._BACKEND_ROOT
+            / "app" / "ai" / "governance" / "unified_model_registry.py"
+        )
+        text = umr_path.read_text()
+        assert "TOMBSTONE" in text or "tombstone" in text.lower(), (
+            "unified_model_registry.py must carry a TOMBSTONE marker so future "
+            "maintainers know the module is deprecated and must not be used in new code"
+        )

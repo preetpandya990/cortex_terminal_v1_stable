@@ -19,7 +19,7 @@
 
 | Document | Description |
 |----------|-------------|
-| [ARCHITECTURE.md](documentation/architecture/ARCHITECTURE.md) | Complete system architecture (2,499 lines) |
+| [ARCHITECTURE.md](documentation/architecture/ARCHITECTURE.md) | Complete system architecture — v1.1.1, post-overhaul (updated 2026-06-01) |
 | [ARCHITECTURE_SUMMARY.md](documentation/architecture/ARCHITECTURE_SUMMARY.md) | Quick reference guide |
 | [ARCHITECTURE_DIAGRAMS.md](documentation/architecture/ARCHITECTURE_DIAGRAMS.md) | Visual architecture diagrams |
 | [MERGE_PLAN.md](documentation/architecture/MERGE_PLAN.md) | Original ML + AI merge plan |
@@ -203,6 +203,6 @@
 
 ---
 
-**Last Updated**: April 28, 2026  
-**Documentation Version**: 1.1  
-**Project Status**: Production Ready
+**Last Updated**: June 1, 2026  
+**Documentation Version**: 1.2  
+**Project Status**: Production Ready (v1.1.1)

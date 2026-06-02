@@ -81,6 +81,10 @@ async def _project_to_ai_ml_models(
         .values(
             deployment_state=deployment_state,
             model_version=model.model_version,
+            # R6 — keep the explicit FK in sync with every lifecycle transition so
+            # ai_ml_models.ml_model_metadata_id always points at the authoritative
+            # ml_model_metadata record that owns the current artifact + metrics.
+            ml_model_metadata_id=model.id,
             updated_at=datetime.now(timezone.utc),
         )
         .execution_options(synchronize_session=False)

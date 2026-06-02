@@ -347,45 +347,9 @@ async def get_current_user(
     return user
 
 
-@router.post("/create-admin", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def create_admin_user(
-    user_data: UserRegister,
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Create an admin user. 
-    
-    WARNING: This endpoint should be disabled in production or protected by IP whitelist.
-    For development/testing only.
-    """
-    # Check if username exists
-    existing_user = await get_user_by_username(db, user_data.username)
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username already registered"
-        )
-    
-    # Check if email exists
-    existing_email = await get_user_by_email(db, user_data.email)
-    if existing_email:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered"
-        )
-    
-    # Create admin user
-    user = User(
-        username=user_data.username,
-        email=user_data.email,
-        hashed_password=hash_password(user_data.password),
-        full_name=user_data.full_name,
-        role="admin",  # Admin role
-        is_active=True,
-    )
-    
-    db.add(user)
-    await db.commit()
-    await db.refresh(user)
-    
-    return user
+# POST /auth/create-admin has been removed.
+#
+# It was an unauthenticated endpoint that created admin users with no
+# authorization guard — a direct privilege-escalation path in production.
+# The equivalent functionality is available via POST /api/v1/admin/users
+# (requires AdminUserID dep — admin JWT only).

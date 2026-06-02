@@ -28,7 +28,7 @@ REPO
 
 SECRETS / ENV  (none of these come from git — `.env*` are .gitignored)
 [ ] cp .env.example .env                 → fill POSTGRES_PASSWORD, SECRET_KEY,
-                                           ML_MODEL_ENCRYPTION_KEY, UPSTOX_API_KEY/SECRET, …
+                                           UPSTOX_API_KEY/SECRET, …
 [ ] cp backend/.env.example backend/.env → same values, plus any backend-only overrides
 
 INFRA
@@ -134,11 +134,10 @@ git clone <repo-url> Cortex_Merge_AI-ML && cd Cortex_Merge_AI-ML
 # 1. Secrets (root .env — Compose reads from here)
 cp .env.example .env
 $EDITOR .env                                # fill POSTGRES_PASSWORD, SECRET_KEY,
-                                            # ML_MODEL_ENCRYPTION_KEY, UPSTOX_API_KEY/SECRET, …
+                                            # UPSTOX_API_KEY/SECRET, …
 
-# 2. Generate the cryptographic keys the .env requires
+# 2. Generate the cryptographic key the .env requires
 openssl rand -hex 32                                                # → SECRET_KEY
-python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"  # → ML_MODEL_ENCRYPTION_KEY
 
 # 3. Up
 docker compose up --build       # add -d to background
@@ -259,7 +258,6 @@ if you switch between Compose and bare-metal frequently.
 | `DATABASE_URL` | `postgresql+asyncpg://user:pass@host:port/db` (async driver) |
 | `REDIS_URL` | `redis://localhost:6379/0` for a local Redis |
 | `SECRET_KEY` | `openssl rand -hex 32` — JWT signing |
-| `ML_MODEL_ENCRYPTION_KEY` | `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` — Fernet key |
 
 ### Required for live trading features
 
@@ -415,12 +413,14 @@ Requires the symbol universe + 10y of OHLCV bars + fundamentals already
 ingested into Postgres (handled by `app.worker` + ingestion scripts).
 Without bars, the orchestrator will fail at the A7 data-coverage gate.
 
-### Encryption note
+### Storage note
 
-The Option-B storage model uses **plaintext + SHA-256 checksum** (not
-Fernet encryption).  `ML_MODEL_ENCRYPTION_KEY` is still required as a
-config var but is accepted-and-ignored in the current code path —
-artefact integrity is enforced via checksum on every load.
+Model artefacts use **plaintext binary + SHA-256 integrity check** on every
+load (`registry_loader._sha256_file`). There is no encryption-at-rest.
+`ML_MODEL_ENCRYPTION_KEY` has been removed from the configuration — it is
+not required and not accepted. If it appears in a legacy `.env` file, remove
+it; the application will ignore unknown env vars but `.env.example` no
+longer documents it.
 
 ---
 

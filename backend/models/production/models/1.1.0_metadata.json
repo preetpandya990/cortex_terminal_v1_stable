@@ -1,0 +1,215 @@
+{
+  "schema_version": "1.0",
+  "model_version": "1.1.0",
+  "trained_at": "2026-06-01T03:22:26Z",
+  "training_run_id": "training_results_20260601_032246",
+
+  "label_scheme": {
+    "type": "binary",
+    "classes": { "0": "DOWN", "1": "UP" },
+    "hold_policy": "selective_classification",
+    "hold_description": "HOLD is applied at inference time via a confidence threshold on the UP probability. It is not a training label — only UP and DOWN samples survive the ATR dead zone and enter the training set.",
+    "horizon_days": 5,
+    "dead_zone": "Symmetric ATR-normalised band: |forward_return| ≤ 0.5 × 14-day ATR / close (clamped ≥ 0.001). Samples inside the band are excluded from training, producing a naturally balanced 50/50 UP/DOWN split on retained samples."
+  },
+
+  "training_data": {
+    "n_symbols_requested": 2551,
+    "n_symbols_trained": 2011,
+    "symbol_coverage": 0.7883,
+    "coverage_threshold": 0.6,
+    "total_samples": 3758747,
+    "xgboost_training_samples": 2448342,
+    "xgboost_validation_samples": 1820919,
+    "gru_training_samples": 240996,
+    "gru_validation_samples": 30000,
+    "held_out_eval_samples": 30000,
+    "lookback_years": 10,
+    "ipo_quarantine_days": 180,
+    "min_bars_short_history": 252
+  },
+
+  "features": {
+    "n_features": 69,
+    "feature_version": "1.0.0",
+    "sequence_length": 60,
+    "manifest": {
+      "technical": [
+        "returns_1d", "returns_5d", "returns_10d", "returns_20d",
+        "log_returns", "volatility_20d", "price_momentum_5d", "price_momentum_10d",
+        "sma_5", "sma_10", "sma_20", "sma_50", "sma_200",
+        "ema_12", "ema_26", "ema_20", "ema_50",
+        "sma_cross_20_50", "sma_cross_50_200", "price_to_sma_20",
+        "rsi_14", "macd", "macd_signal", "macd_hist", "stoch_k", "stoch_d",
+        "bb_upper", "bb_lower", "bb_width", "bb_position", "atr_14", "atr_ratio",
+        "volume_ratio", "volume_momentum_5d", "volume_momentum_10d",
+        "obv", "obv_ema", "vwap", "vwap_deviation", "volume_price_trend",
+        "skewness_20d", "kurtosis_20d", "autocorr_lag1", "autocorr_lag5"
+      ],
+      "sentiment": [
+        "sentiment_score_mean", "sentiment_score_std", "sentiment_volatility",
+        "news_volume", "impact_weighted_sentiment"
+      ],
+      "fundamental": [
+        "pe_ratio", "pb_ratio", "roe", "roce", "ev_ebitda",
+        "revenue_growth_yoy", "revenue_cagr",
+        "profit_growth_yoy", "profit_cagr",
+        "operating_margin", "operating_margin_avg",
+        "net_worth_log", "net_worth_cagr",
+        "debt_ratio", "debt_ratio_trend",
+        "operating_cf_growth", "operating_cf_cagr",
+        "promoter_holding_pct", "fii_holding_pct", "promoter_holding_change"
+      ]
+    }
+  },
+
+  "validation": {
+    "method": "CPCV",
+    "description": "Combinatorial Purged Cross-Validation — embargo prevents lookahead leakage across folds",
+    "cpcv_n_groups": 8,
+    "cpcv_n_test_groups": 2,
+    "cpcv_horizon_days": 5,
+    "cpcv_embargo_days": 5,
+    "cpcv_hpo_train_frac": 0.8,
+    "xgboost_hpo_trials": 100,
+    "gru_hpo_trials": 5,
+    "n_paths": 7,
+    "all_paths_positive_sharpe": true
+  },
+
+  "gate_metrics": {
+    "eval_set": "held_out_30k_samples",
+    "backtest": {
+      "mode": "long_only",
+      "product_type": "CNC",
+      "slippage_bps": 5.0,
+      "notional_inr": 100000
+    },
+    "ensemble": {
+      "directional_accuracy": 0.6804,
+      "precision_down": 0.7228,
+      "precision_up": 0.6430,
+      "recall_down": 0.6416,
+      "recall_up": 0.7240,
+      "f1_down": 0.6798,
+      "f1_up": 0.6811,
+      "sharpe_ratio": 1.0879,
+      "sortino_ratio": 9.3696,
+      "deflated_sharpe": 0.7276,
+      "pbo": 0.095,
+      "win_rate": 0.6430,
+      "profit_factor": 2.828,
+      "auc_pr": 0.7288,
+      "n_trades": 15922,
+      "avg_return_per_trade": 0.03378
+    },
+    "xgboost_standalone": {
+      "directional_accuracy": 0.6395,
+      "sharpe_ratio": 0.9738,
+      "deflated_sharpe": 0.6832,
+      "pbo": 0.485,
+      "win_rate": 0.6200,
+      "profit_factor": 2.744,
+      "auc_pr": 0.6678
+    },
+    "gru_standalone": {
+      "directional_accuracy": 0.6639,
+      "sharpe_ratio": 1.0199,
+      "deflated_sharpe": 0.7246,
+      "pbo": 0.095,
+      "win_rate": 0.6263,
+      "profit_factor": 2.595,
+      "auc_pr": 0.7030
+    }
+  },
+
+  "ensemble": {
+    "components": ["xgboost", "gru"],
+    "weights": { "xgboost": 0.5106, "gru": 0.4894 },
+    "weight_optimisation": "Sharpe-maximising grid search (w ∈ [0, 1], step 0.005) over 200 CPCV paths with PBO regularisation (L2 prior = 0.1)",
+    "accretive": true,
+    "ensemble_beats_best_standalone": true,
+    "best_standalone_model": "gru",
+    "best_standalone_deflated_sharpe": 0.7246,
+    "ensemble_deflated_sharpe": 0.7276
+  },
+
+  "hyperparameters": {
+    "xgboost": {
+      "max_depth": 8,
+      "min_child_weight": 5,
+      "gamma": 0.1529,
+      "subsample": 0.8351,
+      "colsample_bytree": 0.7653,
+      "learning_rate": 0.0794,
+      "lambda": 0.8853,
+      "alpha": 0.3627,
+      "best_rounds": 299
+    },
+    "gru": {
+      "gru_units_1": 128,
+      "gru_units_2": 64,
+      "dense_units": 64,
+      "dropout": 0.1,
+      "recurrent_dropout": 0.1,
+      "l2_reg": 0.000495,
+      "learning_rate": 0.0000828,
+      "clipnorm": 1.0,
+      "sequence_length": 60,
+      "max_epochs": 200,
+      "early_stopping_patience": 20
+    }
+  },
+
+  "storage": {
+    "format": "plaintext_binary",
+    "integrity": "sha256",
+    "encryption": "none",
+    "note": "Artifacts are plaintext binary files. Integrity is verified at load time by registry_loader._sha256_file(). Access control is enforced at the filesystem and infrastructure level."
+  },
+
+  "artifacts": [
+    {
+      "file": "1.1.0_xgboost.json",
+      "role": "xgboost_native_booster",
+      "usage": "training_archive",
+      "bytes": 8016167,
+      "sha256": "b809a453dc97071b9576d3951f823eafcb24da0dfe20e1ebdb7a59f3864698e5"
+    },
+    {
+      "file": "1.1.0_xgboost_calibrator.pkl",
+      "role": "probability_calibrator",
+      "usage": "inference",
+      "bytes": 179,
+      "sha256": "7f6bf82f30c8e78bfd9659a45be7762cb49755f4b394f1182e01d1c1af1f4de5"
+    },
+    {
+      "file": "1.1.0_xgboost_inference.so",
+      "role": "treelite_compiled_booster",
+      "usage": "inference",
+      "bytes": 3346368,
+      "sha256": "c9d4fcd8fe6d41841416cab5f80695dd2d571f150b87b83b082c8fb30cbb2e84"
+    },
+    {
+      "file": "1.1.0_gru.keras",
+      "role": "keras_model",
+      "usage": "training_archive",
+      "bytes": 2423920,
+      "sha256": "9cd5263cf1ec5b0d7e262912de2dc30300637d622de1b53ff413979ffb802b3a"
+    },
+    {
+      "file": "1.1.0_gru_calibrator.pkl",
+      "role": "probability_calibrator",
+      "usage": "inference",
+      "bytes": 158,
+      "sha256": "b57505cc92be5b50b8c5dea598fd4ac2315b9cc43da7bd7a3211cc4f37f51cf3"
+    },
+    {
+      "file": "1.1.0_gru_inference.onnx",
+      "role": "onnx_model",
+      "usage": "inference",
+      "bytes": 505698,
+      "sha256": "67b98bef550d52297910824ff3bd8e77a65b688a7a082d4d4cd433b2d0b52c68"
+    }
+  ]
+}

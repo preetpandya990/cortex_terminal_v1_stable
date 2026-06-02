@@ -1,0 +1,35 @@
+# Cortex AI — ML Training / Evaluation Extras (Abstract Spec)
+# ============================================================
+# Install alongside the main production deps:
+#   pip install --require-hashes -r requirements.lock \
+#               --require-hashes -r requirements-ml-training.lock
+#
+# ⚠  SINGLE SOURCE OF TRUTH RULE
+# The core ML/AI stack (tensorflow, torch, keras, onnx, onnxruntime-gpu,
+# xgboost, optuna, scikit-learn, transformers, optimum, numpy, pandas) is
+# pinned ONLY in requirements.in / requirements.lock.  Never re-pin it here.
+# Doing so will silently downgrade the stack and may break TF GPU training.
+#
+# This file holds ONLY training/evaluation-time extras not present in
+# requirements.in, validated against the locked core stack.
+
+# ── Scientific / serialisation ────────────────────────────────────────────────
+scipy==1.12.0
+joblib==1.3.2
+
+# ── Progress ──────────────────────────────────────────────────────────────────
+tqdm==4.67.3
+
+# ── Scheduled retraining ──────────────────────────────────────────────────────
+APScheduler==3.11.2
+tzlocal==5.3.1
+
+# ── MLflow experiment tracking (skinny — no pandas dependency) ───────────────
+# mlflow-skinny is used instead of full mlflow to avoid a pandas<3 conflict.
+mlflow-skinny==3.12.0
+
+# ── TFT benchmarking (Workstream B — paused, kept for future hardware) ────────
+# pytorch-forecasting 1.7.0 + lightning 2.6.4 were validated safe against the
+# locked core stack (no numpy/sklearn/torch upgrade triggered).
+pytorch-forecasting==1.7.0
+lightning==2.6.4

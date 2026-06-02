@@ -211,7 +211,7 @@ function WatchlistCardComponent({
           instrument={{
             name: item.name || item.trading_symbol,
             trading_symbol: item.trading_symbol,
-            exchange: item.exchange,
+            exchange: item.exchange ?? undefined,
             instrument_key: item.instrument_key,
           }}
           livePrice={ltp}

@@ -399,6 +399,8 @@ backend/models/cache/
 
 # Graphify generated cache
 graphify-out/cache/
+graphify-out/GRAPH_REPORT.md
+graphify-out/graph.json
 /node_modules/
 
 # ============================================

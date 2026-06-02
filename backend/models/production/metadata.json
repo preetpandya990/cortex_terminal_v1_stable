@@ -1,0 +1,45 @@
+{
+  "schema_version": "1.0",
+  "current_version": "1.1.1",
+  "current_version_metadata": "models/1.1.1_metadata.json",
+  "registry_source_of_truth": "unified_model_registry (PostgreSQL) — this file is a human-readable pointer only; the DB record is authoritative for the running service",
+
+  "versions": [
+    {
+      "version": "1.1.1",
+      "status": "production",
+      "promoted_at": "2026-06-01T11:43:00Z",
+      "metadata_file": "models/1.1.1_metadata.json",
+      "note": "Byte-identical to 1.1.0; promoted without retraining"
+    },
+    {
+      "version": "1.1.0",
+      "status": "archived",
+      "trained_at": "2026-06-01T03:22:26Z",
+      "metadata_file": "models/1.1.0_metadata.json",
+      "note": "Origin training run — CPCV + deflated-Sharpe gate passed"
+    }
+  ],
+
+  "current_gate_metrics": {
+    "directional_accuracy": 0.6804,
+    "sharpe_ratio": 1.0879,
+    "deflated_sharpe": 0.7276,
+    "pbo": 0.095,
+    "eval_samples": 30000,
+    "training_run_id": "training_results_20260601_032246"
+  },
+
+  "architecture": {
+    "tft_status": "benchmarked_not_deployed",
+    "tft_note": "TFT was evaluated but excluded from the production ensemble. CPU inference latency was infeasible for the real-time signal path. Decision recorded here to prevent re-evaluation without updated hardware."
+  },
+
+  "storage": {
+    "format": "plaintext_binary",
+    "integrity": "sha256",
+    "encryption": "none",
+    "git_lfs_status": "pending",
+    "git_lfs_note": "Model binaries are currently committed directly to git (audit finding R1). Migration to Git LFS or an external artifact store is tracked in the remediation roadmap."
+  }
+}

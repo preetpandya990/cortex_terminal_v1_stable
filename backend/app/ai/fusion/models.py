@@ -5,7 +5,7 @@ Import from migration 0005 table definitions.
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Index, Integer, LargeBinary, Numeric, String, Text, text
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, LargeBinary, Numeric, String, Text, text
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -115,9 +115,17 @@ class AIMLModel(Base):
     recall: Mapped[Decimal | None] = mapped_column(Numeric(5, 2))
     f1_score: Mapped[Decimal | None] = mapped_column(Numeric(5, 2))
     governance_metadata: Mapped[dict | None] = mapped_column(JSONB)
+    # R6 — explicit FK to the authoritative ml_model_metadata record (migration 0040).
+    # SET NULL on delete: a retracted ml_model_metadata row must not cascade-delete
+    # the governance row, which may still hold drift history and audit trails.
+    ml_model_metadata_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("ml_model_metadata.id", ondelete="SET NULL", name="fk_ai_ml_models_ml_model_metadata"),
+        nullable=True,
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("NOW()"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("NOW()"))
-
 
 
 class AIDriftReport(Base):
