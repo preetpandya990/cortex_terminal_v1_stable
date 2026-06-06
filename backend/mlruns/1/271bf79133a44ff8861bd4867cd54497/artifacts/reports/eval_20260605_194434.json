@@ -1,0 +1,116 @@
+{
+  "run_id": "20260605_194434",
+  "mlflow_run_id": "",
+  "timestamp": "2026-06-05T19:44:46.720838+00:00",
+  "overall_gate": true,
+  "duration_seconds": 12.371847709990107,
+  "categories": [
+    {
+      "category": "retrieval_faithfulness",
+      "score": 0.9,
+      "gate_threshold": 0.9,
+      "gate_passed": true,
+      "total": 10,
+      "passed": 9,
+      "failed": 1,
+      "errors": 0,
+      "details": [
+        {
+          "id": "RF001",
+          "passed": true,
+          "failures": [],
+          "keywords_found": [
+            "profit",
+            "earnings",
+            "Q4"
+          ],
+          "chunks_returned": 5
+        },
+        {
+          "id": "RF002",
+          "passed": true,
+          "failures": [],
+          "keywords_found": [
+            "MSRDC",
+            "payment"
+          ],
+          "chunks_returned": 5
+        },
+        {
+          "id": "RF003",
+          "passed": true,
+          "failures": [],
+          "keywords_found": [
+            "partner"
+          ],
+          "chunks_returned": 5
+        },
+        {
+          "id": "RF004",
+          "passed": true,
+          "failures": [],
+          "keywords_found": [
+            "AUM"
+          ],
+          "chunks_returned": 5
+        },
+        {
+          "id": "RF005",
+          "passed": true,
+          "failures": [],
+          "keywords_found": [
+            "USFDA",
+            "approval"
+          ],
+          "chunks_returned": 5
+        },
+        {
+          "id": "RF006",
+          "passed": true,
+          "failures": [],
+          "keywords_found": [
+            "subscriber",
+            "5G"
+          ],
+          "chunks_returned": 5
+        },
+        {
+          "id": "RF007",
+          "passed": false,
+          "failures": [
+            "context_missing_all_keywords:sales"
+          ],
+          "chunks_returned": 5
+        },
+        {
+          "id": "RF008",
+          "passed": true,
+          "failures": [],
+          "keywords_found": [
+            "order"
+          ],
+          "chunks_returned": 5
+        },
+        {
+          "id": "RF009",
+          "passed": true,
+          "failures": [],
+          "keywords_found": [
+            "Semaglutide",
+            "generic"
+          ],
+          "chunks_returned": 5
+        },
+        {
+          "id": "RF010",
+          "passed": true,
+          "failures": [],
+          "keywords_found": [
+            "SEBI"
+          ],
+          "chunks_returned": 5
+        }
+      ]
+    }
+  ]
+}

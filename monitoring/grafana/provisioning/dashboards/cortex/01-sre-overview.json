@@ -65,6 +65,15 @@
       "tooltip": "",
       "type": "link",
       "url": "/d/cortex-security-realtime"
+    },
+    {
+      "icon": "external link",
+      "tags": [],
+      "targetBlank": false,
+      "title": "LLM Intelligence",
+      "tooltip": "",
+      "type": "link",
+      "url": "/d/cortex-llm-intelligence"
     }
   ],
   "panels": [

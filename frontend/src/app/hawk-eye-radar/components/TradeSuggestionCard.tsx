@@ -175,6 +175,51 @@ function PriceGrid({ suggestion }: { suggestion: TradeSuggestion }) {
   );
 }
 
+/**
+ * Renders the LLM-generated 2–3 sentence summary beneath the price grid.
+ *
+ * Rendering contract (mirrors backend nullable semantics):
+ *   undefined → field absent (old cache / pre-LLM API response) — hide
+ *   null      → explanation pending (worker in progress) — show skeleton
+ *               but only for active suggestions (expired will never be explained)
+ *   string    → explanation ready — render text
+ */
+function LLMSummarySection({
+  summary,
+  status,
+}: {
+  summary: string | null | undefined;
+  status: string;
+}) {
+  // Field absent from the API response — hide entirely
+  if (summary === undefined) return null;
+
+  // Explanation will never be generated for non-active suggestions
+  if (summary === null && status !== 'active') return null;
+
+  // Explanation pending — animated skeleton placeholder
+  if (summary === null) {
+    return (
+      <div
+        className="space-y-1.5 pt-2 border-t border-slate-100"
+        role="status"
+        aria-label="Loading AI explanation"
+        aria-busy="true"
+      >
+        <div className="h-2.5 w-full animate-pulse rounded bg-slate-100" />
+        <div className="h-2.5 w-[82%] animate-pulse rounded bg-slate-100" />
+      </div>
+    );
+  }
+
+  // Explanation ready
+  return (
+    <p className="text-xs text-slate-500 leading-relaxed pt-2 border-t border-slate-100 line-clamp-3">
+      {summary}
+    </p>
+  );
+}
+
 function TradeSuggestionCardComponent({
   suggestion,
   onViewDetails,
@@ -248,6 +293,10 @@ function TradeSuggestionCardComponent({
         <ConsensusBar score={suggestion.consensus_score} />
         <AgentRow />
         <PriceGrid suggestion={suggestion} />
+        <LLMSummarySection
+          summary={suggestion.llm_summary}
+          status={suggestion.status}
+        />
       </CardContent>
 
       {/* ── Footer ── */}

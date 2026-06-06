@@ -212,52 +212,95 @@ def _populate_ml_fields(outcome: PaperTradeOutcome) -> None:
 
     All computations are based on exit_price vs targets — conservative
     (we don't extrapolate post-exit candle data).
+
+    TP validity invariant: a take-profit is only considered "hit" when the
+    target price is in the profit direction from entry (tp > entry for LONG,
+    tp < entry for SHORT).  Stale suggestions can have TP levels that are
+    already below the actual entry price; blindly marking those as hit would
+    corrupt ML feedback and contradict a correct direction signal.
     """
     is_long = outcome.signal_direction == "BUY"
     entry = Decimal(str(outcome.entry_price))
     exit_p = Decimal(str(outcome.exit_price))
 
-    # Direction correctness
-    if is_long:
-        outcome.ml_direction_correct = exit_p > entry
-    else:
-        outcome.ml_direction_correct = exit_p < entry
+    def _in_profit_direction(tp_price: Decimal) -> bool:
+        """True when the target requires price to move in the signal direction."""
+        return tp_price > entry if is_long else tp_price < entry
 
-    # Stop-loss hit: triggered by SL exit_reason, or price crossed stop
+    # ── Stop-loss hit ─────────────────────────────────────────────────────────
     if outcome.exit_reason == "SL":
         outcome.hit_sl = True
     elif outcome.suggested_stop_loss is not None:
         sl = Decimal(str(outcome.suggested_stop_loss))
-        if is_long:
-            outcome.hit_sl = exit_p <= sl
-        else:
-            outcome.hit_sl = exit_p >= sl
+        outcome.hit_sl = (exit_p <= sl) if is_long else (exit_p >= sl)
     else:
         outcome.hit_sl = False
 
-    # TP hits: check if exit price reached each target (conservative — exit price only)
+    # ── Take-profit validity gates ────────────────────────────────────────────
+    tp1_valid = (
+        outcome.suggested_tp1 is not None
+        and _in_profit_direction(Decimal(str(outcome.suggested_tp1)))
+    )
+    tp2_valid = (
+        outcome.suggested_tp2 is not None
+        and _in_profit_direction(Decimal(str(outcome.suggested_tp2)))
+    )
+    tp3_valid = (
+        outcome.suggested_tp3 is not None
+        and _in_profit_direction(Decimal(str(outcome.suggested_tp3)))
+    )
+
+    # ── Take-profit hits ──────────────────────────────────────────────────────
+    # Price-based check: valid TP AND exit_price reached the level.
     if outcome.suggested_tp1 is not None:
         tp1 = Decimal(str(outcome.suggested_tp1))
-        outcome.hit_tp1 = (exit_p >= tp1) if is_long else (exit_p <= tp1)
+        outcome.hit_tp1 = tp1_valid and (
+            (exit_p >= tp1) if is_long else (exit_p <= tp1)
+        )
 
     if outcome.suggested_tp2 is not None:
         tp2 = Decimal(str(outcome.suggested_tp2))
-        outcome.hit_tp2 = (exit_p >= tp2) if is_long else (exit_p <= tp2)
+        outcome.hit_tp2 = tp2_valid and (
+            (exit_p >= tp2) if is_long else (exit_p <= tp2)
+        )
 
     if outcome.suggested_tp3 is not None:
         tp3 = Decimal(str(outcome.suggested_tp3))
-        outcome.hit_tp3 = (exit_p >= tp3) if is_long else (exit_p <= tp3)
+        outcome.hit_tp3 = tp3_valid and (
+            (exit_p >= tp3) if is_long else (exit_p <= tp3)
+        )
 
-    # TP exit_reason overrides (if user exited at TP, mark that level as hit)
+    # Exit-reason overrides — only escalate when the TP was a valid profit target.
+    # TP3 exit implies TP1 and TP2 were also reached (cascading), same for TP2.
     if outcome.exit_reason == "TP1":
-        outcome.hit_tp1 = True
+        if tp1_valid:
+            outcome.hit_tp1 = True
     elif outcome.exit_reason == "TP2":
-        outcome.hit_tp1 = True
-        outcome.hit_tp2 = True
+        if tp1_valid:
+            outcome.hit_tp1 = True
+        if tp2_valid:
+            outcome.hit_tp2 = True
     elif outcome.exit_reason == "TP3":
-        outcome.hit_tp1 = True
-        outcome.hit_tp2 = True
-        outcome.hit_tp3 = True
+        if tp1_valid:
+            outcome.hit_tp1 = True
+        if tp2_valid:
+            outcome.hit_tp2 = True
+        if tp3_valid:
+            outcome.hit_tp3 = True
+
+    # ── Direction correctness ─────────────────────────────────────────────────
+    # Evaluated in priority order:
+    #   1. SL exit → directionally incorrect (price moved against the signal)
+    #   2. Any valid TP was hit → directionally correct (price reached a profit target)
+    #   3. Price comparison → fallback for manual / market-close exits
+    if outcome.exit_reason == "SL":
+        outcome.ml_direction_correct = False
+    elif outcome.hit_tp1 or outcome.hit_tp2 or outcome.hit_tp3:
+        outcome.ml_direction_correct = True
+    elif is_long:
+        outcome.ml_direction_correct = exit_p > entry
+    else:
+        outcome.ml_direction_correct = exit_p < entry
 
 
 def _derive_confidence_level(confidence_score: Decimal) -> str:

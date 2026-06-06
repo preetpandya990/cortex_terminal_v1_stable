@@ -187,6 +187,7 @@ class SignalAssembler:
         db: AsyncSession,
         symbol: str,
         lookback_hours: int = 48,
+        reference_time: Optional[datetime] = None,
     ) -> dict[str, Any]:
         """
         Gather event signals with temporal decay and source provenance for a symbol.
@@ -195,8 +196,20 @@ class SignalAssembler:
         originating raw event: AIEventClassification → AINLPResult → AIProcessedEvent
         → AIRawEvent.  LEFT JOINs are used so that events survive even when
         intermediate chain records are absent (e.g. NLP pass produced no record).
+
+        Args:
+            reference_time: Anchor for the lookback window and decay calculation.
+                            Defaults to ``datetime.now(timezone.utc)``.  Pass the
+                            original signal timestamp when backfilling historical
+                            records so decay is computed relative to signal creation
+                            rather than the current wall-clock time.
         """
-        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+        now = reference_time if reference_time is not None else datetime.now(timezone.utc)
+        cutoff_time = now - timedelta(hours=lookback_hours)
+        # Upper bound: only events that existed at `now`.  In live operation
+        # this is always satisfied (events are in the past); when backfilling
+        # with a historical reference_time, events created after the signal
+        # must not be included — they weren't available when it was generated.
 
         stmt = (
             select(
@@ -221,6 +234,7 @@ class SignalAssembler:
                 and_(
                     AIEventClassification.affected_symbols.contains([symbol]),
                     AIEventClassification.created_at >= cutoff_time,
+                    AIEventClassification.created_at <= now,
                 )
             )
             .order_by(desc(AIEventClassification.created_at))
@@ -232,7 +246,6 @@ class SignalAssembler:
         if not rows:
             return {"score": 0.0, "confidence": 0.0, "event_count": 0, "events": [], "available": False}
 
-        now = datetime.now(timezone.utc)
         n = len(rows)
 
         # Collect per-event decayed scores first so we can apply √N normalization.

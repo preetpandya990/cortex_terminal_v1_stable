@@ -101,7 +101,17 @@ pyarrow>=14.0.0
 
 # ── LLM Inference ──────────────────────────────────────────────────────────────
 ollama==0.3.0
-openai==1.10.0
+# openai: pinned at a version compatible with both litellm and instructor.
+# litellm uses the openai SDK internally for OpenAI-compatible endpoints (NIM).
+openai>=1.30.0
+litellm>=1.40.0
+instructor>=1.5.0
+
+# ── Vector Store & RAG ─────────────────────────────────────────────────────────
+# pgvector: SQLAlchemy + psycopg2 type support for VECTOR columns.
+pgvector>=0.3.0
+# rank-bm25: BM25 lexical scoring for hybrid retrieval (vector + keyword).
+rank-bm25>=0.2.2
 
 # ── NLP ────────────────────────────────────────────────────────────────────────
 spacy==3.7.2
@@ -117,6 +127,8 @@ feedparser==6.0.11
 # ── Observability ──────────────────────────────────────────────────────────────
 python-json-logger==2.0.7
 prometheus-client==0.19.0
+# MLflow: experiment tracking for the eval harness and ML model lifecycle.
+mlflow>=3.0.0
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
 python-dotenv==1.0.0

@@ -161,6 +161,31 @@ async def _pnl_heartbeat(queue: asyncio.Queue[dict[str, Any]]) -> None:
     except asyncio.CancelledError:
         pass
 
+
+async def _push_initial_pnl_snapshot(redis: Redis, portfolio_id: UUID) -> None:
+    """
+    Publish a DB-backed P&L snapshot immediately after a client connects.
+
+    Called as a fire-and-forget task right after the 'connected' handshake.
+    Guarantees the client receives current state on every connect — including
+    after-market-hours reconnects when no tick-driven recomputes have run and
+    the Redis LTP cache (5-min TTL) has already expired.
+
+    ``_recompute_portfolio_pnl`` falls back to ``position.last_price`` (the
+    final closing tick persisted to DB) so the values are always meaningful
+    and never zero regardless of market state.  If the portfolio has no open
+    positions the function is a no-op — the REST response already carries the
+    correct realized P&L and cash balance in that case.
+    """
+    from app.services.paper_trading.pnl_worker import _recompute_portfolio_pnl
+    try:
+        await _recompute_portfolio_pnl(redis, portfolio_id)
+    except Exception as exc:
+        logger.warning(
+            "Initial PnL snapshot failed for portfolio %s: %s", portfolio_id, exc
+        )
+
+
 router = APIRouter(dependencies=[Depends(get_current_user_id)])
 ws_router = APIRouter()
 
@@ -1232,6 +1257,16 @@ async def pnl_websocket(
         asyncio.create_task(_pnl_sender(websocket, queue),  name="pnl-sender"),
         asyncio.create_task(_pnl_heartbeat(queue),          name="pnl-heartbeat"),
     ]
+
+    # Push a DB-backed snapshot so the client immediately receives current state.
+    # Critical for after-hours reconnects: ticks stopped, Redis LTP cache expired,
+    # but position.last_price (closing tick) is persisted in DB and used here.
+    # The pubsub subscription is already established above, so the listener will
+    # buffer and deliver this frame without any race condition.
+    asyncio.create_task(
+        _push_initial_pnl_snapshot(redis, portfolio_id),
+        name=f"pnl-initial-{portfolio_id}",
+    )
 
     try:
         while True:

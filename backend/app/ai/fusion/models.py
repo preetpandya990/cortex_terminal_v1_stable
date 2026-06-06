@@ -4,9 +4,11 @@ Import from migration 0005 table definitions.
 """
 from datetime import datetime
 from decimal import Decimal
+from uuid import UUID
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, LargeBinary, Numeric, String, Text, text
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, LargeBinary, Numeric, String, Text, UniqueConstraint, text
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -221,6 +223,116 @@ class AIKillSwitch(Base):
     expiration_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("NOW()"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("NOW()"))
+
+
+class AIDocumentEmbedding(Base):
+    """
+    Finance-aware RAG vector store.
+
+    One row per source document (ai_raw_events).  The embedding dimension is
+    pinned at 1024 to match nvidia/nv-embedqa-e5-v5.  Changing the embedding
+    model requires a full re-ingestion and a migration to alter the dimension.
+
+    Symbol assignment:
+      - Single-symbol events → symbol = that trading symbol.
+      - Multi-symbol or unclassified events → symbol = NULL (general market;
+        included in every symbol-scoped retrieval pass).
+      - All affected symbols are always stored in metadata['affected_symbols'].
+
+    Indexes (created by migration 0041):
+      - HNSW on embedding (cosine, m=16, ef_construction=64) for ANN search.
+      - B-tree on (symbol, as_of_timestamp DESC) for time-window filtering.
+    """
+
+    __tablename__ = "ai_document_embeddings"
+    __table_args__ = (
+        UniqueConstraint("source_table", "source_id", name="uq_ai_doc_embeddings_source"),
+        Index("idx_ai_doc_embeddings_symbol_time", "symbol", text("as_of_timestamp DESC")),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    # Provenance: which table and which row this embedding was built from.
+    source_table: Mapped[str] = mapped_column(String(50), nullable=False)
+    source_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # NULL = general market event; non-NULL = single-instrument event.
+    symbol: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # SHA-256 of the chunk text; used by the ingester to skip unchanged content.
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # First 200 characters of the chunk for debugging / audit.
+    content_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 1024-dimensional passage embedding (nvidia/nv-embedqa-e5-v5).
+    embedding: Mapped[list] = mapped_column(Vector(1024), nullable=False)
+    # As-of timestamp of the source event (not ingestion time) — used for
+    # the time-window freshness filter in retrieval.
+    as_of_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # source_name, source_url, event_type, affected_symbols, etc.
+    # Column name in DB is "metadata"; "extra_data" avoids the SQLAlchemy
+    # reserved-attribute conflict (same pattern used by AIRawEvent / AITradingSignal).
+    extra_data: Mapped[dict | None] = mapped_column("metadata", JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("NOW()"))
+
+
+class AILLMAuditLog(Base):
+    """
+    Append-only audit trail for every LLM inference in the Intelligence Layer.
+
+    Governance requirement (SR 11-7, CORTEX_LLM_UPGRADE_PLAN.md §8.3):
+    Given any user complaint or regulatory enquiry, the operator must be able
+    to reproduce the exact prompt, model version, retrieved sources, guardrail
+    events, and output for any historical inference.
+
+    Invariant: no UPDATE or DELETE paths exist for this table anywhere in the
+    application.  Only INSERT is permitted.  Schema changes require a migration.
+    """
+    __tablename__ = "ai_llm_audit_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # Stable per logical inference — shared across retries so the full attempt
+    # history is visible under a single invocation_id.
+    invocation_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        nullable=False,
+        server_default=text("gen_random_uuid()"),
+    )
+
+    # "sentiment" | "explanation" | "classification" | "embedding"
+    invocation_type: Mapped[str] = mapped_column(String(50), nullable=False)
+
+    # Table the reference_id belongs to (e.g. "trade_suggestions", "ai_nlp_results")
+    reference_table: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Primary key of the domain object this inference was about
+    reference_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    # "nim" | "ollama"
+    model_provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    # Full model identifier e.g. "qwen/qwen3.5-122b-a10b"
+    model_id: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    # SHA-256 of the fully-rendered prompt — enables exact reproduction without
+    # storing the full text.
+    prompt_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # [{table, id, as_of}] — provenance of every retrieved document chunk
+    retrieved_source_ids: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # [] = all guardrails passed; non-empty = list of triggered guardrail names
+    guardrail_events: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
+    # First 500 chars of output for triage; NULL on failure
+    output_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Exception message on failure; NULL on success
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("NOW()"),
+    )
 
 
 class AISafetyTrigger(Base):

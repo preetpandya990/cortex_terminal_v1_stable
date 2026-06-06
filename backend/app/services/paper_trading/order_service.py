@@ -108,7 +108,7 @@ def _ctx_from_suggestion(suggestion: TradeSuggestion) -> _TradeContext:
 
     return _TradeContext(
         suggestion_id=suggestion.suggestion_id,
-        symbol=suggestion.symbol,
+        symbol=suggestion.trading_symbol or suggestion.symbol,
         instrument_key=suggestion.instrument_key or suggestion.symbol,
         entry_price=_dec(suggestion.entry_price),
         stop_loss=_dec(suggestion.stop_loss),

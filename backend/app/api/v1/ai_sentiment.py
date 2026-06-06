@@ -7,7 +7,7 @@ Endpoint:
   GET /api/v1/ai/sentiment
 
 Features:
-  - FinBERT ONNX GPU inference (18-22ms per article)
+  - LLM-backed NLP inference (NIM primary, Ollama fallback)
   - L1 + L2 (Redis, 2-min TTL) caching
   - Rate limiting: 60 req/min per user
   - JWT authentication
@@ -43,8 +43,8 @@ router = APIRouter(prefix="/ai", tags=["AI Sentiment Analysis"])
     status_code=status.HTTP_200_OK,
     summary="Analyse financial news sentiment for an instrument",
     description="""
-    Fetches recent news from configured RSS + NSE/BSE feeds, runs FinBERT
-    ONNX GPU inference on each headline, and returns an aggregated impact score.
+    Fetches recent news from configured RSS + NSE/BSE feeds, runs LLM-backed
+    NLP inference on each headline, and returns an aggregated impact score.
 
     **Impact score**: -100 (very bearish) to +100 (very bullish).
     Weighted by event recency and source credibility (exchange feeds > news sites).
@@ -90,8 +90,8 @@ async def get_sentiment_analysis(
     """
     Return aggregated news sentiment for an instrument.
 
-    Uses FinBERT ONNX GPU for sentiment classification + recency/credibility
-    weighting to compute a -100 to +100 impact score.
+    Uses LLM-backed NLP (NIM primary, Ollama fallback) for sentiment
+    classification + recency/credibility weighting to compute a -100 to +100 impact score.
     """
     user_id = current_user.get("user_id", "unknown")
 

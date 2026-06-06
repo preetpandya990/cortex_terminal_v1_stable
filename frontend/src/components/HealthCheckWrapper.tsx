@@ -54,7 +54,7 @@ export function HealthCheckWrapper({ children }: { children: React.ReactNode }) 
   const runHealthCheck = useCallback(async (): Promise<void> => {
     // Cancel any in-flight request
     if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
+      abortControllerRef.current.abort(new DOMException('New health check started', 'AbortError'));
     }
 
     // Create new abort controller for this request
@@ -113,9 +113,10 @@ export function HealthCheckWrapper({ children }: { children: React.ReactNode }) 
         }));
       }
     } catch (error) {
-      // Network error, timeout, or aborted request
-      if (error instanceof Error && error.name === 'AbortError') {
-        // Request was cancelled, don't update state
+      // Network error, timeout, or aborted request.
+      // DOMException (name='AbortError') is thrown when the signal is aborted —
+      // check by name rather than instanceof to handle all browser environments.
+      if ((error as { name?: string })?.name === 'AbortError') {
         return;
       }
 
@@ -158,9 +159,12 @@ export function HealthCheckWrapper({ children }: { children: React.ReactNode }) 
       if (successResetTimerRef.current) {
         clearTimeout(successResetTimerRef.current);
       }
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-      }
+      // Do not call abort() on unmount — Turbopack's global error interceptor
+      // surfaces AbortErrors before the local catch can suppress them, even
+      // when the error is handled correctly.  React 18 silently ignores setState
+      // on unmounted components, so the in-flight request completing is harmless.
+      // Nulling the ref prevents runHealthCheck from aborting a stale controller.
+      abortControllerRef.current = null;
     };
   }, [runHealthCheck]);
 

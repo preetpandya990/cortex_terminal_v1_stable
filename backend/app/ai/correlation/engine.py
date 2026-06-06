@@ -975,7 +975,7 @@ class EventCorrelationEngine:
 
         suggestion = TradeSuggestion(
             suggestion_id=uuid4(),
-            symbol=symbol,
+            symbol=trading_sym or symbol,
             instrument_key=symbol,
             trading_symbol=trading_sym,
             company_name=company_name,
@@ -1061,6 +1061,27 @@ class EventCorrelationEngine:
             ai_output=ai_signal,
             ml_output=ml_signal,
         )
+
+        # Trigger async LLM explanation generation — fire-and-forget.
+        # The explanation_worker subscribes to this channel and generates the
+        # plain-English explanation independently of the suggestion creation path.
+        # A failure here must never block or roll back the committed suggestion.
+        try:
+            await self.redis.publish(
+                RedisChannels.LLM_EXPLANATION_PENDING,
+                json.dumps({
+                    "suggestion_id": str(suggestion.suggestion_id),
+                    "id":            suggestion.id,
+                }, default=str),
+            )
+            logger.debug(
+                "explanation trigger published for suggestion %s", suggestion.suggestion_id
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to trigger explanation for suggestion %s (non-fatal): %s",
+                suggestion.suggestion_id, exc,
+            )
 
         # Publish full suggestion payload so WebSocket clients can render
         # immediately without a round-trip REST fetch.

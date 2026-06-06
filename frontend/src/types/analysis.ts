@@ -191,11 +191,50 @@ export type MLEnsemblePrediction =
   | MLEnsemblePredictionData
   | MLEnsemblePredictionUnavailable;
 
+// ─── LLM Explanation ──────────────────────────────────────────────────────────
+
+/** A single news source cited by the LLM in an explanation. */
+export interface ExplanationSource {
+  /** Publication name, e.g. "Economic Times Markets" */
+  source_name: string;
+  /** ISO-8601 UTC timestamp of the original article */
+  as_of: string;
+  /** Original article URL */
+  source_url: string;
+}
+
+/**
+ * LLM-generated plain-English explanation for a trade suggestion.
+ *
+ * ``available`` distinguishes two pending states:
+ *   false → explanation worker has not finished (show skeleton)
+ *   true  → explanation text is ready for display
+ *
+ * ``sources`` is only populated on the real-time push path.  On the
+ * periodic poll fallback, sources will be an empty array — inline citations
+ * within ``full_explanation`` still provide attribution.
+ */
+export interface ExplanationData {
+  available:        boolean;
+  summary:          string | null;
+  full_explanation: string | null;
+  model:            string | null;
+  /** ISO-8601 UTC timestamp when the explanation was written */
+  generated_at:     string | null;
+  sources:          ExplanationSource[];
+}
+
 /** SSE `analysis_update` event payload */
 export interface AnalysisStreamEvent {
-  prediction: MLEnsemblePrediction | null;
-  pattern:    PatternAnalysisCard   | null;
-  sentiment:  SentimentAnalysisCard | null;
+  prediction:  MLEnsemblePrediction | null;
+  pattern:     PatternAnalysisCard   | null;
+  sentiment:   SentimentAnalysisCard | null;
+  /**
+   * LLM explanation for the latest active suggestion on this instrument.
+   * null  → no active suggestion (hide the panel).
+   * obj   → active suggestion exists; check ``available`` for readiness.
+   */
+  explanation: ExplanationData       | null;
   instrument_key: string;
-  emitted_at: string;
+  emitted_at:     string;
 }

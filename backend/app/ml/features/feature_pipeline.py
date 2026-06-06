@@ -98,7 +98,7 @@ async def compute_features_for_symbol(
 
     Feature groups (when all flags True):
       44  technical  — OHLCV-derived indicators
-       5  sentiment  — FinBERT NLP scores
+       5  sentiment  — LLM NLP scores
       20  fundamental — cross-sectional company-level ratios
       ──
       69  total
@@ -125,7 +125,7 @@ async def compute_features_for_symbol(
                               for point-in-time fundamental queries.
         timeframe:            Candle timeframe (e.g. '1D').
         db:                   Async SQLAlchemy session.
-        include_sentiment:    Include the 5 FinBERT sentiment features.
+        include_sentiment:    Include the 5 LLM sentiment features.
         include_fundamentals: Include the 20 fundamental company-level features.
 
     Returns:

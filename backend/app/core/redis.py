@@ -127,6 +127,44 @@ class RedisChannels:
         }
     """
     
+    # ── LLM Explanation Pipeline ───────────────────────────────────────────────
+    LLM_EXPLANATION_PENDING = "cortex:llm:explanation:pending"
+    """
+    Trigger channel — published by the correlation engine immediately after a
+    trade suggestion is committed to DB.  The explanation worker is the sole
+    subscriber.
+
+    Payload:
+        {
+            "suggestion_id": "uuid-string",
+            "id": 123              # integer PK (used as reference_id in audit log)
+        }
+    """
+
+    LLM_EXPLANATION_READY = "cortex:llm:explanation:ready:{suggestion_id}"
+    """
+    Per-suggestion notification published by the explanation worker once the
+    LLM explanation has been written to the DB.  The SSE stream subscribes to
+    the ``cortex:llm:explanation:ready:*`` pattern and emits an analysis_update
+    immediately on receipt, bypassing the polling cycle.
+
+    Channel name: substitute {suggestion_id} with the UUID string.
+    Payload:
+        {
+            "suggestion_id": "uuid-string",
+            "llm_summary":   "2-3 sentence summary...",
+            "model":         "nim/qwen3.5-122b-a10b",
+            "generated_at":  "2026-06-04T12:00:00Z",
+            "sources": [
+                {
+                    "source_name": "Economic Times Markets",
+                    "as_of":       "2026-06-04T10:30:00+00:00",
+                    "source_url":  "https://..."
+                }
+            ]
+        }
+    """
+
     # ── Market Feed ────────────────────────────────────────────────────────────
     MARKET_FEED_LTPC = "cai:market-feed:ltpc"
     """

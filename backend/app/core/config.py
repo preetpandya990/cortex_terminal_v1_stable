@@ -75,7 +75,44 @@ class Settings(BaseSettings):
     RSS_CONCURRENCY: int = Field(5, ge=1, le=20)
     RSS_POLL_JITTER_SECONDS: int = Field(60, ge=0, le=300)
 
-    # ── Ollama ─────────────────────────────────────────────────────────────────
+    # ── Intelligence Layer — NVIDIA NIM (primary LLM provider) ────────────────
+    # Obtain API key from build.nvidia.com → API Keys → Generate.
+    # Set NVIDIA_NIM_API_KEY in .env to activate NIM as the primary backend.
+    # If unset, the system falls back to Ollama automatically (logged at startup).
+    #
+    # Model: verify current availability at build.nvidia.com/models before first run.
+    # The model below is the recommended Qwen3 MoE variant as of 2026-06-03.
+    NVIDIA_NIM_API_KEY: str | None = None
+    NVIDIA_NIM_BASE_URL: str = "https://integrate.api.nvidia.com/v1"
+    NVIDIA_NIM_MODEL: str = "qwen/qwen3.5-122b-a10b"
+    NVIDIA_NIM_EMBED_MODEL: str = "nvidia/nv-embedqa-e5-v5"
+
+    # ── Intelligence Layer — LLM Behaviour ────────────────────────────────────
+    LLM_MAX_RETRIES: int = Field(3, ge=1, le=5)
+    LLM_REQUEST_TIMEOUT: float = Field(30.0, ge=5.0, le=120.0)
+
+    # ── Intelligence Layer — RAG ───────────────────────────────────────────────
+    RAG_TOP_K: int = Field(5, ge=1, le=20)
+    RAG_WINDOW_HOURS: int = Field(24, ge=1, le=168)
+    RAG_EMBED_BATCH_SIZE: int = Field(32, ge=1, le=128)
+
+    # ── Intelligence Layer — Groq (development / staging LLM provider) ───────────
+    # Groq serves Qwen3-32B via custom LPU silicon: ~300ms TTFT, 60 RPM free tier,
+    # OpenAI-compatible API.  Slot 2 in the provider chain — activated when
+    # NVIDIA_NIM_API_KEY is unset (dev) or NIM is unreachable (failover).
+    #
+    # Obtain free API key (no credit card): console.groq.com/keys
+    # Add GROQ_API_KEY to .env to activate.  Leave unset to skip Groq.
+    #
+    # Model: qwen/qwen3-32b — finance-capable, same Qwen3 family as NIM.
+    # Ref: console.groq.com/docs/model/qwen/qwen3-32b
+    GROQ_API_KEY: str | None = None
+    GROQ_BASE_URL: str = "https://api.groq.com/openai/v1"
+    GROQ_MODEL: str = "qwen/qwen3-32b"
+
+    # ── Ollama (local fallback LLM provider — always last in chain) ───────────────
+    # Requires Ollama running locally: ollama serve
+    # Pull required models: ollama pull llama3.1:8b && ollama pull nomic-embed-text
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "llama3.1:8b"
     OLLAMA_TIMEOUT: int = Field(30, ge=5, le=120)

@@ -27,7 +27,16 @@
 
 services:
 
-  # ── TimescaleDB (PostgreSQL 16 + TimescaleDB HA) ──────────────────────────
+  # ── TimescaleDB HA (PostgreSQL 16 + TimescaleDB 2.27.1 + pgvector 0.8.2) ─────
+  # Official timescaledb-ha image — ships with TimescaleDB and pgvector pre-installed.
+  # No custom Dockerfile required.
+  #
+  # Data lives in the external volume `postgres_data_tsdb` (created during the
+  # 2026-06-03 migration from postgres:16-alpine → timescaledb-ha:pg16).
+  # The old volume `cortex_merge_ai-ml_postgres_data` is retained as a backup
+  # and can be removed after 24h of verified operation.
+  #
+  # PGDATA path is /home/postgres/pgdata/data — differs from standard postgres image.
   db:
     image: timescale/timescaledb-ha:pg16
     container_name: cortex-db
@@ -36,9 +45,9 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-cortex}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cortex_pg}
       POSTGRES_DB: ${POSTGRES_DB:-cortex_db}
-      POSTGRES_INITDB_ARGS: "-E UTF8"
+      PGDATA: /home/postgres/pgdata/data
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data_tsdb:/home/postgres/pgdata/data
     ports:
       - "5433:5432"
     healthcheck:
@@ -219,7 +228,11 @@ services:
         condition: service_healthy
 
 volumes:
-  postgres_data:
+  # postgres_data_tsdb is an EXTERNAL volume created during the 2026-06-03 migration.
+  # It was initialised via `docker run` and is managed outside of Compose lifecycle.
+  # Do NOT declare it as a regular Compose volume — that would create a new empty one.
+  postgres_data_tsdb:
+    external: true
   redis_data:
   ollama_data:
   ml_models:

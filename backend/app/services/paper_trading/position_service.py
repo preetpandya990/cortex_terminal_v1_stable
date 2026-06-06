@@ -558,7 +558,10 @@ async def _write_outcome(
         pnl_pct=pnl_pct,
         hold_duration_seconds=hold_duration_seconds,
         exit_reason=exit_reason,
-        suggested_entry_price=suggestion.entry_price if suggestion else None,
+        suggested_entry_price=(
+            suggestion.entry_price if suggestion
+            else (ai_signal.target_price if ai_signal else None)
+        ),
         suggested_stop_loss=_sl,
         suggested_tp1=_tp1,
         suggested_tp2=_tp2,

@@ -159,7 +159,7 @@ export function AISentimentCard({ data, isLoading, error }: AISentimentCardProps
             {data.lookback_hours}h window
           </span>
         </CardTitle>
-        <CardDescription>FinBERT · {data.breakdown.total} news events</CardDescription>
+        <CardDescription>LLM · {data.breakdown.total} news events</CardDescription>
       </CardHeader>
 
       <CardContent className="space-y-4">

@@ -59,13 +59,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     await init_redis()
 
-    # Initialize FinBERT NLP engine (ONNX GPU) — runs model loading in thread pool
+    # Initialize LLM Intelligence Client — probes NIM then Ollama, logs active backend
+    try:
+        from app.ai.intelligence.llm_client import CortexIntelligenceClient
+        await CortexIntelligenceClient.initialize()
+    except Exception as exc:
+        logger.error(
+            "Intelligence client initialization failed (LLM features degraded): %s", exc
+        )
+
+    # Initialize NLP engine — LLM-backed sentiment analysis via CortexIntelligenceClient
     try:
         from app.ai.intelligence.nlp_engine import NLPEngine
         await NLPEngine.initialize()
-        logger.info("FinBERT NLP engine initialized")
+        logger.info("NLP engine initialized")
     except Exception as exc:
-        logger.warning("FinBERT initialization failed (sentiment analysis degraded): %s", exc)
+        logger.warning("NLP engine initialization failed (sentiment analysis degraded): %s", exc)
 
     upstox_client = UpstoxClient()
     await upstox_client.start()
@@ -170,6 +179,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.sl_tp_worker_task = sl_tp_worker_task
     logger.info("Strategy SL/TP monitoring worker started")
 
+    # Start LLM Explanation Worker — generates plain-English trade explanations
+    # asynchronously after each suggestion is committed to the database.
+    from app.ai.intelligence.explanation_worker import explanation_worker
+    explanation_worker_task = asyncio.create_task(
+        explanation_worker(), name="llm_explanation_worker"
+    )
+    app.state.explanation_worker_task = explanation_worker_task
+    logger.info("LLM explanation worker started")
+
     logger.info("All services initialized — ready")
     yield
 
@@ -214,6 +232,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.sl_tp_worker_task.cancel()
         try:
             await asyncio.wait_for(app.state.sl_tp_worker_task, timeout=5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
+    # Cancel LLM explanation worker
+    if hasattr(app.state, "explanation_worker_task") and app.state.explanation_worker_task:
+        app.state.explanation_worker_task.cancel()
+        try:
+            await asyncio.wait_for(app.state.explanation_worker_task, timeout=5.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
 

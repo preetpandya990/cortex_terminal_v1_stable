@@ -33,9 +33,9 @@
       "icon": "external link",
       "tags": [],
       "targetBlank": false,
-      "title": "SRE Overview →",
+      "title": "LLM Intelligence →",
       "type": "link",
-      "url": "/d/cortex-sre-overview"
+      "url": "/d/cortex-llm-intelligence"
     }
   ],
   "panels": [

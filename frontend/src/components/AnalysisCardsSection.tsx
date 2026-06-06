@@ -3,34 +3,48 @@
 /**
  * Analysis Cards Section
  * ======================
- * Three-card financial intelligence panel:
+ * Four-card financial intelligence panel:
  *  1. ML Ensemble Analysis — XGBoost + GRU prediction with per-model breakdown
- *  2. AI Sentiment         — FinBERT ONNX news sentiment (RSS + NSE/BSE feeds)
+ *  2. AI Sentiment         — LLM news sentiment (RSS + NSE/BSE feeds)
  *  3. Prediction Summary   — synthesis of ensemble + sentiment → BUY/SELL/HOLD
+ *  4. AI Explanation       — LLM plain-English narrative grounded in recent news
  *
  * Data flow: SSE stream is the primary source (real-time, 60s–5min refresh per
- * component).  React Query polling is the always-active fallback — it activates
- * immediately on mount and keeps data fresh when SSE is down or retrying.
+ * component; explanation pushed immediately on generation via Redis pub/sub).
+ * React Query polling is the always-active fallback — activates immediately on
+ * mount and keeps data fresh when SSE is down or retrying.
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
+import { cn } from '@/lib/utils';
 import { useAuth } from '@/contexts/AuthContext';
 import { MLPatternCard } from './MLPatternCard';
 import { AISentimentCard } from './AISentimentCard';
 import { PredictionSummaryCard } from './PredictionSummaryCard';
+import { AIExplanationPanel } from './AIExplanationPanel';
 import type {
   AnalysisStreamEvent,
+  ExplanationData,
   MLEnsemblePrediction,
   PatternAnalysisCard,
   SentimentAnalysisCard,
 } from '@/types/analysis';
+import type { TradeSuggestion } from '@/types/trade_suggestions';
 
 interface AnalysisCardsSectionProps {
   instrumentKey: string | null;
   symbol?: string | null;
   className?: string;
+  /**
+   * The trade suggestion currently displayed in the parent pane.
+   * When provided, its explanation fields (from the REST response) are used
+   * to pre-populate the panel immediately — before the SSE stream's first
+   * poll cycle completes.  SSE still overrides once it delivers fresher data
+   * (including structured source citations from the push path).
+   */
+  suggestion?: TradeSuggestion;
 }
 
 // ── SSE connection hook ────────────────────────────────────────────────────────
@@ -44,15 +58,16 @@ function useAnalysisStream(
   accessToken: string | null,
   enabled: boolean,
 ) {
-  const [predictionData, setPredictionData] = useState<MLEnsemblePrediction | null>(null);
-  const [patternData,    setPatternData]    = useState<PatternAnalysisCard   | null>(null);
-  const [sentimentData,  setSentimentData]  = useState<SentimentAnalysisCard | null>(null);
-  const [isConnected,    setIsConnected]    = useState(false);
-  const [isInitialLoad,  setIsInitialLoad]  = useState(true);
+  const [predictionData,  setPredictionData]  = useState<MLEnsemblePrediction | null>(null);
+  const [patternData,     setPatternData]     = useState<PatternAnalysisCard   | null>(null);
+  const [sentimentData,   setSentimentData]   = useState<SentimentAnalysisCard | null>(null);
+  const [explanationData, setExplanationData] = useState<ExplanationData       | null>(null);
+  const [isConnected,     setIsConnected]     = useState(false);
+  const [isInitialLoad,   setIsInitialLoad]   = useState(true);
 
-  const esRef           = useRef<EventSource | null>(null);
-  const retryCountRef   = useRef(0);
-  const retryTimerRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const esRef         = useRef<EventSource | null>(null);
+  const retryCountRef = useRef(0);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const connect = useCallback(() => {
     if (!enabled || !instrumentKey || !accessToken) return;
@@ -73,16 +88,22 @@ function useAnalysisStream(
         if (payload.prediction) setPredictionData(payload.prediction);
         if (payload.pattern)    setPatternData(payload.pattern);
         if (payload.sentiment)  setSentimentData(payload.sentiment);
+
+        // ``explanation`` is explicitly nullable — null means no active suggestion,
+        // which is distinct from "not yet received" (undefined).  Update whenever
+        // the field is present in the payload, including on null.
+        if ('explanation' in payload) setExplanationData(payload.explanation);
+
         setIsInitialLoad(false);
         setIsConnected(true);
         retryCountRef.current = 0;
       } catch {
-        // malformed payload — ignore silently
+        // Malformed payload — ignore silently; SSE will continue
       }
     });
 
     es.addEventListener('error', (_e: MessageEvent) => {
-      // Non-fatal server-side error — keep connection open
+      // Non-fatal server-side error event — keep connection open
     });
 
     es.onerror = () => {
@@ -101,6 +122,7 @@ function useAnalysisStream(
     setPredictionData(null);
     setPatternData(null);
     setSentimentData(null);
+    setExplanationData(null);
     retryCountRef.current = 0;
     connect();
 
@@ -110,7 +132,7 @@ function useAnalysisStream(
     };
   }, [connect, enabled, instrumentKey]);
 
-  return { predictionData, patternData, sentimentData, isConnected, isInitialLoad };
+  return { predictionData, patternData, sentimentData, explanationData, isConnected, isInitialLoad };
 }
 
 // ── Main component ─────────────────────────────────────────────────────────────
@@ -119,18 +141,75 @@ export function AnalysisCardsSection({
   instrumentKey,
   symbol,
   className,
+  suggestion,
 }: AnalysisCardsSectionProps) {
   const { isAuthenticated, isAuthReady, accessToken } = useAuth();
   const canQuery = isAuthReady && isAuthenticated && !!instrumentKey;
 
   // ── SSE real-time stream ───────────────────────────────────────────────────
   const {
-    predictionData: ssePrediction,
-    patternData:    ssePattern,
-    sentimentData:  sseSentiment,
-    isConnected:    sseConnected,
-    isInitialLoad:  sseLoading,
+    predictionData:  ssePrediction,
+    patternData:     ssePattern,
+    sentimentData:   sseSentiment,
+    explanationData: sseExplanation,
+    isConnected:     sseConnected,
+    isInitialLoad:   sseLoading,
   } = useAnalysisStream(instrumentKey, symbol, accessToken, canQuery);
+
+  // ── Invalidate suggestions when explanation becomes ready ─────────────────
+  // When the SSE push path delivers a completed explanation, the suggestion list
+  // in HawkEyeRadarClient still holds a stale snapshot (llm_explanation = null).
+  // Invalidating here causes React Query to refetch, which updates
+  // currentDetailSuggestion → the next suggestionExplanation memo cycle returns
+  // available: true → the panel transitions from skeleton to content.
+  const queryClient = useQueryClient();
+  useEffect(() => {
+    if (sseExplanation?.available) {
+      queryClient.invalidateQueries({ queryKey: ['trade-suggestions'] });
+    }
+  }, [sseExplanation?.available, queryClient]);
+
+  // ── Explanation seed from REST response ────────────────────────────────────
+  // The parent DetailPane already has the suggestion object from the REST list
+  // call (which includes llm_summary / llm_explanation).  Use it to populate
+  // the panel immediately — before the SSE stream's first poll cycle arrives.
+  //
+  // SSE takes priority once it delivers data: it carries structured source
+  // citations (push path) and always reflects the latest DB state (poll path).
+  //
+  // Keyed on suggestion_id so the memo only recomputes when the suggestion
+  // actually changes, not on every parent re-render.
+  const suggestionExplanation = useMemo((): ExplanationData | null => {
+    if (!suggestion) return null;
+
+    // Explanation is fully ready — seed the panel with the REST data immediately.
+    if (suggestion.llm_explanation) {
+      return {
+        available:        true,
+        summary:          suggestion.llm_summary          ?? null,
+        full_explanation: suggestion.llm_explanation,
+        model:            suggestion.explanation_model    ?? null,
+        generated_at:     suggestion.explanation_generated_at ?? null,
+        sources:          [],   // sources arrive via SSE push path, not REST
+      };
+    }
+
+    // Active suggestion exists but explanation not yet generated — show skeleton
+    // so the panel is visible and waiting rather than hidden.
+    if (suggestion.status === 'active') {
+      return {
+        available:        false,
+        summary:          null,
+        full_explanation: null,
+        model:            null,
+        generated_at:     null,
+        sources:          [],
+      };
+    }
+
+    return null;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [suggestion?.suggestion_id, suggestion?.llm_explanation]);
 
   // ── Polling fallback (React Query) ─────────────────────────────────────────
   // All three queries run immediately on mount so the cards are never blank
@@ -182,17 +261,37 @@ export function AnalysisCardsSection({
   if (!instrumentKey) return null;
 
   // SSE data takes priority; React Query fills in until SSE fires
-  const predictionData = ssePrediction ?? predictionQuery.data ?? null;
-  const patternData    = ssePattern    ?? patternQuery.data    ?? null;
-  const sentimentData  = sseSentiment  ?? sentimentQuery.data  ?? null;
+  const predictionData  = ssePrediction  ?? predictionQuery.data  ?? null;
+  const patternData     = ssePattern     ?? patternQuery.data     ?? null;
+  const sentimentData   = sseSentiment   ?? sentimentQuery.data   ?? null;
+  // Priority logic for explanation data:
+  //   1. SSE with available:true  → authoritative (carries structured source citations)
+  //   2. REST seed with available:true → use immediately (push notification may have been
+  //      missed if explanation was pre-generated before SSE watcher subscribed)
+  //   3. Either side with available:false → skeleton (explanation genuinely pending)
+  //   4. Both null → hide panel (no active suggestion)
+  //
+  // The naive `sseExplanation ?? suggestionExplanation` breaks because SSE can fire
+  // a transient { available: false } payload (first poll hits DB before commit, or
+  // returns a newer explanation-less suggestion for the same instrument_key). That
+  // truthy-but-unavailable object wins ?? and permanently blocks the REST seed.
+  const explanationData: ExplanationData | null = (() => {
+    if (sseExplanation?.available) return sseExplanation;
+    if (suggestionExplanation?.available) return suggestionExplanation;
+    return sseExplanation ?? suggestionExplanation ?? null;
+  })();
 
-  const isPredictionLoading = sseLoading && !predictionData && predictionQuery.isLoading;
-  const isPatternLoading    = sseLoading && !patternData    && patternQuery.isLoading;
-  const isSentimentLoading  = sseLoading && !sentimentData  && sentimentQuery.isLoading;
-  const isSummaryLoading    = isPredictionLoading && isPatternLoading && isSentimentLoading;
+  const isPredictionLoading  = sseLoading && !predictionData  && predictionQuery.isLoading;
+  const isPatternLoading     = sseLoading && !patternData     && patternQuery.isLoading;
+  const isSentimentLoading   = sseLoading && !sentimentData   && sentimentQuery.isLoading;
+  const isSummaryLoading     = isPredictionLoading && isPatternLoading && isSentimentLoading;
+  // Show skeleton only during initial SSE load when there is no seeded data at all.
+  // If suggestionExplanation is set, the panel renders from it immediately (no skeleton).
+  const isExplanationLoading = sseLoading && explanationData === null;
 
   return (
-    <div className={className}>
+    <div className={cn('space-y-4', className)}>
+      {/* ── Three-card grid: ML Pattern | AI Sentiment | Prediction Summary ── */}
       <div className="grid gap-4 md:grid-cols-3">
         <MLPatternCard
           data={patternData}
@@ -220,6 +319,12 @@ export function AnalysisCardsSection({
           isLoading={isSummaryLoading}
         />
       </div>
+
+      {/* ── Full-width AI Explanation panel ────────────────────────────────── */}
+      <AIExplanationPanel
+        data={explanationData}
+        isLoading={isExplanationLoading}
+      />
     </div>
   );
 }

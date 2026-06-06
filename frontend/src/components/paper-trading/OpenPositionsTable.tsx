@@ -349,8 +349,9 @@ export function OpenPositionsTable() {
   // ── WebSocket live P&L ────────────────────────────────────────────────────
 
   const {
-    isConnected: wsConnected,
+    isConnected:     wsConnected,
     connectionState: wsState,
+    hasReceivedData: wsHasData,
     positionPnLMap,
     portfolioStats,
     onOrderFilled,
@@ -504,7 +505,7 @@ export function OpenPositionsTable() {
         {/* Portfolio Summary Card */}
         <PortfolioSummaryCard
           portfolio={portfolio}
-          liveStats={wsConnected ? portfolioStats : undefined}
+          liveStats={wsConnected && wsHasData ? portfolioStats : undefined}
           onSettingsClick={() => setShowSettings(true)}
         />
 

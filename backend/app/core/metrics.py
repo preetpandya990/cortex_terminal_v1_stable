@@ -269,6 +269,73 @@ regime_detection_symbols_total = Counter(
 )
 
 
+# ── LLM Intelligence Metrics ──────────────────────────────────────────────────
+# Per CORTEX_LLM_UPGRADE_PLAN.md §8.4 — SLOs: explanation p95 < 5s, success ≥ 95%,
+# NIM fallback < 5%, sentiment p95 < 3s, RAG retrieval p95 < 500ms.
+
+llm_explanation_duration_seconds = Histogram(
+    'llm_explanation_duration_seconds',
+    'End-to-end explanation generation latency (seconds)',
+    ['provider'],   # nim | ollama
+    buckets=(0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0, 30.0),
+)
+
+llm_explanations_total = Counter(
+    'llm_explanations_total',
+    'Total LLM explanation generation attempts',
+    ['status', 'provider'],  # status: success | failure | skipped
+)
+
+llm_sentiment_duration_seconds = Histogram(
+    'llm_sentiment_duration_seconds',
+    'LLM sentiment scoring latency (seconds)',
+    ['provider'],
+    buckets=(0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0),
+)
+
+llm_sentiments_total = Counter(
+    'llm_sentiments_total',
+    'Total LLM sentiment scoring calls',
+    ['status', 'provider'],  # status: success | failure
+)
+
+llm_fallbacks_total = Counter(
+    'llm_fallbacks_total',
+    'Total LLM provider fallbacks within the provider chain',
+    ['provider_from', 'provider_to'],  # e.g. nim→groq, groq→ollama, nim→ollama
+)
+
+rag_retrieval_duration_seconds = Histogram(
+    'rag_retrieval_duration_seconds',
+    'RAG hybrid retrieval latency per call (seconds)',
+    buckets=(0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 2.0),
+)
+
+rag_retrievals_total = Counter(
+    'rag_retrievals_total',
+    'Total RAG retrieval calls',
+    ['status'],  # success | empty | error
+)
+
+llm_guardrail_events_total = Counter(
+    'llm_guardrail_events_total',
+    'Total LLM output guardrail events fired',
+    ['guardrail'],  # price_prediction_filter | citation_missing
+)
+
+llm_audit_log_writes_total = Counter(
+    'llm_audit_log_writes_total',
+    'Total ai_llm_audit_log write attempts',
+    ['status'],  # success | failure
+)
+
+llm_sse_explanation_pushes_total = Counter(
+    'llm_sse_explanation_pushes_total',
+    'Total LLM explanation deliveries via SSE',
+    ['path'],  # push (real-time Redis) | poll (periodic DB refresh)
+)
+
+
 def init_metrics(app_version: str, environment: str):
     """Initialize application info metrics."""
     app_info.info({

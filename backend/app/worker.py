@@ -719,10 +719,6 @@ async def main() -> None:
         return
     
     async with worker_lifespan() as (session_factory, redis_client, ml_components, upstox_client):
-        # Extract ML components
-        ensemble_predictor = ml_components.get("ensemble_predictor")
-        feature_loader = ml_components.get("feature_loader")
-        
         # Create 11 background tasks
         fundamentals_scheduler = FundamentalsRefreshScheduler(
             session_factory=session_factory,
@@ -735,8 +731,8 @@ async def main() -> None:
             asyncio.create_task(
                 event_processing_loop(
                     session_factory,
-                    ensemble_predictor=ensemble_predictor,
-                    feature_loader=feature_loader,
+                    ml_components=ml_components,
+                    redis=redis_client._redis,
                 ),
                 name="event_processing"
             ),

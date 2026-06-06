@@ -13,7 +13,7 @@ class TopEvent(BaseModel):
 
     title: str = Field(..., description="Article headline")
     sentiment: Literal["positive", "negative", "neutral"] = Field(
-        ..., description="FinBERT-classified sentiment"
+        ..., description="LLM-classified sentiment"
     )
     confidence: float = Field(..., ge=0.0, le=1.0, description="Classification confidence (0-1)")
     source: str = Field(..., description="Feed source name (e.g., 'Economic Times Markets')")

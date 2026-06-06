@@ -414,3 +414,10 @@ graphify-out/graph.json
 *_for_ml.txt
 results_for_*.txt
 web_search_*.txt
+
+# MLflow experiment tracking artifacts
+backend/eval/mlruns/
+backend/eval/mlruns.db
+
+# Eval result JSON artifacts
+backend/eval/results/

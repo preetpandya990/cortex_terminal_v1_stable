@@ -1,7 +1,7 @@
 """
 Sentiment Analysis Service
 ==========================
-Fetches recent financial news from ai_raw_events, runs FinBERT ONNX GPU
+Fetches recent financial news from ai_raw_events, runs LLM-backed NLP
 inference, and produces an aggregated impact score for a given instrument.
 
 Architecture:
@@ -10,13 +10,13 @@ Architecture:
   3. Query events via ai_event_classifications.affected_symbols join (precise)
      → adaptive lookback: extends to 3× window when article count is thin
      → text search fallback for instruments not yet in the NLP pipeline
-  4. Run FinBERT inference concurrently in thread pool (asyncio.gather safe —
-     no shared DB session; each inference is a pure CPU call)
+  4. Run LLM sentiment inference concurrently via NLPEngine (asyncio.gather safe —
+     no shared DB session; each inference is an independent remote API call)
   5. Compute weighted impact score and build structured response
   6. Cache and return
 
 Impact score formula:
-  - Each event gets a raw score in [-1, +1] from FinBERT
+  - Each event gets a raw score in [-1, +1] from the LLM
   - Recency weight: exp(-hours_ago / half_life) where half_life = 12h
   - Source credibility weight: 1.0 for exchange feeds, 0.7 for general news
   - Final score = weighted_sum(scores) / weighted_sum(weights) * 100
@@ -73,7 +73,7 @@ class SentimentAnalysisService:
     """
     Service for computing financial sentiment from recent news events.
 
-    The NLPEngine (FinBERT) is a class-level singleton initialized at startup.
+    NLPEngine uses the LLM-backed CortexIntelligenceClient for sentiment scoring.
     Each service instance holds its own DB + Redis references.
     """
 
@@ -163,7 +163,7 @@ class SentimentAnalysisService:
                 computed_at=computed_at,
             )
 
-        # Run FinBERT inference concurrently on all event titles
+        # Run LLM sentiment inference concurrently on all event titles
         titles = [self._extract_title(e.extra_data, e.raw_content) for e in events]
         sentiment_tasks = [self._nlp.analyze_sentiment(t) for t in titles]
         sentiments = await asyncio.gather(*sentiment_tasks, return_exceptions=True)
@@ -176,7 +176,7 @@ class SentimentAnalysisService:
 
         for i, (event, sentiment) in enumerate(zip(events, sentiments)):
             if isinstance(sentiment, Exception):
-                logger.warning("FinBERT failed for event %d: %s", i, sentiment)
+                logger.warning("Sentiment inference failed for event %d: %s", i, sentiment)
                 sentiment = {"label": "neutral", "score": 0.0, "confidence": 0.0, "model": "error"}
 
             label: str = sentiment["label"]

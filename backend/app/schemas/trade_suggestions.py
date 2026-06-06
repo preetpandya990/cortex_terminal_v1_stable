@@ -156,6 +156,26 @@ class TradeSuggestionResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+    # LLM explanation — populated asynchronously by the explanation worker.
+    # null  → worker in progress or failed (frontend renders skeleton loader)
+    # str   → explanation is ready for display
+    llm_summary: str | None = Field(
+        None,
+        description="2–3 sentence plain-English summary for inline display on the card",
+    )
+    llm_explanation: str | None = Field(
+        None,
+        description="Full narrative explanation with news context for the AI Analysis Cards panel",
+    )
+    explanation_model: str | None = Field(
+        None,
+        description="Model identifier that generated the explanation (e.g. nim/qwen3.5-122b-a10b)",
+    )
+    explanation_generated_at: datetime | None = Field(
+        None,
+        description="UTC timestamp when the explanation was written",
+    )
+
     # Per-user strategy compliance annotation (None when user has no subscriptions)
     strategy_compliance: StrategyComplianceInfo | None = Field(
         None,

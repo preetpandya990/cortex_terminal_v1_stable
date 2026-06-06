@@ -701,6 +701,7 @@ export function DetailPane({ instrument, onClose, showAnalysis = true, suggestio
                   <AnalysisCardsSection
                     instrumentKey={instrument.instrument_key}
                     symbol={instrument.trading_symbol ?? undefined}
+                    suggestion={suggestion}
                   />
                 )}
 

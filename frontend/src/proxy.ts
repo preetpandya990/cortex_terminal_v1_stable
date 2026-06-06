@@ -4,10 +4,10 @@ import { type NextRequest, NextResponse } from 'next/server';
 const PUBLIC_PATHS = new Set(['/login']);
 
 // Prefixes to skip entirely — Next.js internals and all API routes handle
-// their own auth; middleware should never interfere with them.
+// their own auth; the proxy should never interfere with them.
 const SKIP_PREFIXES = ['/_next/', '/api/', '/favicon.ico', '/icons/', '/images/'];
 
-export function middleware(request: NextRequest) {
+export function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
   // Short-circuit for static assets and API routes

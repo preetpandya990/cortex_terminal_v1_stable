@@ -92,6 +92,16 @@ class TradeSuggestion(Base):
     regime_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
     time_horizon: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
+    # LLM explanation — populated asynchronously by the explanation worker.
+    # NULL while the worker is in progress or if generation failed.
+    # Frontend renders a loading skeleton when llm_summary is NULL on an active suggestion.
+    llm_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    llm_explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    explanation_model: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    explanation_generated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # Strategy linkage (Phase 2 — Rule Engine)
     strategy_id: Mapped[UUID | None] = mapped_column(
         PG_UUID(as_uuid=True),

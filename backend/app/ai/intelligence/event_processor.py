@@ -195,59 +195,101 @@ async def event_processing_loop(
     session_factory: async_sessionmaker,
     ensemble_predictor=None,
     feature_loader=None,
+    ml_components: dict | None = None,
+    redis=None,
 ) -> None:
     """
     Event processing background loop.
-    
+
     Continuously processes raw events through NLP → Classification → Signals.
     Runs until cancelled via asyncio.CancelledError.
-    
+
+    ML inference mirrors the correlation_loop pattern: a fresh FeatureLoader is
+    bound to the SignalAssembler at the start of each cycle (using the current
+    DB session) and cleared after the batch completes.  This prevents the
+    use-after-close bug that occurred when a single FeatureLoader was created
+    at startup with a session that had already been closed.
+
     Args:
-        session_factory: SQLAlchemy async session factory
-        ensemble_predictor: ML ensemble predictor (optional)
-        feature_loader: Feature loader service (optional)
+        session_factory:  SQLAlchemy async session factory.
+        ensemble_predictor: Deprecated — use ml_components instead.
+                            Still accepted for backward compatibility.
+        feature_loader:   Ignored — FeatureLoader is created per-cycle.
+        ml_components:    Dict from worker_lifespan containing
+                          ensemble_predictor, ensemble_sequence_length,
+                          ensemble_n_features, ensemble_feature_names.
+        redis:            Raw redis.asyncio.Redis client for FeatureLoader cache.
     """
     logger.info("Event processing loop started")
-    
+
+    # Resolve ML components — prefer the ml_components dict (worker path) but
+    # fall back to the direct ensemble_predictor arg for backward compatibility.
+    _mc = ml_components or {}
+    _ml_predictor   = _mc.get("ensemble_predictor") or ensemble_predictor
+    _seq_len        = _mc.get("ensemble_sequence_length", 60)
+    _n_features     = _mc.get("ensemble_n_features", 37)
+    _feature_names  = _mc.get("ensemble_feature_names", ())
+    _ml_available   = _ml_predictor is not None
+
     try:
         logger.info("Creating EventProcessor instance...")
         processor = EventProcessor(
             session_factory,
             batch_size=10,
-            ensemble_predictor=ensemble_predictor,
-            feature_loader=feature_loader,
+            ensemble_predictor=_ml_predictor,
+            feature_loader=None,   # injected per-cycle below
         )
         logger.info("EventProcessor created successfully")
-        if ensemble_predictor:
-            logger.info("✓ ML predictions enabled")
+        if _ml_available:
+            logger.info(
+                "ML predictions enabled — ensemble_predictor=%s features=%d seq_len=%d",
+                type(_ml_predictor).__name__, _n_features, _seq_len,
+            )
         else:
-            logger.info("⚠ ML predictions disabled (no model)")
+            logger.warning(
+                "Event processing loop starting WITHOUT ML predictor — "
+                "signals will be assembled from events + technicals only."
+            )
     except Exception as e:
-        logger.error(f"Failed to create EventProcessor: {e}", exc_info=True)
+        logger.error("Failed to create EventProcessor: %s", e, exc_info=True)
         return
-    
-    # Processing interval (30 seconds default)
+
     processing_interval = 30
-    logger.info(f"Event processing interval: {processing_interval}s")
-    
+    logger.info("Event processing interval: %ds", processing_interval)
+
     try:
         while True:
             try:
-                logger.info("Event processing cycle starting...")
                 async with session_factory() as db:
+                    # Bind a fresh FeatureLoader for this cycle so that
+                    # gather_ml_signals() has a live DB connection.  Cleared
+                    # after the batch so stale session references fail fast.
+                    if _ml_available:
+                        from app.ml.inference.feature_loader import FeatureLoader
+                        processor.signal_assembler.feature_loader = FeatureLoader(
+                            db=db,
+                            redis=redis,
+                            sequence_length=_seq_len,
+                            n_features=_n_features,
+                            feature_names=_feature_names,
+                        )
+
                     processed_count = await processor.process_batch(db)
-                    
+
+                    processor.signal_assembler.feature_loader = None
+
                     if processed_count > 0:
-                        logger.info(f"Event processing cycle complete: {processed_count} events processed")
+                        logger.info("Event processing cycle complete: %d events processed", processed_count)
                     else:
-                        logger.info("No unprocessed events found")
-            
+                        logger.debug("No unprocessed events found")
+
             except Exception as e:
-                logger.error(f"Event processing error: {e}", exc_info=True)
-            
-            # Sleep before next cycle
+                logger.error("Event processing error: %s", e, exc_info=True)
+                # Ensure the feature_loader is cleared even on error
+                processor.signal_assembler.feature_loader = None
+
             await asyncio.sleep(processing_interval)
-    
+
     except asyncio.CancelledError:
         logger.info("Event processing loop cancelled")
         raise

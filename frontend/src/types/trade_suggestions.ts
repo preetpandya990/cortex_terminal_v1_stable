@@ -86,6 +86,20 @@ export interface TradeSuggestion {
   updated_at: string;
   /** Strategy compliance annotation — null when user has no active subscriptions */
   strategy_compliance: StrategyComplianceInfo | null;
+
+  // ── LLM explanation ───────────────────────────────────────────────────────
+  // Populated asynchronously by the explanation worker after the suggestion is
+  // committed to the database.  All four fields are null while generation is
+  // in progress or if it fails.
+  //
+  // Rendering contract (TradeSuggestionCard):
+  //   undefined   → field absent from response (old client cache) — hide section
+  //   null        → explanation pending — show skeleton loader
+  //   string/date → explanation ready   — render content
+  llm_summary:              string | null;
+  llm_explanation:          string | null;
+  explanation_model:        string | null;
+  explanation_generated_at: string | null;
 }
 
 /**

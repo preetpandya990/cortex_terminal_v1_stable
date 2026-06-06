@@ -65,6 +65,18 @@ export interface PnLPortfolioStats {
 export interface UsePnLWebSocketReturn {
   connectionState: PnLConnectionState;
   isConnected:     boolean;
+  /**
+   * True once the first `LivePnLUpdate` frame has been received on the current
+   * portfolio connection.  Callers should gate `portfolioStats` display on this
+   * flag — until it is true, `portfolioStats` holds the INITIAL_STATS zero
+   * sentinel and must not be preferred over REST data.
+   *
+   * Resets to false whenever `portfolioId` changes (new connection to a
+   * different portfolio channel).  Does NOT reset on simple reconnects within
+   * the same portfolio so the last-known values stay visible during the brief
+   * reconnect window.
+   */
+  hasReceivedData: boolean;
   /** Live P&L keyed by position_id — read without triggering re-renders */
   positionPnLMap: React.MutableRefObject<Map<string, LivePositionPnL>>;
   /** Portfolio aggregate stats — one re-render per ~500 ms frame */
@@ -104,8 +116,12 @@ export function usePnLWebSocket(
   enabled = true,
 ): UsePnLWebSocketReturn {
   const queryClient = useQueryClient();
-  const [connectionState, setConnectionState] = useState<PnLConnectionState>('disconnected');
-  const [portfolioStats,  setPortfolioStats]  = useState<PnLPortfolioStats>(INITIAL_STATS);
+  const [connectionState,  setConnectionState]  = useState<PnLConnectionState>('disconnected');
+  const [portfolioStats,   setPortfolioStats]   = useState<PnLPortfolioStats>(INITIAL_STATS);
+  // Ref holds the live value (no stale-closure risk inside ws.onmessage).
+  // State drives the re-render so consumers see the change.
+  const hasReceivedDataRef = useRef(false);
+  const [hasReceivedData,  setHasReceivedData]  = useState(false);
 
   const positionPnLMap = useRef<Map<string, LivePositionPnL>>(new Map());
 
@@ -146,6 +162,10 @@ export function usePnLWebSocket(
 
     attemptsRef.current        = 0;
     shouldReconnectRef.current = true;
+    // Reset the data-received gate whenever the portfolio connection changes
+    // (different portfolioId → different Redis channel → treat as fresh start).
+    hasReceivedDataRef.current = false;
+    setHasReceivedData(false);
 
     const connect = () => {
       if (wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -261,6 +281,13 @@ export function usePnLWebSocket(
           total_return_pct:     update.total_return_pct,
           last_updated:         update.ts,
         });
+
+        // Gate: mark that real data has arrived.  The ref is read inside this
+        // closure (no stale-capture risk); the state setter triggers the render.
+        if (!hasReceivedDataRef.current) {
+          hasReceivedDataRef.current = true;
+          setHasReceivedData(true);
+        }
       };
 
       ws.onerror = () => {
@@ -365,7 +392,8 @@ export function usePnLWebSocket(
 
   return {
     connectionState,
-    isConnected: connectionState === 'connected',
+    isConnected:     connectionState === 'connected',
+    hasReceivedData,
     positionPnLMap,
     portfolioStats,
     disconnect,
