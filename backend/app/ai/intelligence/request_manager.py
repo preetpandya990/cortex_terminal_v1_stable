@@ -5,12 +5,13 @@ Central coordinator for all Gemini API access within the Cortex AI layer.
 
 Problem
 -------
-Six independent callers (explanation worker, news forecaster, NLP sentiment,
-event classifier, RAG embedder, health check) share a single Gemini API key
-with no coordination.  Under market-hours load they burst simultaneously, hit
-the per-minute limit, and their retries starve each other — every retry storm
-can delay the next legitimate call by 30–60 seconds.  A process restart loses
-circuit state, wasting the first post-restart call on a guaranteed 429.
+Multiple independent callers — explanation worker, news forecaster, NLP
+sentiment, event classifier, RAG embedder, health check, and others — share a
+single Gemini API key with no coordination.  Under market-hours load they burst
+simultaneously, hit the per-minute limit, and their retries starve each other:
+every retry storm can delay the next legitimate call by 30–60 seconds.  A
+process restart loses circuit state, wasting the first post-restart call on a
+guaranteed 429.
 
 Solution
 --------
@@ -18,18 +19,22 @@ Three cooperating mechanisms:
 
 1. **Priority queue** — Five tiers (CRITICAL → BACKGROUND) served in strict
    order with FIFO within each tier.  User-facing explanations are always
-   ahead of background RAG embeddings, regardless of arrival order.
+   ahead of background RAG embeddings, regardless of arrival order.  See the
+   ``Priority`` enum for per-tier assignment guidelines.
 
-2. **Token buckets** — Two independent continuous-refill buckets:
-   ``generate`` (RPM + TPM) and ``embed`` (RPM only).  Callers suspend
-   asynchronously via ``asyncio.Event``; there is no busy-polling or sleep
-   loop on the caller side.
+2. **Token buckets** — ``generate`` and ``embed`` are tracked separately
+   because they have independent quota limits.  ``generate`` has both an RPM
+   and a TPM bucket; ``embed`` has RPM only (not TPM-metered by the API).
+   Callers suspend asynchronously via ``asyncio.Event``; there is no
+   busy-polling or sleep loop on the caller side.
 
 3. **Redis-backed circuit breaker** — When a daily-quota 429 is detected,
    the circuit is written to Redis with a TTL of "seconds until midnight PT".
    On the next app restart ``initialize()`` pre-populates the in-process state
    from Redis so the first post-restart call is a sub-millisecond fast-fail
-   rather than a wasted API round-trip.
+   rather than a wasted API round-trip.  If Redis is unavailable at startup
+   the manager fails open (assumes circuit closed) and will reopen the circuit
+   on the next 429 it observes.
 
 Architecture
 ------------
@@ -46,23 +51,47 @@ permit, waits for token budget, deducts, then sets ``permit.ready`` — unblocki
 the caller.  Because the event loop is single-threaded and all token-bucket
 operations are synchronous (no ``await``), no asyncio locks are required.
 
+Failure modes for callers
+-------------------------
+``GeminiQuotaExhausted``
+    Daily quota is exhausted.  The circuit is open until midnight Pacific Time.
+    **Do not retry** — treat as non-retryable and degrade gracefully (skip the
+    call, return a cached result, or surface a user-facing message).  The
+    circuit auto-closes the moment the new quota period begins.
+
+``GeminiRateLimitError``
+    Either the queue is at ``GEMINI_MAX_QUEUE_DEPTH`` capacity (permit rejected
+    immediately) or ``GEMINI_PERMIT_TIMEOUT`` elapsed before the dispatcher
+    could grant a permit.  The system is under heavy per-minute load.  Skip or
+    degrade — the queue drains naturally as the dispatcher works through
+    existing permits; a retry within the same request is unlikely to help.
+
 Thread safety
 -------------
 Pure asyncio — all shared state is mutated only from the event loop thread.
 Never call any method from a thread pool (``run_in_executor``) without adding
 appropriate synchronization.
 
-Usage
------
-::
+Wiring a new caller
+-------------------
+1. Choose ``Operation.GENERATE`` or ``Operation.EMBED`` based on which Gemini
+   API surface you are calling.  They have separate quota tracks and separate
+   circuit breakers — never mix them.
+
+2. Choose a ``Priority`` tier.  See the ``Priority`` enum docstring for
+   per-tier guidelines.  When in doubt: MEDIUM for live pipeline work,
+   BACKGROUND for offline batch jobs.
+
+3. Wrap the call site::
 
     # FastAPI lifespan startup (after init_redis):
     from app.ai.intelligence.request_manager import GeminiRequestManager
     await GeminiRequestManager.initialize(redis=get_redis())
 
-    # All Gemini call sites:
+    # Call site:
     from app.ai.intelligence.request_manager import (
         get_request_manager, Priority, Operation,
+        GeminiQuotaExhausted, GeminiRateLimitError,
     )
     manager = get_request_manager()
     permit = await manager.acquire(Operation.GENERATE, Priority.HIGH)
@@ -199,6 +228,14 @@ class _Permit:
     ready:            asyncio.Event = field(compare=False, default_factory=asyncio.Event)
     cancelled:        bool          = field(compare=False, default=False)
     enqueued_at:      float         = field(compare=False, default_factory=time.monotonic)
+
+    def __hash__(self) -> int:
+        # sequence is assigned once from a global monotonic counter and never
+        # mutated, making it a stable, collision-free hash key.  This is
+        # consistent with the dataclass-generated __eq__, which compares
+        # (priority, sequence) — and since sequence is globally unique, that
+        # comparison is already effectively identity-based.
+        return hash(self.sequence)
 
 
 # ── Token bucket ───────────────────────────────────────────────────────────────
