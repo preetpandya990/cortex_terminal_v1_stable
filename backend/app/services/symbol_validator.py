@@ -175,23 +175,30 @@ class SymbolValidatorService:
         return result
 
     async def get_company_name(
-        self, symbol: str, db: AsyncSession
+        self, symbol: str, db: AsyncSession, *, include_inactive: bool = False
     ) -> str | None:
         """
         Return the official company name from ``instrument_master.name``.
 
         Cached in Redis for ``_ELIGIBLE_TTL`` seconds.  Returns ``None`` when
         the symbol is not found or its name field is null.
+
+        By default only active (live) instruments resolve; callers servicing an
+        existing position/suggestion that may reference a delisted instrument
+        pass ``include_inactive=True`` to still render its name.
         """
         symbol = symbol.strip().upper()
         if not symbol:
             return None
 
+        # Inactive lookups bypass the cache: the cached value is keyed only by
+        # symbol and reflects the active-only result, so reusing it here would
+        # return the wrong answer for a delisted symbol.
         cache_key = f"{_NAME_KEY_PFX}{symbol}"
-
-        cached = await self._cache_get(cache_key)
-        if cached is not None:
-            return cached or None  # empty string sentinel → None
+        if not include_inactive:
+            cached = await self._cache_get(cache_key)
+            if cached is not None:
+                return cached or None  # empty string sentinel → None
 
         stmt = (
             select(InstrumentMaster.name)
@@ -202,31 +209,40 @@ class SymbolValidatorService:
             )
             .limit(1)
         )
+        if not include_inactive:
+            stmt = stmt.where(InstrumentMaster.is_active.is_(True))
         result = await db.execute(stmt)
         name: str | None = result.scalar_one_or_none()
 
-        # Cache result; empty string represents "no name" to avoid repeated DB hits.
-        await self._cache_set(cache_key, name or "", _ELIGIBLE_TTL)
+        # Only the active-only result is cacheable (the cache key is symbol-only).
+        # Empty string represents "no name" to avoid repeated DB hits.
+        if not include_inactive:
+            await self._cache_set(cache_key, name or "", _ELIGIBLE_TTL)
         return name
 
     async def get_instrument_key(
-        self, symbol: str, db: AsyncSession
+        self, symbol: str, db: AsyncSession, *, include_inactive: bool = False
     ) -> str | None:
         """
         Return the Upstox instrument_key for *symbol* (e.g. ``NSE_EQ|INE001A01036``).
 
         Cached in Redis for ``_ELIGIBLE_TTL`` seconds.  Returns ``None`` when
         the symbol is not found in instrument_master.
+
+        By default only active (live) instruments resolve; callers servicing an
+        existing position/suggestion in a delisted instrument pass
+        ``include_inactive=True`` (e.g. to look up its last-known market data).
         """
         symbol = symbol.strip().upper()
         if not symbol:
             return None
 
+        # Inactive lookups bypass the symbol-only cache (see get_company_name).
         cache_key = f"{_IKEY_KEY_PFX}{symbol}"
-
-        cached = await self._cache_get(cache_key)
-        if cached is not None:
-            return cached or None  # empty string sentinel → None
+        if not include_inactive:
+            cached = await self._cache_get(cache_key)
+            if cached is not None:
+                return cached or None  # empty string sentinel → None
 
         stmt = (
             select(InstrumentMaster.instrument_key)
@@ -237,20 +253,27 @@ class SymbolValidatorService:
             )
             .limit(1)
         )
+        if not include_inactive:
+            stmt = stmt.where(InstrumentMaster.is_active.is_(True))
         result = await db.execute(stmt)
         key: str | None = result.scalar_one_or_none()
 
-        await self._cache_set(cache_key, key or "", _ELIGIBLE_TTL)
+        if not include_inactive:
+            await self._cache_set(cache_key, key or "", _ELIGIBLE_TTL)
         return key
 
     async def get_company_names(
-        self, symbols: list[str], db: AsyncSession
+        self, symbols: list[str], db: AsyncSession, *, include_inactive: bool = False
     ) -> dict[str, str]:
         """
         Batch-fetch company names for *symbols*.
 
         Returns ``{trading_symbol: company_name}`` for symbols that have names.
         Symbols with a null name in instrument_master are omitted from the result.
+
+        By default only active (live) instruments resolve; pass
+        ``include_inactive=True`` to also render names for delisted instruments
+        (e.g. historical position/suggestion displays).
         """
         if not symbols:
             return {}
@@ -268,6 +291,8 @@ class SymbolValidatorService:
                 InstrumentMaster.name.isnot(None),
             )
         )
+        if not include_inactive:
+            stmt = stmt.where(InstrumentMaster.is_active.is_(True))
         result = await db.execute(stmt)
         return {row.trading_symbol: row.name for row in result.all()}
 
@@ -281,6 +306,8 @@ class SymbolValidatorService:
                     InstrumentMaster.trading_symbol == symbol,
                     InstrumentMaster.exchange == _EXCHANGE,
                     InstrumentMaster.instrument_type == _INSTRUMENT_TYPE,
+                    # Eligibility gate: a delisted instrument is not tradeable.
+                    InstrumentMaster.is_active.is_(True),
                 )
                 .limit(1)
             )
@@ -301,6 +328,8 @@ class SymbolValidatorService:
                 InstrumentMaster.trading_symbol.in_(symbols),
                 InstrumentMaster.exchange == _EXCHANGE,
                 InstrumentMaster.instrument_type == _INSTRUMENT_TYPE,
+                # Eligibility gate: only active (live) instruments are tradeable.
+                InstrumentMaster.is_active.is_(True),
             )
             result = await db.execute(stmt)
             return {row.trading_symbol for row in result.all()}

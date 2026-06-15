@@ -114,15 +114,19 @@ class TestWeightRenormalization:
         assert result["confidence_score"] == 0.0
         assert result["sources_available"] == 0
 
-    def test_single_source_confidence_capped_at_0_65(self):
-        """Item 5 — one source with confidence=0.92; fused confidence capped to ≤ 0.65."""
+    def test_single_source_confidence_capped_at_0_85(self):
+        """Item 5 — one source with confidence=0.92; fused confidence capped to 0.85.
+
+        The cap was raised from 0.65 to 0.85 to allow a high-conviction calibrated
+        probability to surface while still reflecting reduced multi-stream corroboration.
+        """
         a = self._assembler()
         result = a.fuse_signals(
             {"score": 80.0, "confidence": 0.92, "available": True, "events": []},
             _unavail(),
             _unavail(),
         )
-        assert result["confidence_score"] <= 0.65
+        assert result["confidence_score"] == 0.85
         assert result["sources_available"] == 1
 
     def test_renormalized_weights_always_sum_to_one(self):
@@ -178,6 +182,7 @@ class _MockEventRow:
         self.source_url = None
         self.source_name = None
         self.article_title = None
+        self.raw_content: str | None = None
 
 
 def _mock_db(rows: list) -> AsyncMock:

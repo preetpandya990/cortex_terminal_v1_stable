@@ -185,12 +185,15 @@ export function AnalysisCardsSection({
     // Explanation is fully ready — seed the panel with the REST data immediately.
     if (suggestion.llm_explanation) {
       return {
-        available:        true,
-        summary:          suggestion.llm_summary          ?? null,
-        full_explanation: suggestion.llm_explanation,
-        model:            suggestion.explanation_model    ?? null,
-        generated_at:     suggestion.explanation_generated_at ?? null,
-        sources:          [],   // sources arrive via SSE push path, not REST
+        available:           true,
+        summary:             suggestion.llm_summary          ?? null,
+        full_explanation:    suggestion.llm_explanation,
+        model:               suggestion.explanation_model    ?? null,
+        generated_at:        suggestion.explanation_generated_at ?? null,
+        sources:             [],   // sources arrive via SSE push path, not REST
+        context_type:        'suggestion_explanation',
+        signal_direction:    (suggestion.signal_direction as 'BUY' | 'SELL') ?? null,
+        signal_generated_at: suggestion.created_at ?? null,
       };
     }
 
@@ -198,12 +201,15 @@ export function AnalysisCardsSection({
     // so the panel is visible and waiting rather than hidden.
     if (suggestion.status === 'active') {
       return {
-        available:        false,
-        summary:          null,
-        full_explanation: null,
-        model:            null,
-        generated_at:     null,
-        sources:          [],
+        available:           false,
+        summary:             null,
+        full_explanation:    null,
+        model:               null,
+        generated_at:        null,
+        sources:             [],
+        context_type:        'suggestion_explanation',
+        signal_direction:    (suggestion.signal_direction as 'BUY' | 'SELL') ?? null,
+        signal_generated_at: suggestion.created_at ?? null,
       };
     }
 
@@ -278,6 +284,11 @@ export function AnalysisCardsSection({
   const explanationData: ExplanationData | null = (() => {
     if (sseExplanation?.available) return sseExplanation;
     if (suggestionExplanation?.available) return suggestionExplanation;
+    // A streaming partial from SSE (available:false but with text flowing in)
+    // beats the skeleton seed so the panel renders progressively.
+    if (sseExplanation && !sseExplanation.available && sseExplanation.full_explanation) {
+      return sseExplanation;
+    }
     return sseExplanation ?? suggestionExplanation ?? null;
   })();
 

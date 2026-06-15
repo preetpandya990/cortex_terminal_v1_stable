@@ -12,6 +12,18 @@ from app.ml.inference.ensemble_predictor import EnsemblePredictor
 from app.ml.inference.feature_loader import FeatureLoader
 
 
+@pytest.fixture(autouse=True)
+def _disable_staleness_guard(monkeypatch):
+    """These tests exercise the ML signal MAPPING in isolation (mocked predictor).
+
+    The OHLCV staleness guard adds live-DB freshness queries to gather_ml_signals
+    that a mocked DB can't serve; it is verified separately against real data in
+    tests/integration/test_staleness_guard_live.py, so disable it here.
+    """
+    from app.core.config import get_settings
+    monkeypatch.setattr(get_settings(), "ENABLE_STALENESS_GUARD", False)
+
+
 @pytest.mark.asyncio
 async def test_gather_ml_signals_with_prediction():
     """Test gather_ml_signals calls ensemble predictor correctly."""
@@ -25,7 +37,7 @@ async def test_gather_ml_signals_with_prediction():
         "tp1": 105.0,
         "tp2": 110.0,
         "tp3": 115.0,
-        "metadata": {"model_version": "v1.0.0"},
+        "metadata": {"xgboost_version": "1.1.1", "gru_version": "1.1.1"},
     })
 
     # Mock feature loader
@@ -51,10 +63,11 @@ async def test_gather_ml_signals_with_prediction():
         timeframe="1d",
     )
 
-    # Verify feature loader was called
+    # Verify feature loader was called with the indicator snapshot output buffer
     mock_loader.load_features.assert_called_once_with(
         symbol="NSE_EQ|INE002A01018",
         timeframe="1d",
+        indicator_snapshot_out={},
     )
 
     # Verify predictor was called
@@ -63,7 +76,7 @@ async def test_gather_ml_signals_with_prediction():
     # Verify result
     assert result["score"] == 100.0  # BUY = +100
     assert result["confidence"] == 0.85
-    assert result["model"] == "v1.0.0"
+    assert result["model"] == "xgb_1.1.1+gru_1.1.1"
     assert result["prediction"]["direction"] == "BUY"
     assert result["prediction"]["entry_price"] == 100.0
     assert result["prediction"]["stop_loss"] == 95.0
@@ -194,9 +207,9 @@ async def test_fuse_signals_with_ml():
 
     fused = assembler.fuse_signals(event_signals, ml_signals, technical_signals)
 
-    # Weighted average: 0.4*50 + 0.4*100 + 0.2*0 = 60
-    assert fused["fused_score"] == 60.0
+    # Weighted average: 0.35*50 + 0.40*100 + 0.25*0 = 57.5
+    assert fused["fused_score"] == 57.5
     assert fused["action"] == "BUY"  # score > 50
-    # Confidence: 0.4*0.7 + 0.4*0.85 + 0.2*0 = 0.62
-    assert abs(fused["confidence_score"] - 0.62) < 0.01
+    # Confidence: 0.35*0.7 + 0.40*0.85 + 0.25*0 = 0.585
+    assert abs(fused["confidence_score"] - 0.585) < 0.01
     assert fused["ml_predictions"] == ml_signals

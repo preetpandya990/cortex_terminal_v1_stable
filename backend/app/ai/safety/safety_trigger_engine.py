@@ -8,13 +8,14 @@ import logging
 from datetime import datetime, timedelta
 from decimal import Decimal
 
+from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.ai.fusion.models import AISafetyTrigger
 from app.ai.safety.kill_switch_manager import KillSwitchManager
 from app.core.config import get_settings
-from app.core.redis import PubSubClient, RedisChannels, get_pubsub_client
+from app.core.redis import PubSubClient, RedisChannels
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -23,8 +24,8 @@ settings = get_settings()
 class SafetyTriggerEngine:
     """Monitors safety conditions and triggers actions."""
 
-    def __init__(self):
-        self.kill_switch_manager = KillSwitchManager()
+    def __init__(self, redis: Redis) -> None:
+        self.kill_switch_manager = KillSwitchManager(redis)
 
     async def check_safety_conditions(
         self,
@@ -113,19 +114,24 @@ class SafetyTriggerEngine:
         return trigger
 
 
-async def safety_monitoring_loop(session_factory: async_sessionmaker) -> None:
+async def safety_monitoring_loop(
+    session_factory: async_sessionmaker,
+    redis: Redis,
+) -> None:
     """
     Safety monitoring background loop.
-    
-    Monitors system safety conditions and activates kill switch if thresholds breached.
-    Runs until cancelled via asyncio.CancelledError.
-    
+
+    Monitors system safety conditions and activates the kill switch when
+    thresholds are breached.  Runs until cancelled via asyncio.CancelledError.
+
     Args:
-        session_factory: SQLAlchemy async session factory
+        session_factory: SQLAlchemy async session factory (WorkerSessionLocal).
+        redis: Raw asyncio Redis client — passed to KillSwitchManager for
+               <1ms cache reads and to PubSubClient for event publishing.
     """
     logger.info("Safety monitoring loop started")
-    engine = SafetyTriggerEngine()
-    pubsub = get_pubsub_client()
+    engine = SafetyTriggerEngine(redis)
+    pubsub = PubSubClient(redis)
     
     try:
         while True:

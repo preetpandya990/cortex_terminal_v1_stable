@@ -1,31 +1,37 @@
 """
 Cortex Intelligence Client
 ==========================
-Provider-agnostic LLM client with an ordered N-provider fallback chain.
+Single-provider LLM client backed by **Google Gemini** (``google-genai`` SDK).
 
-Provider chain (resolved at startup, highest priority first):
-  1. NVIDIA NIM  — if NVIDIA_NIM_API_KEY is set and the endpoint responds.
-  2. Groq        — if GROQ_API_KEY is set (60 RPM free tier, Qwen3-32B, ~300ms TTFT).
-  3. Ollama      — always last; zero-cost local fallback, no API key required.
+This client serves the entire Cortex AI layer — text generation, JSON/structured
+output, the news forecaster, explanations, sentiment scoring, event
+classification, fake-news detection, and RAG embeddings — through one provider.
 
-Providers absent from the chain (key not set or probe failed) are skipped.
-Ollama is always appended so the chain is never empty.
+It replaces the former NVIDIA NIM → Groq → Ollama fallback chain (LiteLLM +
+Instructor).  The public method surface is preserved so existing call sites
+(``nlp_engine``, ``event_classifier``, ``fake_news_detector``, ``rag.embedder``,
+``explanation_worker``) continue to work unchanged:
+
+    initialize / get_intelligence_client / get_ollama_client
+    generate / generate_json / generate_structured / generate_structured_with_usage
+    embed / health_check
+    LLMProviderError / LLMFallbackExhausted
 
 Design invariants
 -----------------
-- Every startup emits one log line naming the full ordered chain — silent fallback
-  is prohibited; operators always know which backend is serving requests.
-- Only TRANSIENT failures (rate-limit, timeout, service-unavailable, connection)
-  trigger a move to the next provider.  PERMANENT failures (auth, bad-request,
-  context-window) propagate immediately — the next provider cannot fix these.
-- Every successful fallback increments llm_fallbacks_total{provider_from, provider_to}.
-- Structured output uses Instructor: Mode.TOOLS for NIM and Groq (both serve
-  Qwen3 which supports native tool-calling); Mode.JSON for Ollama (llama3.1).
-- Embeddings are NIM-only (nvidia/nv-embedqa-e5-v5, 1024-dim).  Groq and Ollama
-  produce incompatible vector dimensions; they are not offered as embedding fallbacks.
-- generate_structured() callers MUST pass max_tokens explicitly.  NIM's default
-  (128 tokens) truncates any structured response, causing Instructor to exhaust
-  its retry budget.  Sentinel: sentiment=256, explanation=1500.
+- One Gemini ``genai.Client`` is created at startup and reused (async via
+  ``client.aio``).  No per-call client construction.
+- Structured output uses Gemini's native JSON-schema mode
+  (``response_mime_type='application/json'`` + ``response_schema=<PydanticModel>``)
+  and reads the SDK-parsed instance from ``response.parsed`` — no Instructor.
+- Latency: ``thinking_level`` defaults to ``"minimal"`` (extended thinking off)
+  for fast, predictable replies; callers needing deeper reasoning override it.
+- Resilience: transient failures (5xx / 429 / timeout) are retried with
+  exponential backoff; permanent failures (400/401/403/404) propagate immediately
+  as ``LLMFallbackExhausted`` — retrying cannot fix a misconfiguration.
+- Embeddings use ``gemini-embedding-001`` at ``GEMINI_EMBED_DIM`` dimensions;
+  sub-3072 vectors are L2-normalized (Gemini does not pre-normalize truncated
+  vectors, and cosine/pgvector search assumes unit norm).
 
 Usage
 -----
@@ -37,23 +43,26 @@ Usage
     from app.ai.intelligence.llm_client import get_intelligence_client
     client  = get_intelligence_client()
     text    = await client.generate(prompt="…", system="…")
-    typed   = await client.generate_structured(prompt="…", response_model=MyModel,
-                                               max_tokens=512)
+    typed   = await client.generate_structured(prompt="…", response_model=MyModel)
     vectors = await client.embed(["text a", "text b"])
     status  = await client.health_check()
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import os
+import math
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Type, TypeVar
+from zoneinfo import ZoneInfo
 
-import instructor
-import litellm
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 from pydantic import BaseModel
 from tenacity import (
     AsyncRetrying,
@@ -64,86 +73,280 @@ from tenacity import (
 )
 
 from app.core.config import get_settings
-
-# ── LiteLLM global configuration ──────────────────────────────────────────────
-litellm.suppress_debug_info = True
-os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
-
-# Register models absent from LiteLLM's bundled cost map to suppress DEBUG noise.
-# $0 pricing is accurate for the NIM and Groq free tiers.
-litellm.register_model({
-    # NVIDIA NIM — Qwen3 MoE (added to NIM after last litellm release)
-    "nvidia_nim/qwen/qwen3.5-122b-a10b": {
-        "max_tokens":            32768,
-        "input_cost_per_token":  0.0,
-        "output_cost_per_token": 0.0,
-        "litellm_provider":      "nvidia_nim",
-        "mode":                  "chat",
-    },
-    # Groq — Qwen3-32B (free tier, LPU-accelerated)
-    "groq/qwen/qwen3-32b": {
-        "max_tokens":            32768,
-        "input_cost_per_token":  0.0,
-        "output_cost_per_token": 0.0,
-        "litellm_provider":      "groq",
-        "mode":                  "chat",
-    },
-})
+from app.ai.intelligence import request_manager as _rm
+from app.ai.intelligence.request_manager import GeminiRateLimitError, Priority  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
-# Ollama fallback embedding model (incompatible with pgvector VECTOR(1024) column —
-# kept here for reference only; embeddings always use NIM).
-_OLLAMA_EMBED_FALLBACK = "ollama/nomic-embed-text"
-
-# Strip Qwen3 chain-of-thought tags produced when thinking mode is active.
-_THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
-
-# Extract JSON from markdown code fences (```json ... ``` or ``` ... ```).
+# Extract JSON from markdown code fences (defensive — Gemini JSON mode rarely
+# fences, but generate_json() callers may not use schema mode).
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```")
 
+# Gemini returns un-normalized vectors for output_dimensionality < 3072.  Cosine
+# similarity / pgvector search assume unit norm, so anything below this is
+# L2-normalized by embed().
+_GEMINI_NATIVE_EMBED_DIM = 3072
 
-# ── Custom exceptions ──────────────────────────────────────────────────────────
+# Map the RAG embedder's input_type to Gemini embedding task types.  Using the
+# correct task type for corpus vs. query is required for retrieval quality.
+_TASK_TYPE_BY_INPUT = {
+    "passage": "RETRIEVAL_DOCUMENT",
+    "query":   "RETRIEVAL_QUERY",
+}
+
+# Quota and retry-hint patterns parsed from Gemini error response bodies.
+# Two patterns are needed because the response body format varies:
+#
+#   Full body (with structured details array):
+#     "quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+#     → matched by ``GenerateRequestsPerDay``
+#
+#   Minimal body (details array absent — truncated or simplified responses):
+#     "* Quota exceeded for metric: .../generate_content_free_tier_requests, limit: 20"
+#     → NOT matched by ``GenerateRequestsPerDay``; matched by ``free_tier_requests``
+#
+# Both forms are non-recoverable within the current day and must open the circuit
+# rather than retry.  Per-minute rate limits use different metric names (e.g.
+# ``GenerateRequestsPerMinute``) and do NOT match either pattern.
+_DAILY_QUOTA_RE = re.compile(
+    r"GenerateRequestsPerDay"   # quotaId in structured details (full body)
+    r"|free_tier_requests",     # metric name in human-readable message (minimal body)
+    re.IGNORECASE,
+)
+# Gemini embeds structured retry guidance in 429 bodies:
+#   {"@type": "…RetryInfo", "retryDelay": "53s"}
+_RETRY_DELAY_RE = re.compile(r'"retryDelay":\s*"(\d+(?:\.\d+)?)s"')
+
+# Default estimated token budget for generate calls when the caller does not
+# specify max_tokens.  The token buckets credit back the unused portion after
+# release(), so over-estimating is safe; under-estimating risks burst overuse.
+_DEFAULT_ESTIMATED_TOKENS: int = 1_400
+
+
+# ── Custom exceptions (preserved for existing call sites) ───────────────────────
 
 class LLMProviderError(Exception):
-    """A specific provider failed after exhausting its retry budget."""
+    """The LLM provider failed after exhausting its retry budget."""
 
 
 class LLMFallbackExhausted(Exception):
-    """Every provider in the fallback chain failed."""
+    """The LLM call could not be completed (no key, or unrecoverable failure)."""
 
 
-# ── Provider identity ──────────────────────────────────────────────────────────
+class GeminiQuotaExhausted(LLMFallbackExhausted):
+    """
+    Gemini daily generation quota exhausted.
+
+    Raised instead of retrying when the 429 error body indicates a
+    ``GenerateRequestsPerDay`` violation.  All LLM generate calls fast-fail with
+    this exception until the circuit resets at midnight Pacific Time.
+
+    Callers that catch ``LLMFallbackExhausted`` handle this automatically.
+    Callers that need to distinguish quota exhaustion from other permanent
+    failures can catch this subclass specifically.
+    """
+
+
+# ── Provider identity (single provider; retained for back-compat) ───────────────
 
 class LLMProvider(str, Enum):
-    NIM    = "nim"
-    GROQ   = "groq"
-    OLLAMA = "ollama"
+    GEMINI = "gemini"
 
 
 # ── Error classification ───────────────────────────────────────────────────────
 
-_TRANSIENT: tuple[type[Exception], ...] = (
-    litellm.RateLimitError,
-    litellm.Timeout,
-    litellm.ServiceUnavailableError,
-    litellm.APIConnectionError,
-)
+# Definitive client-side HTTP statuses: bad request, auth, forbidden, not-found.
+# These indicate misconfiguration that will not self-heal — never retried.
+# 429 (rate limit) is deliberately excluded; it is transient.
+_DEFINITIVE_HTTP_STATUSES = frozenset({400, 401, 403, 404})
 
-_PERMANENT: tuple[type[Exception], ...] = (
-    litellm.AuthenticationError,
-    litellm.BadRequestError,
-    litellm.ContextWindowExceededError,
-)
+
+def _status_code(exc: Exception) -> int | None:
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    try:
+        return int(code)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_permanent(exc: Exception) -> bool:
+    """True if ``exc`` is a non-recoverable client/config error (do not retry)."""
+    return _status_code(exc) in _DEFINITIVE_HTTP_STATUSES
+
+
+def _is_transient(exc: Exception) -> bool:
+    """True if ``exc`` is a recoverable blip worth retrying (5xx / 429 / network)."""
+    if isinstance(exc, (asyncio.TimeoutError, genai_errors.ServerError)):
+        return True
+    code = _status_code(exc)
+    if code == 429:
+        return True
+    if code is not None and 500 <= code < 600:
+        return True
+    # Connection/transport errors carry no HTTP status — treat as transient.
+    return code is None and isinstance(exc, genai_errors.APIError)
+
+
+class _TransientLLMError(Exception):
+    """
+    Internal marker so tenacity retries only transient failures.
+
+    ``retry_delay_secs`` carries the server's own ``retryDelay`` hint when
+    present.  ``_gemini_wait`` reads it to honour the server's recovery estimate
+    instead of guessing with exponential jitter.
+    """
+
+    __slots__ = ("retry_delay_secs",)
+
+    def __init__(self, msg: str, retry_delay_secs: float | None = None) -> None:
+        super().__init__(msg)
+        self.retry_delay_secs = retry_delay_secs
+
+
+# ── Quota circuit — process-lifetime state ────────────────────────────────────
+# Daily Gemini quota exhaustion opens this circuit until the next reset point
+# (midnight Pacific Time).  While open, every LLM generate call fast-fails in
+# under a millisecond rather than spending seconds on retries that are
+# guaranteed to receive another 429.
+#
+# State is in-process memory — no Redis dependency — which is correct here:
+# the asyncio event loop is single-threaded (no concurrent mutation), and a
+# restart after quota exhaustion will yield at most one fresh 429 before the
+# circuit reopens.  The benefit of simplicity outweighs the marginal cost.
+
+_quota_open_until: datetime | None = None
+
+
+def _quota_reset_at() -> datetime:
+    """Return the next Gemini daily quota reset — midnight Pacific Time as UTC."""
+    pt = ZoneInfo("America/Los_Angeles")
+    now_pt = datetime.now(pt)
+    midnight_tomorrow_pt = (now_pt + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return midnight_tomorrow_pt.astimezone(timezone.utc)
+
+
+def _quota_exhausted() -> bool:
+    """True if the quota circuit is currently open."""
+    global _quota_open_until
+    if _quota_open_until is None:
+        return False
+    if datetime.now(timezone.utc) >= _quota_open_until:
+        _quota_open_until = None  # auto-close: quota has reset
+        logger.info("llm: daily Gemini quota circuit auto-closed — quota has reset")
+        return False
+    return True
+
+
+def _open_quota_circuit(op: str = _rm.Operation.GENERATE) -> None:
+    """
+    Open the in-process quota circuit for ``op`` until the next daily reset.
+
+    Also delegates to the GeminiRequestManager (when initialized) so that:
+    - All queued permits for ``op`` are cancelled immediately.
+    - The circuit state is persisted to Redis for crash-restart recovery.
+
+    Idempotent: a second call within the same day is a no-op unless the new
+    reset time is later than the currently stored one (defensive — normally
+    reset times within the same calendar day are identical).
+    """
+    global _quota_open_until
+    reset = _quota_reset_at()
+    if _quota_open_until is None or reset > _quota_open_until:
+        _quota_open_until = reset
+        logger.error(
+            "llm: daily Gemini %s quota EXHAUSTED — circuit OPEN until %s UTC. "
+            "All LLM %s calls will fast-fail until then. "
+            "Provision a paid Gemini API key (GEMINI_API_KEY) to eliminate this limit.",
+            op, reset.strftime("%Y-%m-%dT%H:%M:%SZ"), op,
+        )
+    manager = _try_get_request_manager()
+    if manager is not None:
+        manager.open_circuit(op)
+
+
+def _check_quota_circuit(op: str) -> None:
+    """Raise ``GeminiQuotaExhausted`` immediately if the daily quota circuit is open."""
+    if _quota_exhausted():
+        reset = _quota_open_until
+        raise GeminiQuotaExhausted(
+            f"Gemini {op} skipped — daily quota exhausted, circuit open until "
+            f"{reset.strftime('%Y-%m-%dT%H:%M:%SZ') if reset else 'unknown'} UTC."
+        )
+
+
+def _try_get_request_manager() -> _rm.GeminiRequestManager | None:
+    """Return the GeminiRequestManager singleton if initialized, None otherwise.
+
+    Accessing the class variable directly avoids the RuntimeError raised by
+    get_request_manager() when the manager hasn't been started — allowing
+    _acall() and embed() to degrade gracefully in unit tests and early startup
+    code paths without forcing the manager to be running.
+    """
+    return _rm.GeminiRequestManager._instance
+
+
+def _is_daily_quota_exhausted(exc: Exception) -> bool:
+    """
+    True when *exc* carries a Gemini daily-quota violation.
+
+    Matches ``GenerateRequestsPerDay`` in the error body, which is present in
+    both the free-tier variant (``-FreeTier`` suffix) and paid-tier daily caps.
+    Per-minute rate limits (``GenerateRequestsPerMinute``) do NOT match and are
+    left to the normal transient-retry path.
+    """
+    return bool(_DAILY_QUOTA_RE.search(str(exc)))
+
+
+def _extract_retry_delay_secs(exc: Exception) -> float | None:
+    """
+    Parse the ``retryDelay`` hint (seconds) from a Gemini 429 error body.
+
+    Gemini embeds structured retry guidance in its 429 responses::
+
+        {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "53s"}
+
+    Using this value instead of exponential jitter aligns the client's backoff
+    with the server's own recovery estimate, preventing premature retries against
+    a still-rate-limited endpoint.  Returns ``None`` when the hint is absent.
+    """
+    m = _RETRY_DELAY_RE.search(str(exc))
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            pass
+    return None
+
+
+# Pre-instantiated default wait for non-hinted retries (5xx, network, timeout).
+_DEFAULT_WAIT = wait_exponential_jitter(initial=1, max=20, jitter=1)
+
+
+def _gemini_wait(retry_state: Any) -> float:
+    """
+    Tenacity wait strategy that honours Gemini's own ``retryDelay`` hint.
+
+    When the active exception is a ``_TransientLLMError`` that carries an
+    explicit server hint, that value is returned directly.  This keeps the
+    client in sync with the server's recovery timeline rather than guessing
+    with exponential jitter.  All other transient errors (5xx, network,
+    timeout) fall back to ``wait_exponential_jitter``.
+    """
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    if isinstance(exc, _TransientLLMError) and exc.retry_delay_secs is not None:
+        return float(exc.retry_delay_secs)
+    return _DEFAULT_WAIT(retry_state)
 
 
 # ── Client ─────────────────────────────────────────────────────────────────────
 
 class CortexIntelligenceClient:
     """
-    Provider-agnostic LLM client for the Cortex Intelligence Layer.
+    Gemini-backed LLM client for the Cortex Intelligence Layer.
 
     Obtain via ``get_intelligence_client()`` after calling
     ``await CortexIntelligenceClient.initialize()`` at startup.
@@ -162,9 +365,8 @@ class CortexIntelligenceClient:
     @classmethod
     async def initialize(cls) -> None:
         """
-        Create the singleton, configure providers, probe backends, and log the
-        active provider chain.  Safe to call multiple times — subsequent calls
-        are no-ops.
+        Create the singleton, build the Gemini client, and log the active model.
+        Safe to call multiple times — subsequent calls are no-ops.
         """
         global _client
         if _client is not None:
@@ -173,12 +375,19 @@ class CortexIntelligenceClient:
         settings = get_settings()
         instance: CortexIntelligenceClient = object.__new__(cls)
         instance._configure(settings)
-
-        # Register singleton before probe so an unexpected probe failure never
-        # leaves the global as None.
         _client = instance
 
-        await instance._build_provider_chain(settings)
+        if instance._genai is None:
+            logger.warning(
+                "LLM backend: Gemini NOT configured — set GEMINI_API_KEY in .env. "
+                "All LLM/embedding calls will raise until a key is provided."
+            )
+        else:
+            logger.info(
+                "LLM backend: gemini/%s (embed=%s @ %d-dim, thinking=%s)",
+                instance._model, instance._embed_model,
+                instance._embed_dim, instance._thinking_level,
+            )
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -188,50 +397,42 @@ class CortexIntelligenceClient:
         system: str | None = None,
         temperature: float = 0.7,
         max_tokens: int | None = None,
+        *,
+        priority: Priority = Priority.MEDIUM,
     ) -> dict[str, Any]:
         """
-        Unstructured text generation via the provider chain.
+        Unstructured text generation.
 
         Returns:
             {
-                "content":           str   — model output (think-tags stripped),
-                "model":             str   — model identifier reported by the API,
-                "provider":          str   — "nim" | "groq" | "ollama",
+                "content":           str,
+                "model":             str,
+                "provider":          "gemini",
                 "prompt_tokens":     int,
                 "completion_tokens": int,
                 "latency_ms":        int,
             }
         """
-        messages = _build_messages(prompt, system)
-
-        async def _call(provider: LLMProvider) -> Any:
-            return await self._completion_with_retry(
-                provider=provider,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-
-        t0 = time.monotonic()
-        provider, response = await self._try_providers(_call)
-        latency_ms = int((time.monotonic() - t0) * 1000)
-
-        content = _strip_thinking(response.choices[0].message.content or "")
-        usage = response.usage
+        config = self._gen_config(
+            system=system, temperature=temperature, max_tokens=max_tokens,
+        )
+        response, latency_ms = await self._acall(
+            prompt, config,
+            priority=priority,
+            estimated_tokens=max_tokens or _DEFAULT_ESTIMATED_TOKENS,
+        )
+        in_tok, out_tok = _usage_tokens(response)
 
         logger.info(
-            "llm.generate provider=%s prompt_tokens=%d completion_tokens=%d latency_ms=%d",
-            provider.value,
-            usage.prompt_tokens if usage else 0,
-            usage.completion_tokens if usage else 0,
-            latency_ms,
+            "llm.generate provider=gemini prompt_tokens=%d completion_tokens=%d latency_ms=%d",
+            in_tok, out_tok, latency_ms,
         )
         return {
-            "content":           content,
-            "model":             response.model or self._model_name(provider),
-            "provider":          provider.value,
-            "prompt_tokens":     usage.prompt_tokens if usage else 0,
-            "completion_tokens": usage.completion_tokens if usage else 0,
+            "content":           response.text or "",
+            "model":             getattr(response, "model_version", None) or self._model,
+            "provider":          LLMProvider.GEMINI.value,
+            "prompt_tokens":     in_tok,
+            "completion_tokens": out_tok,
             "latency_ms":        latency_ms,
         }
 
@@ -240,28 +441,20 @@ class CortexIntelligenceClient:
         prompt: str,
         system: str | None = None,
         temperature: float = 0.3,
+        *,
+        priority: Priority = Priority.MEDIUM,
     ) -> dict[str, Any]:
         """
-        Generate a JSON-structured dict from the model.
+        Generate a JSON object (schema-free) and return it as a dict.
 
-        Backward-compatible with the former OllamaClient.generate_json() signature.
-        A JSON-only instruction is appended to the system prompt; the output is
-        parsed and returned as a dict.
-
-        For new code that owns the output schema, prefer generate_structured()
-        which adds Pydantic validation and Instructor retry logic.
+        Uses Gemini JSON mode (``response_mime_type='application/json'``).  For new
+        code that owns the output schema, prefer ``generate_structured()``.
         """
-        json_system = (
-            (system or "").rstrip()
-            + "\n\nYou MUST respond with a valid JSON object only. "
-              "No markdown fences, no explanation — raw JSON only."
+        config = self._gen_config(
+            system=system, temperature=temperature, json_mime=True,
         )
-        response = await self.generate(
-            prompt=prompt,
-            system=json_system,
-            temperature=temperature,
-        )
-        return _parse_json(response["content"])
+        response, _ = await self._acall(prompt, config, priority=priority)
+        return _parse_json(response.text or "")
 
     async def generate_structured(
         self,
@@ -270,53 +463,36 @@ class CortexIntelligenceClient:
         system: str | None = None,
         temperature: float = 0.1,
         max_tokens: int | None = None,
+        *,
+        priority: Priority = Priority.MEDIUM,
     ) -> T:
         """
-        Typed structured output via Instructor + Pydantic validation.
+        Typed structured output via Gemini's native JSON-schema mode.
 
-        Uses Mode.TOOLS on NIM and Groq (Qwen3 supports tool-calling on both),
-        and Mode.JSON on Ollama (llama3.1 does not).  Instructor retries up to
-        2 times internally on structurally invalid output before propagating.
+        The validated Pydantic instance is read from ``response.parsed``; if the
+        SDK leaves it unset, the raw JSON text is validated against
+        ``response_model`` as a fallback.
 
         Args:
-            prompt:         User prompt.
             response_model: Pydantic BaseModel subclass defining the output schema.
-            system:         Optional system prompt.
-            temperature:    Low values (≤0.2) improve JSON adherence.
-            max_tokens:     Maximum tokens in the completion.  Always set this
-                            explicitly — NIM and Groq default to 128 tokens which
-                            truncates any non-trivial structured response, causing
-                            Instructor to exhaust its retry budget silently.
-                            Sentinel values: sentiment=256, explanation=1500.
-
-        Returns:
-            A fully validated instance of ``response_model``.
+            temperature:    Low values (≤0.2) improve adherence.
+            max_tokens:     Optional cap on completion tokens.
+            priority:       GeminiRequestManager permit priority (keyword-only).
         """
-        messages = _build_messages(prompt, system)
-
-        async def _call(provider: LLMProvider) -> T:
-            extra: dict = {}
-            if max_tokens is not None:
-                extra["max_tokens"] = max_tokens
-            return await self._instructor_for(provider).chat.completions.create(
-                **self._provider_kwargs(provider),
-                response_model=response_model,
-                messages=messages,
-                temperature=temperature,
-                timeout=self._timeout,
-                max_retries=2,
-                **extra,
-            )
-
-        t0 = time.monotonic()
-        provider, result = await self._try_providers(_call)
-        latency_ms = int((time.monotonic() - t0) * 1000)
+        config = self._gen_config(
+            system=system, temperature=temperature, max_tokens=max_tokens,
+            response_schema=response_model,
+        )
+        response, latency_ms = await self._acall(
+            prompt, config,
+            priority=priority,
+            estimated_tokens=max_tokens or _DEFAULT_ESTIMATED_TOKENS,
+        )
+        result = self._extract_parsed(response, response_model)
 
         logger.info(
-            "llm.generate_structured provider=%s response_model=%s latency_ms=%d",
-            provider.value,
-            response_model.__name__,
-            latency_ms,
+            "llm.generate_structured provider=gemini response_model=%s latency_ms=%d",
+            response_model.__name__, latency_ms,
         )
         return result
 
@@ -327,64 +503,45 @@ class CortexIntelligenceClient:
         system: str | None = None,
         temperature: float = 0.1,
         max_tokens: int | None = None,
+        *,
+        priority: Priority = Priority.HIGH,
     ) -> tuple[T, dict[str, Any]]:
         """
-        Identical to generate_structured() but also returns token-usage metadata.
-
-        Uses Instructor's ``create_with_completion()`` which returns the raw API
-        response alongside the validated Pydantic model, making prompt_tokens and
-        completion_tokens available for audit logging and cost tracking.
+        Identical to ``generate_structured()`` but also returns token-usage
+        metadata for ``ai_llm_audit_log`` writers.
 
         Returns:
-            (model_instance, usage_dict) where usage_dict contains:
-                {
-                    "input_tokens":    int | None,
-                    "output_tokens":   int | None,
-                    "provider":        str,   — "nim" | "groq" | "ollama"
-                    "model_id":        str,   — model name as reported by the API
-                    "latency_ms":      int,
-                }
-
-        Use this variant in any call site that writes to ai_llm_audit_log.
-        Use generate_structured() everywhere else (lighter return type).
+            (model_instance, {
+                "input_tokens":  int | None,
+                "output_tokens": int | None,
+                "provider":      "gemini",
+                "model_id":      str,
+                "latency_ms":    int,
+            })
         """
-        messages = _build_messages(prompt, system)
+        config = self._gen_config(
+            system=system, temperature=temperature, max_tokens=max_tokens,
+            response_schema=response_model,
+        )
+        response, latency_ms = await self._acall(
+            prompt, config,
+            priority=priority,
+            estimated_tokens=max_tokens or _DEFAULT_ESTIMATED_TOKENS,
+        )
+        result = self._extract_parsed(response, response_model)
+        in_tok, out_tok = _usage_tokens(response)
 
-        async def _call(provider: LLMProvider) -> tuple[T, Any]:
-            extra: dict = {}
-            if max_tokens is not None:
-                extra["max_tokens"] = max_tokens
-            return await self._instructor_for(provider).chat.completions.create_with_completion(
-                **self._provider_kwargs(provider),
-                response_model=response_model,
-                messages=messages,
-                temperature=temperature,
-                timeout=self._timeout,
-                max_retries=2,
-                **extra,
-            )
-
-        t0 = time.monotonic()
-        provider, (result, raw_completion) = await self._try_providers(_call)
-        latency_ms = int((time.monotonic() - t0) * 1000)
-
-        usage = getattr(raw_completion, "usage", None)
         usage_dict: dict[str, Any] = {
-            "input_tokens":  getattr(usage, "prompt_tokens", None),
-            "output_tokens": getattr(usage, "completion_tokens", None),
-            "provider":      provider.value,
-            "model_id":      self._model_name(provider),
+            "input_tokens":  in_tok,
+            "output_tokens": out_tok,
+            "provider":      LLMProvider.GEMINI.value,
+            "model_id":      self._model,
             "latency_ms":    latency_ms,
         }
-
         logger.info(
-            "llm.generate_structured provider=%s response_model=%s "
+            "llm.generate_structured provider=gemini response_model=%s "
             "input_tokens=%s output_tokens=%s latency_ms=%d",
-            provider.value,
-            response_model.__name__,
-            usage_dict["input_tokens"],
-            usage_dict["output_tokens"],
-            latency_ms,
+            response_model.__name__, in_tok, out_tok, latency_ms,
         )
         return result, usage_dict
 
@@ -392,395 +549,366 @@ class CortexIntelligenceClient:
         self,
         texts: list[str],
         input_type: str = "passage",
+        *,
+        priority: Priority = Priority.BACKGROUND,
     ) -> list[list[float]]:
         """
-        Generate embeddings via NVIDIA NIM (nvidia/nv-embedqa-e5-v5, 1024-dim).
-
-        Groq and Ollama do not produce 1024-dim vectors compatible with the
-        pgvector VECTOR(1024) column and are not offered as fallbacks.
+        Generate embeddings via ``gemini-embedding-001`` at GEMINI_EMBED_DIM dims.
 
         Args:
-            texts:      Strings to embed.  Batch up to RAG_EMBED_BATCH_SIZE.
-            input_type: "passage" for document indexing, "query" for retrieval.
-                        nv-embedqa-e5-v5 requires correct input_type — the wrong
-                        value degrades retrieval accuracy measurably.
+            texts:      Strings to embed.
+            input_type: "passage" (RETRIEVAL_DOCUMENT) for indexing, "query"
+                        (RETRIEVAL_QUERY) for retrieval.  Using the correct task
+                        type for corpus vs. query is required for retrieval quality.
+            priority:   GeminiRequestManager permit priority (keyword-only).
+                        Defaults to BACKGROUND — embed work must not compete
+                        with the live signal pipeline.
+
+        Returns:
+            One float vector per input, L2-normalized when the dimension < 3072.
 
         Raises:
-            LLMFallbackExhausted: NIM is unavailable or NVIDIA_NIM_API_KEY is unset.
+            LLMFallbackExhausted: Gemini is not configured, or the call failed.
+            GeminiQuotaExhausted: Daily embed quota exhausted.
+            GeminiRateLimitError: Manager queue full or permit timeout elapsed.
         """
         if not texts:
             return []
+        self._require_client()
 
-        if not self._nim_api_key:
-            raise LLMFallbackExhausted(
-                "Embeddings require NVIDIA NIM (1024-dim vectors). "
-                "Set NVIDIA_NIM_API_KEY in backend/.env and restart."
+        task_type = _TASK_TYPE_BY_INPUT.get(input_type, "RETRIEVAL_DOCUMENT")
+        config = genai_types.EmbedContentConfig(
+            task_type=task_type,
+            output_dimensionality=self._embed_dim,
+            http_options=self._http_options(),
+        )
+
+        manager = _try_get_request_manager()
+        permit = None
+        if manager is not None:
+            try:
+                permit = await manager.acquire(
+                    _rm.Operation.EMBED, priority, len(texts)
+                )
+            except _rm.GeminiQuotaExhausted as exc:
+                raise GeminiQuotaExhausted(str(exc)) from exc
+            # GeminiRateLimitError propagates as-is — callers should degrade gracefully.
+
+        async def _do() -> list[list[float]]:
+            resp = await self._genai.aio.models.embed_content(
+                model=self._embed_model, contents=texts, config=config,
             )
+            vectors = [list(e.values) for e in (resp.embeddings or [])]
+            if self._embed_dim < _GEMINI_NATIVE_EMBED_DIM:
+                vectors = [_l2_normalize(v) for v in vectors]
+            return vectors
 
-        last_exc: Exception | None = None
-        async for attempt in AsyncRetrying(
-            retry=retry_if_exception_type(_TRANSIENT),
-            stop=stop_after_attempt(self._max_retries),
-            wait=wait_exponential_jitter(initial=1, max=30, jitter=2),
-            before_sleep=before_sleep_log(logger, logging.WARNING),
-            reraise=False,
-        ):
-            with attempt:
-                try:
-                    response = await litellm.aembedding(
-                        model=self._nim_embed_model,
-                        input=texts,
-                        api_base=self._nim_base_url,
-                        api_key=self._nim_api_key,
-                        timeout=self._timeout,
-                        input_type=input_type,
-                    )
-                    vectors: list[list[float]] = [
-                        item["embedding"] for item in response["data"]
-                    ]
-                    logger.debug(
-                        "llm.embed provider=nim input_type=%s count=%d",
-                        input_type, len(vectors),
-                    )
-                    return vectors
-                except _PERMANENT as exc:
-                    raise LLMFallbackExhausted(
-                        f"Embedding call failed (permanent error): "
-                        f"{type(exc).__name__}: {exc}"
-                    ) from exc
-                except Exception as exc:
-                    last_exc = exc
-                    raise
+        try:
+            vectors = await self._retry(_do, op="embed")
+        except Exception:
+            if permit is not None:
+                manager.release(permit, outcome="error")
+            raise
 
-        raise LLMFallbackExhausted(
-            f"Embedding failed after {self._max_retries} attempts. "
-            f"Last error ({type(last_exc).__name__}): {last_exc}"
-        ) from last_exc
+        if permit is not None:
+            manager.release(permit, outcome="success")
+
+        logger.debug(
+            "llm.embed provider=gemini task_type=%s count=%d dim=%d",
+            task_type, len(vectors), self._embed_dim,
+        )
+        return vectors
+
+    @property
+    def model_id(self) -> str:
+        """Serving model identifier for audit/logging, e.g. ``gemini/gemini-2.5-flash``."""
+        return f"{LLMProvider.GEMINI.value}/{self._model}"
+
+    async def aclose(self) -> None:
+        """Close the underlying Gemini transport.  Call once at application shutdown.
+
+        The async httpx transport inside genai.Client is long-lived; closing it
+        avoids leaked connections / ResourceWarnings on shutdown.
+        """
+        if self._genai is None:
+            return
+        try:
+            await self._genai.aio.aclose()
+        except Exception as exc:  # noqa: BLE001 — shutdown best-effort
+            logger.debug("llm: transport close failed (non-fatal): %s", exc)
 
     async def health_check(self) -> dict[str, str]:
-        """
-        Probe all known providers with a minimal completion call.
-
-        Returns a dict with keys for each provider plus chain summary:
-            primary, chain, nim, groq, ollama, nim_model, groq_model, ollama_model
-        Values for provider keys: "healthy" | "not_configured" | "unhealthy (<ExcType>)"
-        """
+        """Probe Gemini with a 1-token completion.  Returns status + model info."""
         result: dict[str, str] = {
-            "primary":       self._primary.value,
-            "chain":         " → ".join(p.value for p in self._provider_chain),
-            "nim_model":     self._nim_model_name,
-            "groq_model":    self._groq_model_name,
-            "ollama_model":  self._ollama_model_name,
+            "provider":    LLMProvider.GEMINI.value,
+            "model":       self._model,
+            "embed_model": self._embed_model,
+            "embed_dim":   str(self._embed_dim),
         }
-
-        for provider in LLMProvider:
-            configured = self._is_configured(provider)
-            if not configured:
-                result[provider.value] = "not_configured"
-                continue
-            try:
-                await litellm.acompletion(
-                    **self._provider_kwargs(provider),
-                    messages=[{"role": "user", "content": "ping"}],
-                    max_tokens=1,
-                    timeout=10,
-                )
-                result[provider.value] = "healthy"
-            except Exception as exc:
-                result[provider.value] = f"unhealthy ({type(exc).__name__})"
-
+        if self._genai is None:
+            result["gemini"] = "not_configured"
+            return result
+        try:
+            await self._genai.aio.models.generate_content(
+                model=self._model,
+                contents="ping",
+                config=genai_types.GenerateContentConfig(
+                    max_output_tokens=1,
+                    thinking_config=self._thinking_config(),
+                    http_options=self._http_options(),
+                ),
+            )
+            result["gemini"] = "healthy"
+        except Exception as exc:  # noqa: BLE001 — surfaced as a status string
+            result["gemini"] = f"unhealthy ({type(exc).__name__})"
         return result
 
     # ── Private — configuration ────────────────────────────────────────────────
 
     def _configure(self, settings: Any) -> None:
-        """Populate instance attributes from application settings."""
-        # NVIDIA NIM
-        self._nim_api_key: str | None = settings.NVIDIA_NIM_API_KEY
-        self._nim_base_url: str = settings.NVIDIA_NIM_BASE_URL
-        self._nim_model: str = f"nvidia_nim/{settings.NVIDIA_NIM_MODEL}"
-        self._nim_embed_model: str = f"nvidia_nim/{settings.NVIDIA_NIM_EMBED_MODEL}"
-        self._nim_model_name: str = settings.NVIDIA_NIM_MODEL
-
-        # Groq
-        self._groq_api_key: str | None = settings.GROQ_API_KEY
-        self._groq_base_url: str = settings.GROQ_BASE_URL
-        self._groq_model: str = f"groq/{settings.GROQ_MODEL}"
-        self._groq_model_name: str = settings.GROQ_MODEL
-
-        # Ollama
-        self._ollama_model: str = f"ollama/{settings.OLLAMA_MODEL}"
-        self._ollama_base_url: str = settings.OLLAMA_BASE_URL
-        self._ollama_model_name: str = settings.OLLAMA_MODEL
-
-        # Behaviour
+        self._model: str = settings.GEMINI_MODEL
+        self._embed_model: str = settings.GEMINI_EMBED_MODEL
+        self._embed_dim: int = settings.GEMINI_EMBED_DIM
+        self._thinking_level: str = settings.GEMINI_THINKING_LEVEL
         self._max_retries: int = settings.LLM_MAX_RETRIES
         self._timeout: float = settings.LLM_REQUEST_TIMEOUT
+        self._api_key: str | None = settings.GEMINI_API_KEY
 
-        # Provider chain — will be set by _build_provider_chain(); initialised
-        # to Ollama-only so any unexpected probe failure leaves a working chain.
-        self._provider_chain: list[LLMProvider] = [LLMProvider.OLLAMA]
-        self._primary: LLMProvider = LLMProvider.OLLAMA
-
-        # Instructor clients
-        # Mode.TOOLS: NIM and Groq both serve Qwen3, which supports tool-calling.
-        # Mode.JSON: Ollama (llama3.1:8b) does not support tool-calling.
-        self._nim_instructor: instructor.AsyncInstructor = instructor.from_litellm(
-            litellm.acompletion,
-            mode=instructor.Mode.TOOLS,
-        )
-        self._groq_instructor: instructor.AsyncInstructor = instructor.from_litellm(
-            litellm.acompletion,
-            mode=instructor.Mode.TOOLS,
-        )
-        self._ollama_instructor: instructor.AsyncInstructor = instructor.from_litellm(
-            litellm.acompletion,
-            mode=instructor.Mode.JSON,
+        self._genai: genai.Client | None = (
+            genai.Client(api_key=self._api_key) if self._api_key else None
         )
 
-    async def _build_provider_chain(self, settings: Any) -> None:
-        """
-        Probe configured providers and build the ordered fallback chain.
-
-        Ordering policy:
-          1. NIM   — if key is set and endpoint responds (highest capability).
-          2. Groq  — if key is set (always added when configured; not probed to
-                     avoid consuming free-tier rate-limit quota at startup).
-          3. Ollama — always last; no key required, no probe.
-
-        Emits the mandatory startup log line naming the full chain.
-        """
-        chain: list[LLMProvider] = []
-
-        # ── NIM ────────────────────────────────────────────────────────────────
-        nim_status = "not_configured"
-        if self._nim_api_key:
-            try:
-                await litellm.acompletion(
-                    **self._provider_kwargs(LLMProvider.NIM),
-                    messages=[{"role": "user", "content": "ping"}],
-                    max_tokens=1,
-                    timeout=10,
-                )
-                chain.append(LLMProvider.NIM)
-                nim_status = "reachable"
-            except Exception as exc:
-                nim_status = f"unreachable ({type(exc).__name__})"
-                logger.warning(
-                    "llm: NIM probe failed (%s) — excluded from chain", nim_status
-                )
-
-        # ── Groq ───────────────────────────────────────────────────────────────
-        # Not probed at startup to avoid burning free-tier RPM quota.
-        # Groq is included in the chain if a key is present; failures surface at
-        # inference time and trigger a move to Ollama.
-        if self._groq_api_key:
-            chain.append(LLMProvider.GROQ)
-
-        # ── Ollama — always last ───────────────────────────────────────────────
-        chain.append(LLMProvider.OLLAMA)
-
-        self._provider_chain = chain
-        self._primary = chain[0]
-
-        # Mandatory startup log — operators must always see the active chain.
-        chain_desc = " → ".join(
-            f"{p.value}/{self._model_name(p)}" for p in chain
-        )
-        if self._primary == LLMProvider.OLLAMA and not self._nim_api_key and not self._groq_api_key:
-            logger.warning(
-                "LLM backend: %s  |  No cloud keys set — set NVIDIA_NIM_API_KEY "
-                "or GROQ_API_KEY in .env for higher-capability inference.",
-                chain_desc,
+    def _require_client(self) -> None:
+        if self._genai is None:
+            raise LLMFallbackExhausted(
+                "Gemini is not configured. Set GEMINI_API_KEY in backend/.env "
+                "and restart."
             )
-        else:
-            logger.info("LLM backend: %s", chain_desc)
 
-        if nim_status not in ("not_configured", "reachable"):
-            logger.warning("LLM: NIM status — %s", nim_status)
+    def _http_options(self) -> genai_types.HttpOptions:
+        # google-genai timeout is in milliseconds.
+        return genai_types.HttpOptions(timeout=int(self._timeout * 1000))
+
+    def _thinking_config(self) -> genai_types.ThinkingConfig | None:
+        """Build the thinking config appropriate to the model generation.
+
+        Gemini 3.x exposes the ``thinking_level`` string enum
+        ("minimal"/"low"/"medium"/"high").  Gemini 2.x predates it and only
+        accepts the integer ``thinking_budget`` (it 400s on ``thinking_level``).
+        For 2.x we map "minimal" → ``thinking_budget=0`` (thinking off) and leave
+        deeper levels to the model default.  Returns None when no thinking config
+        should be sent.
+        """
+        level = self._thinking_level
+        if _model_uses_thinking_budget(self._model):
+            return genai_types.ThinkingConfig(thinking_budget=0) if level == "minimal" else None
+        return genai_types.ThinkingConfig(thinking_level=level)
+
+    def _gen_config(
+        self,
+        *,
+        system: str | None = None,
+        temperature: float = 0.1,
+        max_tokens: int | None = None,
+        response_schema: Type[BaseModel] | None = None,
+        json_mime: bool = False,
+    ) -> genai_types.GenerateContentConfig:
+        """Assemble a GenerateContentConfig from the common call parameters."""
+        kwargs: dict[str, Any] = {
+            "temperature":     temperature,
+            "thinking_config": self._thinking_config(),
+            "http_options":    self._http_options(),
+            "safety_settings": _PERMISSIVE_SAFETY_SETTINGS,
+        }
+        if system:
+            kwargs["system_instruction"] = system
+        if max_tokens is not None:
+            kwargs["max_output_tokens"] = max_tokens
+        if response_schema is not None:
+            kwargs["response_mime_type"] = "application/json"
+            kwargs["response_schema"] = response_schema
+        elif json_mime:
+            kwargs["response_mime_type"] = "application/json"
+        return genai_types.GenerateContentConfig(**kwargs)
 
     # ── Private — request execution ────────────────────────────────────────────
 
-    def _is_configured(self, provider: LLMProvider) -> bool:
-        if provider == LLMProvider.NIM:
-            return bool(self._nim_api_key)
-        if provider == LLMProvider.GROQ:
-            return bool(self._groq_api_key)
-        return True  # Ollama requires no key
-
-    def _provider_kwargs(self, provider: LLMProvider) -> dict[str, Any]:
-        """Return LiteLLM call kwargs for the given provider."""
-        if provider == LLMProvider.NIM:
-            return {
-                "model":    self._nim_model,
-                "api_base": self._nim_base_url,
-                "api_key":  self._nim_api_key,
-            }
-        if provider == LLMProvider.GROQ:
-            return {
-                "model":    self._groq_model,
-                "api_base": self._groq_base_url,
-                "api_key":  self._groq_api_key,
-            }
-        return {
-            "model":    self._ollama_model,
-            "api_base": self._ollama_base_url,
-        }
-
-    def _model_name(self, provider: LLMProvider) -> str:
-        if provider == LLMProvider.NIM:
-            return self._nim_model_name
-        if provider == LLMProvider.GROQ:
-            return self._groq_model_name
-        return self._ollama_model_name
-
-    def _instructor_for(self, provider: LLMProvider) -> instructor.AsyncInstructor:
-        """Return the Instructor client configured for the given provider's mode."""
-        if provider == LLMProvider.NIM:
-            return self._nim_instructor
-        if provider == LLMProvider.GROQ:
-            return self._groq_instructor
-        return self._ollama_instructor
-
-    async def _completion_with_retry(
+    async def _acall(
         self,
-        provider: LLMProvider,
-        messages: list[dict[str, str]],
-        temperature: float,
-        max_tokens: int | None,
-    ) -> Any:
-        """
-        Execute a litellm.acompletion with provider-aware retry policy.
+        contents: Any,
+        config: genai_types.GenerateContentConfig,
+        *,
+        priority: Priority = Priority.MEDIUM,
+        estimated_tokens: int = _DEFAULT_ESTIMATED_TOKENS,
+    ) -> tuple[Any, int]:
+        """Execute one generate_content with quota management and retry.  Returns (response, latency_ms)."""
+        self._require_client()
+        t0 = time.monotonic()
 
-        Only TRANSIENT exceptions trigger retries.  PERMANENT exceptions propagate
-        immediately.  Unrecognised exceptions are treated as transient and retried.
-        """
-        call_kwargs: dict[str, Any] = {
-            **self._provider_kwargs(provider),
-            "messages":    messages,
-            "temperature": temperature,
-            "timeout":     self._timeout,
-        }
-        if max_tokens is not None:
-            call_kwargs["max_tokens"] = max_tokens
-
-        async for attempt in AsyncRetrying(
-            retry=retry_if_exception_type(_TRANSIENT),
-            stop=stop_after_attempt(self._max_retries),
-            wait=wait_exponential_jitter(initial=1, max=10, jitter=1),
-            before_sleep=before_sleep_log(logger, logging.WARNING),
-            reraise=True,
-        ):
-            with attempt:
-                return await litellm.acompletion(**call_kwargs)
-
-    async def _try_providers(
-        self,
-        fn: Any,  # Callable[[LLMProvider], Awaitable[Any]]
-    ) -> tuple[LLMProvider, Any]:
-        """
-        Execute fn against each provider in the chain until one succeeds.
-
-        - Permanent failures (auth, bad-request, context-window) propagate
-          immediately — fallback cannot fix these.
-        - Every transient failure that causes a chain advance is logged at WARNING
-          and increments llm_fallbacks_total{provider_from, provider_to}.
-        - If all providers fail, raises LLMFallbackExhausted with a full trace
-          of each provider's error.
-
-        Returns:
-            (serving_provider, raw_result)
-        """
-        # Import here to avoid circular import at module load time.
-        from app.core.metrics import llm_fallbacks_total
-
-        failures: list[str] = []
-
-        for idx, provider in enumerate(self._provider_chain):
+        manager = _try_get_request_manager()
+        permit = None
+        if manager is not None:
             try:
-                result = await fn(provider)
-                if idx > 0:
-                    logger.info(
-                        "llm: request served by fallback provider %s (after %d failure(s))",
-                        provider.value, idx,
-                    )
-                return provider, result
-
-            except _PERMANENT:
-                # Permanent error: retrying with another provider won't help.
-                raise
-
-            except Exception as exc:
-                err_summary = f"{provider.value}: {type(exc).__name__}: {exc}"
-                failures.append(err_summary)
-
-                is_last = idx == len(self._provider_chain) - 1
-                if is_last:
-                    break
-
-                next_provider = self._provider_chain[idx + 1]
-                logger.warning(
-                    "llm: provider %s failed (%s: %s) — advancing to %s",
-                    provider.value,
-                    type(exc).__name__,
-                    exc,
-                    next_provider.value,
+                permit = await manager.acquire(
+                    _rm.Operation.GENERATE, priority, estimated_tokens
                 )
-                try:
-                    llm_fallbacks_total.labels(
-                        provider_from=provider.value,
-                        provider_to=next_provider.value,
-                    ).inc()
-                except Exception:
-                    pass  # Metric emission must never abort the fallback logic.
+            except _rm.GeminiQuotaExhausted as exc:
+                # Translate so callers catching LLMFallbackExhausted or
+                # llm_client.GeminiQuotaExhausted continue to work unchanged.
+                raise GeminiQuotaExhausted(str(exc)) from exc
+            # GeminiRateLimitError propagates as-is — callers should degrade gracefully.
 
-        raise LLMFallbackExhausted(
-            f"All {len(self._provider_chain)} provider(s) in chain exhausted. "
-            f"Failures: {' | '.join(failures)}"
-        )
+        async def _do() -> Any:
+            return await self._genai.aio.models.generate_content(
+                model=self._model, contents=contents, config=config,
+            )
+
+        try:
+            response = await self._retry(_do, op="generate")
+        except Exception:
+            if permit is not None:
+                manager.release(permit, outcome="error")
+            raise
+
+        if permit is not None:
+            manager.release(permit, outcome="success")
+
+        return response, int((time.monotonic() - t0) * 1000)
+
+    async def _retry(self, fn: Any, *, op: str) -> Any:
+        """
+        Run ``fn`` with bounded retries on transient errors only.
+
+        Error routing
+        -------------
+        - **Circuit open** (daily quota known exhausted): raises
+          ``GeminiQuotaExhausted`` immediately — zero network calls.
+        - **Daily quota 429** (``GenerateRequestsPerDay`` in body): opens the
+          circuit, raises ``GeminiQuotaExhausted`` — no retry.
+        - **Transient 429 / 5xx / network / timeout**: retried up to
+          ``LLM_MAX_RETRIES`` times.  The wait between attempts uses Gemini's
+          own ``retryDelay`` hint when present; otherwise falls back to
+          ``wait_exponential_jitter``.
+        - **Permanent 4xx** (400/401/403/404): raises ``LLMFallbackExhausted``
+          immediately — retrying cannot fix a misconfiguration.
+        - **Unknown exception**: raises ``LLMFallbackExhausted`` immediately —
+          silent retry of an unclassified error is unsafe.
+        """
+        # Fast-fail if the daily quota is already known exhausted.
+        _check_quota_circuit(op)
+
+        last_exc: Exception | None = None
+        try:
+            async for attempt in AsyncRetrying(
+                retry=retry_if_exception_type(_TransientLLMError),
+                stop=stop_after_attempt(self._max_retries),
+                wait=_gemini_wait,
+                before_sleep=before_sleep_log(logger, logging.WARNING),
+                reraise=True,
+            ):
+                with attempt:
+                    try:
+                        return await fn()
+                    except Exception as exc:  # noqa: BLE001 — classified below
+                        last_exc = exc
+                        if _is_permanent(exc):
+                            raise LLMFallbackExhausted(
+                                f"Gemini {op} failed (permanent {_status_code(exc)}): "
+                                f"{type(exc).__name__}: {exc}"
+                            ) from exc
+                        if _is_daily_quota_exhausted(exc):
+                            _open_quota_circuit(op)
+                            raise GeminiQuotaExhausted(
+                                f"Gemini {op} aborted — daily quota exhausted. "
+                                f"Resets at {_quota_reset_at().strftime('%Y-%m-%dT%H:%M:%SZ')} UTC. "
+                                f"Provision a paid Gemini API key to eliminate this limit."
+                            ) from exc
+                        if _is_transient(exc):
+                            delay = _extract_retry_delay_secs(exc)
+                            raise _TransientLLMError(str(exc), retry_delay_secs=delay) from exc
+                        # Unknown — do not silently retry an unclassified error.
+                        raise LLMFallbackExhausted(
+                            f"Gemini {op} failed: {type(exc).__name__}: {exc}"
+                        ) from exc
+        except _TransientLLMError as exc:
+            raise LLMFallbackExhausted(
+                f"Gemini {op} failed after {self._max_retries} attempts "
+                f"(last: {type(last_exc).__name__}: {last_exc})"
+            ) from (last_exc or exc)
+
+    def _extract_parsed(self, response: Any, response_model: Type[T]) -> T:
+        """Return the validated model from response.parsed, or validate the raw text."""
+        parsed = getattr(response, "parsed", None)
+        if isinstance(parsed, response_model):
+            return parsed
+        text = response.text or ""
+        if not text.strip():
+            raise LLMFallbackExhausted(
+                f"Gemini returned no parseable output for {response_model.__name__} "
+                f"(finish_reason may indicate a block or truncation)."
+            )
+        try:
+            return response_model.model_validate_json(text)
+        except Exception as exc:
+            raise LLMFallbackExhausted(
+                f"Gemini output failed {response_model.__name__} validation: "
+                f"{type(exc).__name__}: {exc}. Preview: {text[:200]!r}"
+            ) from exc
+
+
+# ── Safety settings — permissive (avoid false-positive blocks on finance text) ──
+# A trading-analysis tool must not have benign market commentary suppressed by
+# the default content filters.  Output guardrails are enforced separately in the
+# explanation worker.
+_PERMISSIVE_SAFETY_SETTINGS = [
+    genai_types.SafetySetting(category=cat, threshold="BLOCK_NONE")
+    for cat in (
+        "HARM_CATEGORY_HARASSMENT",
+        "HARM_CATEGORY_HATE_SPEECH",
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        "HARM_CATEGORY_DANGEROUS_CONTENT",
+    )
+]
 
 
 # ── Module-level helpers ───────────────────────────────────────────────────────
 
-def _strip_thinking(text: str) -> str:
-    """Remove Qwen3 chain-of-thought <think>…</think> blocks from output."""
-    return _THINK_TAG_RE.sub("", text).strip()
+def _model_uses_thinking_budget(model: str) -> bool:
+    """True for model generations that use integer thinking_budget, not thinking_level.
+
+    Gemini 3.x introduced the ``thinking_level`` enum; 1.x/2.x only accept
+    ``thinking_budget`` and 400 on ``thinking_level``.
+    """
+    m = model.lower()
+    return any(m.startswith(p) for p in ("gemini-1.", "gemini-2."))
 
 
-def _build_messages(
-    prompt: str,
-    system: str | None,
-) -> list[dict[str, str]]:
-    messages: list[dict[str, str]] = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-    return messages
+def _usage_tokens(response: Any) -> tuple[int, int]:
+    """Extract (prompt_tokens, completion_tokens) from a Gemini response."""
+    usage = getattr(response, "usage_metadata", None)
+    in_tok = getattr(usage, "prompt_token_count", None) or 0
+    out_tok = getattr(usage, "candidates_token_count", None) or 0
+    return int(in_tok), int(out_tok)
+
+
+def _l2_normalize(vector: list[float]) -> list[float]:
+    """Return the unit-norm vector (no-op for a zero vector)."""
+    norm = math.sqrt(sum(x * x for x in vector))
+    if norm == 0.0:
+        return vector
+    return [x / norm for x in vector]
 
 
 def _parse_json(content: str) -> dict[str, Any]:
-    """
-    Parse JSON from LLM output, handling think-tags and markdown code fences.
-
-    Raises:
-        ValueError: If the content cannot be parsed as a JSON object.
-    """
-    content = _strip_thinking(content)
-
-    fence_match = _CODE_FENCE_RE.search(content)
-    raw = fence_match.group(1).strip() if fence_match else content.strip()
-
+    """Parse a JSON object from model output, tolerating markdown code fences."""
+    fence = _CODE_FENCE_RE.search(content)
+    raw = fence.group(1).strip() if fence else content.strip()
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
-        logger.error(
-            "llm: JSON parse failed. preview=%r error=%s",
-            raw[:300],
-            exc,
-        )
+        logger.error("llm: JSON parse failed. preview=%r error=%s", raw[:300], exc)
         raise ValueError(
-            f"LLM returned non-JSON output: {exc}. "
-            f"Content preview: {raw[:200]!r}"
+            f"LLM returned non-JSON output: {exc}. Content preview: {raw[:200]!r}"
         ) from exc
 
 
@@ -794,8 +922,7 @@ def get_intelligence_client() -> CortexIntelligenceClient:
     Return the CortexIntelligenceClient singleton.
 
     If initialize() was not called at startup, a lazy instance is created from
-    settings without a provider probe (Groq skipped since it wasn't probed).
-    A warning is logged — proper production usage always calls initialize().
+    settings.  A warning is logged — production usage always calls initialize().
     """
     global _client
     if _client is not None:
@@ -804,23 +931,11 @@ def get_intelligence_client() -> CortexIntelligenceClient:
     settings = get_settings()
     instance: CortexIntelligenceClient = object.__new__(CortexIntelligenceClient)
     instance._configure(settings)
-
-    # Build chain from key presence alone (no network probe).
-    chain: list[LLMProvider] = []
-    if settings.NVIDIA_NIM_API_KEY:
-        chain.append(LLMProvider.NIM)
-    if settings.GROQ_API_KEY:
-        chain.append(LLMProvider.GROQ)
-    chain.append(LLMProvider.OLLAMA)
-
-    instance._provider_chain = chain
-    instance._primary = chain[0]
-
     _client = instance
     logger.warning(
-        "CortexIntelligenceClient lazy-initialized without provider probe. "
-        "Chain: %s  |  Call `await CortexIntelligenceClient.initialize()` at startup.",
-        " → ".join(p.value for p in chain),
+        "CortexIntelligenceClient lazy-initialized (gemini/%s). "
+        "Call `await CortexIntelligenceClient.initialize()` at startup.",
+        instance._model,
     )
     return _client
 
@@ -829,7 +944,15 @@ def get_ollama_client() -> CortexIntelligenceClient:
     """
     Backward-compatibility alias for get_intelligence_client().
 
-    Existing callers (EventClassifier, FakeNewsDetector) use this name.
-    All calls are transparently routed through the provider-agnostic client.
+    Retained so existing callers (EventClassifier, FakeNewsDetector) keep working;
+    all calls route through the Gemini-backed client.
     """
     return get_intelligence_client()
+
+
+async def close_intelligence_client() -> None:
+    """Close the singleton client's Gemini transport at app shutdown (no-op if unset)."""
+    global _client
+    if _client is not None:
+        await _client.aclose()
+        _client = None

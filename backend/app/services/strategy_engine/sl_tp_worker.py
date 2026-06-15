@@ -73,9 +73,9 @@ async def _worker_loop(redis: Redis) -> None:
 
 async def _process_tick(redis: Redis) -> None:
     """Load active activations and check SL/TP for each."""
-    from app.core.database import AsyncSessionLocal
+    from app.core.database import WorkerSessionLocal
 
-    async with AsyncSessionLocal() as db:
+    async with WorkerSessionLocal() as db:
         activations = await _load_active_activations(db)
         if not activations:
             return

@@ -7,27 +7,31 @@ All embedding calls flow through this module so that batching strategy and
 rate-limit behaviour are configured in one place.  Callers pass plain strings;
 this module handles chunking into API-sized batches and reassembling the result.
 
-Embedding model:  nvidia/nv-embedqa-e5-v5 (1024-dim, finance-adapted, NIM)
-Fallback:         Requires NIM — Ollama's nomic-embed-text is 768-dim and
-                  incompatible with the VECTOR(1024) column.  If NIM is not
-                  configured, embed_texts() raises LLMFallbackExhausted with
-                  a clear message so the operator knows to add NVIDIA_NIM_API_KEY.
+Embedding model:  gemini-embedding-001 (GEMINI_EMBED_DIM dims, L2-normalized).
+                  The model and dimension are owned by CortexIntelligenceClient;
+                  if GEMINI_API_KEY is unset, embed_texts() raises
+                  LLMFallbackExhausted with a clear message.
 """
 from __future__ import annotations
 
 import logging
 from typing import Literal
 
-from app.ai.intelligence.llm_client import LLMFallbackExhausted, get_intelligence_client
+from app.ai.intelligence.llm_client import Priority, get_intelligence_client
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 InputType = Literal["passage", "query"]
 
-# Expected output dimension from nvidia/nv-embedqa-e5-v5.
-# The database column is pinned to this value; mismatches are caught early.
-EXPECTED_DIM = 1024
+
+def expected_dim() -> int:
+    """The embedding dimension the ai_document_embeddings column is pinned to.
+
+    Owned by GEMINI_EMBED_DIM so the pgvector column, the migration, and the
+    runtime guard below can never drift apart.
+    """
+    return get_settings().GEMINI_EMBED_DIM
 
 
 async def embed_texts(
@@ -49,38 +53,29 @@ async def embed_texts(
         List of float vectors in the same order as the input texts.
 
     Raises:
-        LLMFallbackExhausted: If no embedding provider is available or NIM key
-            is missing (NIM is required for 1024-dim vectors).
-        RuntimeError: If the embedding provider returns vectors of the wrong
-            dimension (signals a model or configuration mismatch).
+        LLMFallbackExhausted: If Gemini is not configured (GEMINI_API_KEY unset)
+            or the embedding call fails.
+        RuntimeError: If the provider returns vectors of the wrong dimension
+            (signals a model or configuration mismatch vs. GEMINI_EMBED_DIM).
     """
     if not texts:
         return []
 
     client = get_intelligence_client()
-
-    if not client._nim_api_key:
-        raise LLMFallbackExhausted(
-            "Embeddings require NVIDIA NIM (1024-dim vectors). "
-            "Add NVIDIA_NIM_API_KEY to backend/.env and restart. "
-            "Ollama fallback is intentionally disabled for embeddings because "
-            "nomic-embed-text produces 768-dim vectors incompatible with the "
-            "VECTOR(1024) database column."
-        )
-
     settings = get_settings()
+    dim = settings.GEMINI_EMBED_DIM
     effective_batch = batch_size or settings.RAG_EMBED_BATCH_SIZE
     vectors: list[list[float]] = []
 
     for batch_start in range(0, len(texts), effective_batch):
         batch = texts[batch_start : batch_start + effective_batch]
-        batch_vectors = await client.embed(batch, input_type=input_type)
+        batch_vectors = await client.embed(batch, input_type=input_type, priority=Priority.BACKGROUND)
 
-        if batch_vectors and len(batch_vectors[0]) != EXPECTED_DIM:
+        if batch_vectors and len(batch_vectors[0]) != dim:
             raise RuntimeError(
-                f"Embedding dimension mismatch: expected {EXPECTED_DIM}, "
+                f"Embedding dimension mismatch: expected {dim}, "
                 f"got {len(batch_vectors[0])}. "
-                f"Verify NVIDIA_NIM_EMBED_MODEL is set to nvidia/nv-embedqa-e5-v5."
+                f"Verify GEMINI_EMBED_DIM matches the ai_document_embeddings column."
             )
 
         vectors.extend(batch_vectors)
@@ -99,7 +94,7 @@ async def embed_query(query: str) -> list[float]:
     Embed a single query string for retrieval-time use.
 
     Convenience wrapper around embed_texts() with input_type="query".
-    Returns a single 1024-dim float vector.
+    Returns a single GEMINI_EMBED_DIM float vector.
     """
     vectors = await embed_texts([query], input_type="query")
     return vectors[0]

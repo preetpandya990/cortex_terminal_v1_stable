@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     Index,
     Numeric,
@@ -17,6 +18,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -138,6 +140,12 @@ class InstrumentMaster(Base):
         # Indexes exist in DB under these names; defined here for ORM awareness only.
         Index("idx_instrument_symbol", "trading_symbol"),
         Index("idx_instrument_exchange", "exchange"),
+        # Partial index backing the active-universe hot path (see migration 0045).
+        Index(
+            "idx_instrument_active",
+            "trading_symbol",
+            postgresql_where=text("is_active"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -146,6 +154,27 @@ class InstrumentMaster(Base):
     name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     exchange: Mapped[str] = mapped_column(String(20), nullable=False)
     instrument_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # ── Lifecycle (migration 0045) ──────────────────────────────────────────
+    # is_active is derived state: true iff the instrument was present in the
+    # most recent successful sync. The daily Upstox BOD file drops delisted
+    # stocks/expired contracts, so reconciliation soft-deletes missing rows.
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        server_default=text("true"),
+        nullable=False,
+    )
+    # Watermark stamped to the sync's start time for every instrument present
+    # in the file; reconciliation delists rows whose watermark predates the run.
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    # When the instrument first went missing from the file; NULL while active.
+    delisted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

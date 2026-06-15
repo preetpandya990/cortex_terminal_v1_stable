@@ -10,29 +10,45 @@ Weights (Phase 2–4): event=0.50, ml=0.50, technical=0.00
 Weights (Phase 5+):  event=0.35, ml=0.40, technical=0.25
 """
 import asyncio
+import hashlib
 import json
 import logging
 import math
 from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
+from time import monotonic
 from typing import Any, Optional
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import numpy as np
-from sqlalchemy import and_, desc, func, select
+from sqlalchemy import and_, desc, func, select, text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.fusion.models import (
     AIActiveStrategy,
     AIEventClassification,
+    AILLMAuditLog,
     AINLPResult,
     AIProcessedEvent,
     AIRawEvent,
     AIRegimeDetection,
     AITradingSignal,
 )
+from app.ai.fusion.news_forecaster import (
+    CircuitBreaker,
+    generate_news_forecast,
+    score_from_direction,
+)
 from app.ai.fusion.serializers import serialise_signal
-from app.core.metrics import signal_generation_total
+from app.ai.intelligence.llm_client import Priority, get_intelligence_client
+from app.core.config import get_settings
+from app.core.metrics import (
+    llm_news_forecast_duration_seconds,
+    llm_news_forecasts_total,
+    signal_generation_total,
+    signal_staleness_abstentions_total,
+)
 from app.core.redis import PubSubClient, RedisChannels
 from app.ml.inference.ensemble_predictor import EnsemblePredictor
 from app.ml.inference.feature_loader import FeatureLoader
@@ -122,6 +138,16 @@ class SignalAssembler:
         self.technical_weight = technical_weight
         # raw redis.asyncio.Redis client; None disables caching transparently
         self._ml_cache = redis
+
+        # News-forecaster circuit breaker (provider-wide; one per assembler).
+        _s = get_settings()
+        self._forecast_breaker = CircuitBreaker(
+            threshold=_s.NEWS_FORECAST_BREAKER_THRESHOLD,
+            cooldown=_s.NEWS_FORECAST_BREAKER_COOLDOWN,
+        )
+        # Cached global latest 1D OHLCV bar (the data frontier) for the staleness
+        # guard: (frontier_timestamp_or_None, monotonic_cached_at).
+        self._frontier_cache: tuple[Any, float] | None = None
 
         total_weight = event_weight + ml_weight + technical_weight
         if not math.isclose(total_weight, 1.0, rel_tol=1e-5):
@@ -278,6 +304,269 @@ class SignalAssembler:
             ],
         }
 
+    # ── News forecaster (Gemini, AI/news consensus slot) ───────────────────────
+
+    _FORECAST_CACHE_PREFIX = "cortex:news_forecast"
+
+    async def gather_news_forecast(
+        self,
+        db: AsyncSession,
+        symbol: str,
+        *,
+        ml_signal: dict[str, Any] | None = None,
+        event_signals: dict[str, Any] | None = None,
+        regime: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Gemini news-conditioned forecast for the AI/news consensus slot.
+
+        Reasons over the ML's exact indicators (``ml_signal["indicators"]``) plus
+        recent news to produce {direction, confidence}, mapped to the −100..100
+        event-slot shape consumed unchanged by ``fuse_signals`` and the engine
+        consensus.
+
+        Runs inside the 5s consensus budget with a tight per-call timeout, a
+        per-symbol cache, and a circuit breaker.  On ANY failure it falls back to
+        the deterministic NLP event score, so suggestion creation and the
+        directional-alignment gate never stall.
+
+        The forecaster only contributes when there is news: with no events it
+        returns the (unavailable) event signal unchanged, keeping the AI slot
+        purely news-driven and avoiding double-counting the technical slot.
+        """
+        if event_signals is None:
+            event_signals = await self.gather_event_signals(db, symbol)
+        events = event_signals.get("events") or []
+
+        # Stale-data guard: the forecaster reasons over the same indicators the ML
+        # saw, so if those are stale (daily sync lagging) it abstains too rather
+        # than forecast on stale technicals.  Mirrors gather_ml_signals.
+        if (ml_signal or {}).get("stale"):
+            signal_staleness_abstentions_total.labels(component="forecaster").inc()
+            return {**event_signals, "available": False, "forecast_source": "stale_data"}
+
+        # No news → forecaster abstains; fusion excludes the (unavailable) AI slot.
+        if not events:
+            return {**event_signals, "forecast_source": "no_news"}
+
+        indicators = (ml_signal or {}).get("indicators") or {}
+
+        def _fallback(reason: str) -> dict[str, Any]:
+            return {
+                **event_signals,
+                "available": True,
+                "forecast_source": "fallback",
+                "fallback_reason": reason,
+            }
+
+        # Circuit breaker open → skip the call, fall straight through.
+        if not self._forecast_breaker.allow():
+            llm_news_forecasts_total.labels(outcome="breaker_open").inc()
+            return _fallback("circuit_breaker_open")
+
+        cache_key = self._forecast_cache_key(symbol, events, indicators)
+        cached = await self._forecast_cache_get(cache_key)
+        if cached is not None:
+            llm_news_forecasts_total.labels(outcome="cache_hit").inc()
+            return cached
+
+        settings = get_settings()
+        client = get_intelligence_client()
+        invocation_id = uuid4()
+        prompt_hash = cache_key.rsplit(":", 1)[-1]
+        t0 = monotonic()
+        try:
+            out, usage = await generate_news_forecast(
+                client,
+                symbol=symbol,
+                indicators=indicators,
+                events=events,
+                regime=regime,
+                timeout=settings.GEMINI_FORECAST_TIMEOUT,
+                max_tokens=settings.GEMINI_FORECAST_MAX_TOKENS,
+                priority=Priority.MEDIUM,
+            )
+        except Exception as exc:  # incl. asyncio.TimeoutError, LLMFallbackExhausted
+            self._forecast_breaker.record_failure()
+            llm_news_forecasts_total.labels(outcome="fallback").inc()
+            err = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "news_forecaster: forecast failed for %s (%s) — NLP fallback",
+                symbol, err,
+            )
+            await self._write_forecast_audit(
+                invocation_id=invocation_id, prompt_hash=prompt_hash,
+                model_id=client.model_id, latency_ms=int((monotonic() - t0) * 1000),
+                output=None, error=err, usage=None,
+            )
+            return _fallback(err)
+
+        self._forecast_breaker.record_success()
+        latency_ms = int((monotonic() - t0) * 1000)
+        result = {
+            "score":           score_from_direction(out.direction, out.confidence),
+            "confidence":      float(out.confidence),
+            "available":       True,
+            "events":          events,
+            "event_count":     event_signals.get("event_count", len(events)),
+            "direction":       out.direction,
+            "rationale":       out.rationale,
+            "forecast_source": "gemini",
+            "model":           usage.get("model_id", client.model_id),
+        }
+        llm_news_forecasts_total.labels(outcome="success").inc()
+        llm_news_forecast_duration_seconds.labels(provider="gemini").observe(latency_ms / 1000.0)
+        await self._forecast_cache_set(cache_key, result, settings.NEWS_FORECAST_CACHE_TTL)
+        await self._write_forecast_audit(
+            invocation_id=invocation_id, prompt_hash=prompt_hash,
+            model_id=usage.get("model_id", client.model_id), latency_ms=latency_ms,
+            output=out, error=None, usage=usage,
+        )
+        return result
+
+    def _forecast_cache_key(
+        self, symbol: str, events: list[dict], indicators: dict[str, Any]
+    ) -> str:
+        """Stable key over symbol + news identity + rounded indicators.
+
+        A new event or a materially changed indicator value busts the cache.
+        """
+        ev_ids = sorted(
+            str(e.get("id") or e.get("article_title") or e.get("type") or "")
+            for e in events
+        )
+        ind = {
+            k: round(float(v), 4)
+            for k, v in indicators.items()
+            if isinstance(v, (int, float))
+        }
+        basis = json.dumps({"s": symbol, "e": ev_ids, "i": ind}, sort_keys=True, default=str)
+        digest = hashlib.sha256(basis.encode()).hexdigest()[:16]
+        return f"{self._FORECAST_CACHE_PREFIX}:{symbol}:{digest}"
+
+    async def _forecast_cache_get(self, key: str) -> dict[str, Any] | None:
+        if self._ml_cache is None:
+            return None
+        try:
+            raw = await self._ml_cache.get(key)
+            return json.loads(raw) if raw else None
+        except Exception as exc:
+            logger.debug("news_forecaster: cache read failed (non-fatal): %s", exc)
+            return None
+
+    async def _forecast_cache_set(self, key: str, value: dict[str, Any], ttl: int) -> None:
+        if self._ml_cache is None:
+            return
+        try:
+            await self._ml_cache.setex(key, ttl, json.dumps(value, default=str))
+        except Exception as exc:
+            logger.debug("news_forecaster: cache write failed (non-fatal): %s", exc)
+
+    async def _write_forecast_audit(
+        self,
+        *,
+        invocation_id: Any,
+        prompt_hash: str,
+        model_id: str,
+        latency_ms: int,
+        output: Any,
+        error: str | None,
+        usage: dict[str, Any] | None,
+    ) -> None:
+        """Append one ai_llm_audit_log row for the forecast call (governance).
+
+        Uses its OWN session so it never commits the in-flight consensus
+        transaction prematurely.  Never raises — audit failures are logged only.
+        """
+        from app.core.database import AsyncSessionLocal
+        from app.core.metrics import llm_audit_log_writes_total
+
+        provider, _, mid = (model_id or "gemini/").partition("/")
+        preview: str | None = None
+        if output is not None:
+            preview = (
+                f"{output.direction} conf={float(output.confidence):.2f}: "
+                f"{output.rationale}"
+            )[:500]
+        try:
+            async with AsyncSessionLocal() as audit_db:
+                audit_db.add(AILLMAuditLog(
+                    invocation_id=invocation_id,
+                    invocation_type="news_forecast",
+                    reference_table="ai_trading_signals",
+                    reference_id=None,
+                    model_provider=provider or "gemini",
+                    model_id=mid or model_id,
+                    prompt_hash=prompt_hash,
+                    retrieved_source_ids=None,
+                    input_tokens=(usage or {}).get("input_tokens"),
+                    output_tokens=(usage or {}).get("output_tokens"),
+                    latency_ms=latency_ms,
+                    guardrail_events=[],
+                    output_preview=preview,
+                    error_message=error,
+                ))
+                await audit_db.commit()
+            llm_audit_log_writes_total.labels(status="success").inc()
+        except Exception as exc:
+            llm_audit_log_writes_total.labels(status="failure").inc()
+            logger.error("news_forecaster: audit write failed: %s", exc, exc_info=True)
+
+    # ── Data freshness guard (daily OHLCV sync lag) ────────────────────────────
+
+    async def _ohlcv_frontier(self, db: AsyncSession) -> Any:
+        """Robust global daily-data frontier, cached briefly.
+
+        The newest day on which at least STALENESS_FRONTIER_MIN_INSTRUMENTS daily
+        bars exist — i.e. the day the *bulk* of the universe has reached.  Using a
+        count threshold (not ``max``) makes it outlier-proof: a single instrument
+        synced a day ahead cannot drag the frontier forward and flag the rest of
+        the universe stale.  Windowed to 30 days so the scan stays cheap (~18ms).
+        """
+        s = get_settings()
+        if self._frontier_cache is not None:
+            val, at = self._frontier_cache
+            if monotonic() - at < s.STALENESS_FRONTIER_CACHE_SECS:
+                return val
+        val = (await db.execute(sa_text(
+            "SELECT date_trunc('day', timestamp) AS d FROM upstox_ohlcv "
+            "WHERE timeframe='1D' AND timestamp > NOW() - make_interval(days => 30) "
+            "GROUP BY 1 HAVING COUNT(*) >= :minc ORDER BY d DESC LIMIT 1"
+        ), {"minc": s.STALENESS_FRONTIER_MIN_INSTRUMENTS})).scalar()
+        self._frontier_cache = (val, monotonic())
+        return val
+
+    async def _resolve_instrument_key(self, db: AsyncSession, symbol: str) -> str | None:
+        if "|" in symbol:
+            return symbol
+        return (await db.execute(sa_text(
+            "SELECT instrument_key FROM instrument_master "
+            "WHERE trading_symbol=:s AND exchange='NSE' AND instrument_type='EQ' LIMIT 1"
+        ), {"s": symbol})).scalar()
+
+    async def _data_stale(self, db: AsyncSession, symbol: str) -> tuple[bool, dict[str, Any]]:
+        """True if the symbol's latest daily bar lags the global 1D frontier.
+
+        Frontier-relative (no trading calendar needed): if the rest of the universe
+        has a newer daily bar than this symbol, the daily sync hasn't reached it
+        yet — so its technicals are stale and the consumers should abstain.  When
+        freshness can't be determined (no frontier / unknown symbol) it returns
+        False so the guard never blocks on missing data.
+        """
+        frontier = await self._ohlcv_frontier(db)
+        instrument_key = await self._resolve_instrument_key(db, symbol)
+        if frontier is None or instrument_key is None:
+            return False, {}
+        latest = (await db.execute(sa_text(
+            "SELECT max(timestamp) FROM upstox_ohlcv "
+            "WHERE instrument_key=:k AND timeframe='1D'"
+        ), {"k": instrument_key})).scalar()
+        if latest is None:
+            return True, {"latest": None, "frontier": frontier.isoformat(), "lag_days": None}
+        lag = (frontier.date() - latest.date()).days
+        info = {"latest": latest.isoformat(), "frontier": frontier.isoformat(), "lag_days": lag}
+        return lag > get_settings().STALENESS_MAX_LAG_DAYS, info
+
     async def gather_ml_signals(
         self,
         db: AsyncSession,
@@ -296,6 +585,23 @@ class SignalAssembler:
         if not self.ensemble_predictor or not self.feature_loader:
             logger.debug("ML prediction skipped — predictor not initialised")
             return {"score": 0.0, "confidence": 0.0, "model": None, "available": False}
+
+        # Freshness guard: abstain on stale daily OHLCV (the sync hasn't reached
+        # this symbol yet) rather than predict on stale technicals.  Self-heals
+        # next cycle.  The `stale` flag also makes the news forecaster abstain.
+        if get_settings().ENABLE_STALENESS_GUARD:
+            stale, info = await self._data_stale(db, symbol)
+            if stale:
+                signal_staleness_abstentions_total.labels(component="ml").inc()
+                logger.info(
+                    "gather_ml_signals: abstaining on stale OHLCV — symbol=%s lag_days=%s",
+                    symbol, info.get("lag_days"),
+                )
+                return {
+                    "score": 0.0, "confidence": 0.0, "model": None,
+                    "available": False, "stale": True, "reason": "stale_data",
+                    "staleness": info,
+                }
 
         cache_key = f"cortex:ml:signal:{symbol}:{timeframe}"
 
@@ -316,9 +622,13 @@ class SignalAssembler:
         feature_cache_hit_rate.labels(cache_type="ml_signal").set(0.0)
 
         try:
+            # Capture the raw labeled indicators the model sees so the Gemini news
+            # forecaster reasons over the identical numbers (see gather_news_forecast).
+            indicator_snapshot: dict[str, float] = {}
             tabular, sequence, current_price, volatility = await self.feature_loader.load_features(
                 symbol=symbol,
                 timeframe=timeframe,
+                indicator_snapshot_out=indicator_snapshot,
             )
 
             prediction = await self.ensemble_predictor.predict(
@@ -362,6 +672,9 @@ class SignalAssembler:
                 # before the weighted blend. Passed through to JSONB for the
                 # serialiser to surface individually in contributing_factors.
                 "models": prediction.get("models", {}),
+                # Raw labeled indicators (RSI/MACD/EMA/ATR/…) the model saw, for the
+                # Gemini news forecaster to reuse verbatim (identical numbers).
+                "indicators": indicator_snapshot,
             }
 
             if self._ml_cache is not None:
@@ -724,8 +1037,6 @@ class SignalAssembler:
         regime = await self.get_latest_regime(db)
         strategy_id = await self.get_active_strategy(db, regime) if regime else None
 
-        event_signals = await self.gather_event_signals(db, symbol)
-
         if precomputed_ml is not None:
             # Batch scheduler path — ML inference already completed in Phase B.
             # Re-wrap the prediction dict into the same shape gather_ml_signals returns.
@@ -758,6 +1069,14 @@ class SignalAssembler:
             }
         else:
             ml_signals = await self.gather_ml_signals(db, symbol, timeframe)
+
+        # AI/news slot: the Gemini news-conditioned forecast reasons over the ML's
+        # own indicators + recent news, then maps to the event-slot shape.  Falls
+        # back to the deterministic event score on any failure (never blocks).
+        event_signals = await self.gather_news_forecast(
+            db, symbol, ml_signal=ml_signals, regime=regime,
+        )
+
         # Derive time_horizon once — used for technical candle resolution,
         # expiry computation, and reasoning string.
         time_horizon = self._derive_time_horizon(timeframe)

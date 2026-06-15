@@ -165,6 +165,52 @@ class RedisChannels:
         }
     """
 
+    LLM_CONTEXT_PENDING = "cortex:llm:context:pending"
+    """
+    Trigger channel published by the SSE stream when an instrument has no active
+    suggestion AND no valid cached context.  The explanation worker is the sole
+    subscriber and dispatches to ``_generate_instrument_context``.
+
+    A Redis distributed lock (SET NX EX 120) on
+    ``cortex:instrument_context:generating:{instrument_key}`` prevents duplicate
+    generation requests from concurrent SSE connections on the same instrument.
+
+    Payload:
+        {
+            "instrument_key":  "NSE_EQ|INE002A01018",
+            "symbol":          "RELIANCE",          # may be null
+            "prediction_data": { ... } | null       # current ML snapshot from SSE state
+        }
+    """
+
+    LLM_CONTEXT_READY = "cortex:llm:context:ready:{instrument_key}"
+    """
+    Per-instrument notification published by the explanation worker after a
+    successful ``_generate_instrument_context`` run.  The SSE stream subscribes to
+    the ``cortex:llm:context:ready:*`` pattern and emits an analysis_update
+    immediately on receipt.
+
+    Channel name: substitute {instrument_key} with the full instrument key string
+    (URL-safe; the colons and pipe in "NSE_EQ|..." are fine in Redis channel names).
+
+    Payload:
+        {
+            "instrument_key":  "NSE_EQ|INE002A01018",
+            "context_summary": "2-3 sentence market context...",
+            "context_full":    "Full narrative with citations...",
+            "model":           "nim/qwen3.5-122b-a10b",
+            "generated_at":    "2026-06-06T12:00:00Z",
+            "sources": [
+                {
+                    "source_name": "Economic Times Markets",
+                    "as_of":       "2026-06-06T10:30:00+00:00",
+                    "source_url":  "https://..."
+                }
+            ]
+        }
+    """
+
+
     # ── Market Feed ────────────────────────────────────────────────────────────
     MARKET_FEED_LTPC = "cai:market-feed:ltpc"
     """

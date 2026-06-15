@@ -104,3 +104,63 @@ reboots, integrates with the journal, doesn't need a babysitter process).
   journal + per-run log; the next scheduled fire is independent.
 - It does **not** auto-clean old `models/production/` runs.  Future C2 work
   will rotate them as part of the Promotion Report lifecycle.
+
+
+## Instrument master sync
+
+`instrument_master` is reconciled daily against Upstox's begin-of-day (BOD)
+`NSE.json.gz` file.  Unlike the retrain (a systemd timer), this runs **in-process**
+inside the API via `InstrumentSyncService` (registered in the FastAPI lifespan),
+so there is no systemd unit to install — it starts and stops with the app.
+
+### How it runs
+
+- **Cadence:** daily at `INSTRUMENT_SYNC_HOUR_IST` (default **08:00 IST**) on NSE
+  trading days only — after Upstox's ~06:00 refresh, before the 09:15 open.
+- **Startup catch-up:** on boot, if the table is empty or its newest watermark is
+  older than `INSTRUMENT_SYNC_STALE_HOURS` (default 24h), one sync runs
+  immediately (fire-and-forget, so a slow upstream never blocks startup).
+- **Conditional GET:** each run sends the last `ETag`/`Last-Modified`; the CDN
+  answers `304` when unchanged, so most days do zero database work.
+- **Single-runner:** the sync holds a PostgreSQL advisory lock, so concurrent
+  workers/replicas never run it twice — only one performs the sync, the rest
+  no-op.
+
+### Semantics
+
+- **Soft-delete:** instruments that drop out of the file (delisted / expired) are
+  marked `is_active = false` with `delisted_at` set — never hard-deleted, so
+  history and foreign references are preserved.  A relisted instrument that
+  reappears is reactivated (`is_active = true`, `delisted_at = NULL`).
+- **Sanity guard (atomic):** the whole sync is one transaction.  If the file
+  holds fewer than `max(INSTRUMENT_SYNC_MIN_INSTRUMENTS, 90% of current active)`
+  in-scope instruments, it **rolls back** rather than mass-delist the universe
+  from a truncated/corrupt file.
+- **Active universe:** consumers that need the live tradeable set filter
+  `WHERE is_active`.  Lookups that resolve a *specific* delisted instrument for
+  an existing position/suggestion pass `include_inactive=True`.
+
+### Operator commands (manual / on-demand)
+
+The manual entrypoint shares the **exact** fetch + reconcile path as the
+scheduler (and takes the same advisory lock, so it cannot race it):
+
+```bash
+cd backend
+.venv/bin/python scripts/sync_instruments.py              # conditional GET; sync if changed
+.venv/bin/python scripts/sync_instruments.py --force      # ignore the 304 cache; full re-sync
+.venv/bin/python scripts/sync_instruments.py --dry-run    # report planned changes, write nothing
+```
+
+Exit codes: `0` success / nothing to do · `1` advisory lock held elsewhere ·
+`2` sanity guard aborted or unexpected error.
+
+### Observability
+
+Prometheus metrics (scraped at `/metrics`):
+
+- `instrument_sync_total{result=success|skipped_304|aborted_sanity|error}`
+- `instrument_sync_duration_seconds`
+- `instrument_active_count` / `instrument_delisted_count`
+- `instrument_sync_last_success_timestamp` — **alert if this falls more than ~26h
+  behind now**, which means the daily sync has stopped succeeding.

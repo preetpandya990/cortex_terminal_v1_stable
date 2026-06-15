@@ -124,6 +124,9 @@ async def _load_company_name_map(
     """Batch-fetch company names from instrument_master for the given keys."""
     if not instrument_keys:
         return {}
+    # Identity resolution by explicit key for existing suggestions: intentionally
+    # NOT filtered on is_active so a suggestion in a since-delisted instrument
+    # still renders its name.
     stmt = select(InstrumentMaster.instrument_key, InstrumentMaster.name).where(
         InstrumentMaster.instrument_key.in_(instrument_keys)
     )

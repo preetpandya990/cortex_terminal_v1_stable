@@ -16,6 +16,7 @@ Author: Cortex AI Team
 Version: 1.0.0
 """
 import asyncio
+import json
 import pytest
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -47,6 +48,15 @@ def mock_db():
     db.add = MagicMock()
     db.commit = AsyncMock()
     db.refresh = AsyncMock()
+    # db.execute() is async; the returned Result's scalar_one_or_none() is
+    # synchronous.  AsyncMock children are also AsyncMock, so calling
+    # scalar_one_or_none() without await returns a coroutine and breaks the
+    # deduplication guard in _compute_consensus.  Use a plain MagicMock for
+    # the execute return value so the synchronous call returns None (no existing
+    # suggestion) as expected by all unit tests here.
+    execute_result = MagicMock()
+    execute_result.scalar_one_or_none.return_value = None
+    db.execute = AsyncMock(return_value=execute_result)
     return db
 
 
@@ -55,6 +65,21 @@ def mock_redis():
     """Mock Redis client."""
     redis = AsyncMock()
     redis.publish = AsyncMock()
+    # redis-py's pipeline() is synchronous — it returns a Pipeline object whose
+    # command methods (setex, zadd, etc.) are also synchronous; only execute()
+    # is async.  AsyncMock children are also AsyncMock, so calling
+    # self.redis.pipeline() without await creates an unawaited coroutine which
+    # pytest turns into a PytestUnraisableExceptionWarning (treated as an error
+    # via filterwarnings = error).  Use a plain MagicMock so the synchronous
+    # call pattern matches real redis-py behaviour.
+    pipeline = MagicMock()
+    pipeline.setex = MagicMock()
+    pipeline.zadd = MagicMock()
+    pipeline.expire = MagicMock()
+    pipeline.delete = MagicMock()
+    pipeline.zrem = MagicMock()
+    pipeline.execute = AsyncMock(return_value=[])
+    redis.pipeline = MagicMock(return_value=pipeline)
     return redis
 
 
@@ -62,15 +87,12 @@ def mock_redis():
 def mock_signal_assembler():
     """Mock SignalAssembler."""
     assembler = AsyncMock()
-    
-    # Default responses
-    assembler.gather_event_signals = AsyncMock(return_value={
-        "score": 75.0,
-        "confidence": 0.85,
-        "event_count": 2,
-        "events": [{"id": 1, "type": "earnings", "impact": 80.0}],
-    })
-    
+
+    # Pathway 1 calls gather_ml_signals first (its indicator snapshot feeds the
+    # news forecaster), then gather_news_forecast for the AI/news slot.
+    # gather_event_signals is retained for backward compat but is no longer
+    # called by the engine pathways; tests that used to configure it now use
+    # gather_news_forecast instead.
     assembler.gather_ml_signals = AsyncMock(return_value={
         "score": 100.0,  # BUY
         "confidence": 0.90,
@@ -83,7 +105,24 @@ def mock_signal_assembler():
             "probabilities": {"BUY": 0.90, "SELL": 0.05, "HOLD": 0.05},
         },
     })
-    
+
+    assembler.gather_news_forecast = AsyncMock(return_value={
+        "score": 75.0,
+        "confidence": 0.85,
+        "event_count": 2,
+        "available": True,
+        "source": "gemini",
+        "direction": "BUY",
+    })
+
+    # Kept for direct callers; not invoked by engine Pathway 1 or 2.
+    assembler.gather_event_signals = AsyncMock(return_value={
+        "score": 75.0,
+        "confidence": 0.85,
+        "event_count": 2,
+        "events": [{"id": 1, "type": "earnings", "impact": 80.0}],
+    })
+
     return assembler
 
 
@@ -239,13 +278,13 @@ class TestConsensusComputation:
         scanner_signal_buy,
     ):
         """All agents agree BUY with high confidence → HIGH suggestion."""
-        # Setup: All agents BUY with high confidence
         scanner_conf = 85.0
         ai_conf = 90.0
         ml_conf = 88.0
-        
+
         scanner_signal = {**scanner_signal_buy, "confidence": scanner_conf}
-        ai_signal = {"score": 80.0, "confidence": ai_conf / 100}
+        # available=True + event_count=2 → standard 3-weight formula (no redistribution).
+        ai_signal = {"score": 80.0, "confidence": ai_conf / 100, "available": True, "event_count": 2}
         ml_signal = {
             "score": 100.0,
             "confidence": ml_conf / 100,
@@ -256,11 +295,20 @@ class TestConsensusComputation:
                 "targets": [1600.0, 1650.0, 1700.0],
             },
         }
-        
-        # Expected consensus: 0.3*85 + 0.4*90 + 0.3*88 = 87.9 (HIGH)
-        expected_score = SCANNER_WEIGHT * scanner_conf + AI_WEIGHT * ai_conf + ML_WEIGHT * ml_conf
+
+        # The engine blends scanner_conf 70/30 with the volume-ratio signal.
+        # scanner_signal_buy has volume_ratio=2.8 → vol_conf=28.0
+        # blended = min(85*0.70 + 28*0.30, 100) = min(59.5+8.4, 100) = 67.9
+        # consensus = 0.30*67.9 + 0.40*90 + 0.30*88 = 20.37+36.0+26.4 = 82.77 (HIGH)
+        _vol_conf = min(scanner_signal["volume_ratio"], 10.0) / 10.0 * 100.0
+        blended_scanner = min(scanner_conf * 0.70 + _vol_conf * 0.30, 100.0)
+        expected_score = (
+            SCANNER_WEIGHT * blended_scanner
+            + AI_WEIGHT * ai_conf
+            + ML_WEIGHT * ml_conf
+        )
         assert expected_score >= CONSENSUS_HIGH_THRESHOLD
-        
+
         suggestion = await correlation_engine._compute_consensus(
             db=mock_db,
             correlation_id=uuid4(),
@@ -271,7 +319,7 @@ class TestConsensusComputation:
             ml_signal=ml_signal,
             latencies={"scanner_ms": 10, "ai_ms": 50, "ml_ms": 40, "total_ms": 100},
         )
-        
+
         assert suggestion is not None
         assert suggestion.signal_direction == "BUY"
         assert suggestion.confidence_level == "HIGH"
@@ -288,13 +336,13 @@ class TestConsensusComputation:
         scanner_signal_sell,
     ):
         """All agents agree SELL with medium confidence → MEDIUM suggestion."""
-        # Setup: All agents SELL with medium confidence
         scanner_conf = 70.0
         ai_conf = 65.0
         ml_conf = 68.0
-        
+
         scanner_signal = {**scanner_signal_sell, "confidence": scanner_conf}
-        ai_signal = {"score": -60.0, "confidence": ai_conf / 100}  # Negative = SELL
+        # Negative score → SELL; available=True + event_count=2 → standard 3-weight formula.
+        ai_signal = {"score": -60.0, "confidence": ai_conf / 100, "available": True, "event_count": 2}
         ml_signal = {
             "score": -100.0,
             "confidence": ml_conf / 100,
@@ -305,11 +353,20 @@ class TestConsensusComputation:
                 "targets": [1300.0, 1250.0, 1200.0],
             },
         }
-        
-        # Expected consensus: 0.3*70 + 0.4*65 + 0.3*68 = 67.4 (MEDIUM)
-        expected_score = SCANNER_WEIGHT * scanner_conf + AI_WEIGHT * ai_conf + ML_WEIGHT * ml_conf
+
+        # The engine blends scanner_conf 70/30 with the volume-ratio signal.
+        # scanner_signal_sell has volume_ratio=2.2 → vol_conf=22.0
+        # blended = min(70*0.70 + 22*0.30, 100) = min(49.0+6.6, 100) = 55.6
+        # consensus = 0.30*55.6 + 0.40*65 + 0.30*68 = 16.68+26.0+20.4 = 63.08 (MEDIUM)
+        _vol_conf = min(scanner_signal["volume_ratio"], 10.0) / 10.0 * 100.0
+        blended_scanner = min(scanner_conf * 0.70 + _vol_conf * 0.30, 100.0)
+        expected_score = (
+            SCANNER_WEIGHT * blended_scanner
+            + AI_WEIGHT * ai_conf
+            + ML_WEIGHT * ml_conf
+        )
         assert CONSENSUS_MEDIUM_THRESHOLD <= expected_score < CONSENSUS_HIGH_THRESHOLD
-        
+
         suggestion = await correlation_engine._compute_consensus(
             db=mock_db,
             correlation_id=uuid4(),
@@ -320,7 +377,7 @@ class TestConsensusComputation:
             ml_signal=ml_signal,
             latencies={"scanner_ms": 15, "ai_ms": 45, "ml_ms": 35, "total_ms": 95},
         )
-        
+
         assert suggestion is not None
         assert suggestion.signal_direction == "SELL"
         assert suggestion.confidence_level == "MEDIUM"
@@ -409,23 +466,32 @@ class TestRejectionReasons:
         scanner_signal_buy,
     ):
         """Consensus score <60 → rejection."""
-        # All agents BUY but low confidence
         scanner_conf = 50.0
         ai_conf = 55.0
         ml_conf = 52.0
-        
+
         scanner_signal = {**scanner_signal_buy, "confidence": scanner_conf}
-        ai_signal = {"score": 60.0, "confidence": ai_conf / 100}
+        # available=True + event_count=2 → standard 3-weight formula (no redistribution).
+        ai_signal = {"score": 60.0, "confidence": ai_conf / 100, "available": True, "event_count": 2}
         ml_signal = {
             "score": 100.0,
             "confidence": ml_conf / 100,
             "prediction": {"direction": "BUY"},
         }
-        
-        # Expected consensus: 0.3*50 + 0.4*55 + 0.3*52 = 52.6 (<60)
-        expected_score = SCANNER_WEIGHT * scanner_conf + AI_WEIGHT * ai_conf + ML_WEIGHT * ml_conf
+
+        # The engine blends scanner_conf 70/30 with the volume-ratio signal.
+        # scanner_signal_buy has volume_ratio=2.8 → vol_conf=28.0
+        # blended = min(50*0.70 + 28*0.30, 100) = min(35.0+8.4, 100) = 43.4
+        # consensus = 0.30*43.4 + 0.40*55 + 0.30*52 = 13.02+22.0+15.6 = 50.62 (<60)
+        _vol_conf = min(scanner_signal["volume_ratio"], 10.0) / 10.0 * 100.0
+        blended_scanner = min(scanner_conf * 0.70 + _vol_conf * 0.30, 100.0)
+        expected_score = (
+            SCANNER_WEIGHT * blended_scanner
+            + AI_WEIGHT * ai_conf
+            + ML_WEIGHT * ml_conf
+        )
         assert expected_score < CONSENSUS_MEDIUM_THRESHOLD
-        
+
         suggestion = await correlation_engine._compute_consensus(
             db=mock_db,
             correlation_id=uuid4(),
@@ -436,10 +502,11 @@ class TestRejectionReasons:
             ml_signal=ml_signal,
             latencies={"scanner_ms": 10, "ai_ms": 50, "ml_ms": 40, "total_ms": 100},
         )
-        
+
         assert suggestion is None
         correlation = mock_db.add.call_args[0][0]
         assert "LOW_CONFIDENCE" in correlation.rejection_reason
+        # Verify the rejection reason contains the actual computed score (2 d.p.)
         assert str(expected_score)[:4] in correlation.rejection_reason
 
 
@@ -459,11 +526,14 @@ class TestPathway1:
         scanner_signal_buy,
     ):
         """Scanner anomaly triggers AI+ML validation → suggestion."""
-        # Mock assembler returns aligned signals
-        mock_signal_assembler.gather_event_signals.return_value = {
+        # Pathway 1 (TECHNICAL_FIRST) calls gather_news_forecast, not gather_event_signals.
+        mock_signal_assembler.gather_news_forecast.return_value = {
             "score": 80.0,
             "confidence": 0.88,
             "event_count": 2,
+            "available": True,
+            "source": "gemini",
+            "direction": "BUY",
         }
         mock_signal_assembler.gather_ml_signals.return_value = {
             "score": 100.0,
@@ -475,16 +545,16 @@ class TestPathway1:
                 "targets": [1600.0, 1650.0, 1700.0],
             },
         }
-        
+
         suggestion = await correlation_engine.on_scanner_anomaly(
             db=mock_db,
             scanner_signal=scanner_signal_buy,
         )
-        
+
         assert suggestion is not None
         assert suggestion.signal_direction == "BUY"
         assert suggestion.trigger_pathway == "TECHNICAL_FIRST"
-        mock_signal_assembler.gather_event_signals.assert_awaited_once()
+        mock_signal_assembler.gather_news_forecast.assert_awaited_once()
         mock_signal_assembler.gather_ml_signals.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -519,13 +589,14 @@ class TestPathway1:
         scanner_signal_buy,
     ):
         """Exception during gathering → None with ERROR reason."""
-        mock_signal_assembler.gather_event_signals.side_effect = Exception("DB connection failed")
-        
+        # Pathway 1 gathers via gather_news_forecast; simulate that failure.
+        mock_signal_assembler.gather_news_forecast.side_effect = Exception("DB connection failed")
+
         suggestion = await correlation_engine.on_scanner_anomaly(
             db=mock_db,
             scanner_signal=scanner_signal_buy,
         )
-        
+
         assert suggestion is None
         correlation = mock_db.add.call_args[0][0]
         assert "ERROR" in correlation.rejection_reason
@@ -543,7 +614,12 @@ class TestPathway2:
         news_event,
     ):
         """News event triggers validation for multiple symbols."""
-        # Create fresh mocks for this test
+        # Create fresh mocks for this test.
+        # Pathway 2 (FUNDAMENTAL_FIRST) calls gather_ml_signals + gather_news_forecast.
+        # scanner_cache=None → synthetic fallback (confidence=50, volume_ratio=1.0).
+        # blended_scanner = min(50*0.70 + 10*0.30, 100) = 38.0
+        # gather_news_forecast: available=True, event_count=2 → standard 3-weight
+        # consensus = 0.30*38 + 0.40*88 + 0.30*90 = 73.6 (MEDIUM ≥ 60 → suggestion)
         assembler = AsyncMock()
         assembler.gather_ml_signals = AsyncMock(return_value={
             "score": 100.0,
@@ -555,7 +631,15 @@ class TestPathway2:
                 "targets": [1600.0, 1650.0, 1700.0],
             },
         })
-        
+        assembler.gather_news_forecast = AsyncMock(return_value={
+            "score": 80.0,
+            "confidence": 0.88,
+            "event_count": 2,
+            "available": True,
+            "source": "gemini",
+            "direction": "BUY",
+        })
+
         engine = EventCorrelationEngine(
             signal_assembler=assembler,
             redis=mock_redis,
@@ -759,8 +843,9 @@ class TestLatencyAndRedis:
         mock_redis,
         scanner_signal_buy,
     ):
-        """Successful suggestion publishes to Redis."""
-        ai_signal = {"score": 80.0, "confidence": 0.88}
+        """Successful suggestion publishes to Redis on the SUGGESTIONS_NEW channel."""
+        # available=True + event_count=2 → standard 3-weight formula (no redistribution).
+        ai_signal = {"score": 80.0, "confidence": 0.88, "available": True, "event_count": 2}
         ml_signal = {
             "score": 100.0,
             "confidence": 0.90,
@@ -771,7 +856,7 @@ class TestLatencyAndRedis:
                 "targets": [1600.0],
             },
         }
-        
+
         suggestion = await correlation_engine._compute_consensus(
             db=mock_db,
             correlation_id=uuid4(),
@@ -782,11 +867,30 @@ class TestLatencyAndRedis:
             ml_signal=ml_signal,
             latencies={"scanner_ms": 10, "ai_ms": 50, "ml_ms": 40, "total_ms": 100},
         )
-        
-        mock_redis.publish.assert_awaited_once_with(
-            "cai:suggestions:new",
-            str(suggestion.suggestion_id)
+
+        assert suggestion is not None
+
+        # The engine publishes to three channels on success:
+        #   1. LLM_EXPLANATION_PENDING  (fire-and-forget explanation trigger)
+        #   2. SUGGESTIONS_NEW          (full JSON payload for WebSocket clients)
+        #   3. CORRELATIONS_COMPLETED   (ML-activity live feed)
+        # Verify that SUGGESTIONS_NEW was published with a JSON payload that
+        # includes the correct suggestion_id — channel order is an implementation
+        # detail so we match by channel name, not call index.
+        published_channels = [
+            call.args[0] for call in mock_redis.publish.await_args_list
+        ]
+        assert "cai:suggestions:new" in published_channels, (
+            f"Expected SUGGESTIONS_NEW publish; got channels: {published_channels}"
         )
+        # Find the SUGGESTIONS_NEW call and validate the payload shape.
+        suggestions_new_call = next(
+            call for call in mock_redis.publish.await_args_list
+            if call.args[0] == "cai:suggestions:new"
+        )
+        payload = json.loads(suggestions_new_call.args[1])
+        assert payload["suggestion_id"] == str(suggestion.suggestion_id)
+        assert payload["signal_direction"] == "BUY"
 
     @pytest.mark.asyncio
     async def test_redis_publish_failure_handled(

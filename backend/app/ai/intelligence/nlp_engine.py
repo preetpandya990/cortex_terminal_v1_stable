@@ -41,6 +41,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
+# Sentiment results are cached in Redis keyed by prompt SHA-256.  One hour
+# covers the active news cycle: the same article may re-appear across several
+# consecutive event-processing batches, but its sentiment does not change within
+# that window.  Only successful LLM results are cached — fallback
+# ``model=unavailable`` responses are never written to the cache.
+_SENTIMENT_CACHE_TTL_SECS = 3600
+
 
 # ── Pydantic output schema ─────────────────────────────────────────────────────
 
@@ -161,6 +168,11 @@ class NLPEngine:
         """
         Classify the financial sentiment of a news article.
 
+        Results are cached in Redis by prompt SHA-256 for
+        ``_SENTIMENT_CACHE_TTL_SECS`` seconds.  The same article surfacing
+        across multiple event-processing batches hits the cache on the second
+        and subsequent calls, consuming zero Gemini quota.
+
         Args:
             text: Full article body.  No length truncation — the LLM reads the
                   complete text.
@@ -173,11 +185,33 @@ class NLPEngine:
                 "model":      str    — serving model identifier,
             }
         """
-        from app.ai.intelligence.llm_client import LLMFallbackExhausted, get_intelligence_client
+        from app.ai.intelligence.llm_client import (
+            LLMFallbackExhausted,
+            Priority,
+            get_intelligence_client,
+        )
+        from app.core.redis import get_cache_service
 
         client = get_intelligence_client()
         prompt = f"Classify the financial sentiment of the following news article:\n\n{text}"
         prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+        cache_key = f"nlp:sentiment:{prompt_hash}"
+
+        # ── Cache check ────────────────────────────────────────────────────────
+        # Non-fatal: a Redis error falls through to a live LLM call.
+        try:
+            cached = await get_cache_service().get(cache_key)
+            if cached is not None and isinstance(cached, dict):
+                logger.debug("nlp: sentiment cache hit hash=%.12s", prompt_hash)
+                self._last_invocation_id = uuid4()
+                self._last_prompt_hash   = prompt_hash
+                self._last_latency_ms    = 0
+                self._last_error         = None
+                return cached
+        except Exception as _cache_exc:
+            logger.debug("nlp: sentiment cache read failed (non-fatal): %s", _cache_exc)
+
+        # ── Live LLM call ──────────────────────────────────────────────────────
         invocation_id = uuid4()
         t0 = time.monotonic()
 
@@ -191,6 +225,7 @@ class NLPEngine:
                 system=_SENTIMENT_SYSTEM_PROMPT,
                 temperature=0.1,
                 max_tokens=256,
+                priority=Priority.MEDIUM,
             )
         except LLMFallbackExhausted as exc:
             error_message = f"{type(exc).__name__}: {exc}"
@@ -203,22 +238,29 @@ class NLPEngine:
 
         # Store invocation metadata for process_event() to include in the audit log.
         self._last_invocation_id = invocation_id
-        self._last_prompt_hash = prompt_hash
-        self._last_latency_ms = latency_ms
-        self._last_error = error_message
+        self._last_prompt_hash   = prompt_hash
+        self._last_latency_ms    = latency_ms
+        self._last_error         = error_message
 
         if llm_result is not None:
-            model_tag = (
-                f"nim/{client._nim_model_name}"
-                if client._primary.value == "nim"
-                else f"ollama/{client._ollama_model_name}"
-            )
-            return {
+            model_tag = client.model_id
+            result: dict[str, Any] = {
                 "label":      llm_result.label,
                 "score":      round(float(llm_result.score), 4),
                 "confidence": round(float(llm_result.confidence), 4),
                 "model":      model_tag,
             }
+            # ── Cache write ────────────────────────────────────────────────────
+            # Non-fatal: a Redis error must never suppress a successful result.
+            try:
+                await get_cache_service().set(cache_key, result, ttl=_SENTIMENT_CACHE_TTL_SECS)
+                logger.debug(
+                    "nlp: sentiment cached hash=%.12s ttl=%ds",
+                    prompt_hash, _SENTIMENT_CACHE_TTL_SECS,
+                )
+            except Exception as _cache_exc:
+                logger.debug("nlp: sentiment cache write failed (non-fatal): %s", _cache_exc)
+            return result
 
         # Graceful degradation — return neutral/0.0 so the event pipeline continues.
         return {"label": "neutral", "score": 0.0, "confidence": 0.0, "model": "unavailable"}
@@ -257,12 +299,8 @@ class NLPEngine:
             invocation_type="sentiment",
             reference_table="ai_nlp_results",
             reference_id=nlp_result.id,
-            model_provider="nim" if "nim/" in sentiment["model"] else "ollama",
-            model_id=(
-                sentiment["model"].split("/", 1)[-1]
-                if "/" in sentiment["model"]
-                else sentiment["model"]
-            ),
+            model_provider=sentiment["model"].split("/", 1)[0] if "/" in sentiment["model"] else "gemini",
+            model_id=sentiment["model"].split("/", 1)[-1] if "/" in sentiment["model"] else sentiment["model"],
             prompt_hash=self._last_prompt_hash,
             retrieved_source_ids=None,
             latency_ms=self._last_latency_ms,
@@ -299,7 +337,11 @@ class NLPEngine:
         Returns an empty string on LLM failure so the eval correctly marks the
         test as failed rather than masking the error as a passing disclaimer.
         """
-        from app.ai.intelligence.llm_client import LLMFallbackExhausted, get_intelligence_client
+        from app.ai.intelligence.llm_client import (
+            LLMFallbackExhausted,
+            Priority,
+            get_intelligence_client,
+        )
 
         client = get_intelligence_client()
         try:
@@ -308,6 +350,7 @@ class NLPEngine:
                 system=_SAFETY_SYSTEM_PROMPT,
                 temperature=0.1,
                 max_tokens=512,
+                priority=Priority.LOW,
             )
             return result["content"]
         except LLMFallbackExhausted as exc:

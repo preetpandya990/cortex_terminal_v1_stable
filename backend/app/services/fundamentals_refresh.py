@@ -186,7 +186,9 @@ async def _load_all_eq_keys(session_factory: async_sessionmaker) -> list[str]:
     async with session_factory() as db:
         result = await db.execute(
             select(InstrumentMaster.instrument_key)
-            .where(InstrumentMaster.instrument_type == "EQ")
+            # Only refresh fundamentals for live instruments — no point spending
+            # API budget on delisted ones.
+            .where(InstrumentMaster.instrument_type == "EQ", InstrumentMaster.is_active.is_(True))
             .order_by(InstrumentMaster.instrument_key)
         )
         return [row[0] for row in result.all()]
@@ -215,6 +217,7 @@ async def _load_tier1_keys(
                 select(InstrumentMaster.instrument_key).where(
                     InstrumentMaster.instrument_type == "EQ",
                     InstrumentMaster.trading_symbol.in_(universe_symbols),
+                    InstrumentMaster.is_active.is_(True),
                 )
             )
             scheduled: set[str] = {row[0] for row in result.all()}

@@ -14,9 +14,10 @@ Features:
 Author: Cortex AI Team
 Date: 2026-04-14
 """
+import argparse
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 import sys
 
@@ -50,20 +51,28 @@ class FeatureComputationPipeline:
         lookback_days: int = 90,
         batch_size: int = 10,
         max_workers: int = 5,
+        mode: str = "incremental",
+        stale_days: int = 3,
     ):
         """
         Initialize pipeline.
-        
+
         Args:
-            db_url: Database connection URL
-            lookback_days: Days of historical data to compute features for
-            batch_size: Number of symbols to process before committing
-            max_workers: Maximum concurrent workers
+            db_url:        Database connection URL.
+            lookback_days: Days of historical OHLCV to include in feature computation.
+            batch_size:    Number of symbols to process concurrently per batch.
+            max_workers:   Maximum concurrent workers.
+            mode:          "incremental" — only symbols with no features at all (default).
+                           "refresh"     — symbols where MAX(ml_features.timestamp) is
+                                           older than stale_days calendar days.
+            stale_days:    Staleness threshold in calendar days (refresh mode only).
         """
         self.db_url = db_url
         self.lookback_days = lookback_days
         self.batch_size = batch_size
         self.max_workers = max_workers
+        self.mode = mode
+        self.stale_days = stale_days
         
         self.engine = None
         self.session_factory = None
@@ -98,13 +107,16 @@ class FeatureComputationPipeline:
     
     async def get_symbols_to_process(self) -> list[str]:
         """
-        Get list of symbols that need feature computation.
-        
+        Return symbols that need feature computation.
+
+        incremental mode — symbols with no ml_features row at all (first-time fill).
+        refresh mode     — symbols where MAX(ml_features.timestamp) < today − stale_days,
+                           plus any symbol present in OHLCV but absent from ml_features.
+
         Returns:
-            List of instrument_key values
+            Ordered list of instrument_key values to process.
         """
         async with self.session_factory() as session:
-            # Get all symbols with OHLCV data
             result = await session.execute(text('''
                 SELECT DISTINCT instrument_key
                 FROM upstox_ohlcv
@@ -112,26 +124,44 @@ class FeatureComputationPipeline:
                 ORDER BY instrument_key
             '''))
             all_symbols = [row[0] for row in result.fetchall()]
-            
             logger.info(f"Found {len(all_symbols)} symbols with OHLCV data")
-            
-            # Check which symbols already have features
+
+            if self.mode == "incremental":
+                result2 = await session.execute(text('''
+                    SELECT DISTINCT symbol
+                    FROM ml_features
+                    WHERE feature_version = 'v1.0'
+                '''))
+                existing = {row[0] for row in result2.fetchall()}
+                symbols = [s for s in all_symbols if s not in existing]
+                logger.info(
+                    f"Mode=incremental: {len(symbols)} symbols need first-time computation"
+                )
+                return symbols
+
+            # mode == "refresh"
+            # For each symbol already in the feature store, find the latest feature date.
+            # Symbols absent from ml_features are treated as infinitely stale.
             result2 = await session.execute(text('''
-                SELECT DISTINCT symbol
+                SELECT symbol, MAX(timestamp)::date AS latest
                 FROM ml_features
                 WHERE feature_version = 'v1.0'
+                GROUP BY symbol
             '''))
-            existing_symbols = set(row[0] for row in result2.fetchall())
-            
-            if existing_symbols:
-                logger.info(f"Found {len(existing_symbols)} symbols with existing features")
-            
-            # Filter out symbols that already have features
-            symbols_to_process = [s for s in all_symbols if s not in existing_symbols]
-            
-            logger.info(f"Need to process {len(symbols_to_process)} symbols")
-            
-            return symbols_to_process
+            latest_by_symbol = {row[0]: row[1] for row in result2.fetchall()}
+
+            threshold = date.today() - timedelta(days=self.stale_days)
+
+            stale = [
+                sym for sym in all_symbols
+                if latest_by_symbol.get(sym) is None or latest_by_symbol[sym] < threshold
+            ]
+
+            logger.info(
+                f"Mode=refresh (stale_days={self.stale_days}, threshold={threshold}): "
+                f"{len(stale)}/{len(all_symbols)} symbols need refresh"
+            )
+            return stale
     
     async def compute_features_for_symbol_safe(
         self,
@@ -165,14 +195,12 @@ class FeatureComputationPipeline:
             end_date = row[0]
             start_date = end_date - timedelta(days=self.lookback_days)
             
-            # Compute features (disable sentiment due to timezone mismatch)
             features_df = await compute_features_for_symbol(
                 symbol=symbol,
                 start_date=start_date,
                 end_date=end_date,
                 timeframe='1D',
                 db=session,
-                include_sentiment=False,
             )
             
             if features_df.empty:
@@ -274,14 +302,18 @@ class FeatureComputationPipeline:
             self.total_symbols = len(symbols)
             
             if self.total_symbols == 0:
-                logger.info("✓ All symbols already have features computed")
+                _suffix = f", stale_days={self.stale_days}" if self.mode == "refresh" else ""
+                logger.info(f"✓ No symbols require processing (mode={self.mode}{_suffix})")
                 return
             
             logger.info(f"Starting computation for {self.total_symbols} symbols...")
-            logger.info(f"Configuration:")
+            logger.info("Configuration:")
+            logger.info(f"  Mode:          {self.mode}")
+            if self.mode == "refresh":
+                logger.info(f"  Stale days:    {self.stale_days}")
             logger.info(f"  Lookback days: {self.lookback_days}")
-            logger.info(f"  Batch size: {self.batch_size}")
-            logger.info(f"  Max workers: {self.max_workers}")
+            logger.info(f"  Batch size:    {self.batch_size}")
+            logger.info(f"  Max workers:   {self.max_workers}")
             logger.info("")
             
             # Process in batches
@@ -328,28 +360,67 @@ class FeatureComputationPipeline:
             await self.cleanup()
 
 
-async def main():
-    """Main entry point."""
-    # Configuration
-    db_url = str(settings.DATABASE_URL)
-    lookback_days = 90  # 90 days of features
-    batch_size = 10  # Process 10 symbols at a time
-    max_workers = 5  # 5 concurrent workers
-    
-    # Run pipeline
-    pipeline = FeatureComputationPipeline(
-        db_url=db_url,
-        lookback_days=lookback_days,
-        batch_size=batch_size,
-        max_workers=max_workers,
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Pre-compute and store ML features for all OHLCV symbols.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    
+    parser.add_argument(
+        "--mode",
+        choices=["incremental", "refresh"],
+        default="incremental",
+        help=(
+            "incremental: only process symbols with no features at all. "
+            "refresh: recompute symbols where features are older than --stale-days."
+        ),
+    )
+    parser.add_argument(
+        "--stale-days",
+        type=int,
+        default=3,
+        dest="stale_days",
+        help="Staleness threshold in calendar days (refresh mode only).",
+    )
+    parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=90,
+        dest="lookback_days",
+        help="Days of historical OHLCV to include in feature computation.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=10,
+        dest="batch_size",
+        help="Number of symbols to process concurrently per batch.",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=5,
+        dest="max_workers",
+        help="Maximum concurrent workers.",
+    )
+    return parser.parse_args()
+
+
+async def main(args: argparse.Namespace) -> None:
+    pipeline = FeatureComputationPipeline(
+        db_url=str(settings.DATABASE_URL),
+        lookback_days=args.lookback_days,
+        batch_size=args.batch_size,
+        max_workers=args.max_workers,
+        mode=args.mode,
+        stale_days=args.stale_days,
+    )
     await pipeline.run()
 
 
 if __name__ == "__main__":
+    _args = _parse_args()
     try:
-        asyncio.run(main())
+        asyncio.run(main(_args))
     except KeyboardInterrupt:
         logger.info("\n✗ Interrupted by user")
         sys.exit(1)

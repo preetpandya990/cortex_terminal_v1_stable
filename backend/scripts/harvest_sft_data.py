@@ -4,7 +4,7 @@ Cortex Phase 1 — SFT Training Data Harvester
 =============================================
 Extracts high-quality explanation invocations from the Phase 0 production
 audit log and formats them as ChatML JSONL for ORPO fine-tuning of
-Agentar-Fin-R1-32B (Qwen3-based).
+Qwen/Qwen3-32B (Apache 2.0).
 
 Data source
 -----------
@@ -75,28 +75,58 @@ _DISCLAIMER_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
-# ── System prompt (verbatim from explanation_worker to ensure distribution match) ─
+# ── System prompt — must stay byte-for-byte identical to _EXPLANATION_SYSTEM_PROMPT
+# in app/ai/intelligence/explanation_worker.py.  Distribution shift between training
+# and inference degrades the fine-tuned model immediately; keep these in sync.
 _SYSTEM_PROMPT = """\
 You are a financial signal analysis tool for the Cortex algorithmic trading platform.
 You are NOT a licensed financial advisor and must not provide investment recommendations.
 
-Your task: generate a concise, factual explanation for a machine-generated trade signal,
-grounded exclusively in the retrieved news articles provided.
+Your task: explain a machine-generated trade signal in plain English — what the ML
+ensemble (XGBoost + GRU) and technical scanner observed, how that evidence combined into
+a consensus, and what it implies — grounded strictly in the structured signal data and the
+retrieved news articles provided in the prompt.
+
+Write full_explanation as Markdown with EXACTLY these five section headers, in order, each
+on its own line:
+### What the models saw
+### Technical picture
+### News context
+### What this suggests
+### Key risks
+
+Be concise — 1–2 short sentences per section, ≤110 words total for full_explanation.
+No preamble, no filler, no restating the prompt; an analyst is skimming this. When a
+section has nothing substantive (e.g. no news, no per-model split), state it in one short
+line rather than padding.
+
+Section guidance:
+- "What the models saw": describe the ensemble direction and calibrated confidence, then
+  the per-model (XGBoost and GRU) directions, buy/sell/hold probabilities, and how each
+  model's conviction compares to its regime-adaptive threshold. Note agreement or
+  disagreement between the two models. Use ONLY the numbers given.
+- "Technical picture": summarise the scanner readings provided (e.g. RSI, volume ratio,
+  price change). If none are present, say so briefly.
+- "News context": summarise the retrieved articles and CITE each factual claim inline as
+  According to [Source Name, YYYY-MM-DD]... If no articles were provided, state that no
+  recent news context was available — never invent sources.
+- "What this suggests": a neutral synthesis of direction, confidence band and time horizon.
+  Describe; do NOT advise.
+- "Key risks": what could invalidate the setup (model disagreement, low conviction, thin
+  news corroboration, regime, etc.).
 
 Mandatory rules:
-1. BASE ALL CLAIMS on the retrieved news context provided in the prompt.
-   Do not invent facts, prices, or events not present in the context.
-2. CITE EVERY FACTUAL CLAIM inline: According to [Source Name, YYYY-MM-DD]...
-   If no context is provided, state that clearly rather than inventing sources.
+1. GROUND every ML/technical claim in the numbers provided; never invent figures, prices,
+   model internals, events, or sources.
+2. CITE news claims inline: According to [Source Name, YYYY-MM-DD]...
 3. PROHIBITED language (these will be filtered):
    - Price predictions: "will reach ₹X", "target price", "price target"
    - Guarantees: "guaranteed", "certain to", "will definitely"
    - Advisory language: "you should buy/sell", "recommend buying", "buy now"
-4. ALLOWED: describe what the signal detected, what the news says, what the risk is.
-5. DISCLAIMER: The system will automatically append the required regulatory disclaimer.
-   Do NOT add your own disclaimer — it will duplicate the injected one.
-6. Output JSON only: {"summary": "...", "full_explanation": "...", "sources_used": [...]}
-   No markdown fences, no extra keys.\
+4. DISCLAIMER: The system automatically appends the required regulatory disclaimer.
+   Do NOT add your own disclaimer — it would duplicate the injected one.
+5. Output JSON only: {"summary": "...", "full_explanation": "...", "sources_used": [...]}
+   The summary is plain text (no headers); full_explanation contains the five sections.\
 """
 
 
@@ -124,8 +154,10 @@ SELECT
     ts.risk_reward_ratio,
     ts.time_horizon,
     ts.regime_type,
+    ts.trigger_pathway,
     ts.ml_signal,
     ts.ai_signal,
+    ts.scanner_signal,
     ts.llm_summary,
     ts.llm_explanation
 FROM ai_llm_audit_log al
@@ -143,24 +175,96 @@ ORDER BY al.created_at DESC
 """
 
 
-# ── Prompt reconstruction ──────────────────────────────────────────────────────
+# ── Prompt reconstruction helpers (mirrors explanation_worker exactly) ─────────
+
+def _fmt_pct(value: Any, default: str = "N/A") -> str:
+    try:
+        return f"{float(value) * 100:.0f}%"
+    except (TypeError, ValueError):
+        return default
+
+
+def _format_probabilities(probs: dict | None) -> str | None:
+    if not probs:
+        return None
+    parts = [
+        f"{label} {_fmt_pct(probs[key])}"
+        for key, label in (("buy", "BUY"), ("sell", "SELL"), ("hold", "HOLD"))
+        if probs.get(key) is not None
+    ]
+    return " · ".join(parts) if parts else None
+
+
+def _render_model_breakdown(models: dict | None) -> list[str]:
+    if not models:
+        return []
+    lines: list[str] = []
+    for key, label in (("xgboost", "XGBoost"), ("gru", "GRU")):
+        m = models.get(key)
+        if not m:
+            continue
+        bits = [f"{label}: {m.get('direction', 'N/A')}"]
+        probs = _format_probabilities(m.get("probabilities"))
+        if probs:
+            bits.append(f"probs {probs}")
+        if m.get("conviction_scale") is not None:
+            bits.append(f"conviction {_fmt_pct(m['conviction_scale'])}")
+        if m.get("threshold") is not None:
+            bits.append(f"threshold {_fmt_pct(m['threshold'])}")
+        if m.get("weight") is not None:
+            try:
+                bits.append(f"weight {float(m['weight']):.2f}")
+            except (TypeError, ValueError):
+                pass
+        lines.append("  - " + ", ".join(bits))
+    return lines
+
+
+_SCANNER_LABELS: dict[str, str] = {
+    "signal":           "Signal",
+    "direction":        "Direction",
+    "score":            "Score",
+    "rsi":              "RSI-14",
+    "volume_ratio":     "Volume Ratio",
+    "price_change_pct": "Price Change %",
+    "last_price":       "Last Price",
+    "previous_close":   "Prev Close",
+    "volume":           "Volume",
+}
+
+
+def _render_scanner(scanner: dict | None) -> list[str]:
+    if not scanner:
+        return []
+    lines: list[str] = []
+    for key, label in _SCANNER_LABELS.items():
+        if key not in scanner:
+            continue
+        value = scanner[key]
+        if value is None or isinstance(value, (dict, list)):
+            continue
+        if isinstance(value, float):
+            value = round(value, 2)
+        lines.append(f"{label}: {value}")
+    return lines
+
 
 def _reconstruct_user_prompt(row: dict[str, Any]) -> str:
     """
-    Re-build the explanation prompt from the suggestion row fields.
+    Re-build the explanation prompt from the persisted suggestion fields.
 
-    This mirrors explanation_worker._build_explanation_prompt() exactly —
-    the audit log schema stores signal fields on trade_suggestions, so we
-    can faithfully reconstruct the user turn without storing the raw prompt.
+    Mirrors explanation_worker._build_explanation_prompt() exactly so the
+    reconstructed user turn matches the inference-time prompt distribution.
 
-    Note: the RAG context is NOT available in the audit log (only source IDs
-    are stored).  The reconstructed prompt uses the no-context branch, which
-    tells the model context was unavailable.  Rows where context was available
-    will have citation-style outputs that remain valid training examples — the
-    model learns the output schema regardless.
+    RAG context is not stored in the audit log, so all rows use the no-context
+    branch.  Rows whose stored explanation cites news sources remain valid
+    training examples — the model learns to cite when context is present, and
+    to acknowledge its absence when it is not.
     """
     ml = row.get("ml_signal") or {}
     ai = row.get("ai_signal") or {}
+    scanner = row.get("scanner_signal") or {}
+    prediction = ml.get("prediction") or {}
 
     lines = [
         "## Trade Signal Summary",
@@ -179,35 +283,82 @@ def _reconstruct_user_prompt(row: dict[str, Any]) -> str:
         lines.append(f"Time Horizon:     {row['time_horizon']}")
     if row.get("regime_type"):
         lines.append(f"Market Regime:    {row['regime_type']}")
+    if row.get("trigger_pathway"):
+        lines.append(
+            f"Trigger Pathway:  {row['trigger_pathway'].replace('_', ' ').title()}"
+        )
 
-    if isinstance(ml, dict) and ml.get("available"):
-        lines += [
-            "",
-            "## ML Model Output",
-            f"ML Direction:     {ml.get('action', 'N/A')}",
-            f"ML Confidence:    {ml.get('confidence', 0.0):.2%}",
-        ]
+    # ── ML ensemble detail ────────────────────────────────────────────────────
+    if ml.get("available"):
+        lines.append("")
+        lines.append("## ML Ensemble Output")
+        score = ml.get("score", 0.0) or 0.0
+        ens_dir = prediction.get("direction") or (
+            "BUY" if score > 0 else "SELL" if score < 0 else "HOLD"
+        )
+        lines.append(f"Ensemble Direction:     {ens_dir}")
+        lines.append(f"Calibrated Confidence:  {_fmt_pct(ml.get('confidence'))}")
+        if prediction.get("conviction_scale") is not None:
+            lines.append(
+                f"Conviction (0=threshold,1=max): {_fmt_pct(prediction['conviction_scale'])}"
+            )
+        ens_probs = _format_probabilities(prediction.get("probabilities"))
+        if ens_probs:
+            lines.append(f"Ensemble Probabilities: {ens_probs}")
+        if ml.get("model"):
+            lines.append(f"Model Versions:         {ml['model']}")
+        model_lines = _render_model_breakdown(ml.get("models"))
+        if model_lines:
+            lines.append("Per-model breakdown:")
+            lines.extend(model_lines)
 
-    sentiment_label = None
-    if isinstance(ai, dict):
-        sentiment_label = ai.get("sentiment_label") or ai.get("sentiment")
-    if sentiment_label:
-        lines += [
-            "",
-            "## News Sentiment Signal",
-            f"Sentiment:        {sentiment_label}",
-        ]
-        event_count = ai.get("event_count") or len(ai.get("contributing_events", []))
+    # ── Technical scanner detail ──────────────────────────────────────────────
+    scanner_lines = _render_scanner(scanner)
+    if scanner_lines:
+        lines.append("")
+        lines.append("## Technical Scanner Readings")
+        lines.extend(scanner_lines)
+
+    # ── News / event signal detail ────────────────────────────────────────────
+    sentiment_label = ai.get("sentiment_label") or ai.get("sentiment")
+    forecast_dir = ai.get("direction")
+    forecast_rationale = ai.get("rationale")
+    events = ai.get("events") or ai.get("contributing_events") or []
+    event_count = ai.get("event_count") or len(events)
+    if sentiment_label or forecast_dir or events or event_count:
+        lines.append("")
+        lines.append("## News & Event Signal")
+        if forecast_dir:
+            lines.append(
+                f"News Forecaster Lean: {forecast_dir} "
+                f"(confidence {_fmt_pct(ai.get('confidence'))})"
+            )
+        if forecast_rationale:
+            lines.append(f"News Forecaster View: {forecast_rationale}")
+        if sentiment_label:
+            lines.append(f"Sentiment:           {sentiment_label}")
         if event_count:
             lines.append(f"Contributing Events: {event_count}")
+        for ev in events[:5]:
+            title = ev.get("article_title") or ev.get("type") or "event"
+            extra: list[str] = []
+            if ev.get("impact") is not None:
+                try:
+                    extra.append(f"impact {float(ev['impact']):+.1f}")
+                except (TypeError, ValueError):
+                    pass
+            if ev.get("source_name"):
+                extra.append(str(ev["source_name"]))
+            suffix = f" ({', '.join(extra)})" if extra else ""
+            lines.append(f"  - {title}{suffix}")
 
-    # Context was not stored in the audit log; use the no-context branch.
+    # RAG context is not stored in the audit log — use the no-context branch.
     lines += [
         "",
         "## Retrieved News Context",
-        "No recent news articles were found for this symbol. "
-        "Base your explanation on the quantitative signal data above only, "
-        "and state clearly that no news context was available.",
+        "No recent news articles were found for this symbol. State clearly in the "
+        "News context section that no news context was available, and base the rest "
+        "of the explanation on the quantitative signal data above.",
     ]
 
     return "\n".join(lines)
@@ -252,7 +403,7 @@ async def harvest(
     rows_fetched = 0
     rows_passed = 0
     skipped_short = 0
-    symbols_seen: set[str] = []
+    symbols_seen: list[str] = []
 
     async with AsyncSessionLocal() as db:
         result = await db.execute(text(_HARVEST_QUERY))
@@ -304,6 +455,7 @@ async def harvest(
                 "output_tokens":  row["output_tokens"],
                 "latency_ms":     row["latency_ms"],
                 "created_at":     row["created_at"].isoformat() if row.get("created_at") else None,
+                "data_source":    "production",
             },
         }
         output_records.append(record)

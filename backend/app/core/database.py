@@ -58,6 +58,29 @@ def _attach_query_metrics(async_engine: AsyncEngine) -> None:
             ).observe(time.perf_counter() - start)
 
 
+# ── SQLAlchemy pool-utilisation hooks ──────────────────────────────────────────
+def _attach_pool_metrics(async_engine: AsyncEngine, engine_name: str) -> None:
+    """Track checked-out connections via the pool's checkout/checkin events.
+
+    Event-driven (not polled) so the gauge reflects the live in-use count exactly.
+    A sustained reading near ``pool_size + max_overflow`` is the early-warning
+    signature of pool exhaustion — the failure mode behind long-lived-session
+    leaks on streaming endpoints.
+    """
+    from app.core.metrics import db_connections_active
+
+    gauge = db_connections_active.labels(engine=engine_name)
+    gauge.set(0)
+
+    @event.listens_for(async_engine.sync_engine, "checkout")
+    def _on_checkout(dbapi_conn, conn_record, conn_proxy):
+        gauge.inc()
+
+    @event.listens_for(async_engine.sync_engine, "checkin")
+    def _on_checkin(dbapi_conn, conn_record):
+        gauge.dec()
+
+
 # ── API Engine (main process) ──────────────────────────────────────────────────
 engine = create_async_engine(
     str(settings.DATABASE_URL),
@@ -92,9 +115,12 @@ worker_engine = create_async_engine(
     },
 )
 
-# Attach Prometheus query-timing hooks to both engines at module load time.
+# Attach Prometheus query-timing + pool-utilisation hooks to both engines at
+# module load time.
 _attach_query_metrics(engine)
 _attach_query_metrics(worker_engine)
+_attach_pool_metrics(engine, "api")
+_attach_pool_metrics(worker_engine, "worker")
 
 # ── Session factories ──────────────────────────────────────────────────────────
 AsyncSessionLocal = async_sessionmaker(

@@ -204,7 +204,7 @@ export interface ExplanationSource {
 }
 
 /**
- * LLM-generated plain-English explanation for a trade suggestion.
+ * LLM-generated plain-English explanation for a trade suggestion or instrument.
  *
  * ``available`` distinguishes two pending states:
  *   false → explanation worker has not finished (show skeleton)
@@ -213,15 +213,42 @@ export interface ExplanationSource {
  * ``sources`` is only populated on the real-time push path.  On the
  * periodic poll fallback, sources will be an empty array — inline citations
  * within ``full_explanation`` still provide attribution.
+ *
+ * ``context_type`` determines the display mode in AIExplanationPanel:
+ *   'suggestion_explanation' → explanation for a specific (possibly recent but
+ *                               non-active) ML signal; renders staleness banner
+ *   'instrument_context'     → market context for a Watchlist item with no
+ *                               recent signal; no staleness banner
+ *
+ * ``signal_direction`` and ``signal_generated_at`` are populated only when
+ * ``context_type === 'suggestion_explanation'``.
  */
 export interface ExplanationData {
   available:        boolean;
+  /**
+   * True while the worker is streaming the explanation token-by-token:
+   * ``available`` is still false but ``full_explanation`` holds the partial text
+   * so the panel renders it progressively instead of showing the skeleton.
+   */
+  streaming?:       boolean;
   summary:          string | null;
   full_explanation: string | null;
   model:            string | null;
   /** ISO-8601 UTC timestamp when the explanation was written */
   generated_at:     string | null;
   sources:          ExplanationSource[];
+
+  /**
+   * Discriminates the content type so the panel renders appropriate copy.
+   * null only during the very brief window before the first SSE poll resolves.
+   */
+  context_type:       'suggestion_explanation' | 'instrument_context' | null;
+
+  /** Signal direction — populated only for 'suggestion_explanation' context. */
+  signal_direction:   'BUY' | 'SELL' | null;
+
+  /** ISO-8601 UTC timestamp when the underlying signal was created. */
+  signal_generated_at: string | null;
 }
 
 /** SSE `analysis_update` event payload */

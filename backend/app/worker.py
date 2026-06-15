@@ -1,26 +1,34 @@
 """
-Cortex AI Worker Process - Background Task Orchestration
+Cortex AI — Worker Task Coroutines
+====================================
 
-Production-grade worker process managing 11 concurrent background loops:
-- RSS ingestion (news feeds)
-- Event processing (ML predictions)
-- Regime detection (market conditions)
-- Drift monitoring (model performance)
-- Safety monitoring (risk management)
-- Data ingestion (OHLCV market data)
-- Heartbeat (health check)
-- Correlation engine (trade suggestions)
-- Suggestion expiry (TTL management)
-- Cache invalidation (real-time cache consistency)
-- Fundamentals refresh (key-ratios, corp-actions, financials, holdings, nightly universe)
+Pure task-coroutine module.  Contains:
 
-Graceful shutdown with SIGTERM handling and 30s timeout.
+  worker_lifespan()          Context manager that initialises all shared resources
+                             (DB engine, Redis, ML models, Upstox client) and tears
+                             them down cleanly.  Used by worker_app.py's lifespan.
+
+  heartbeat_loop()           Writes worker:heartbeat to Redis every 30s.
+  cache_invalidation_loop()  Event-driven suggestion cache flusher.
+  expiry_loop()              Batch-marks expired TradeSuggestions every 60s.
+  correlation_loop()         Bidirectional scanner→AI + news→AI consensus engine.
+  feature_refresh_loop()     Daily ML feature store refresh at 16:00 IST.
+
+The first four loops accept PauseToken, TriggerToken, and a shutdown Event so
+the control-plane (worker_control.py) can pause, resume, and trigger them
+without restarting the process.  feature_refresh_loop accepts shutdown only.
+
+Orchestration (TaskGroup, supervisor, signal handling) lives in worker_app.py.
+The 9 imported coroutines (rss_ingestion, event_processing, regime_detection,
+drift_detection, safety_monitoring, data_ingestion, fundamentals_refresh,
+pnl_worker, sl_tp_worker) are registered in workers/registry.py.
 """
 import asyncio
 import logging
-import signal
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import AsyncGenerator
 
 from sqlalchemy import select, update
@@ -39,25 +47,10 @@ from app.models.trade_suggestions import TradeSuggestion
 from app.services.data_ingestion_worker import data_ingestion_loop
 from app.services.fundamentals_refresh import FundamentalsRefreshScheduler
 from app.services.upstox_client import UpstoxClient
+from app.workers.supervisor import PauseToken, TriggerToken
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
-
-# Global shutdown event
-shutdown_event = asyncio.Event()
-
-
-def signal_handler(signum: int, frame) -> None:
-    """
-    Handle SIGTERM/SIGINT signals for graceful shutdown.
-    
-    Args:
-        signum: Signal number
-        frame: Current stack frame
-    """
-    sig_name = signal.Signals(signum).name
-    logger.info(f"Received {sig_name}, initiating graceful shutdown...")
-    shutdown_event.set()
 
 
 @asynccontextmanager
@@ -158,34 +151,33 @@ async def worker_lifespan() -> AsyncGenerator[tuple[async_sessionmaker, AsyncSes
         logger.info("Worker resources cleaned up")
 
 
-async def heartbeat_loop() -> None:
+async def heartbeat_loop(
+    pause: PauseToken,
+    trigger: TriggerToken,
+    shutdown: asyncio.Event,
+) -> None:
     """
-    Heartbeat loop - writes timestamp to Redis every 30s.
-    
-    Allows monitoring systems to detect worker health.
-    Key: worker:heartbeat, TTL: 60s
+    Heartbeat loop — writes a UTC timestamp to Redis every 30s.
+
+    Key: worker:heartbeat  TTL: 60s
+    Allows the main API's /health/ready probe and Grafana to detect worker health.
     """
     logger.info("Heartbeat loop started")
     redis_client = get_cache_service()
-    
+
     try:
-        while not shutdown_event.is_set():
+        while not shutdown.is_set():
+            await pause.checkpoint()
+
             try:
-                from datetime import timezone as _tz
-                timestamp = datetime.now(_tz.utc).isoformat()
+                timestamp = datetime.now(timezone.utc).isoformat()
                 await redis_client.set("worker:heartbeat", timestamp, ttl=60)
                 logger.debug("Heartbeat: %s", timestamp)
-            except Exception as e:
-                logger.error(f"Heartbeat error: {e}", exc_info=True)
-            
-            # Sleep 30s or until shutdown
-            try:
-                await asyncio.wait_for(
-                    shutdown_event.wait(),
-                    timeout=30.0
-                )
-            except asyncio.TimeoutError:
-                continue
+            except Exception as exc:
+                logger.error("Heartbeat error: %s", exc, exc_info=True)
+
+            await trigger.wait_or_timeout(30.0)
+
     except asyncio.CancelledError:
         logger.info("Heartbeat loop cancelled")
         raise
@@ -193,120 +185,109 @@ async def heartbeat_loop() -> None:
         logger.info("Heartbeat loop stopped")
 
 
-async def cache_invalidation_loop(redis_client) -> None:
+async def cache_invalidation_loop(
+    redis_client,
+    pause: PauseToken,
+    trigger: TriggerToken,
+    shutdown: asyncio.Event,
+) -> None:
     """
-    Cache invalidation loop - subscribes to SUGGESTIONS_NEW and invalidates list caches.
-    
-    Production-grade cache invalidation subscriber with:
-    - Redis pub/sub subscription to cai:suggestions:new
-    - Pattern-based cache invalidation (suggestions:list:*)
-    - Prometheus metrics tracking
-    - Structured logging with context
-    - Graceful shutdown handling
-    
-    Cadence: Real-time (event-driven via Redis pub/sub)
-    Invalidation pattern: suggestions:list:* (all list caches)
-    Metrics: api_cache_invalidations_total counter
-    
-    Best Practices (2026):
-    - Event-driven invalidation for real-time consistency
-    - Pattern-based deletion for hierarchical cache keys
-    - Fire-and-forget pub/sub for low latency
-    - Metrics track invalidation rate and deleted key count
+    Cache invalidation loop — event-driven via Redis pub/sub.
+
+    Subscribes to SUGGESTIONS_NEW and invalidates all suggestions:list:* keys
+    whenever a new suggestion is created, ensuring zero stale-cache windows
+    on the suggestions list endpoint.
+
+    Cadence: real-time (no sleep; driven by pub/sub message arrival)
+    Pattern:  suggestions:list:*
+    Metrics:  api_cache_invalidations_total
     """
     logger.info("Cache invalidation loop started")
-    
+
     from app.core.cache_decorator import invalidate_cache_pattern
     from app.core.metrics import api_cache_invalidations_total
     from app.core.redis import RedisChannels, PubSubClient
-    
+
     pubsub = PubSubClient(redis_client._redis)
-    
+    ps = await pubsub.subscribe(RedisChannels.SUGGESTIONS_NEW)
+    logger.info("Subscribed to %s for cache invalidation", RedisChannels.SUGGESTIONS_NEW)
+
     try:
-        # Subscribe to SUGGESTIONS_NEW channel
-        ps = await pubsub.subscribe(RedisChannels.SUGGESTIONS_NEW)
-        logger.info(f"Subscribed to {RedisChannels.SUGGESTIONS_NEW} for cache invalidation")
-        
-        # Listen for new suggestion events
         async for message in pubsub.listen(ps):
+            # Respect shutdown: break the pub/sub loop cleanly.
+            if shutdown.is_set():
+                break
+
+            # Cooperative pause: block here (holding the pub/sub connection open)
+            # until the control plane calls resume().  Messages that arrive while
+            # paused accumulate in the Redis client buffer and are processed when
+            # the pause lifts — no events are lost.
+            await pause.checkpoint()
+
             try:
-                channel = message["channel"]
                 data = message["data"]
-                
                 suggestion_id = data.get("suggestion_id")
                 symbol = data.get("symbol", "UNKNOWN")
-                
+
                 logger.debug(
-                    f"[Cache Invalidation] Received new suggestion event: {suggestion_id} ({symbol})"
+                    "[Cache Invalidation] New suggestion event: %s (%s)",
+                    suggestion_id, symbol,
                 )
-                
-                # Invalidate all list caches (pattern: suggestions:list:*)
+
                 deleted_count = await invalidate_cache_pattern("suggestions:list:*")
-                
-                # Track metrics
+
                 api_cache_invalidations_total.labels(
                     pattern="suggestions:list:*",
                     trigger="new_suggestion",
                 ).inc()
-                
+
                 logger.info(
-                    f"[Cache Invalidation] Invalidated {deleted_count} list cache keys for new suggestion {suggestion_id}",
+                    "[Cache Invalidation] Invalidated %d list cache keys "
+                    "(suggestion=%s symbol=%s)",
+                    deleted_count, suggestion_id, symbol,
                     extra={
                         "suggestion_id": suggestion_id,
                         "symbol": symbol,
                         "deleted_count": deleted_count,
-                        "pattern": "suggestions:list:*",
-                    }
+                    },
                 )
-            
-            except Exception as e:
+
+            except Exception as exc:
                 logger.error(
-                    f"[Cache Invalidation] Error processing message: {e}",
-                    exc_info=True
+                    "[Cache Invalidation] Error processing message: %s", exc,
+                    exc_info=True,
                 )
                 continue
-    
+
     except asyncio.CancelledError:
         logger.info("Cache invalidation loop cancelled")
         raise
     finally:
-        # Unsubscribe and close
         try:
             await ps.unsubscribe(RedisChannels.SUGGESTIONS_NEW)
-            await ps.close()
-        except Exception as e:
-            logger.warning(f"Error closing pub/sub connection: {e}")
-        
+            await ps.aclose()
+        except Exception as exc:
+            logger.warning("Error closing pub/sub connection: %s", exc)
         logger.info("Cache invalidation loop stopped")
 
 
 async def expiry_loop(
     session_factory: async_sessionmaker,
     redis_client,
+    pause: PauseToken,
+    trigger: TriggerToken,
+    shutdown: asyncio.Event,
 ) -> None:
     """
-    Suggestion expiry loop - marks expired trade suggestions.
-    
-    Production-grade expiry worker with:
-    - Batch processing (100 records per cycle)
-    - Redis pub/sub notifications for real-time updates
-    - Prometheus metrics tracking
-    - Structured logging with context
-    - Graceful shutdown handling
-    
-    Cadence: 60s
-    Batch size: 100 suggestions per cycle
-    Metrics: suggestions_expired_total counter
-    Pub/Sub: cai:suggestions:expired channel
-    
-    Best Practices (2026):
-    - Uses RETURNING clause for atomic update + fetch
-    - Batch processing prevents table lock contention
-    - Fire-and-forget pub/sub for real-time notifications
-    - Metrics track expiry rate and direction distribution
+    Suggestion expiry loop — marks expired TradeSuggestions every 60s.
+
+    Cadence:    60s (interruptible via trigger.fire() for immediate sweep)
+    Batch size: 100 per cycle (avoids table lock contention)
+    Pub/Sub:    cai:suggestions:expired (real-time browser WS updates)
+    Metrics:    suggestions_expired_total, suggestions_active, worker_loop_*
     """
     logger.info("Suggestion expiry loop started")
-    
+
     from app.core.metrics import (
         suggestion_expiry_total,
         suggestions_active,
@@ -314,32 +295,31 @@ async def expiry_loop(
         worker_loop_duration_seconds,
     )
     from app.core.redis import RedisChannels, PubSubClient
-    
+
     pubsub = PubSubClient(redis_client._redis)
     loop_iteration = 0
-    
+
     try:
-        while not shutdown_event.is_set():
+        while not shutdown.is_set():
+            await pause.checkpoint()
+
             loop_iteration += 1
             cycle_start = datetime.now(timezone.utc)
             worker_loop_iterations_total.labels(loop_name="suggestion_expiry").inc()
 
             try:
                 async with session_factory() as session:
-                    # Fetch expired suggestions in batch (LIMIT 100)
                     now = datetime.now(timezone.utc)
-                    
-                    # First, select IDs to update (with LIMIT)
+
                     select_stmt = (
                         select(TradeSuggestion.id)
                         .where(
                             TradeSuggestion.status == "active",
                             TradeSuggestion.expires_at <= now,
                         )
-                        .limit(100)  # Batch size
+                        .limit(100)
                     )
-                    
-                    # Then update those IDs
+
                     stmt = (
                         update(TradeSuggestion)
                         .where(TradeSuggestion.id.in_(select_stmt))
@@ -353,27 +333,25 @@ async def expiry_loop(
                             TradeSuggestion.expires_at,
                         )
                     )
-                    
+
                     result = await session.execute(stmt)
                     expired_suggestions = result.fetchall()
-                    
+
                     if expired_suggestions:
                         await session.commit()
-                        
+
                         logger.info(
-                            f"[Expiry #{loop_iteration}] Expired {len(expired_suggestions)} suggestions",
+                            "[Expiry #%d] Expired %d suggestions",
+                            loop_iteration, len(expired_suggestions),
                             extra={
                                 "loop_iteration": loop_iteration,
                                 "expired_count": len(expired_suggestions),
-                                "batch_size": 100,
-                            }
+                            },
                         )
-                        
-                        # Publish expiry events to Redis pub/sub
+
                         for row in expired_suggestions:
                             suggestion_id, symbol, direction, confidence, score, expired_at = row
-                            
-                            # Track metrics
+
                             suggestion_expiry_total.labels(
                                 direction=direction,
                                 confidence_level=confidence,
@@ -382,8 +360,7 @@ async def expiry_loop(
                                 direction=direction,
                                 confidence_level=confidence,
                             ).dec()
-                            
-                            # Publish to Redis pub/sub (fire-and-forget)
+
                             try:
                                 await pubsub.publish_json(
                                     RedisChannels.SUGGESTIONS_EXPIRED,
@@ -395,45 +372,35 @@ async def expiry_loop(
                                         "consensus_score": float(score),
                                         "expired_at": expired_at.isoformat(),
                                         "reason": "TTL_EXPIRED",
-                                    }
+                                    },
                                 )
-                            except Exception as e:
+                            except Exception as exc:
                                 logger.warning(
-                                    f"[Expiry #{loop_iteration}] Failed to publish expiry event for {suggestion_id}: {e}"
+                                    "[Expiry #%d] Failed to publish expiry event %s: %s",
+                                    loop_iteration, suggestion_id, exc,
                                 )
-                        
-                        logger.debug(
-                            f"[Expiry #{loop_iteration}] Published {len(expired_suggestions)} expiry events to Redis"
-                        )
                     else:
-                        logger.debug(f"[Expiry #{loop_iteration}] No expired suggestions found")
-                
-                # Log cycle performance
+                        logger.debug("[Expiry #%d] No expired suggestions", loop_iteration)
+
                 cycle_duration = (datetime.now(timezone.utc) - cycle_start).total_seconds()
                 worker_loop_duration_seconds.labels(loop_name="suggestion_expiry").observe(
                     cycle_duration
                 )
                 logger.debug(
-                    f"[Expiry #{loop_iteration}] Cycle completed in {cycle_duration:.2f}s"
+                    "[Expiry #%d] Cycle completed in %.2fs",
+                    loop_iteration, cycle_duration,
                 )
-                
-                # Sleep 60s or until shutdown
-                try:
-                    await asyncio.wait_for(
-                        shutdown_event.wait(),
-                        timeout=60.0
-                    )
-                except asyncio.TimeoutError:
-                    continue
-            
-            except Exception as e:
+
+                await trigger.wait_or_timeout(60.0)
+
+            except Exception as exc:
                 logger.error(
-                    f"[Expiry #{loop_iteration}] Unexpected error in expiry loop: {e}",
-                    exc_info=True
+                    "[Expiry #%d] Unexpected error: %s",
+                    loop_iteration, exc,
+                    exc_info=True,
                 )
-                # Back off on error (120s)
                 await asyncio.sleep(120)
-    
+
     except asyncio.CancelledError:
         logger.info("Suggestion expiry loop cancelled")
         raise
@@ -441,11 +408,96 @@ async def expiry_loop(
         logger.info("Suggestion expiry loop stopped")
 
 
+async def feature_refresh_loop(shutdown: asyncio.Event) -> None:
+    """
+    Daily ML feature store refresh — fires at 16:00 IST (30 min after NSE close).
+
+    Instantiates FeatureComputationPipeline in refresh mode and recomputes
+    features for all symbols where ml_features.MAX(timestamp) is older than
+    _STALE_DAYS calendar days.  Uses a dedicated DB connection pool (isolated
+    from the worker's shared pool) to prevent resource contention during the
+    heavy batch operation.
+
+    Sleeps in 60 s chunks so the cooperative shutdown event is honoured within
+    one minute of a stop signal — the standard pattern used across this worker.
+    """
+    from zoneinfo import ZoneInfo
+
+    _IST            = ZoneInfo("Asia/Kolkata")
+    _REFRESH_HOUR   = 16
+    _REFRESH_MINUTE = 0
+    _STALE_DAYS     = 3
+    _LOOKBACK_DAYS  = 90
+
+    # Add the scripts directory to sys.path once so FeatureComputationPipeline
+    # is importable.  This is idempotent — the module is cached in sys.modules
+    # after the first import so subsequent loop iterations pay no I/O cost.
+    _scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
+    if _scripts_dir not in sys.path:
+        sys.path.insert(0, _scripts_dir)
+
+    from compute_production_features import FeatureComputationPipeline  # noqa: PLC0415
+
+    logger.info(
+        "Feature refresh loop started — daily at %02d:%02d IST",
+        _REFRESH_HOUR, _REFRESH_MINUTE,
+    )
+
+    while not shutdown.is_set():
+        now_ist = datetime.now(_IST)
+        target  = now_ist.replace(
+            hour=_REFRESH_HOUR, minute=_REFRESH_MINUTE, second=0, microsecond=0,
+        )
+        if now_ist >= target:
+            target += timedelta(days=1)
+
+        wait_total = (target - now_ist).total_seconds()
+        logger.info(
+            "Feature refresh: next run at %s IST (in %.0f min)",
+            target.strftime("%Y-%m-%d %H:%M"), wait_total / 60,
+        )
+
+        # Sleep in 60 s chunks so shutdown is honoured within one minute.
+        slept = 0.0
+        while slept < wait_total and not shutdown.is_set():
+            chunk  = min(60.0, wait_total - slept)
+            await asyncio.sleep(chunk)
+            slept += chunk
+
+        if shutdown.is_set():
+            break
+
+        logger.info(
+            "Feature refresh: starting daily run (mode=refresh, stale_days=%d)",
+            _STALE_DAYS,
+        )
+        try:
+            pipeline = FeatureComputationPipeline(
+                db_url=str(settings.DATABASE_URL),
+                lookback_days=_LOOKBACK_DAYS,
+                batch_size=10,
+                max_workers=5,
+                mode="refresh",
+                stale_days=_STALE_DAYS,
+            )
+            await pipeline.run()
+            logger.info("Feature refresh: daily run complete")
+        except Exception as exc:
+            logger.error(
+                "Feature refresh: daily run failed — %s", exc, exc_info=True,
+            )
+
+    logger.info("Feature refresh loop stopped")
+
+
 async def correlation_loop(
     session_factory: async_sessionmaker,
     redis_client,
     ml_components: dict,
     upstox_client: UpstoxClient,
+    pause: PauseToken,
+    trigger: TriggerToken,
+    shutdown: asyncio.Event,
 ) -> None:
     """
     Correlation engine loop - monitors scanner anomalies and news events.
@@ -507,7 +559,9 @@ async def correlation_loop(
 
         loop_iteration = 0
 
-        while not shutdown_event.is_set():
+        while not shutdown.is_set():
+            await pause.checkpoint()
+
             loop_iteration += 1
             cycle_start = datetime.now(timezone.utc)
 
@@ -671,15 +725,10 @@ async def correlation_loop(
                     f"Cycle completed in {cycle_duration:.2f}s"
                 )
                 
-                # Sleep 30 s (market open) or 5 min (market closed) before next cycle.
+                # Sleep 30s (market open) or 5min (market closed) before next cycle.
+                # trigger.fire() (from the control plane) wakes the loop immediately.
                 sleep_secs = 30.0 if market.is_open_now else 300.0
-                try:
-                    await asyncio.wait_for(
-                        shutdown_event.wait(),
-                        timeout=sleep_secs
-                    )
-                except asyncio.TimeoutError:
-                    continue
+                await trigger.wait_or_timeout(sleep_secs)
             
             except Exception as e:
                 logger.error(
@@ -697,113 +746,10 @@ async def correlation_loop(
         logger.info("Correlation loop stopped")
 
 
-async def main() -> None:
-    """
-    Main worker orchestration function.
+# ── worker.py is now a pure task-coroutines module ────────────────────────────
+# Orchestration lives in worker_app.py (FastAPI lifespan + TaskGroup).
+# The 4 loops defined here (heartbeat, cache_invalidation, expiry, correlation)
+# accept PauseToken/TriggerToken so the control-plane can pause, resume, and
+# trigger them remotely.  The 9 imported loops respond to CancelledError only;
+# full safepoint support for those is a planned Phase 2 initiative.
 
-    Spawns 11 concurrent background tasks and manages graceful shutdown.
-    """
-    # Register signal handlers
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-    
-    logger.info("=" * 80)
-    logger.info("Cortex AI Worker Process Starting")
-    logger.info(f"Environment: {settings.ENVIRONMENT}")
-    logger.info(f"Background tasks enabled: {settings.ENABLE_BACKGROUND_TASKS}")
-    logger.info(f"Shutdown timeout: {settings.WORKER_SHUTDOWN_TIMEOUT}s")
-    logger.info("=" * 80)
-    
-    if not settings.ENABLE_BACKGROUND_TASKS:
-        logger.warning("Background tasks disabled, worker exiting")
-        return
-    
-    async with worker_lifespan() as (session_factory, redis_client, ml_components, upstox_client):
-        # Create 11 background tasks
-        fundamentals_scheduler = FundamentalsRefreshScheduler(
-            session_factory=session_factory,
-            redis=redis_client,
-            shutdown=shutdown_event,
-        )
-
-        tasks = [
-            asyncio.create_task(rss_ingestion_loop(session_factory), name="rss_ingestion"),
-            asyncio.create_task(
-                event_processing_loop(
-                    session_factory,
-                    ml_components=ml_components,
-                    redis=redis_client._redis,
-                ),
-                name="event_processing"
-            ),
-            asyncio.create_task(regime_detection_loop(session_factory), name="regime_detection"),
-            asyncio.create_task(drift_detection_loop(session_factory), name="drift_detection"),
-            asyncio.create_task(safety_monitoring_loop(session_factory), name="safety_monitoring"),
-            asyncio.create_task(data_ingestion_loop(session_factory, upstox_client), name="data_ingestion"),
-            asyncio.create_task(heartbeat_loop(), name="heartbeat"),
-            asyncio.create_task(
-                correlation_loop(session_factory, redis_client, ml_components, upstox_client),
-                name="correlation_engine"
-            ),
-            asyncio.create_task(
-                expiry_loop(session_factory, redis_client),
-                name="suggestion_expiry"
-            ),
-            asyncio.create_task(
-                cache_invalidation_loop(redis_client),
-                name="cache_invalidation"
-            ),
-            asyncio.create_task(
-                fundamentals_scheduler.run(),
-                name="fundamentals_refresh"
-            ),
-        ]
-        
-        logger.info(f"Started {len(tasks)} background tasks")
-        for task in tasks:
-            logger.info(f"  - {task.get_name()}")
-        
-        # Wait for shutdown signal
-        await shutdown_event.wait()
-        
-        logger.info("Shutdown signal received, cancelling tasks...")
-        
-        # Cancel all tasks
-        for task in tasks:
-            task.cancel()
-        
-        # Wait for tasks to complete with timeout
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*tasks, return_exceptions=True),
-                timeout=settings.WORKER_SHUTDOWN_TIMEOUT
-            )
-            logger.info("All tasks completed gracefully")
-        except asyncio.TimeoutError:
-            logger.error(f"Tasks did not complete within {settings.WORKER_SHUTDOWN_TIMEOUT}s timeout")
-            # Force kill remaining tasks
-            for task in tasks:
-                if not task.done():
-                    logger.warning(f"Force killing task: {task.get_name()}")
-                    task.cancel()
-        
-        logger.info("Worker process shutdown complete")
-
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-    # Suppress httpx / httpcore request-level INFO logs — each Upstox batch URL
-    # contains 500 URL-encoded instrument keys (~50 KB per line of log noise).
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-    
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Worker interrupted by user")
-    except Exception as e:
-        logger.error(f"Worker crashed: {e}", exc_info=True)
-        raise

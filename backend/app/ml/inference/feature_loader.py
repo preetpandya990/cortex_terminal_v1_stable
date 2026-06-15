@@ -27,8 +27,9 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from contextlib import asynccontextmanager
 from redis.asyncio import Redis
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.ml.features.feature_store import load_features_from_db
 from app.ml.features.feature_pipeline import compute_features_for_symbol, normalize_features
@@ -54,17 +55,19 @@ class FeatureLoader:
 
     def __init__(
         self,
-        db:              AsyncSession,
-        redis:           Redis,
-        sequence_length: int = 60,
-        n_features:      int = 49,
-        feature_names:   tuple[str, ...] | list[str] = (),
+        db:               AsyncSession,
+        redis:            Redis,
+        session_factory:  async_sessionmaker | None = None,
+        sequence_length:  int = 60,
+        n_features:       int = 49,
+        feature_names:    tuple[str, ...] | list[str] = (),
     ) -> None:
-        self.db              = db
-        self.redis           = redis
-        self.sequence_length = sequence_length
-        self.n_features      = n_features
-        self.feature_names   = list(feature_names)
+        self.db               = db
+        self.redis            = redis
+        self._session_factory = session_factory
+        self.sequence_length  = sequence_length
+        self.n_features       = n_features
+        self.feature_names    = list(feature_names)
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -72,6 +75,8 @@ class FeatureLoader:
         self,
         symbol: str,
         timeframe: str = "1d",
+        *,
+        indicator_snapshot_out: dict | None = None,
     ) -> tuple[np.ndarray, np.ndarray, float, float]:
         """
         Load and normalize features for a trading symbol.
@@ -83,6 +88,12 @@ class FeatureLoader:
         Args:
             symbol:    NSE trading symbol ("RELIANCE") or instrument_key
             timeframe: Prediction timeframe (default "1d")
+            indicator_snapshot_out: Optional caller-owned dict.  When provided, it
+                is populated with the latest RAW (un-normalized) labeled indicator
+                values (rsi_14, macd_line, ema_20, atr_14, …) — the same numbers
+                the model sees before z-scoring.  Used by the Gemini news
+                forecaster so both forecasters share identical indicators.  The
+                caller owns the dict, so this is concurrency-safe.
 
         Returns:
             (tabular, sequence, current_price, volatility)
@@ -99,7 +110,9 @@ class FeatureLoader:
                     "Feature store hit for %s → %s (%d rows)",
                     symbol, instrument_key, len(features_df),
                 )
-                return self._prepare_features(features_df)
+                return self._prepare_features(
+                    features_df, indicator_snapshot_out=indicator_snapshot_out
+                )
             if not features_df.empty:
                 logger.warning(
                     "Feature store: only %d rows for %s (need %d) — "
@@ -119,7 +132,9 @@ class FeatureLoader:
             )
             features_df = await self._compute_on_demand(instrument_key, timeframe)
             if not features_df.empty and len(features_df) >= 20:
-                return self._prepare_features(features_df)
+                return self._prepare_features(
+                    features_df, indicator_snapshot_out=indicator_snapshot_out
+                )
         except Exception as exc:
             logger.error(
                 "On-demand computation failed for %s: %s", symbol, exc, exc_info=True,
@@ -179,6 +194,26 @@ class FeatureLoader:
 
     # ── Private: data loading ───────────────────────────────────────────────────
 
+    @asynccontextmanager
+    async def _read_session(self):
+        """
+        Yields an isolated read-only session when session_factory is available.
+
+        Falls back to self.db for callers that did not provide a session_factory
+        (e.g. correlation_loop, which creates a fresh session per cycle with no
+        prior commits on the same connection — no isolation needed there).
+
+        This isolation is critical in the event processing pipeline where
+        NLPEngine and EventClassifier each commit before feature loading runs.
+        Post-commit state on asyncpg connections causes ORM SELECT queries to
+        return 0 rows; a fresh session avoids this entirely.
+        """
+        if self._session_factory is not None:
+            async with self._session_factory() as session:
+                yield session
+        else:
+            yield self.db
+
     async def _load_from_database(
         self,
         instrument_key: str,
@@ -189,39 +224,41 @@ class FeatureLoader:
 
         Lookback is 2×sequence_length + 30 days so the rolling normalization
         window (window=60) is fully populated for every row in the GRU sequence.
+        Uses an isolated session via _read_session() to avoid post-commit state
+        contamination from earlier commits in the event processing pipeline.
         """
         end_date   = datetime.now(timezone.utc)
         start_date = end_date - timedelta(days=self.sequence_length * 2 + 30)
 
-        features_df = await load_features_from_db(
-            symbol=instrument_key,
-            start_date=start_date,
-            end_date=end_date,
-            db=self.db,
-        )
-
-        if features_df.empty:
-            return features_df
-
-        # Enrich with the latest close price for current_price extraction
         timeframe_map = {"1d": "1D", "1D": "1D", "1w": "1week", "1week": "1week"}
         db_tf = timeframe_map.get(timeframe, timeframe)
 
         from sqlalchemy import text as sa_text
 
-        row = (
-            await self.db.execute(
-                sa_text("""
-                    SELECT close
-                    FROM   upstox_ohlcv
-                    WHERE  instrument_key = :ik
-                      AND  timeframe       = :tf
-                    ORDER  BY timestamp DESC
-                    LIMIT  1
-                """),
-                {"ik": instrument_key, "tf": db_tf},
+        async with self._read_session() as db:
+            features_df = await load_features_from_db(
+                symbol=instrument_key,
+                start_date=start_date,
+                end_date=end_date,
+                db=db,
             )
-        ).fetchone()
+
+            if features_df.empty:
+                return features_df
+
+            row = (
+                await db.execute(
+                    sa_text("""
+                        SELECT close
+                        FROM   upstox_ohlcv
+                        WHERE  instrument_key = :ik
+                          AND  timeframe       = :tf
+                        ORDER  BY timestamp DESC
+                        LIMIT  1
+                    """),
+                    {"ik": instrument_key, "tf": db_tf},
+                )
+            ).fetchone()
 
         if row:
             features_df["close"] = float(row[0])
@@ -233,26 +270,34 @@ class FeatureLoader:
         instrument_key: str,
         timeframe: str,
     ) -> pd.DataFrame:
-        """Compute features on-demand from raw OHLCV data."""
+        """
+        Compute features on-demand from raw OHLCV data.
+
+        Uses an isolated session via _read_session() to avoid post-commit state
+        contamination from earlier commits in the event processing pipeline.
+        """
         end_date   = datetime.now(timezone.utc)
         start_date = end_date - timedelta(days=self.sequence_length * 2 + 30)
 
         _tf_map      = {"1d": "1D", "1w": "1week"}
         db_timeframe = _tf_map.get(timeframe, timeframe)
 
-        return await compute_features_for_symbol(
-            symbol=instrument_key,
-            start_date=start_date,
-            end_date=end_date,
-            timeframe=db_timeframe,
-            db=self.db,
-        )
+        async with self._read_session() as db:
+            return await compute_features_for_symbol(
+                symbol=instrument_key,
+                start_date=start_date,
+                end_date=end_date,
+                timeframe=db_timeframe,
+                db=db,
+            )
 
     # ── Private: feature preparation ───────────────────────────────────────────
 
     def _prepare_features(
         self,
         features_df: pd.DataFrame,
+        *,
+        indicator_snapshot_out: dict | None = None,
     ) -> tuple[np.ndarray, np.ndarray, float, float]:
         """
         Normalize and extract inference-ready arrays from a feature DataFrame.
@@ -283,6 +328,19 @@ class FeatureLoader:
             feature_cols = self.feature_names
         else:
             feature_cols = [c for c in features_df.columns if c not in _exclude]
+
+        # ── Capture raw labeled indicators (pre-normalization) ─────────────────
+        # The latest row holds human-readable values (RSI≈68, EMA≈₹1450) that the
+        # Gemini news forecaster needs — captured here, before z-scoring, so both
+        # forecasters reason over identical numbers.  Caller owns the dict.
+        if indicator_snapshot_out is not None and len(features_df):
+            latest = features_df.iloc[-1]
+            for col in feature_cols:
+                val = latest.get(col)
+                if val is not None and not pd.isna(val):
+                    indicator_snapshot_out[col] = float(val)
+            if "close" in features_df.columns and not pd.isna(latest.get("close")):
+                indicator_snapshot_out["close"] = float(latest["close"])
 
         # ── Rolling z-score normalization (must match training) ─────────────────
         # normalize_features updates feature_cols in-place on the DataFrame copy;
@@ -349,14 +407,20 @@ class FeatureLoader:
 # ── Factory ────────────────────────────────────────────────────────────────────
 
 def create_feature_loader(
-    db: AsyncSession,
-    redis: Redis,
-    sequence_length: int = 60,
-    n_features: int = 49,
-    feature_names: tuple[str, ...] = (),
+    db:               AsyncSession,
+    redis:            Redis,
+    session_factory:  async_sessionmaker | None = None,
+    sequence_length:  int = 60,
+    n_features:       int = 49,
+    feature_names:    tuple[str, ...] = (),
 ) -> FeatureLoader:
     """
     Convenience factory for FeatureLoader.
+
+    Pass session_factory at any call site where intermediate DB commits occur
+    before feature loading (e.g. event_processing_loop) so that _load_from_database
+    and _compute_on_demand open isolated sessions, avoiding post-commit state
+    contamination on the shared connection.
 
     In production inference paths always pass n_features, sequence_length, and
     feature_names from the loaded EnsemblePredictor — never rely on these defaults.
@@ -364,6 +428,7 @@ def create_feature_loader(
     return FeatureLoader(
         db=db,
         redis=redis,
+        session_factory=session_factory,
         sequence_length=sequence_length,
         n_features=n_features,
         feature_names=feature_names,

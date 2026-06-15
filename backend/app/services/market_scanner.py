@@ -266,8 +266,14 @@ class MarketScannerService:
             )
 
         # ── Stage 5: score + sort ─────────────────────────────────────────
+        # _build_results() iterates synchronously over all instruments (RSI,
+        # volume ratio, signal tagging) — offload to the thread pool so the
+        # event loop remains responsive to the worker control-plane during the
+        # ~30s correlation cycle.  numpy/pure-Python work releases the GIL.
         yield ScanProgressEvent(pct=85, stage="scoring", message="Computing signals and scores…")
-        results = self._build_results(instrument_data, live_quotes, is_market_open, now_utc)
+        results = await asyncio.to_thread(
+            self._build_results, instrument_data, live_quotes, is_market_open, now_utc
+        )
         results.sort(key=lambda r: abs(r.price_change_pct), reverse=True)
 
         logger.info(
@@ -358,6 +364,9 @@ class MarketScannerService:
             WHERE  o.timeframe  = :timeframe
               AND  o.timestamp <= :ref_ts
               AND  o.timestamp >= :since
+              -- Exclude known-delisted instruments (keep active rows and any
+              -- OHLCV instrument that has no master row).
+              AND  im.is_active IS DISTINCT FROM FALSE
             ORDER BY o.instrument_key, o.timestamp DESC
         """)
         try:

@@ -65,9 +65,52 @@ class Settings(BaseSettings):
     UPSTOX_BASE_URL: str = "https://api.upstox.com/v3/"
     UPSTOX_INSTRUMENTS_URL: AnyHttpUrl = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 
+    # ── Instrument master sync ─────────────────────────────────────────────────
+    # Upstox regenerates the BOD instrument file ~06:00 IST; we sync after that
+    # and before the 09:15 open on trading days.
+    INSTRUMENT_SYNC_HOUR_IST: int = Field(
+        8, ge=0, le=23, description="Hour (IST) at which the daily instrument sync runs"
+    )
+    # Absolute floor for the sanity guard: a file with fewer in-scope instruments
+    # than this is treated as truncated/corrupt and the sync is aborted.
+    INSTRUMENT_SYNC_MIN_INSTRUMENTS: int = Field(
+        1500, ge=1, description="Minimum plausible in-scope instrument count; below this the sync aborts"
+    )
+    # On startup, run an immediate catch-up sync if the last success is older
+    # than this (or the table is empty) so a fresh deploy is usable at once.
+    INSTRUMENT_SYNC_STALE_HOURS: int = Field(
+        24, ge=1, le=168, description="Age past which a startup catch-up instrument sync is triggered"
+    )
+
     # ── Worker ─────────────────────────────────────────────────────────────────
     ENABLE_BACKGROUND_TASKS: bool = True
     WORKER_SHUTDOWN_TIMEOUT: int = Field(30, ge=5, le=120)
+
+    # ── Worker Sidecar ─────────────────────────────────────────────────────────
+    # The worker sidecar runs as a separate Docker Compose service on port 8001
+    # (internal only — never exposed to the host).  The main API calls it via
+    # httpx + circuit breaker for control-plane operations (pause/resume/trigger).
+    # All data flow continues through Redis pub/sub — these settings only affect
+    # the HTTP control plane.
+    WORKER_BASE_URL: str = Field(
+        "http://worker:8001",
+        description="Internal base URL of the worker sidecar service",
+    )
+    INTERNAL_API_SECRET: str = Field(
+        ...,
+        min_length=64,
+        description=(
+            "Shared secret for service-to-service auth (X-Internal-Token header). "
+            "Must be 64+ hex characters. "
+            "Generate: python -c \"import secrets; print(secrets.token_hex(32))\""
+        ),
+    )
+    WORKER_HTTP_TIMEOUT: float = Field(
+        3.0,
+        ge=0.5,
+        le=30.0,
+        description="HTTP read timeout (seconds) for control-plane calls to the worker sidecar",
+    )
 
     # ── RSS Ingestion ──────────────────────────────────────────────────────────
     RSS_MIN_POLL_SECONDS: int = Field(300, ge=60)
@@ -87,6 +130,106 @@ class Settings(BaseSettings):
     NVIDIA_NIM_MODEL: str = "qwen/qwen3.5-122b-a10b"
     NVIDIA_NIM_EMBED_MODEL: str = "nvidia/nv-embedqa-e5-v5"
 
+    # ── Intelligence Layer — Google Gemini (active LLM + embedding provider) ──
+    # Single provider for the entire AI layer: text generation, structured
+    # output, the news forecaster, explanations, sentiment, classification,
+    # fake-news detection, and RAG embeddings.  Obtain a key from Google AI
+    # Studio (https://aistudio.google.com/apikey) and set GEMINI_API_KEY in .env.
+    #
+    # The NIM / Groq / Ollama settings above/below are legacy and no longer wired
+    # into the client; they are retained only for reference and rollback.
+    GEMINI_API_KEY: str | None = None
+    # gemini-2.5-flash: stable, low-latency, best price-performance for the
+    # high-volume reliability-critical paths (the forecaster gates suggestions).
+    # gemini-3.5-flash was capacity-constrained (503) at cutover; revisit when its
+    # availability stabilizes.
+    GEMINI_MODEL: str = "gemini-2.5-flash"
+    # Latency control: "minimal" disables extended thinking for the fastest,
+    # most predictable replies.  The client maps this per model generation —
+    # thinking_level (Gemini 3.x) vs. thinking_budget=0 (Gemini 2.x) — see
+    # llm_client._thinking_config.  Use "low"/"medium"/"high" for deeper reasoning.
+    GEMINI_THINKING_LEVEL: str = "minimal"
+    # Embeddings — gemini-embedding-001.  output_dimensionality pins the pgvector
+    # column dimension (see ai_document_embeddings).  Vectors below 3072 are
+    # L2-normalized by the embedder.  Recommended values: 768, 1536, 3072.
+    GEMINI_EMBED_MODEL: str = "gemini-embedding-001"
+    GEMINI_EMBED_DIM: int = Field(1536, ge=128, le=3072)
+
+    # ── Gemini Request Manager — quota budgets and queue tuning ───────────────
+    # These values must match your API key's tier.  Upgrading tiers is a single
+    # .env change — no code changes required.
+    #
+    # Paid Tier 1 (default):  generate 150 RPM / 1M TPM, embed 90 RPM
+    # Paid Tier 2:            generate 500 RPM / 2M TPM
+    # Free tier:              generate 10 RPM / 250K TPM, embed 90 RPM
+    #
+    # The burst_cap on the token buckets (min(rpm, 10)) is hard-coded in the
+    # manager to prevent a quiet period from banking a full minute's budget and
+    # then releasing it in a single burst — it is NOT configurable here.
+    GEMINI_GENERATE_RPM: int = Field(
+        150, ge=1, le=1500,
+        description="Gemini generate requests/min budget — 10=free, 150=Tier1, 500=Tier2",
+    )
+    GEMINI_GENERATE_TPM: int = Field(
+        1_000_000, ge=1, le=10_000_000,
+        description="Gemini generate tokens/min budget — 250K=free, 1M=Tier1, 2M=Tier2",
+    )
+    GEMINI_EMBED_RPM: int = Field(
+        90, ge=1, le=2000,
+        description="Gemini embed requests/min budget — 90=free/Tier1, higher on Tier2",
+    )
+    GEMINI_MAX_QUEUE_DEPTH: int = Field(
+        50, ge=10, le=500,
+        description=(
+            "Maximum permits waiting in the GeminiRequestManager priority queue. "
+            "Callers beyond this limit receive GeminiRateLimitError immediately — "
+            "backpressure prevents unbounded memory growth under sustained overload."
+        ),
+    )
+    GEMINI_PERMIT_TIMEOUT: float = Field(
+        30.0, ge=5.0, le=120.0,
+        description=(
+            "Maximum seconds a caller blocks waiting for a Gemini API permit. "
+            "On timeout the caller receives GeminiRateLimitError and should degrade "
+            "gracefully.  Must be less than LLM_REQUEST_TIMEOUT."
+        ),
+    )
+
+    # ── Intelligence Layer — Gemini news forecaster (consensus-path) ──────────
+    # The forecaster runs INSIDE the 5s consensus gather budget, so its own call
+    # timeout must leave room for the ML/scanner work; on timeout/error it falls
+    # back to the deterministic NLP event score (never blocks suggestion creation).
+    # ~2.0–2.5s observed live on gemini-2.5-flash; 3.0s leaves headroom before
+    # the forecast times out to the NLP fallback.
+    GEMINI_FORECAST_TIMEOUT: float = Field(3.0, ge=0.5, le=4.5)
+    GEMINI_FORECAST_MAX_TOKENS: int = Field(400, ge=128, le=2048)
+    # Ceiling for the whole consensus signal-gather (ML → news forecast, sequential
+    # because the forecaster reasons over the ML's indicators).  Lifted from the
+    # legacy 5s so a legitimate ML+forecast is never rejected as a timeout.
+    CONSENSUS_GATHER_TIMEOUT: float = Field(6.0, ge=3.0, le=15.0)
+    # Per-symbol forecast cache; busted when the news/event set changes.
+    NEWS_FORECAST_CACHE_TTL: int = Field(30, ge=5, le=300)
+    # Circuit breaker: after N consecutive Gemini failures, short-circuit to the
+    # NLP fallback for COOLDOWN seconds instead of paying the timeout every call.
+    NEWS_FORECAST_BREAKER_THRESHOLD: int = Field(4, ge=1, le=20)
+    NEWS_FORECAST_BREAKER_COOLDOWN: float = Field(60.0, ge=5.0, le=600.0)
+
+    # ── Live data freshness guard ─────────────────────────────────────────────
+    # The daily OHLCV sync refreshes ~2,400 instruments incrementally, so for a
+    # while some symbols lag the rest.  When a symbol's latest daily bar is behind
+    # the global 1D data frontier by more than the tolerance, the ML ensemble and
+    # the news forecaster ABSTAIN for that symbol (available=False) rather than
+    # emit a signal on stale technicals.  Self-heals next cycle once the sync
+    # reaches the symbol.  Frontier-relative, so it needs no trading calendar.
+    ENABLE_STALENESS_GUARD: bool = True
+    # A symbol is stale if its latest daily bar lags the frontier by MORE than this.
+    STALENESS_MAX_LAG_DAYS: int = Field(1, ge=0, le=10)
+    # Robust frontier = the newest day on which at least this many daily bars exist
+    # (the "bulk" of the universe).  This is outlier-proof — a single instrument
+    # synced ahead cannot drag the frontier forward and flag everyone else stale.
+    STALENESS_FRONTIER_MIN_INSTRUMENTS: int = Field(500, ge=1)
+    STALENESS_FRONTIER_CACHE_SECS: int = Field(60, ge=5, le=600)
+
     # ── Intelligence Layer — LLM Behaviour ────────────────────────────────────
     LLM_MAX_RETRIES: int = Field(3, ge=1, le=5)
     LLM_REQUEST_TIMEOUT: float = Field(30.0, ge=5.0, le=120.0)
@@ -95,6 +238,40 @@ class Settings(BaseSettings):
     RAG_TOP_K: int = Field(5, ge=1, le=20)
     RAG_WINDOW_HOURS: int = Field(24, ge=1, le=168)
     RAG_EMBED_BATCH_SIZE: int = Field(32, ge=1, le=128)
+
+    # ── RAG corpus backfill (paced, monitorable background job) ────────────────
+    # Outbound embedding pace (texts/min).  Free-tier gemini-embedding-001 allows
+    # ~100/min; with the empty-start bucket the worst-case 60s window is
+    # RPM + sub_batch, so 80 + 10 = 90 stays safely under 100.  Raise
+    # substantially on a billing-enabled key.
+    RAG_BACKFILL_RPM: int = Field(80, ge=1, le=10000)
+    # Texts per embed call / DB upsert; smaller = finer pacing + tighter error
+    # isolation, larger = fewer DB commits.
+    RAG_BACKFILL_SUB_BATCH: int = Field(10, ge=1, le=100)
+    # Backfill lookback.  RAG retrieval only queries the last RAG_WINDOW_HOURS
+    # (24h), so embedding deep history is wasted quota.  Default 3 days = the
+    # retrieval window with 3x margin; widen explicitly only for special cases.
+    RAG_BACKFILL_WINDOW_DAYS: int = Field(3, ge=1, le=36500)
+    # How often the lifespan RAG refresh worker wakes to embed new news events.
+    # Default 4h: ~130 new events per cycle at the observed 33 events/h ingest
+    # rate → ~780 embed texts/day, safely under the free-tier 1000/day cap.
+    # Lower to 1–2h on a billing-enabled key for near-real-time corpus freshness.
+    RAG_REFRESH_INTERVAL_HOURS: int = Field(4, ge=1, le=168)
+
+    # ── Observability — Explanation-pipeline diagnostics log ──────────────────
+    # When enabled, routes the explanation worker + LLM client + RAG loggers at
+    # DEBUG into a dedicated rotating file, isolated from the multi-WebSocket
+    # console firehose.  Console still shows INFO+ for these loggers; the file
+    # additionally captures the full DEBUG trace (RAG retrieval + NIM embedding
+    # timing, provider/stream events).  Off by default; purely additive.
+    EXPLANATION_PIPELINE_LOG_ENABLED: bool = Field(
+        False,
+        description="Write explanation-pipeline DEBUG logs to a dedicated rotating file",
+    )
+    EXPLANATION_PIPELINE_LOG_PATH: str = Field(
+        "logs/explanation_pipeline.log",
+        description="Path for the explanation-pipeline diagnostics log file",
+    )
 
     # ── Intelligence Layer — Groq (development / staging LLM provider) ───────────
     # Groq serves Qwen3-32B via custom LPU silicon: ~300ms TTFT, 60 RPM free tier,
@@ -282,6 +459,17 @@ class Settings(BaseSettings):
         forbidden = {"your-secret-key-change-in-production", "your-secret-key", "secret", "changeme"}
         if v.lower() in forbidden:
             raise ValueError("SECRET_KEY must not be a placeholder. Generate with: openssl rand -hex 32")
+        return v
+
+    @field_validator("INTERNAL_API_SECRET")
+    @classmethod
+    def internal_secret_must_not_be_placeholder(cls, v: str) -> str:
+        forbidden = {"changeme", "secret", "your-internal-secret", "change-me", "placeholder"}
+        if v.lower() in forbidden or v.startswith("<") or v.startswith("REPLACE"):
+            raise ValueError(
+                "INTERNAL_API_SECRET must not be a placeholder. "
+                "Generate with: python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
         return v
 
     @model_validator(mode="after")

@@ -49,6 +49,8 @@ async def _enrich_instrument_keys(signals_data: list[dict], db: AsyncSession) ->
                 InstrumentMaster.trading_symbol.in_(symbols_needing_key),
                 InstrumentMaster.exchange == "NSE",
                 InstrumentMaster.instrument_type == "EQ",
+                # Signal-generation path: resolve keys for live instruments only.
+                InstrumentMaster.is_active.is_(True),
             )
         )
     ).all()

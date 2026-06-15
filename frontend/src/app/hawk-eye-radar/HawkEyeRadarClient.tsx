@@ -10,6 +10,7 @@ import { InstrumentSearchCombobox } from "@/components/market/InstrumentSearchCo
 import { TradeSuggestionCard } from "./components/TradeSuggestionCard";
 import { WatchlistCard } from "./components/WatchlistCard";
 import { DetailPane } from "./components/DetailPane";
+import { SuggestionDetailModal } from "./components/SuggestionDetailModal";
 import { SuggestionFilters } from "./components/SuggestionFilters";
 import { SuggestionStats } from "./components/SuggestionStats";
 import { MLActivityCard } from "./components/MLActivityCard";
@@ -29,6 +30,9 @@ export default function HawkEyeRadarClient() {
   const { isAuthenticated, isAuthReady, accessToken, isLoading: authLoading } = useAuth();
   const [selectedInstrument, setSelectedInstrument] = useState<UpstoxInstrument | null>(null);
   const [detailSuggestion, setDetailSuggestion] = useState<TradeSuggestion | null>(null);
+  // Suggestion shown in the focused SuggestionDetailModal (opened from a card).
+  // Distinct from detailSuggestion, which drives the full-view DetailPane.
+  const [modalSuggestion, setModalSuggestion] = useState<TradeSuggestion | null>(null);
   const [filters, setFilters] = useState<Filters>({ status: "active", page: 1, page_size: 50 });
   const queryClient = useQueryClient();
 
@@ -138,31 +142,49 @@ export default function HawkEyeRadarClient() {
     }
   }, [searchParams, suggestionsData, selectedInstrument]);
 
-  // Read suggestion_id from URL on mount (deep linking support)
+  // Read suggestion_id from URL on mount → open the focused modal (deep linking).
   useEffect(() => {
     const suggestionId = searchParams.get('suggestion_id');
-    if (suggestionId && !detailSuggestion && suggestionsData) {
+    if (suggestionId && !modalSuggestion && suggestionsData) {
       const suggestion = suggestionsData.suggestions.find(
         s => s.suggestion_id === suggestionId
       );
       if (suggestion) {
-        setDetailSuggestion(suggestion);
-        const params = new URLSearchParams(searchParams.toString());
-        params.delete('suggestion_id');
-        params.set('instrument_key', suggestion.instrument_key);
-        router.replace(`?${params.toString()}`, { scroll: false });
+        setModalSuggestion(suggestion);
       }
     }
-  }, [searchParams, suggestionsData, detailSuggestion, router]);
+  }, [searchParams, suggestionsData, modalSuggestion]);
 
+  // Suggestion card → open the focused modal (not the full DetailPane).
+  // Keyed in the URL by suggestion_id so the view is shareable/deep-linkable.
   const handleViewDetails = (suggestionId: string) => {
     const suggestion = suggestionsData?.suggestions.find((s) => s.suggestion_id === suggestionId);
     if (suggestion) {
-      setDetailSuggestion(suggestion);
+      setModalSuggestion(suggestion);
       const params = new URLSearchParams(searchParams.toString());
-      params.set('instrument_key', suggestion.instrument_key);
+      params.set('suggestion_id', suggestion.suggestion_id);
+      params.delete('instrument_key');
       router.push(`?${params.toString()}`, { scroll: false });
     }
+  };
+
+  const handleCloseModal = () => {
+    setModalSuggestion(null);
+    const params = new URLSearchParams(searchParams.toString());
+    params.delete('suggestion_id');
+    const newUrl = params.toString() ? `?${params.toString()}` : '/hawk-eye-radar';
+    router.push(newUrl, { scroll: false });
+  };
+
+  // Modal "Open full view" → promote to the DetailPane (chart, live price, trade).
+  const handleOpenFullView = () => {
+    if (!modalSuggestion) return;
+    setDetailSuggestion(modalSuggestion);
+    setModalSuggestion(null);
+    const params = new URLSearchParams(searchParams.toString());
+    params.delete('suggestion_id');
+    params.set('instrument_key', modalSuggestion.instrument_key);
+    router.push(`?${params.toString()}`, { scroll: false });
   };
 
   const handleManualSelect = (instrument: UpstoxInstrument) => {
@@ -220,6 +242,18 @@ export default function HawkEyeRadarClient() {
       ) ?? detailSuggestion  // fall back to stored object if not in current list
     );
   }, [detailSuggestion?.suggestion_id, suggestionsData?.suggestions]);
+
+  // Same freshness guarantee for the modal: when React Query refetches after the
+  // explanation worker writes llm_summary / llm_explanation, the modal's embedded
+  // AnalysisCardsSection re-seeds from the updated suggestion snapshot.
+  const currentModalSuggestion = useMemo(() => {
+    if (!modalSuggestion) return null;
+    return (
+      suggestionsData?.suggestions.find(
+        (s) => s.suggestion_id === modalSuggestion.suggestion_id,
+      ) ?? modalSuggestion
+    );
+  }, [modalSuggestion?.suggestion_id, suggestionsData?.suggestions]);
 
   const detailInstrument = selectedInstrument ?? (currentDetailSuggestion
     ? ({
@@ -414,7 +448,15 @@ export default function HawkEyeRadarClient() {
         </div>
       </div>
 
-      {/* Detail Pane Overlay */}
+      {/* Focused suggestion modal — opens from a TradeSuggestionCard */}
+      <SuggestionDetailModal
+        suggestion={currentModalSuggestion}
+        open={currentModalSuggestion !== null}
+        onClose={handleCloseModal}
+        onOpenFullView={handleOpenFullView}
+      />
+
+      {/* Detail Pane Overlay — full view (chart, live price, trade) */}
       {detailInstrument && (
         <DetailPane
           instrument={detailInstrument}

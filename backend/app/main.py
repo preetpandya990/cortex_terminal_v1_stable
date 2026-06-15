@@ -20,10 +20,10 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from app.api.v1 import (
-    admin_strategies, admin_training, admin_users, auth, cai, fusion, fundamentals, governance,
-    hawk_eye, ingestion, intelligence, market_data, ml_drift, ml_patterns, ml_predictions,
-    paper_trading, safety, scanner, strategies, strategy, trade_suggestions, upstox, health,
-    users, watchlist, ai_sentiment, ai_stream,
+    admin_strategies, admin_training, admin_users, admin_worker, auth, cai, fusion, fundamentals,
+    governance, hawk_eye, ingestion, intelligence, market_data, ml_drift, ml_patterns,
+    ml_predictions, paper_trading, safety, scanner, strategies, strategy, trade_suggestions,
+    upstox, health, users, watchlist, ai_sentiment, ai_stream,
 )
 from app.core.config import get_settings
 from app.core.database import engine, worker_engine
@@ -42,7 +42,12 @@ settings = get_settings()
 # ── Logging ────────────────────────────────────────────────────────────────────
 from app.core.logging_config import setup_logging
 
-setup_logging(log_level=settings.LOG_LEVEL, environment=settings.ENVIRONMENT)
+setup_logging(
+    log_level=settings.LOG_LEVEL,
+    environment=settings.ENVIRONMENT,
+    explanation_log_enabled=settings.EXPLANATION_PIPELINE_LOG_ENABLED,
+    explanation_log_path=settings.EXPLANATION_PIPELINE_LOG_PATH,
+)
 logger = logging.getLogger(__name__)
 
 
@@ -58,6 +63,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Prometheus metrics initialized")
 
     await init_redis()
+
+    # Initialize Gemini Request Manager — central coordinator for all 6 Gemini callers.
+    # Pre-loads quota circuit state from Redis so a post-exhaustion restart fast-fails
+    # immediately rather than wasting an API round-trip.  Must run AFTER init_redis()
+    # (circuit pre-load needs Redis) and BEFORE the LLM client (client calls acquire()).
+    try:
+        from app.ai.intelligence.request_manager import GeminiRequestManager
+        from app.core.redis import get_redis
+        await GeminiRequestManager.initialize(redis=get_redis())
+        logger.info("Gemini request manager initialized")
+    except Exception as exc:
+        logger.error(
+            "Gemini request manager initialization failed (quota coordination degraded): %s", exc
+        )
 
     # Initialize LLM Intelligence Client — probes NIM then Ollama, logs active backend
     try:
@@ -147,6 +166,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     from app.ai.fusion.signal_pipeline import SignalPipeline
     app.state.signal_pipeline = SignalPipeline(scheduler=signal_scheduler)
 
+    # Instrument Sync Service — daily reconcile of instrument_master against the
+    # Upstox BOD file (soft-deletes delistings) + startup catch-up if stale.
+    from app.services.instrument_sync_service import InstrumentSyncService
+
+    instrument_sync_service = InstrumentSyncService(
+        db_factory=AsyncSessionLocal,
+        redis=get_redis(),
+    )
+    await instrument_sync_service.start()
+    app.state.instrument_sync_service = instrument_sync_service
+
     # Start CAI WebSocket Redis listener — fans out all 4 CAI pub/sub channels
     # to connected browser clients via the in-process CAIConnectionManager.
     from app.api.v1.cai import cai_redis_listener
@@ -163,21 +193,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.suggestions_listener_task = suggestions_listener_task
     logger.info("Trade Suggestions Redis listener started")
 
-    # Start Paper Trading P&L recompute worker
-    from app.services.paper_trading.pnl_worker import run_pnl_worker
-    pnl_worker_task = asyncio.create_task(
-        run_pnl_worker(get_redis()), name="paper_trading_pnl_worker"
-    )
-    app.state.pnl_worker_task = pnl_worker_task
-    logger.info("Paper Trading P&L worker started")
-
-    # Start Strategy SL/TP monitoring worker
-    from app.services.strategy_engine.sl_tp_worker import run_sl_tp_worker
-    sl_tp_worker_task = asyncio.create_task(
-        run_sl_tp_worker(get_redis()), name="strategy_sl_tp_worker"
-    )
-    app.state.sl_tp_worker_task = sl_tp_worker_task
-    logger.info("Strategy SL/TP monitoring worker started")
+    # Initialise WorkerClient — fail-open HTTP client for the worker sidecar
+    # control-plane.  The pnl_worker and sl_tp_worker tasks now run inside the
+    # worker sidecar; this client enables pause/resume/trigger/restart of all
+    # 13 background tasks from the main API without coupling the processes.
+    from app.core.worker_client import WorkerClient
+    worker_client = WorkerClient()
+    app.state.worker_client = worker_client
+    logger.info("Worker sidecar client initialized (base_url=%s)", settings.WORKER_BASE_URL)
 
     # Start LLM Explanation Worker — generates plain-English trade explanations
     # asynchronously after each suggestion is committed to the database.
@@ -187,6 +210,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     app.state.explanation_worker_task = explanation_worker_task
     logger.info("LLM explanation worker started")
+
+    # Start RAG corpus refresh worker — incrementally embeds new news events
+    # (ai_raw_events → ai_document_embeddings) on startup and every
+    # RAG_REFRESH_INTERVAL_HOURS hours.  Paced, resumable, and Redis-locked so
+    # at most one backfill runs at a time across all processes.
+    from app.ai.rag.backfill_service import run_rag_refresh_worker
+    rag_refresh_task = asyncio.create_task(
+        run_rag_refresh_worker(get_redis()), name="rag_corpus_refresh"
+    )
+    app.state.rag_refresh_task = rag_refresh_task
+    logger.info(
+        "RAG corpus refresh worker started (interval=%dh)",
+        settings.RAG_REFRESH_INTERVAL_HOURS,
+    )
 
     logger.info("All services initialized — ready")
     yield
@@ -202,6 +239,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Stop signal scheduler
     if hasattr(app.state, "signal_scheduler") and app.state.signal_scheduler:
         await app.state.signal_scheduler.stop()
+
+    # Stop instrument sync service
+    if hasattr(app.state, "instrument_sync_service") and app.state.instrument_sync_service:
+        await app.state.instrument_sync_service.stop()
 
     # Cancel CAI Redis listener
     if hasattr(app.state, "cai_listener_task") and app.state.cai_listener_task:
@@ -219,21 +260,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
 
-    # Cancel P&L worker
-    if hasattr(app.state, "pnl_worker_task") and app.state.pnl_worker_task:
-        app.state.pnl_worker_task.cancel()
-        try:
-            await asyncio.wait_for(app.state.pnl_worker_task, timeout=5.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
-            pass
-
-    # Cancel Strategy SL/TP worker
-    if hasattr(app.state, "sl_tp_worker_task") and app.state.sl_tp_worker_task:
-        app.state.sl_tp_worker_task.cancel()
-        try:
-            await asyncio.wait_for(app.state.sl_tp_worker_task, timeout=5.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
-            pass
+    # Close the WorkerClient connection pool
+    if hasattr(app.state, "worker_client") and app.state.worker_client:
+        await app.state.worker_client.aclose()
 
     # Cancel LLM explanation worker
     if hasattr(app.state, "explanation_worker_task") and app.state.explanation_worker_task:
@@ -242,6 +271,32 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             await asyncio.wait_for(app.state.explanation_worker_task, timeout=5.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
+
+    # Cancel RAG corpus refresh worker — 10s timeout to allow an in-flight embed
+    # API call to be interrupted and the lock/metrics to be cleaned up cleanly.
+    if hasattr(app.state, "rag_refresh_task") and app.state.rag_refresh_task:
+        app.state.rag_refresh_task.cancel()
+        try:
+            await asyncio.wait_for(app.state.rag_refresh_task, timeout=10.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
+    # Shut down Gemini Request Manager — drains the permit queue and cancels all waiting
+    # callers before the LLM transport is closed.  Order matters: callers must receive
+    # GeminiRateLimitError (not a transport error) if they are still queued at shutdown.
+    try:
+        from app.ai.intelligence.request_manager import GeminiRequestManager
+        if GeminiRequestManager._instance is not None:
+            await GeminiRequestManager._instance.aclose()
+    except Exception as exc:
+        logger.debug("Gemini request manager close failed (non-fatal): %s", exc)
+
+    # Close the Gemini LLM client transport
+    try:
+        from app.ai.intelligence.llm_client import close_intelligence_client
+        await close_intelligence_client()
+    except Exception as exc:
+        logger.debug("Gemini client close failed (non-fatal): %s", exc)
 
     await market_feed_service.stop()
     await upstox_client.stop()
@@ -295,6 +350,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_users.router, prefix=f"{settings.API_V1_PREFIX}/admin", tags=["Admin — User Management"])
     app.include_router(admin_strategies.router, prefix=f"{settings.API_V1_PREFIX}/admin/strategies", tags=["Admin — Strategy Governance"])
     app.include_router(admin_training.router,    prefix=f"{settings.API_V1_PREFIX}/admin/training",   tags=["Admin — ML Training Console"])
+    app.include_router(admin_worker.router,      prefix=f"{settings.API_V1_PREFIX}/admin/worker",     tags=["Admin — Worker Control"])
     app.include_router(admin_training.ws_router, prefix=f"{settings.API_V1_PREFIX}/admin/training",   tags=["Admin — ML Training WebSocket"])
     app.include_router(watchlist.router, prefix=f"{settings.API_V1_PREFIX}/watchlist", tags=["Watchlist"])
     app.include_router(market_data.router, prefix=f"{settings.API_V1_PREFIX}/market-data", tags=["Market Data"])
@@ -357,15 +413,37 @@ def create_app() -> FastAPI:
     async def health_readiness() -> JSONResponse:
         """
         Readiness probe for Kubernetes.
-        
-        Checks if service can handle traffic by verifying critical dependencies.
-        
+
+        Checks critical dependencies (DB + Redis).  The worker sidecar is
+        checked as a non-critical component: if unreachable the API stays
+        ready (fail-open) but the response body reflects the degraded state.
+
         Returns:
             200: Ready to accept traffic
-            503: Not ready (dependencies unavailable)
+            503: Not ready (DB or Redis unavailable)
         """
+        from app.core.health_checks import check_worker
         is_ready, status_data = await readiness_check()
-        
+
+        # Worker health is non-critical: a restarting worker must not take the
+        # API out of service rotation.  Add the check for visibility only.
+        if hasattr(app.state, "worker_client") and app.state.worker_client:
+            from app.core.health_checks import HealthStatus
+            # Reconstruct a HealthStatus so we can add the worker check with
+            # the correct critical=False flag, then re-derive is_ready.
+            result = HealthStatus()
+            result.status = status_data.get("status", HealthStatus.HEALTHY)
+            result.checks = status_data.get("checks", {})
+            result.timestamp = status_data.get("timestamp", "")
+            worker_healthy, worker_details = await check_worker(
+                app.state.worker_client, timeout=1.0
+            )
+            result.add_check("worker", worker_healthy, worker_details, critical=False)
+            # Ready if status is "healthy" or "degraded" (worker non-critical).
+            # "unhealthy" only when a critical check (DB/Redis) failed above.
+            is_ready = result.status != HealthStatus.UNHEALTHY
+            status_data = result.to_dict()
+
         return JSONResponse(
             status_code=http_status.HTTP_200_OK if is_ready else http_status.HTTP_503_SERVICE_UNAVAILABLE,
             content=status_data

@@ -114,6 +114,18 @@ class DatabaseError(CortexBaseError):
     status_code = 500
 
 
+class SyncSanityError(CortexBaseError):
+    """Raised when an ingestion sync is aborted by a sanity guard.
+
+    Signals that the source payload was implausibly small/incomplete (e.g. a
+    truncated instrument file) and the transaction was rolled back rather than
+    allowed to corrupt the table (e.g. mass-delisting the universe).
+    """
+
+    default_message = "Sync aborted by sanity guard; source payload failed validation"
+    status_code = 502
+
+
 # ── Paper Trading ───────────────────────────────────────────────────────────────
 
 class InsufficientFundsError(CortexBaseError):

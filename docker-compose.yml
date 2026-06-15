@@ -83,31 +83,6 @@ services:
     networks:
       - cortex-network
 
-  # ── Ollama (Local LLM with GPU) ───────────────────────────────────────────
-  ollama:
-    image: ollama/ollama:latest
-    container_name: cortex-ollama
-    restart: unless-stopped
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-    networks:
-      - cortex-network
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-
   # ── Prometheus (Metrics) ──────────────────────────────────────────────────
   prometheus:
     image: prom/prometheus:v2.53.0
@@ -170,7 +145,51 @@ services:
     networks:
       - cortex-network
 
-  # ── API (FastAPI + Worker) ───────────────────────────────────────────────
+  # ── Worker Sidecar (Background Tasks + Control Plane) ────────────────────
+  # Hosts all 13 background tasks under the supervised() restart framework.
+  # Exposes port 8001 on the internal Docker network ONLY — never on the host.
+  # The api service communicates with it via httpx over cortex-network.
+  #
+  # start_period: 60s accounts for ML model loading time on cold start.
+  # INTERNAL_API_SECRET must be set in .env (64+ hex chars, no default).
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cortex-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-cortex}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-cortex_db}"
+      REDIS_URL: "redis://redis:6379/0"
+    expose:
+      - "8001"
+    volumes:
+      - ml_models:/app/models
+      - ./.cache:/app/.cache
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    networks:
+      - cortex-network
+    command: >
+      uvicorn app.worker_app:app
+        --host 0.0.0.0
+        --port 8001
+        --workers 1
+        --loop uvloop
+        --log-level info
+
+  # ── API (FastAPI) ─────────────────────────────────────────────────────────
   api:
     build:
       context: ./backend
@@ -182,7 +201,7 @@ services:
     environment:
       DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-cortex}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-cortex_db}"
       REDIS_URL: "redis://redis:6379/0"
-      OLLAMA_BASE_URL: "http://ollama:11434"
+      WORKER_BASE_URL: "http://worker:8001"
     ports:
       - "8000:8000"
     volumes:
@@ -193,7 +212,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      ollama:
+      worker:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -234,7 +253,6 @@ volumes:
   postgres_data_tsdb:
     external: true
   redis_data:
-  ollama_data:
   ml_models:
   prometheus_data:
   grafana_data:

@@ -1,233 +1,64 @@
 """
-Test Ollama LLM Client
+Pure-logic unit tests for the Gemini-backed CortexIntelligenceClient.
 
-Tests OllamaClient with mocked ollama.Client.
+These cover deterministic, side-effect-free logic with literal inputs only —
+error classification, vector normalization, and the model-id property.  Live
+generation, structured output, and embeddings are verified against the real
+Gemini API in the integration suite, not here.
 """
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
-import asyncio
+from __future__ import annotations
 
-from app.ai.intelligence.llm_client import OllamaClient, get_ollama_client
+import math
 
-
-@pytest.fixture
-def mock_ollama_client():
-    """Mock ollama.Client."""
-    with patch("app.ai.intelligence.llm_client.ollama.Client") as mock:
-        yield mock
+from app.ai.intelligence import llm_client as L
+from app.ai.intelligence.llm_client import CortexIntelligenceClient
 
 
-@pytest.fixture
-def ollama_client(mock_ollama_client):
-    """Create OllamaClient with mocked ollama.Client."""
-    # Reset singleton
-    OllamaClient._instance = None
-    client = OllamaClient()
-    return client
+def _exc(code):
+    """A bare exception carrying an HTTP-style status code (not a service mock)."""
+    e = Exception("boom")
+    e.code = code
+    return e
 
 
-@pytest.mark.asyncio
-async def test_ollama_client_singleton():
-    """Test OllamaClient is a singleton."""
-    OllamaClient._instance = None
-    client1 = OllamaClient()
-    client2 = OllamaClient()
-    assert client1 is client2
+# ── Error classification ─────────────────────────────────────────────────────
+
+def test_permanent_errors():
+    for code in (400, 401, 403, 404):
+        assert L._is_permanent(_exc(code)) is True
+        assert L._is_transient(_exc(code)) is False
 
 
-@pytest.mark.asyncio
-async def test_verify_model_availability_success(ollama_client):
-    """Test verify_model_availability succeeds when model exists."""
-    # Mock list response
-    ollama_client.client.list = MagicMock(return_value={
-        "models": [
-            {"name": "llama3.1:8b"},
-            {"name": "mistral:7b"},
-        ]
-    })
-    
-    result = await ollama_client.verify_model_availability(max_retries=1)
-    
-    assert result is True
-    ollama_client.client.list.assert_called_once()
+def test_transient_errors():
+    for code in (429, 500, 502, 503, 504):
+        assert L._is_transient(_exc(code)) is True
+        assert L._is_permanent(_exc(code)) is False
 
 
-@pytest.mark.asyncio
-async def test_verify_model_availability_model_not_found(ollama_client):
-    """Test verify_model_availability fails when model not found."""
-    ollama_client.client.list = MagicMock(return_value={
-        "models": [
-            {"name": "mistral:7b"},
-        ]
-    })
-    
-    result = await ollama_client.verify_model_availability(max_retries=1)
-    
-    assert result is False
+# ── Vector normalization ─────────────────────────────────────────────────────
+
+def test_l2_normalize_unit_norm():
+    v = L._l2_normalize([3.0, 4.0])
+    assert math.isclose(math.sqrt(sum(x * x for x in v)), 1.0, rel_tol=1e-9)
 
 
-@pytest.mark.asyncio
-async def test_verify_model_availability_retries(ollama_client):
-    """Test verify_model_availability retries on failure."""
-    # Fail first 2 times, succeed on 3rd
-    ollama_client.client.list = MagicMock(side_effect=[
-        Exception("Connection refused"),
-        Exception("Connection refused"),
-        {"models": [{"name": "llama3.1:8b"}]},
-    ])
-    
-    result = await ollama_client.verify_model_availability(
-        max_retries=3,
-        retry_delay=0.1,  # Fast retry for testing
-    )
-    
-    assert result is True
-    assert ollama_client.client.list.call_count == 3
+def test_l2_normalize_zero_vector_is_noop():
+    assert L._l2_normalize([0.0, 0.0, 0.0]) == [0.0, 0.0, 0.0]
 
 
-@pytest.mark.asyncio
-async def test_verify_model_availability_max_retries_exceeded(ollama_client):
-    """Test verify_model_availability fails after max retries."""
-    ollama_client.client.list = MagicMock(side_effect=Exception("Connection refused"))
-    
-    result = await ollama_client.verify_model_availability(
-        max_retries=2,
-        retry_delay=0.1,
-    )
-    
-    assert result is False
-    assert ollama_client.client.list.call_count == 2
+# ── Thinking-config model routing ────────────────────────────────────────────
+
+def test_thinking_param_routing_by_model_generation():
+    # Gemini 3.x uses thinking_level; 2.x uses integer thinking_budget.
+    assert L._model_uses_thinking_budget("gemini-2.5-flash") is True
+    assert L._model_uses_thinking_budget("gemini-2.0-flash") is True
+    assert L._model_uses_thinking_budget("gemini-3.5-flash") is False
+    assert L._model_uses_thinking_budget("gemini-flash-latest") is False
 
 
-@pytest.mark.asyncio
-async def test_generate_success(ollama_client):
-    """Test generate returns response successfully."""
-    ollama_client.client.chat = MagicMock(return_value={
-        "message": {"content": "This is a test response"},
-        "done": True,
-        "total_duration": 1000000,
-        "prompt_eval_count": 10,
-        "eval_count": 20,
-    })
-    
-    response = await ollama_client.generate(
-        prompt="Test prompt",
-        system="Test system",
-        temperature=0.7,
-    )
-    
-    assert response["content"] == "This is a test response"
-    assert response["model"] == "llama3.1:8b"
-    assert response["done"] is True
-    
-    # Verify chat was called with correct args
-    call_args = ollama_client.client.chat.call_args
-    assert call_args[1]["model"] == "llama3.1:8b"
-    assert len(call_args[1]["messages"]) == 2
-    assert call_args[1]["messages"][0]["role"] == "system"
-    assert call_args[1]["messages"][1]["role"] == "user"
+# ── model_id property ────────────────────────────────────────────────────────
 
-
-@pytest.mark.asyncio
-async def test_generate_without_system_prompt(ollama_client):
-    """Test generate works without system prompt."""
-    ollama_client.client.chat = MagicMock(return_value={
-        "message": {"content": "Response"},
-        "done": True,
-    })
-    
-    response = await ollama_client.generate(prompt="Test")
-    
-    # Should only have user message
-    call_args = ollama_client.client.chat.call_args
-    assert len(call_args[1]["messages"]) == 1
-    assert call_args[1]["messages"][0]["role"] == "user"
-
-
-@pytest.mark.asyncio
-async def test_generate_with_retry_success_after_failure(ollama_client):
-    """Test generate retries and succeeds."""
-    ollama_client.client.chat = MagicMock(side_effect=[
-        Exception("Timeout"),
-        {"message": {"content": "Success"}, "done": True},
-    ])
-    
-    response = await ollama_client.generate(prompt="Test")
-    
-    assert response["content"] == "Success"
-    assert ollama_client.client.chat.call_count == 2
-
-
-@pytest.mark.asyncio
-async def test_generate_fails_after_max_retries(ollama_client):
-    """Test generate raises after max retries."""
-    ollama_client.client.chat = MagicMock(side_effect=Exception("Timeout"))
-    
-    with pytest.raises(Exception, match="failed after 3 attempts"):
-        await ollama_client.generate(prompt="Test")
-
-
-@pytest.mark.asyncio
-async def test_generate_json_success(ollama_client):
-    """Test generate_json parses JSON response."""
-    ollama_client.client.chat = MagicMock(return_value={
-        "message": {"content": '{"key": "value", "number": 42}'},
-        "done": True,
-    })
-    
-    result = await ollama_client.generate_json(prompt="Return JSON")
-    
-    assert result == {"key": "value", "number": 42}
-
-
-@pytest.mark.asyncio
-async def test_generate_json_extracts_from_markdown(ollama_client):
-    """Test generate_json extracts JSON from markdown code blocks."""
-    ollama_client.client.chat = MagicMock(return_value={
-        "message": {"content": '```json\n{"extracted": true}\n```'},
-        "done": True,
-    })
-    
-    result = await ollama_client.generate_json(prompt="Return JSON")
-    
-    assert result == {"extracted": True}
-
-
-@pytest.mark.asyncio
-async def test_generate_json_invalid_json_raises(ollama_client):
-    """Test generate_json raises on invalid JSON."""
-    ollama_client.client.chat = MagicMock(return_value={
-        "message": {"content": "This is not JSON"},
-        "done": True,
-    })
-    
-    with pytest.raises(ValueError, match="Invalid JSON response"):
-        await ollama_client.generate_json(prompt="Return JSON")
-
-
-@pytest.mark.asyncio
-async def test_health_check_success(ollama_client):
-    """Test health_check returns True when service is healthy."""
-    ollama_client.client.list = MagicMock(return_value={"models": []})
-    
-    result = await ollama_client.health_check()
-    
-    assert result is True
-
-
-@pytest.mark.asyncio
-async def test_health_check_failure(ollama_client):
-    """Test health_check returns False on failure."""
-    ollama_client.client.list = MagicMock(side_effect=Exception("Connection refused"))
-    
-    result = await ollama_client.health_check()
-    
-    assert result is False
-
-
-def test_get_ollama_client_returns_singleton():
-    """Test get_ollama_client returns singleton instance."""
-    with patch("app.ai.intelligence.llm_client.ollama.Client"):
-        client1 = get_ollama_client()
-        client2 = get_ollama_client()
-        assert client1 is client2
+def test_model_id_property():
+    inst = object.__new__(CortexIntelligenceClient)
+    inst._model = "gemini-2.5-flash"
+    assert inst.model_id == "gemini/gemini-2.5-flash"

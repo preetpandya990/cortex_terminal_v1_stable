@@ -198,13 +198,15 @@ async def compute_price_targets_ml(
                 InstrumentMaster.trading_symbol == symbol_upper,
                 InstrumentMaster.exchange == "NSE",
                 InstrumentMaster.instrument_type == "EQ",
+                # Fresh ML price targets are only meaningful for live instruments.
+                InstrumentMaster.is_active.is_(True),
             )
         )
         .limit(1)
     )
     instr_row = (await session.execute(instr_stmt)).first()
     if instr_row is None:
-        logger.debug("ml_price_targets: no NSE EQ entry for symbol=%s", symbol_upper)
+        logger.debug("ml_price_targets: no active NSE EQ entry for symbol=%s", symbol_upper)
         return None
     instrument_key: str = instr_row[0]
 
@@ -281,13 +283,15 @@ async def _fetch_volatility_context(
                 InstrumentMaster.trading_symbol == symbol,
                 InstrumentMaster.exchange == "NSE",
                 InstrumentMaster.instrument_type == "EQ",
+                # Volatility context for fresh targets — live instruments only.
+                InstrumentMaster.is_active.is_(True),
             )
         )
         .limit(1)
     )
     instr_row = (await session.execute(instr_stmt)).first()
     if instr_row is None:
-        logger.debug("price_targets: no NSE EQ entry for symbol=%s", symbol)
+        logger.debug("price_targets: no active NSE EQ entry for symbol=%s", symbol)
         return None
     instrument_key: str = instr_row[0]
 

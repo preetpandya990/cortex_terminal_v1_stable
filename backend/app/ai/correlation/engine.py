@@ -154,6 +154,10 @@ class EventCorrelationEngine:
         self.redis = redis
         self.scanner_cache = scanner_cache
 
+        # Ceiling for the consensus signal-gather (ML → news forecast).
+        from app.core.config import get_settings
+        self._gather_timeout = get_settings().CONSENSUS_GATHER_TIMEOUT
+
         # Circuit breakers per agent
         self.circuit_breakers = {
             "scanner": CircuitBreaker(failure_threshold=5, timeout_seconds=60),
@@ -270,7 +274,7 @@ class EventCorrelationEngine:
             try:
                 ai_signal, ml_signal, latencies = await asyncio.wait_for(
                     self._gather_signals_pathway1(db, scanner_signal),
-                    timeout=5.0,
+                    timeout=self._gather_timeout,
                 )
             except asyncio.TimeoutError:
                 logger.warning(
@@ -415,23 +419,15 @@ class EventCorrelationEngine:
 
                 scanner_signal, ml_signal, latencies = await asyncio.wait_for(
                     self._gather_signals_pathway2(db, symbol, event),
-                    timeout=5.0,
+                    timeout=self._gather_timeout,
                 )
 
-                # AI signal from event
-                ai_signal = {
-                    "score": float(event.impact_score),
-                    "confidence": float(event.classification_confidence),
-                    "sentiment": "positive" if event.impact_score > 0 else "negative",
-                    "event_type": event.event_type,
-                    "event_count": 1,
-                    "available": True,
-                    "events": [{
-                        "id": event.id,
-                        "type": event.event_type,
-                        "impact": float(event.impact_score)
-                    }],
-                }
+                # AI/news slot: Gemini news forecast over the ML's indicators +
+                # recent news (incl. this trigger event); deterministic event-score
+                # fallback on any failure.
+                ai_signal = await self.assembler.gather_news_forecast(
+                    db, symbol, ml_signal=ml_signal,
+                )
 
                 suggestion = await self._compute_consensus(
                     db=db,
@@ -485,17 +481,18 @@ class EventCorrelationEngine:
         start_time = datetime.now(timezone.utc)
         symbol = scanner_signal.get("instrument_key")
 
-        # Parallel async calls to AI and ML
-        ai_task = self.assembler.gather_event_signals(db, symbol)
-        ml_task = self.assembler.gather_ml_signals(db, symbol)
+        # ML first (its indicators feed the news forecaster), then the AI/news
+        # forecast.  Sequential by necessity: both share one DB session, and the
+        # forecaster reasons over the ML's exact indicator snapshot.
+        ml_start = datetime.now(timezone.utc)
+        ml_signal = await self.assembler.gather_ml_signals(db, symbol)
+        ml_latency = (datetime.now(timezone.utc) - ml_start).total_seconds() * 1000
 
         ai_start = datetime.now(timezone.utc)
-        ai_signal = await ai_task
+        ai_signal = await self.assembler.gather_news_forecast(
+            db, symbol, ml_signal=ml_signal,
+        )
         ai_latency = (datetime.now(timezone.utc) - ai_start).total_seconds() * 1000
-
-        ml_start = datetime.now(timezone.utc)
-        ml_signal = await ml_task
-        ml_latency = (datetime.now(timezone.utc) - ml_start).total_seconds() * 1000
 
         total_latency = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
 

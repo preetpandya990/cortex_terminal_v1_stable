@@ -132,6 +132,33 @@ async def check_redis(timeout: float = 2.0) -> tuple[bool, dict[str, Any]]:
         return False, {"connected": False, "error": str(exc)}
 
 
+async def check_worker(worker_client: Any, timeout: float = 1.0) -> tuple[bool, dict[str, Any]]:
+    """
+    Check worker sidecar reachability.
+
+    Intentionally fail-open: the API must not fail readiness checks because the
+    worker is temporarily restarting.  critical=False in the readiness check
+    ensures a degraded worker keeps the API in service.
+
+    Args:
+        worker_client: WorkerClient instance (from app.state.worker_client).
+        timeout:       Max seconds to wait for a response.
+
+    Returns:
+        (reachable, details) tuple — never raises.
+    """
+    try:
+        async with asyncio.timeout(timeout):
+            result = await worker_client.get_health()
+        if result is not None:
+            return True, {"reachable": True}
+        return False, {"reachable": False, "error": "no_response"}
+    except asyncio.TimeoutError:
+        return False, {"reachable": False, "error": "timeout"}
+    except Exception as exc:
+        return False, {"reachable": False, "error": str(exc)}
+
+
 async def liveness_check() -> dict[str, Any]:
     """
     Liveness probe for Kubernetes.

@@ -40,7 +40,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.fusion.models import AINLPResult, AIEventClassification
-from app.ai.intelligence.llm_client import get_ollama_client
+from app.ai.intelligence.llm_client import Priority, get_ollama_client
 from app.models.upstox_data import InstrumentMaster
 from app.services.symbol_validator import symbol_validator
 
@@ -272,6 +272,8 @@ async def normalize_and_validate_symbols(
                 .where(
                     InstrumentMaster.exchange == exchange,
                     InstrumentMaster.instrument_type == "EQ",
+                    # Only match news against the live tradeable universe.
+                    InstrumentMaster.is_active.is_(True),
                     or_(*name_conds),
                 )
                 # Cap results at (unresolved × 3) to guard against pathological
@@ -533,6 +535,7 @@ class EventClassifier:
                     "names. If you are not certain of a symbol, omit it rather than guessing."
                 ),
                 temperature=0.1,
+                priority=Priority.MEDIUM,
             )
 
             return {

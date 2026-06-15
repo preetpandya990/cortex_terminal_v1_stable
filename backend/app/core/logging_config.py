@@ -5,8 +5,21 @@ Production-grade logging setup with environment-based log levels and PII masking
 """
 import logging
 import logging.config
+import os
 import re
 from typing import Any
+
+# Loggers whose DEBUG output forms the explanation-generation pipeline trace
+# (worker orchestration + LLM provider/stream events + RAG retrieval/embedding).
+# Routed to a dedicated file when EXPLANATION_PIPELINE_LOG_ENABLED is set.
+_EXPLANATION_PIPELINE_LOGGERS = (
+    "app.api.v1.ai_stream",                      # SSE: 3-stage decision + delivery
+    "app.ai.intelligence.explanation_worker",
+    "app.ai.intelligence.llm_client",
+    "app.ai.rag",
+)
+_PIPELINE_LOG_MAX_BYTES = 10 * 1024 * 1024   # 10 MB per file before rotation
+_PIPELINE_LOG_BACKUP_COUNT = 5               # retain 5 rotated files (~60 MB cap)
 
 
 class WebSocketPingPongFilter(logging.Filter):
@@ -49,13 +62,23 @@ class WebSocketPingPongFilter(logging.Filter):
         return True  # Keep all other logs
 
 
-def setup_logging(log_level: str = "INFO", environment: str = "production") -> None:
+def setup_logging(
+    log_level: str = "INFO",
+    environment: str = "production",
+    *,
+    explanation_log_enabled: bool = False,
+    explanation_log_path: str = "logs/explanation_pipeline.log",
+) -> None:
     """
     Configure structured JSON logging for the application.
-    
+
     Args:
         log_level: Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
         environment: Environment name (development, staging, production)
+        explanation_log_enabled: When True, route the explanation-pipeline
+            loggers (worker + llm_client + rag) at DEBUG to a dedicated rotating
+            file, keeping console at INFO+ for them.  See _EXPLANATION_PIPELINE_LOGGERS.
+        explanation_log_path: Destination path for that diagnostics log file.
     """
     # Determine log level based on environment
     if environment == "development":
@@ -130,6 +153,41 @@ def setup_logging(log_level: str = "INFO", environment: str = "production") -> N
         },
     }
     
+    # ── Dedicated explanation-pipeline diagnostics log (opt-in) ───────────────
+    # Isolates the explanation worker + LLM client + RAG loggers (at DEBUG) into
+    # a rotating file so their detailed timing trace is readable away from the
+    # multi-WebSocket console.  A leveled console handler keeps INFO+ for these
+    # loggers on stdout (so normal operation stays visible at a glance) while the
+    # file additionally captures DEBUG.  propagate=False prevents duplication via
+    # the parent "app" logger.
+    if explanation_log_enabled:
+        # RotatingFileHandler opens its file lazily (delay=True), but ensure the
+        # parent directory exists so the first emit cannot fail on a fresh clone.
+        os.makedirs(os.path.dirname(explanation_log_path) or ".", exist_ok=True)
+        logging_config["handlers"]["explanation_console"] = {
+            "class": "logging.StreamHandler",
+            "formatter": "json",
+            "stream": "ext://sys.stdout",
+            "level": "INFO",
+            "filters": ["websocket_filter"],
+        }
+        logging_config["handlers"]["explanation_file"] = {
+            "class": "logging.handlers.RotatingFileHandler",
+            "formatter": "json",
+            "filename": explanation_log_path,
+            "maxBytes": _PIPELINE_LOG_MAX_BYTES,
+            "backupCount": _PIPELINE_LOG_BACKUP_COUNT,
+            "encoding": "utf-8",
+            "delay": True,
+            "level": "DEBUG",
+        }
+        for logger_name in _EXPLANATION_PIPELINE_LOGGERS:
+            logging_config["loggers"][logger_name] = {
+                "level": "DEBUG",
+                "handlers": ["explanation_console", "explanation_file"],
+                "propagate": False,
+            }
+
     logging.config.dictConfig(logging_config)
     logger = logging.getLogger("app")
     logger.info(
@@ -138,6 +196,9 @@ def setup_logging(log_level: str = "INFO", environment: str = "production") -> N
             "log_level": log_level,
             "environment": environment,
             "websocket_filter": "enabled",
+            "explanation_pipeline_log": (
+                explanation_log_path if explanation_log_enabled else "disabled"
+            ),
         },
     )
 

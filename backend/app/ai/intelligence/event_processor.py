@@ -269,6 +269,7 @@ async def event_processing_loop(
                         processor.signal_assembler.feature_loader = FeatureLoader(
                             db=db,
                             redis=redis,
+                            session_factory=session_factory,
                             sequence_length=_seq_len,
                             n_features=_n_features,
                             feature_names=_feature_names,

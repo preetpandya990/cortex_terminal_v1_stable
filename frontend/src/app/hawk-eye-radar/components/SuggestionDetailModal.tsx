@@ -1,18 +1,18 @@
 "use client";
 
 import { useMemo } from "react";
-import { TrendingUp as TrendingUpIcon, TrendingDown, Clock, Brain, Cpu, Target, Shield } from "lucide-react";
+import { TrendingUp as TrendingUpIcon, TrendingDown, Clock, Brain, Cpu, Target, Shield, Sparkles, ArrowUpRight } from "lucide-react";
 import {
   Dialog,
   DialogContent,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 import { FundamentalsTab } from "@/components/hawk-eye-radar/FundamentalsTab";
+import { AnalysisCardsSection } from "@/components/AnalysisCardsSection";
 import type { TradeSuggestion } from "@/types/trade_suggestions";
 
 const SIGNAL_SKIP_KEYS = new Set([
@@ -99,16 +99,146 @@ function SignalPanel({
   );
 }
 
+// ── ML Predictor breakdown ──────────────────────────────────────────────────
+// Renders the ensemble + per-model (XGBoost / GRU) detail that the generic
+// SignalPanel would otherwise dump as JSON.  Reads the ml_signal shape produced
+// by SignalAssembler.gather_ml_signals (prediction + models sub-dicts).
+
+function fmtPct(value: unknown): string {
+  const n = Number(value);
+  return Number.isFinite(n) ? `${(n * 100).toFixed(0)}%` : "—";
+}
+
+function ProbBar({
+  probs,
+  compact = false,
+}: {
+  probs: Record<string, unknown>;
+  compact?: boolean;
+}) {
+  const buy = Number(probs.buy) || 0;
+  const sell = Number(probs.sell) || 0;
+  const hold = Number(probs.hold) || 0;
+  return (
+    <div className="space-y-1">
+      <div className="flex h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
+        <div className="bg-emerald-500" style={{ width: `${buy * 100}%` }} />
+        <div className="bg-rose-500" style={{ width: `${sell * 100}%` }} />
+        <div className="bg-slate-300" style={{ width: `${hold * 100}%` }} />
+      </div>
+      {!compact && (
+        <div className="flex justify-between text-[10px] tabular-nums">
+          <span className="text-emerald-600">Buy {fmtPct(buy)}</span>
+          <span className="text-rose-600">Sell {fmtPct(sell)}</span>
+          <span className="text-slate-500">Hold {fmtPct(hold)}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EnsembleStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex flex-col">
+      <span className="text-[10px] uppercase tracking-wide text-indigo-400">{label}</span>
+      <span className="text-sm font-semibold text-indigo-900 tabular-nums">{value}</span>
+    </div>
+  );
+}
+
+function MLPredictorPanel({ ml }: { ml: Record<string, unknown> }) {
+  const prediction = (ml?.prediction ?? {}) as Record<string, unknown>;
+  const models = (ml?.models ?? {}) as Record<string, Record<string, unknown> | null>;
+  const score = Number(ml?.score) || 0;
+  const ensembleDir =
+    (prediction.direction as string | undefined) ??
+    (score > 0 ? "BUY" : score < 0 ? "SELL" : "HOLD");
+  const probs = prediction.probabilities as Record<string, unknown> | undefined;
+
+  const rows = (["xgboost", "gru"] as const)
+    .map((key) => ({ key, label: key === "xgboost" ? "XGBoost" : "GRU", m: models[key] }))
+    .filter((r): r is { key: "xgboost" | "gru"; label: string; m: Record<string, unknown> } => !!r.m);
+
+  return (
+    <div className="rounded-lg border border-indigo-200 bg-indigo-50 p-3">
+      <div className="flex items-center gap-2 mb-2.5">
+        <Cpu className="h-4 w-4 text-indigo-600" />
+        <p className="text-sm font-semibold text-indigo-900">ML Predictor</p>
+      </div>
+
+      {!ml?.available ? (
+        <p className="text-xs italic text-indigo-700">No ML prediction available</p>
+      ) : (
+        <>
+          {/* Ensemble summary */}
+          <div className="grid grid-cols-3 gap-x-4 gap-y-1.5 mb-3">
+            <EnsembleStat label="Ensemble" value={ensembleDir} />
+            <EnsembleStat label="Confidence" value={fmtPct(ml.confidence)} />
+            {prediction.conviction_scale != null && (
+              <EnsembleStat label="Conviction" value={fmtPct(prediction.conviction_scale)} />
+            )}
+          </div>
+
+          {/* Ensemble probability distribution */}
+          {probs && (
+            <div className="mb-3">
+              <ProbBar probs={probs} />
+            </div>
+          )}
+
+          {/* Per-model breakdown */}
+          {rows.length > 0 && (
+            <div className="space-y-2">
+              {rows.map(({ key, label, m }) => (
+                <div
+                  key={key}
+                  className="rounded-md border border-indigo-100 bg-white/60 px-2.5 py-2"
+                >
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="text-[11px] font-semibold text-indigo-900">{label}</span>
+                    <span className="text-[11px] font-semibold text-indigo-700 tabular-nums">
+                      {(m.direction as string) ?? "—"}
+                      {m.weight != null && (
+                        <span className="font-normal text-indigo-400">
+                          {" · wt "}
+                          {Number(m.weight).toFixed(2)}
+                        </span>
+                      )}
+                    </span>
+                  </div>
+                  {(m.probabilities as Record<string, unknown> | undefined) && (
+                    <ProbBar probs={m.probabilities as Record<string, unknown>} compact />
+                  )}
+                  <div className="mt-1.5 flex items-center justify-between text-[10px] tabular-nums text-indigo-500">
+                    <span>Conviction {fmtPct(m.conviction_scale)}</span>
+                    <span>Threshold {fmtPct(m.threshold)}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 interface SuggestionDetailModalProps {
   suggestion: TradeSuggestion | null;
   open: boolean;
   onClose: () => void;
+  /**
+   * Launches the full DetailPane (live price, chart, trade actions) for this
+   * suggestion.  When provided, an "Open full view" action is shown in the footer.
+   */
+  onOpenFullView?: () => void;
 }
 
 export function SuggestionDetailModal({
   suggestion,
   open,
   onClose,
+  onOpenFullView,
 }: SuggestionDetailModalProps) {
   const timeRemaining = useMemo(() => {
     if (!suggestion) return null;
@@ -184,9 +314,13 @@ export function SuggestionDetailModal({
           </div>
         </DialogHeader>
 
-        <Tabs defaultValue="fundamentals" className="mt-4">
-          <TabsList className="grid w-full grid-cols-2">
+        <Tabs defaultValue="ai" className="mt-4">
+          <TabsList className="grid w-full grid-cols-3">
             <TabsTrigger value="signal">Signal Details</TabsTrigger>
+            <TabsTrigger value="ai" className="gap-1.5">
+              <Sparkles className="h-3.5 w-3.5" />
+              AI Analysis
+            </TabsTrigger>
             <TabsTrigger value="fundamentals">Fundamentals</TabsTrigger>
           </TabsList>
 
@@ -235,12 +369,7 @@ export function SuggestionDetailModal({
                     data={suggestion.ai_signal}
                     theme="violet"
                   />
-                  <SignalPanel
-                    icon={<Cpu className="h-4 w-4 text-indigo-600" />}
-                    title="ML Predictor"
-                    data={suggestion.ml_signal}
-                    theme="indigo"
-                  />
+                  <MLPredictorPanel ml={suggestion.ml_signal} />
                 </div>
               </div>
 
@@ -368,6 +497,20 @@ export function SuggestionDetailModal({
             </div>
           </TabsContent>
 
+          {/* ── AI Analysis tab — ML cards + sectioned LLM explanation ──────── */}
+          {/* Lazy-mounted: AnalysisCardsSection opens its SSE stream only while
+              this tab is active.  Seeded immediately from the suggestion's
+              llm_summary / llm_explanation, then kept live via SSE. */}
+          <TabsContent value="ai">
+            <div className="mt-4">
+              <AnalysisCardsSection
+                instrumentKey={suggestion.instrument_key}
+                symbol={suggestion.trading_symbol ?? suggestion.symbol}
+                suggestion={suggestion}
+              />
+            </div>
+          </TabsContent>
+
           {/* ── Fundamentals tab — lazy mounted (TabsContent returns null when inactive) ── */}
           <TabsContent value="fundamentals">
             <div className="mt-4">
@@ -377,7 +520,15 @@ export function SuggestionDetailModal({
         </Tabs>
 
         {/* Footer Actions */}
-        <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-200 mt-6">
+        <div className="flex items-center justify-between gap-3 pt-4 border-t border-slate-200 mt-6">
+          {onOpenFullView ? (
+            <Button variant="ghost" onClick={onOpenFullView} className="gap-1.5">
+              Open full view
+              <ArrowUpRight className="h-4 w-4" />
+            </Button>
+          ) : (
+            <span />
+          )}
           <Button variant="outline" onClick={onClose}>
             Close
           </Button>

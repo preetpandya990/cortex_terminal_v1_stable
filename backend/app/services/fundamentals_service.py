@@ -620,6 +620,9 @@ async def _resolve_competitor_symbols(
     ]
     if not keys:
         return {}
+    # Identity resolution by explicit key (metadata enrichment): intentionally
+    # NOT filtered on is_active so already-stored fundamentals still resolve
+    # their symbol/name even if the instrument has since delisted.
     result = await db.execute(
         select(
             InstrumentMaster.instrument_key,
@@ -1400,6 +1403,8 @@ async def get_fundamentals(
 
 async def is_eq_instrument(instrument_key: str, db: AsyncSession) -> bool:
     """Returns True iff the instrument is of type EQ. Derivatives return False."""
+    # Type classification by explicit key: a delisted instrument keeps its type,
+    # so this is intentionally NOT filtered on is_active.
     result = await db.execute(
         select(InstrumentMaster.instrument_type)
         .where(InstrumentMaster.instrument_key == instrument_key)

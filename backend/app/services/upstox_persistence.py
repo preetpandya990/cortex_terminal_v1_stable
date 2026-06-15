@@ -38,8 +38,10 @@ async def search_instruments_db(
             stmt = (
                 select(InstrumentMaster)
                 .where(
+                    # Symbol picker: never surface delisted instruments to trade.
+                    InstrumentMaster.is_active.is_(True),
                     InstrumentMaster.trading_symbol.ilike(pattern)
-                    | InstrumentMaster.name.ilike(pattern)
+                    | InstrumentMaster.name.ilike(pattern),
                 )
                 .order_by(InstrumentMaster.trading_symbol)
                 .limit(limit)
@@ -70,6 +72,10 @@ async def get_instruments_paginated(
     Avoids the OFFSET performance cliff for large result sets.
 
     Returns (instruments, next_cursor). next_cursor is None on last page.
+
+    Intentionally returns the full table (active and delisted): this is a generic
+    keyset export over instrument_master, not a tradeable-symbol picker. A caller
+    needing only the live universe should filter is_active on the result.
     """
     stmt = select(InstrumentMaster).order_by(InstrumentMaster.instrument_key)
 
