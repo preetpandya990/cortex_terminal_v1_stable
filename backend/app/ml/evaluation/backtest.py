@@ -34,6 +34,43 @@ logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Decision threshold — principled prior  (Phase C, June 2026)
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# This is the P(UP) operating point used to convert calibrated probabilities to
+# binary UP/DOWN decisions in all TRAINING-SIDE evaluation code (DSR backtests,
+# CPCV OOF Sharpe computation, ensemble weight optimisation, event backtest).
+# It is a PRINCIPLED PRIOR, not a searched value.  Any search over this
+# threshold — even a retrospective grid search — would add trials to N in the
+# Deflated Sharpe Ratio and must be counted.
+#
+# Derivation:
+#   The ATR dead-zone labeling scheme (see ATR_MULTIPLIER_DEFAULT in
+#   target_generator.py) applies a symmetric threshold to both the UP and DOWN
+#   barriers.  After dead-zone removal, the retained label distribution is
+#   structurally balanced (≈ 50 % UP / 50 % DOWN) by construction — the same
+#   fractional threshold filters symmetric tails of the return distribution.
+#
+#   For a balanced binary classification task with equal prior P(UP) = P(DOWN):
+#     · The Bayes-optimal decision boundary is at P(UP) = 0.5.
+#     · Deviating from 0.5 decreases the expected directional accuracy.
+#     · A well-calibrated model maps real-world probabilities to 0.5 at the
+#       decision boundary, so 0.5 is the correct operating point.
+#
+#   This is the training-side threshold — it measures RAW directional skill of
+#   the model.  The production inference threshold (0.55–0.70, regime-adaptive)
+#   is a separate, higher gate applied by EnsemblePredictor._post_process to
+#   filter low-conviction signals before they reach the order router.  That gate
+#   is derived from volatility-regime bands (not from search) and is documented
+#   in ensemble_predictor.py.  The two thresholds serve different purposes and
+#   their justifications are independent.
+#
+# Single source of truth: all evaluation-side `>= threshold` comparisons MUST
+# reference this constant so that any future change propagates consistently.
+TRAINING_DECISION_THRESHOLD: float = 0.5
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Position mapping
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -263,7 +300,7 @@ def compute_cpcv_path_net_sharpes(
     sharpes: list[float] = []
     for pi in range(n_paths):
         p_ens  = w_xgb * xgb_cal_matrix[:, pi] + w_gru * p_gru_f
-        active = p_ens >= 0.5
+        active = p_ens >= TRAINING_DECISION_THRESHOLD
         if int(active.sum()) < 2:
             sharpes.append(float("nan"))
             continue

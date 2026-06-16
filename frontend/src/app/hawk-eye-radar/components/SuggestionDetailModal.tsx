@@ -1,7 +1,20 @@
 "use client";
 
-import { useMemo } from "react";
-import { TrendingUp as TrendingUpIcon, TrendingDown, Clock, Brain, Cpu, Target, Shield, Sparkles, ArrowUpRight } from "lucide-react";
+import { useMemo, useRef, useEffect } from "react";
+import {
+  TrendingUp as TrendingUpIcon,
+  TrendingDown,
+  Clock,
+  Brain,
+  Cpu,
+  Target,
+  Shield,
+  Sparkles,
+  ArrowUpRight,
+  X,
+  ChevronLeft,
+  ChevronRight,
+} from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -13,6 +26,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 import { FundamentalsTab } from "@/components/hawk-eye-radar/FundamentalsTab";
 import { AnalysisCardsSection } from "@/components/AnalysisCardsSection";
+import { useFocusTrap } from "@/hooks/useFocusTrap";
 import type { TradeSuggestion } from "@/types/trade_suggestions";
 
 const SIGNAL_SKIP_KEYS = new Set([
@@ -20,23 +34,23 @@ const SIGNAL_SKIP_KEYS = new Set([
 ]);
 
 const SIGNAL_KEY_LABELS: Record<string, string> = {
-  signal:        "Direction",
-  score:         "Score",
-  rsi:           "RSI",
-  volume_ratio:  "Vol Ratio",
+  signal:           "Direction",
+  score:            "Score",
+  rsi:              "RSI",
+  volume_ratio:     "Vol Ratio",
   price_change_pct: "Price Δ%",
-  last_price:    "Price",
-  previous_close: "Prev Close",
-  volume:        "Volume",
-  direction:     "Direction",
-  confidence:    "Confidence",
-  event_count:   "Events",
-  sentiment:     "Sentiment",
-  available:     "Available",
-  ml_direction:  "Direction",
-  buy_prob:      "Buy Prob",
-  sell_prob:     "Sell Prob",
-  hold_prob:     "Hold Prob",
+  last_price:       "Price",
+  previous_close:   "Prev Close",
+  volume:           "Volume",
+  direction:        "Direction",
+  confidence:       "Confidence",
+  event_count:      "Events",
+  sentiment:        "Sentiment",
+  available:        "Available",
+  ml_direction:     "Direction",
+  buy_prob:         "Buy Prob",
+  sell_prob:        "Sell Prob",
+  hold_prob:        "Hold Prob",
 };
 
 function formatSignalValue(key: string, value: unknown): string {
@@ -98,11 +112,6 @@ function SignalPanel({
     </div>
   );
 }
-
-// ── ML Predictor breakdown ──────────────────────────────────────────────────
-// Renders the ensemble + per-model (XGBoost / GRU) detail that the generic
-// SignalPanel would otherwise dump as JSON.  Reads the ml_signal shape produced
-// by SignalAssembler.gather_ml_signals (prediction + models sub-dicts).
 
 function fmtPct(value: unknown): string {
   const n = Number(value);
@@ -170,7 +179,6 @@ function MLPredictorPanel({ ml }: { ml: Record<string, unknown> }) {
         <p className="text-xs italic text-indigo-700">No ML prediction available</p>
       ) : (
         <>
-          {/* Ensemble summary */}
           <div className="grid grid-cols-3 gap-x-4 gap-y-1.5 mb-3">
             <EnsembleStat label="Ensemble" value={ensembleDir} />
             <EnsembleStat label="Confidence" value={fmtPct(ml.confidence)} />
@@ -179,14 +187,12 @@ function MLPredictorPanel({ ml }: { ml: Record<string, unknown> }) {
             )}
           </div>
 
-          {/* Ensemble probability distribution */}
           {probs && (
             <div className="mb-3">
               <ProbBar probs={probs} />
             </div>
           )}
 
-          {/* Per-model breakdown */}
           {rows.length > 0 && (
             <div className="space-y-2">
               {rows.map(({ key, label, m }) => (
@@ -232,6 +238,16 @@ interface SuggestionDetailModalProps {
    * suggestion.  When provided, an "Open full view" action is shown in the footer.
    */
   onOpenFullView?: () => void;
+  /** Navigate to the previous suggestion in the grid. */
+  onPrevious?: () => void;
+  /** Navigate to the next suggestion in the grid. */
+  onNext?: () => void;
+  /** Whether there is a previous suggestion to navigate to. */
+  hasPrevious?: boolean;
+  /** Whether there is a next suggestion to navigate to. */
+  hasNext?: boolean;
+  /** Position label shown between the prev/next buttons, e.g. "3 of 12". */
+  positionLabel?: string;
 }
 
 export function SuggestionDetailModal({
@@ -239,10 +255,54 @@ export function SuggestionDetailModal({
   open,
   onClose,
   onOpenFullView,
+  onPrevious,
+  onNext,
+  hasPrevious = false,
+  hasNext = false,
+  positionLabel,
 }: SuggestionDetailModalProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // WAI-ARIA 1.2 focus trap — skipRestoration because the parent grid restores
+  // focus to the originating card imperatively in handleCloseModal.
+  useFocusTrap({
+    active: open,
+    containerRef,
+    initialFocusSelector: '[aria-label="Close"]',
+    onEscape: onClose,
+    skipRestoration: true,
+  });
+
+  // J/K modal cycling shortcut. Active only when the modal is open and focus is
+  // NOT inside an input-like element (so typed searches are unaffected).
+  useEffect(() => {
+    if (!open) return;
+
+    function handleKeyDown(e: KeyboardEvent): void {
+      // Only fire when no modifier keys are held.
+      if (e.ctrlKey || e.altKey || e.metaKey) return;
+
+      const activeEl = document.activeElement as HTMLElement | null;
+      const tag = activeEl?.tagName ?? "";
+      if (["INPUT", "TEXTAREA", "SELECT"].includes(tag)) return;
+      if (activeEl?.isContentEditable) return;
+
+      if (e.key === "j" || e.key === "J") {
+        e.preventDefault();
+        onNext?.();
+      } else if (e.key === "k" || e.key === "K") {
+        e.preventDefault();
+        onPrevious?.();
+      }
+    }
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [open, onNext, onPrevious]);
+
   const timeRemaining = useMemo(() => {
     if (!suggestion) return null;
-    
+
     const now = new Date().getTime();
     const expiry = new Date(suggestion.expires_at).getTime();
     const diff = expiry - now;
@@ -275,264 +335,307 @@ export function SuggestionDetailModal({
   };
   const confidenceColor = confidenceStyles[suggestion.confidence_level];
 
+  const showNavigation = hasPrevious || hasNext;
+
   return (
     <Dialog open={open} onOpenChange={(isOpen) => !isOpen && onClose()}>
-      <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto">
-        <DialogHeader>
-          <div className="flex items-start justify-between gap-4">
-            <div className="flex-1 min-w-0">
-              <DialogTitle className="text-2xl font-bold text-slate-900 leading-none mb-1">
-                {ticker}
-              </DialogTitle>
-              {companyName ? (
-                <p className="text-sm text-slate-500">{companyName}</p>
-              ) : null}
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
-              <span
-                className={cn(
-                  "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-bold tracking-wide uppercase",
-                  isBuy ? "bg-emerald-600 text-white" : "bg-rose-600 text-white"
-                )}
-              >
-                {isBuy ? (
-                  <TrendingUpIcon className="h-4 w-4 stroke-[2.5]" />
-                ) : (
-                  <TrendingDown className="h-4 w-4 stroke-[2.5]" />
-                )}
-                {suggestion.signal_direction}
-              </span>
-              <span
-                className={cn(
-                  "inline-flex items-center rounded-md border px-2.5 py-1.5 text-sm font-semibold",
-                  confidenceColor
-                )}
-              >
-                {suggestion.confidence_level.charAt(0) + suggestion.confidence_level.slice(1).toLowerCase()}
-              </span>
-            </div>
-          </div>
-        </DialogHeader>
+      <DialogContent
+        ref={containerRef}
+        className="max-w-3xl max-h-[90vh] overflow-hidden"
+      >
+        <Tabs defaultValue="ai" className="flex flex-col min-h-0 flex-1">
 
-        <Tabs defaultValue="ai" className="mt-4">
-          <TabsList className="grid w-full grid-cols-3">
-            <TabsTrigger value="signal">Signal Details</TabsTrigger>
-            <TabsTrigger value="ai" className="gap-1.5">
-              <Sparkles className="h-3.5 w-3.5" />
-              AI Analysis
-            </TabsTrigger>
-            <TabsTrigger value="fundamentals">Fundamentals</TabsTrigger>
-          </TabsList>
+          {/* ── Pinned header — always visible, never scrolls away ── */}
+          <div className="relative shrink-0 px-6 pt-5 pb-4 border-b border-slate-200 bg-white rounded-t-lg">
+            {/* Close button + optional prev/next navigation */}
+            <div className="absolute top-4 right-4 flex items-center gap-1">
+              {showNavigation && (
+                <>
+                  <button
+                    onClick={onPrevious}
+                    disabled={!hasPrevious}
+                    aria-label="Previous suggestion (K)"
+                    className={cn(
+                      "rounded-md p-1.5 transition-colors",
+                      hasPrevious
+                        ? "text-slate-500 hover:text-slate-700 hover:bg-slate-100"
+                        : "text-slate-300 cursor-not-allowed"
+                    )}
+                  >
+                    <ChevronLeft className="h-4 w-4" />
+                  </button>
+                  {positionLabel && (
+                    <span className="text-xs text-slate-400 tabular-nums px-1 select-none">
+                      {positionLabel}
+                    </span>
+                  )}
+                  <button
+                    onClick={onNext}
+                    disabled={!hasNext}
+                    aria-label="Next suggestion (J)"
+                    className={cn(
+                      "rounded-md p-1.5 transition-colors",
+                      hasNext
+                        ? "text-slate-500 hover:text-slate-700 hover:bg-slate-100"
+                        : "text-slate-300 cursor-not-allowed"
+                    )}
+                  >
+                    <ChevronRight className="h-4 w-4" />
+                  </button>
+                </>
+              )}
+              <button
+                onClick={onClose}
+                aria-label="Close"
+                className="rounded-md p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
 
-          {/* ── Signal Details tab ───────────────────────────────────────── */}
-          <TabsContent value="signal">
-            <div className="space-y-6 mt-4">
-              {/* Consensus Score */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-sm font-semibold text-slate-700">Consensus Score</h3>
-                  <span className="text-2xl font-bold text-slate-900">
-                    {suggestion.consensus_score.toFixed(1)}%
+            <DialogHeader>
+              <div className="flex items-start gap-4 pr-28">
+                <div className="flex-1 min-w-0">
+                  <DialogTitle className="text-2xl font-bold text-slate-900 leading-none mb-1">
+                    {ticker}
+                  </DialogTitle>
+                  {companyName && (
+                    <p className="text-sm text-slate-500">{companyName}</p>
+                  )}
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span
+                    className={cn(
+                      "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-bold tracking-wide uppercase",
+                      isBuy ? "bg-emerald-600 text-white" : "bg-rose-600 text-white"
+                    )}
+                  >
+                    {isBuy ? (
+                      <TrendingUpIcon className="h-4 w-4 stroke-[2.5]" />
+                    ) : (
+                      <TrendingDown className="h-4 w-4 stroke-[2.5]" />
+                    )}
+                    {suggestion.signal_direction}
+                  </span>
+                  <span
+                    className={cn(
+                      "inline-flex items-center rounded-md border px-2.5 py-1.5 text-sm font-semibold",
+                      confidenceColor
+                    )}
+                  >
+                    {suggestion.confidence_level.charAt(0) +
+                      suggestion.confidence_level.slice(1).toLowerCase()}
                   </span>
                 </div>
-                <div className="h-3 bg-slate-100 rounded-full overflow-hidden">
-                  <div
-                    className={cn(
-                      "h-full transition-all rounded-full",
-                      suggestion.consensus_score >= 80
-                        ? "bg-green-500"
-                        : suggestion.consensus_score >= 60
-                        ? "bg-yellow-500"
-                        : "bg-orange-500",
-                    )}
-                    style={{ width: `${suggestion.consensus_score}%` }}
-                  />
-                </div>
               </div>
+            </DialogHeader>
 
-              {/* Agent Signals */}
-              <div className="space-y-3">
-                <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
-                  <Brain className="h-4 w-4" />
-                  Multi-Agent Signals
-                </h3>
-                <div className="grid gap-3">
-                  <SignalPanel
-                    icon={<TrendingUpIcon className="h-4 w-4 text-blue-600" />}
-                    title="Technical Scanner"
-                    data={suggestion.scanner_signal}
-                    theme="blue"
-                  />
-                  <SignalPanel
-                    icon={<Brain className="h-4 w-4 text-violet-600" />}
-                    title="AI Intelligence"
-                    data={suggestion.ai_signal}
-                    theme="violet"
-                  />
-                  <MLPredictorPanel ml={suggestion.ml_signal} />
+            <TabsList className="grid w-full grid-cols-3 mt-4">
+              <TabsTrigger value="signal">Signal Details</TabsTrigger>
+              <TabsTrigger value="ai" className="gap-1.5">
+                <Sparkles className="h-3.5 w-3.5" />
+                AI Analysis
+              </TabsTrigger>
+              <TabsTrigger value="fundamentals">Fundamentals</TabsTrigger>
+            </TabsList>
+          </div>
+
+          {/* ── Scrollable body ── */}
+          <div className="flex-1 overflow-y-auto min-h-0 px-6 py-5">
+
+            {/* Signal Details */}
+            <TabsContent value="signal">
+              <div className="space-y-6">
+                {/* Consensus Score */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-sm font-semibold text-slate-700">Consensus Score</h3>
+                    <span className="text-2xl font-bold text-slate-900">
+                      {suggestion.consensus_score.toFixed(1)}%
+                    </span>
+                  </div>
+                  <div className="h-3 bg-slate-100 rounded-full overflow-hidden">
+                    <div
+                      className={cn(
+                        "h-full transition-all rounded-full",
+                        suggestion.consensus_score >= 80
+                          ? "bg-green-500"
+                          : suggestion.consensus_score >= 60
+                          ? "bg-yellow-500"
+                          : "bg-orange-500",
+                      )}
+                      style={{ width: `${suggestion.consensus_score}%` }}
+                    />
+                  </div>
                 </div>
-              </div>
 
-              {/* Trade Parameters */}
-              {suggestion.entry_price && (
+                {/* Agent Signals */}
                 <div className="space-y-3">
                   <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
-                    <Target className="h-4 w-4" />
-                    Trade Parameters
+                    <Brain className="h-4 w-4" />
+                    Multi-Agent Signals
+                  </h3>
+                  <div className="grid gap-3">
+                    <SignalPanel
+                      icon={<TrendingUpIcon className="h-4 w-4 text-blue-600" />}
+                      title="Technical Scanner"
+                      data={suggestion.scanner_signal}
+                      theme="blue"
+                    />
+                    <SignalPanel
+                      icon={<Brain className="h-4 w-4 text-violet-600" />}
+                      title="AI Intelligence"
+                      data={suggestion.ai_signal}
+                      theme="violet"
+                    />
+                    <MLPredictorPanel ml={suggestion.ml_signal} />
+                  </div>
+                </div>
+
+                {/* Trade Parameters */}
+                {suggestion.entry_price && (
+                  <div className="space-y-3">
+                    <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
+                      <Target className="h-4 w-4" />
+                      Trade Parameters
+                    </h3>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                        <p className="text-xs text-slate-500 mb-1">Entry Price</p>
+                        <p className="text-lg font-semibold text-slate-900">
+                          ₹{suggestion.entry_price.toFixed(2)}
+                        </p>
+                      </div>
+                      {suggestion.stop_loss && (
+                        <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
+                          <p className="text-xs text-red-600 mb-1 flex items-center gap-1">
+                            <Shield className="h-3 w-3" />
+                            Stop Loss
+                          </p>
+                          <p className="text-lg font-semibold text-red-700">
+                            ₹{suggestion.stop_loss.toFixed(2)}
+                          </p>
+                        </div>
+                      )}
+                    </div>
+
+                    {(suggestion.take_profit_1 || suggestion.take_profit_2 || suggestion.take_profit_3) && (
+                      <div className="space-y-2">
+                        <p className="text-xs font-medium text-slate-600">Take Profit Targets</p>
+                        <div className="grid grid-cols-3 gap-2">
+                          {suggestion.take_profit_1 && (
+                            <div className="p-2 bg-green-50 border border-green-200 rounded text-center">
+                              <p className="text-xs text-green-600 mb-0.5">Target 1</p>
+                              <p className="text-sm font-semibold text-green-700">
+                                ₹{suggestion.take_profit_1.toFixed(2)}
+                              </p>
+                            </div>
+                          )}
+                          {suggestion.take_profit_2 && (
+                            <div className="p-2 bg-green-50 border border-green-200 rounded text-center">
+                              <p className="text-xs text-green-600 mb-0.5">Target 2</p>
+                              <p className="text-sm font-semibold text-green-700">
+                                ₹{suggestion.take_profit_2.toFixed(2)}
+                              </p>
+                            </div>
+                          )}
+                          {suggestion.take_profit_3 && (
+                            <div className="p-2 bg-green-50 border border-green-200 rounded text-center">
+                              <p className="text-xs text-green-600 mb-0.5">Target 3</p>
+                              <p className="text-sm font-semibold text-green-700">
+                                ₹{suggestion.take_profit_3.toFixed(2)}
+                              </p>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {suggestion.risk_reward_ratio && (
+                      <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                        <p className="text-xs text-blue-600 mb-1">Risk/Reward Ratio</p>
+                        <p className="text-lg font-semibold text-blue-700">
+                          1:{suggestion.risk_reward_ratio.toFixed(2)}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Timing */}
+                <div className="space-y-3">
+                  <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
+                    <Clock className="h-4 w-4" />
+                    Timing
                   </h3>
                   <div className="grid grid-cols-2 gap-3">
                     <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
-                      <p className="text-xs text-slate-500 mb-1">Entry Price</p>
-                      <p className="text-lg font-semibold text-slate-900">
-                        ₹{suggestion.entry_price.toFixed(2)}
+                      <p className="text-xs text-slate-500 mb-1">Generated</p>
+                      <p className="text-sm font-medium text-slate-900">
+                        {new Date(suggestion.generated_at).toLocaleString("en-IN", {
+                          dateStyle: "medium",
+                          timeStyle: "short",
+                        })}
                       </p>
                     </div>
-                    {suggestion.stop_loss && (
-                      <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
-                        <p className="text-xs text-red-600 mb-1 flex items-center gap-1">
-                          <Shield className="h-3 w-3" />
-                          Stop Loss
-                        </p>
-                        <p className="text-lg font-semibold text-red-700">
-                          ₹{suggestion.stop_loss.toFixed(2)}
-                        </p>
-                      </div>
-                    )}
+                    <div
+                      className={cn(
+                        "p-3 border rounded-lg",
+                        timeRemaining === "Expired"
+                          ? "bg-red-50 border-red-200"
+                          : "bg-amber-50 border-amber-200",
+                      )}
+                    >
+                      <p className={cn("text-xs mb-1", timeRemaining === "Expired" ? "text-red-600" : "text-amber-600")}>
+                        {timeRemaining === "Expired" ? "Expired" : "Time Remaining"}
+                      </p>
+                      <p className={cn("text-sm font-medium", timeRemaining === "Expired" ? "text-red-700" : "text-amber-700")}>
+                        {timeRemaining}
+                      </p>
+                    </div>
                   </div>
-
-                  {(suggestion.take_profit_1 ||
-                    suggestion.take_profit_2 ||
-                    suggestion.take_profit_3) && (
-                    <div className="space-y-2">
-                      <p className="text-xs font-medium text-slate-600">Take Profit Targets</p>
-                      <div className="grid grid-cols-3 gap-2">
-                        {suggestion.take_profit_1 && (
-                          <div className="p-2 bg-green-50 border border-green-200 rounded text-center">
-                            <p className="text-xs text-green-600 mb-0.5">Target 1</p>
-                            <p className="text-sm font-semibold text-green-700">
-                              ₹{suggestion.take_profit_1.toFixed(2)}
-                            </p>
-                          </div>
-                        )}
-                        {suggestion.take_profit_2 && (
-                          <div className="p-2 bg-green-50 border border-green-200 rounded text-center">
-                            <p className="text-xs text-green-600 mb-0.5">Target 2</p>
-                            <p className="text-sm font-semibold text-green-700">
-                              ₹{suggestion.take_profit_2.toFixed(2)}
-                            </p>
-                          </div>
-                        )}
-                        {suggestion.take_profit_3 && (
-                          <div className="p-2 bg-green-50 border border-green-200 rounded text-center">
-                            <p className="text-xs text-green-600 mb-0.5">Target 3</p>
-                            <p className="text-sm font-semibold text-green-700">
-                              ₹{suggestion.take_profit_3.toFixed(2)}
-                            </p>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  )}
-
-                  {suggestion.risk_reward_ratio && (
-                    <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg">
-                      <p className="text-xs text-blue-600 mb-1">Risk/Reward Ratio</p>
-                      <p className="text-lg font-semibold text-blue-700">
-                        1:{suggestion.risk_reward_ratio.toFixed(2)}
-                      </p>
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Temporal Metadata */}
-              <div className="space-y-3">
-                <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
-                  <Clock className="h-4 w-4" />
-                  Timing
-                </h3>
-                <div className="grid grid-cols-2 gap-3">
                   <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
-                    <p className="text-xs text-slate-500 mb-1">Generated</p>
+                    <p className="text-xs text-slate-500 mb-1">Trigger Pathway</p>
                     <p className="text-sm font-medium text-slate-900">
-                      {new Date(suggestion.generated_at).toLocaleString("en-IN", {
-                        dateStyle: "medium",
-                        timeStyle: "short",
-                      })}
+                      {suggestion.trigger_pathway.replace(/_/g, " ")}
                     </p>
                   </div>
-                  <div
-                    className={cn(
-                      "p-3 border rounded-lg",
-                      timeRemaining === "Expired"
-                        ? "bg-red-50 border-red-200"
-                        : "bg-amber-50 border-amber-200",
-                    )}
-                  >
-                    <p
-                      className={cn(
-                        "text-xs mb-1",
-                        timeRemaining === "Expired" ? "text-red-600" : "text-amber-600",
-                      )}
-                    >
-                      {timeRemaining === "Expired" ? "Expired" : "Time Remaining"}
-                    </p>
-                    <p
-                      className={cn(
-                        "text-sm font-medium",
-                        timeRemaining === "Expired" ? "text-red-700" : "text-amber-700",
-                      )}
-                    >
-                      {timeRemaining}
-                    </p>
-                  </div>
-                </div>
-                <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
-                  <p className="text-xs text-slate-500 mb-1">Trigger Pathway</p>
-                  <p className="text-sm font-medium text-slate-900">
-                    {suggestion.trigger_pathway.replace(/_/g, " ")}
-                  </p>
                 </div>
               </div>
-            </div>
-          </TabsContent>
+            </TabsContent>
 
-          {/* ── AI Analysis tab — ML cards + sectioned LLM explanation ──────── */}
-          {/* Lazy-mounted: AnalysisCardsSection opens its SSE stream only while
-              this tab is active.  Seeded immediately from the suggestion's
-              llm_summary / llm_explanation, then kept live via SSE. */}
-          <TabsContent value="ai">
-            <div className="mt-4">
+            {/* AI Analysis */}
+            <TabsContent value="ai">
               <AnalysisCardsSection
                 instrumentKey={suggestion.instrument_key}
                 symbol={suggestion.trading_symbol ?? suggestion.symbol}
                 suggestion={suggestion}
               />
-            </div>
-          </TabsContent>
+            </TabsContent>
 
-          {/* ── Fundamentals tab — lazy mounted (TabsContent returns null when inactive) ── */}
-          <TabsContent value="fundamentals">
-            <div className="mt-4">
+            {/* Fundamentals */}
+            <TabsContent value="fundamentals">
               <FundamentalsTab instrumentKey={suggestion.instrument_key} />
-            </div>
-          </TabsContent>
-        </Tabs>
+            </TabsContent>
 
-        {/* Footer Actions */}
-        <div className="flex items-center justify-between gap-3 pt-4 border-t border-slate-200 mt-6">
-          {onOpenFullView ? (
-            <Button variant="ghost" onClick={onOpenFullView} className="gap-1.5">
-              Open full view
-              <ArrowUpRight className="h-4 w-4" />
+          </div>
+
+          {/* ── Pinned footer ── */}
+          <div className="shrink-0 flex items-center justify-between gap-3 px-6 py-4 border-t border-slate-200 bg-white rounded-b-lg">
+            {onOpenFullView ? (
+              <Button variant="ghost" onClick={onOpenFullView} className="gap-1.5">
+                Open full view
+                <ArrowUpRight className="h-4 w-4" />
+              </Button>
+            ) : (
+              <span />
+            )}
+            <Button variant="outline" onClick={onClose}>
+              Close
             </Button>
-          ) : (
-            <span />
-          )}
-          <Button variant="outline" onClick={onClose}>
-            Close
-          </Button>
-        </div>
+          </div>
+
+        </Tabs>
       </DialogContent>
     </Dialog>
   );

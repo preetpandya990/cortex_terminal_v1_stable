@@ -295,26 +295,27 @@ export function MLPatternCard({ data, prediction, isLoading, error }: MLPatternC
               cfg.wrapBorder,
             )}
           >
-            <div className="flex items-center gap-3">
+            {/* Row 1 — badge + confidence */}
+            <div className="flex items-center justify-between gap-2">
               <span
                 className={cn(
-                  'inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-black tracking-wide uppercase shrink-0',
+                  'inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-black tracking-wide uppercase shrink-0',
                   cfg.badgeBg,
                   cfg.badgeText,
                 )}
               >
-                <DirIcon className="h-4 w-4" />
+                <DirIcon className="h-3.5 w-3.5" />
                 {dir}
               </span>
-              <div className="min-w-0">
-                <p className={cn('text-base font-bold leading-tight', cfg.labelText)}>
-                  {confPct}% confidence
-                </p>
-                <p className={cn('text-[11px] leading-tight', regimeTextColor(pred.threshold))}>
-                  {regimeLabel(pred.threshold)} regime · threshold {thresholdPct}%
-                </p>
-              </div>
+              <p className={cn('text-sm font-bold leading-tight tabular-nums', cfg.labelText)}>
+                {confPct}% confidence
+              </p>
             </div>
+
+            {/* Row 2 — regime info */}
+            <p className={cn('text-[11px] leading-tight truncate', regimeTextColor(pred.threshold))}>
+              {regimeLabel(pred.threshold)} regime · threshold {thresholdPct}%
+            </p>
 
             {/* Conviction bar */}
             <div className="space-y-1">

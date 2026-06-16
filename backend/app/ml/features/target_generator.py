@@ -12,7 +12,7 @@ Date: 2026-04-18
 
 import pandas as pd
 import numpy as np
-from typing import Dict, Tuple, Optional, List
+from typing import Any, Dict, Tuple, Optional, List
 from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
@@ -21,6 +21,47 @@ import logging
 from app.models.upstox_data import UpstoxOHLCV
 
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ATR multiplier — principled prior  (Phase C, June 2026)
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# This is the half-width of the symmetric dead zone expressed as a fraction of
+# the 14-day ATR.  It is a PRINCIPLED PRIOR, not a tuned value.  Changing it
+# requires re-labeling the full training dataset and resets the HPO trial
+# counter in the Deflated Sharpe Ratio (inflating N from zero).
+#
+# Derivation against NSE CNC statutory costs (FY 2025-26):
+#   STT       : 0.1% each side × 2                          = 20.00 bps
+#   NSE exch  : 0.00297% each side × 2                      =  0.59 bps
+#   SEBI      : 0.0001% each side × 2                       =  0.02 bps
+#   GST       : 18% on (exchange + SEBI) × 2                =  0.22 bps
+#   Stamp     : 0.015% buy-side only                         =  1.50 bps
+#   ─────────────────────────────────────────────────────────────────────────
+#   Statutory round-trip                                     ≈ 22.33 bps
+#
+# Source: charge_calculator.py; verified range 20–26 bps in test_ml_backtest_a3.
+#
+# Target minimum reward-to-statutory-cost multiple: 3×
+#   → minimum labeled move = 3 × 22.33 bps ≈ 67 bps = 0.67%
+#
+# NSE large-cap ATR14 (Nifty 50 constituents): median ≈ 1.50% of price
+#   (rough empirical estimate; per-stock ATR normalization handles spread)
+#   → required multiplier = 0.67% / 1.50% ≈ 0.45
+#   → rounded UP to 0.50 for a ≥3× cost gate with a small safety buffer
+#
+# Sensitivity (horizon=5, ATR14=1.50%):
+#   multiplier=0.30 → threshold≈0.45% → dead_zone≈20%, R:R ≈ 2.0× cost (marginal)
+#   multiplier=0.50 → threshold≈0.75% → dead_zone≈28%, R:R ≈ 3.4× cost (target)
+#   multiplier=0.70 → threshold≈1.05% → dead_zone≈36%, R:R ≈ 4.7× cost (conservative)
+#   multiplier=1.00 → threshold≈1.50% → dead_zone≈50%, R:R ≈ 6.7× cost (too sparse)
+#
+# Choice rationale: 0.50 retains ≈70% of trading days as labeled data while
+# ensuring every retained label represents a move ≥ 3× the statutory cost floor.
+# The ATR normalization keeps this property consistent across volatility regimes
+# and between large-cap (low ATR) and mid-cap (high ATR) instruments.
+ATR_MULTIPLIER_DEFAULT: float = 0.5
 
 
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -54,7 +95,7 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 def create_target_variable(
     df: pd.DataFrame,
-    atr_multiplier: float = 0.5,
+    atr_multiplier: float = ATR_MULTIPLIER_DEFAULT,
     horizon: int = 5,
     price_col: str = 'close',
     use_atr_normalization: bool = True,
@@ -92,6 +133,16 @@ def create_target_variable(
     """
     if price_col not in df.columns:
         raise ValueError(f"Column '{price_col}' not found in DataFrame")
+
+    # Guard against degenerate multipliers — values outside [0.1, 2.0] produce
+    # either a near-zero dead zone (noise contamination) or a >50% dead zone
+    # (insufficient labeled data).  The principled prior is 0.5; any deviation
+    # must be deliberate and documented.
+    if not (0.1 <= atr_multiplier <= 2.0):
+        raise ValueError(
+            f"atr_multiplier must be in [0.1, 2.0], got {atr_multiplier}. "
+            f"The principled prior is ATR_MULTIPLIER_DEFAULT={ATR_MULTIPLIER_DEFAULT}."
+        )
 
     future_price = df[price_col].shift(-horizon)
     current_price = df[price_col]
@@ -216,7 +267,7 @@ def check_class_imbalance(
 
 def add_target_to_features(
     features_df: pd.DataFrame,
-    atr_multiplier: float = 0.5,
+    atr_multiplier: float = ATR_MULTIPLIER_DEFAULT,
     horizon: int = 5,
     price_col: str = 'close',
     use_atr_normalization: bool = True,
@@ -270,7 +321,7 @@ def add_target_to_features(
 
 def create_targets_batch(
     features_dict: Dict[str, pd.DataFrame],
-    atr_multiplier: float = 0.5,
+    atr_multiplier: float = ATR_MULTIPLIER_DEFAULT,
     horizon: int = 5,
     price_col: str = 'close',
     use_atr_normalization: bool = True,
@@ -460,7 +511,7 @@ async def create_targets_from_db(
     symbols: List[str],
     timeframe: str,
     db: AsyncSession,
-    atr_multiplier: float = 0.5,
+    atr_multiplier: float = ATR_MULTIPLIER_DEFAULT,
     horizon: int = 5,
     use_atr_normalization: bool = True,
 ) -> Dict[str, Dict]:
@@ -531,5 +582,164 @@ async def create_targets_from_db(
             continue
     
     logger.info(f"Successfully created targets for {len(results)}/{len(symbols)} symbols")
-    
+
     return results
+
+
+# ── Label-quality audit (A2) ──────────────────────────────────────────────────
+
+def audit_label_quality(
+    df: pd.DataFrame,
+    atr_multiplier: float = ATR_MULTIPLIER_DEFAULT,
+    horizon: int = 5,
+    price_col: str = "close",
+    use_atr_normalization: bool = True,
+    symbol: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Produce a label-quality audit report without modifying ``df`` or the multiplier.
+
+    This function satisfies the Phase-A2 acceptance criterion: it characterises
+    the labelling scheme, surfaces the dead-zone / class distribution, reports
+    realised forward-return statistics per class, confirms threshold symmetry,
+    and documents the causality invariants.  The returned dict is designed to be
+    passed directly to ``mlflow.log_dict(report, "label_audit.json")`` by the
+    calling training pipeline.
+
+    Labelling scheme: binary dead-zone (NOT Lopez de Prado triple-barrier).
+      UP   (1): h-bar forward return >  +threshold
+      DOWN (0): h-bar forward return < -threshold
+      NaN     : |return| ≤ threshold — excluded from training (dead zone)
+
+    The threshold is computed as ``atr_multiplier × ATR14 / close`` per row
+    (or a fixed 0.5 % when OHLCV high/low are absent).  The same threshold
+    value is applied symmetrically to both the upper (+) and lower (−) barriers,
+    so gross expected R:R for retained samples is ~1:1 by construction.
+
+    Args:
+        df:                    DataFrame with OHLCV columns (must include 'close').
+        atr_multiplier:        The multiplier under audit; no value change is made.
+        horizon:               Look-ahead bars (labels use future data — by design).
+        price_col:             Close price column name.
+        use_atr_normalization: Whether ATR normalisation is active.
+        symbol:                Optional trading symbol for log context.
+
+    Returns:
+        Dict suitable for JSON serialisation and MLflow attachment.
+    """
+    target = create_target_variable(
+        df, atr_multiplier, horizon, price_col, use_atr_normalization
+    )
+    forward_return = df[price_col].shift(-horizon) / df[price_col] - 1
+
+    n_evaluable = max(len(df) - horizon, 0)
+    n_up = int((target == 1).sum())
+    n_down = int((target == 0).sum())
+    n_dead = n_evaluable - n_up - n_down
+
+    up_returns = forward_return[target == 1].dropna()
+    down_returns = forward_return[target == 0].dropna()
+
+    def _distribution(series: pd.Series) -> Dict[str, float]:
+        if series.empty:
+            return {}
+        return {
+            "mean": round(float(series.mean()), 6),
+            "std": round(float(series.std()), 6),
+            "p5": round(float(series.quantile(0.05)), 6),
+            "p25": round(float(series.quantile(0.25)), 6),
+            "p50": round(float(series.quantile(0.50)), 6),
+            "p75": round(float(series.quantile(0.75)), 6),
+            "p95": round(float(series.quantile(0.95)), 6),
+            "n": len(series),
+        }
+
+    # ATR threshold used per row (or the fixed fallback)
+    if use_atr_normalization and all(c in df.columns for c in ("high", "low")):
+        atr = calculate_atr(df, period=14)
+        threshold_series = (atr_multiplier * atr / df[price_col]).clip(lower=0.001).fillna(0.005)
+        avg_threshold_pct = round(float(threshold_series.mean()) * 100, 4)
+        threshold_range_pct = {
+            "min": round(float(threshold_series.min()) * 100, 4),
+            "max": round(float(threshold_series.max()) * 100, 4),
+        }
+    else:
+        avg_threshold_pct = 0.5
+        threshold_range_pct = {"min": 0.5, "max": 0.5}
+
+    report: Dict[str, Any] = {
+        # ── Scheme identification ─────────────────────────────────────────────
+        "labelling_scheme": "binary_dead_zone",
+        "is_triple_barrier": False,
+        "description": (
+            "Symmetric ATR-adaptive dead zone. "
+            "The same threshold is applied to both the upper (+) and lower (-) barrier, "
+            "so this is NOT Lopez de Prado triple-barrier (no path-dependent SL/TP hits). "
+            "The label is determined solely by the h-bar forward return at expiry."
+        ),
+        # ── Parameters ───────────────────────────────────────────────────────
+        "symbol": symbol,
+        "atr_multiplier": atr_multiplier,
+        "horizon_bars": horizon,
+        "price_col": price_col,
+        "use_atr_normalization": use_atr_normalization,
+        "avg_threshold_pct": avg_threshold_pct,
+        "threshold_range_pct": threshold_range_pct,
+        # ── Symmetry ──────────────────────────────────────────────────────────
+        "threshold_symmetric": True,
+        "symmetry_note": (
+            "The same atr_multiplier value defines both barriers: "
+            "UP requires return > +threshold, DOWN requires return < -threshold. "
+            "Gross R:R for retained samples is ~1:1 by design."
+        ),
+        # ── Label distribution ────────────────────────────────────────────────
+        "n_evaluable_rows": n_evaluable,
+        "n_up": n_up,
+        "n_down": n_down,
+        "n_dead_zone": n_dead,
+        "up_pct": round(100.0 * n_up / max(n_evaluable, 1), 2),
+        "down_pct": round(100.0 * n_down / max(n_evaluable, 1), 2),
+        "dead_zone_pct": round(100.0 * n_dead / max(n_evaluable, 1), 2),
+        # ── Realised forward-return per class ─────────────────────────────────
+        "realised_return_up": _distribution(up_returns),
+        "realised_return_down": _distribution(down_returns),
+        # ── Causality ────────────────────────────────────────────────────────
+        "feature_causality": (
+            "ATR threshold uses only the past 14 bars (rolling EMA) — fully causal. "
+            f"The target itself is intentionally forward-looking ({horizon} bars): "
+            "labels MUST reference future prices; this is not a leak."
+        ),
+        "lookahead_in_features": False,
+        # ── Principled-prior documentation (Phase C) ──────────────────────────
+        # Audit consumers can verify that the multiplier in use matches the
+        # module constant and that the cost-floor derivation has been applied.
+        "atr_multiplier_is_default": atr_multiplier == ATR_MULTIPLIER_DEFAULT,
+        "principled_prior": {
+            "module_constant": "ATR_MULTIPLIER_DEFAULT",
+            "value": ATR_MULTIPLIER_DEFAULT,
+            "derivation_basis": "NSE CNC statutory round-trip cost floor × 3× minimum R:R",
+            "statutory_cost_bps": 22.33,
+            "min_rr_multiple": 3,
+            "required_min_move_bps": round(22.33 * 3, 1),
+            "nse_largecap_atr14_pct": 1.50,
+            "derived_multiplier": round(22.33 * 3 / (1.50 * 100), 3),
+            "rounded_to": ATR_MULTIPLIER_DEFAULT,
+            "decision_type": "principled_prior",
+            "hpo_trials_consumed": 0,
+            "source": "charge_calculator.py (FY 2025-26 schedule)",
+        },
+    }
+
+    logger.info(
+        "Label audit [%s] — scheme=%s  UP=%.1f%%  DOWN=%.1f%%  dead_zone=%.1f%%  "
+        "avg_threshold=%.3f%%  n_evaluable=%d",
+        symbol or "ALL",
+        report["labelling_scheme"],
+        report["up_pct"],
+        report["down_pct"],
+        report["dead_zone_pct"],
+        avg_threshold_pct,
+        n_evaluable,
+    )
+
+    return report

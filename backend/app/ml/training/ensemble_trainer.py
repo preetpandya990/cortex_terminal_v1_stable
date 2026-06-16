@@ -43,6 +43,7 @@ import joblib
 import numpy as np
 
 from app.ml.evaluation import compute_dsr_and_pbo
+from app.ml.evaluation.backtest import TRAINING_DECISION_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
@@ -238,7 +239,7 @@ class EnsembleTrainer:
             w_g = 1.0 - w
             for ps_xgb, ps_gru, r in zip(path_xgb, path_gru, path_fwd):
                 p_ens = w * ps_xgb + w_g * ps_gru
-                up = p_ens >= 0.5
+                up = p_ens >= TRAINING_DECISION_THRESHOLD
                 if long_only:
                     # pos ∈ {0, +1}; active == pos. Costs apply only on
                     # active bars; the risk-free rate is subtracted from

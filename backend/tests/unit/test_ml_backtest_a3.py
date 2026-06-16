@@ -281,14 +281,21 @@ class TestComputeDsrAndPbo:
         from app.ml.evaluation.deflated_sharpe import compute_dsr_and_pbo
         paths = self._make_paths()
         result = compute_dsr_and_pbo(paths)
-        required = {
+        # Original keys (all preserved for backward compat)
+        original = {
             "deflated_sharpe", "pbo", "path_sharpes_annualised",
             "path_sharpes_per_period", "best_path_idx",
             "best_per_period_sharpe", "sr0_benchmark",
             "sr_std_across_paths", "n_trials", "n_obs_per_path",
             "skewness", "kurtosis_raw",
         }
-        assert required <= set(result)
+        # Phase-B additions
+        phase_b = {
+            "pooled_oos_sharpe", "n_obs_pooled", "oos_loss_rate",
+            "dsr_sensitivity", "n_cpcv_paths",
+            "sr_std_across_trials", "n_hpo_trials",
+        }
+        assert (original | phase_b) <= set(result)
 
     def test_dsr_in_unit_interval(self):
         from app.ml.evaluation.deflated_sharpe import compute_dsr_and_pbo
@@ -306,7 +313,9 @@ class TestComputeDsrAndPbo:
         from app.ml.evaluation.deflated_sharpe import compute_dsr_and_pbo
         for n in (3, 7):
             result = compute_dsr_and_pbo(self._make_paths(n_paths=n))
-            assert result["n_trials"] == n
+            # n_cpcv_paths is the correct key; n_trials is the deprecated alias
+            assert result["n_cpcv_paths"] == n
+            assert result["n_trials"] == n  # deprecated alias must still match
             assert len(result["path_sharpes_annualised"]) == n
             assert len(result["path_sharpes_per_period"]) == n
 
@@ -337,10 +346,92 @@ class TestComputeDsrAndPbo:
                 "forward_return": fwd_ret,
             })
         result = compute_dsr_and_pbo(paths)
-        # All paths profitable → PBO = 0
+        # All paths profitable → OOS loss rate = 0 (and deprecated "pbo" alias)
+        assert result["oos_loss_rate"] == 0.0
         assert result["pbo"] == 0.0
-        # Good model → DSR should be reasonably high
+        # Good model → PSR at N=1 should be reasonably high
         assert result["deflated_sharpe"] > 0.5
+
+    # ── Phase-B correctness tests ─────────────────────────────────────────────
+
+    def test_dsr_sensitivity_band_present(self):
+        """dsr_sensitivity must contain n1, n_eff, n_upper and metadata keys."""
+        from app.ml.evaluation.deflated_sharpe import compute_dsr_and_pbo
+        result = compute_dsr_and_pbo(self._make_paths())
+        s = result["dsr_sensitivity"]
+        for key in ("n1", "n_eff", "n_upper", "n1_value", "n_eff_value",
+                    "n_upper_value", "sr_std_source", "trials_instrumented", "basis"):
+            assert key in s, f"dsr_sensitivity missing key '{key}'"
+
+    def test_dsr_n1_equals_deflated_sharpe(self):
+        """deflated_sharpe must be exactly dsr_sensitivity['n1'] (pure PSR)."""
+        from app.ml.evaluation.deflated_sharpe import compute_dsr_and_pbo
+        result = compute_dsr_and_pbo(self._make_paths())
+        assert abs(result["deflated_sharpe"] - result["dsr_sensitivity"]["n1"]) < 1e-12
+
+    def test_sensitivity_band_n1_geq_n_upper(self):
+        """Higher N → higher SR₀ → lower DSR; N=1 DSR must be ≥ N_upper DSR."""
+        from app.ml.evaluation.deflated_sharpe import compute_dsr_and_pbo
+        result = compute_dsr_and_pbo(self._make_paths())
+        s = result["dsr_sensitivity"]
+        # Allow floating-point tolerance
+        assert s["n1"] >= s["n_upper"] - 1e-10
+
+    def test_oos_loss_rate_in_unit_interval(self):
+        from app.ml.evaluation.deflated_sharpe import compute_dsr_and_pbo
+        result = compute_dsr_and_pbo(self._make_paths())
+        assert 0.0 <= result["oos_loss_rate"] <= 1.0
+
+    def test_pbo_equals_oos_loss_rate(self):
+        """pbo is the deprecated alias for oos_loss_rate — values must match."""
+        from app.ml.evaluation.deflated_sharpe import compute_dsr_and_pbo
+        result = compute_dsr_and_pbo(self._make_paths())
+        assert result["pbo"] == result["oos_loss_rate"]
+
+    def test_pooled_oos_fields_present_and_sane(self):
+        """pooled_oos_sharpe and n_obs_pooled must be present and consistent."""
+        from app.ml.evaluation.deflated_sharpe import compute_dsr_and_pbo
+        result = compute_dsr_and_pbo(self._make_paths(n_paths=7, n_obs=100))
+        assert "pooled_oos_sharpe" in result
+        assert "n_obs_pooled" in result
+        # 7 paths × 100 obs each = 700 pooled observations
+        assert result["n_obs_pooled"] == 700
+
+    def test_without_trial_sharpes_source_is_proxy(self):
+        """When trial_sharpes not provided, sr_std_source reports the proxy."""
+        from app.ml.evaluation.deflated_sharpe import compute_dsr_and_pbo
+        result = compute_dsr_and_pbo(self._make_paths())
+        s = result["dsr_sensitivity"]
+        assert s["trials_instrumented"] is False
+        assert s["sr_std_source"] == "cpcv_paths_proxy"
+        assert s["n_eff"] is None
+        assert s["n_eff_value"] is None
+        assert result["sr_std_across_trials"] is None
+        assert result["n_hpo_trials"] is None
+
+    def test_with_trial_sharpes_uses_real_variance(self):
+        """When trial_sharpes are provided, DSR uses the real trial σ_SR."""
+        from app.ml.evaluation.deflated_sharpe import compute_dsr_and_pbo
+        rng = np.random.default_rng(99)
+        trial_sharpes = rng.normal(0.0, 0.04, 50).astype(np.float64)
+        result = compute_dsr_and_pbo(self._make_paths(), trial_sharpes=trial_sharpes)
+        s = result["dsr_sensitivity"]
+        assert s["trials_instrumented"] is True
+        assert s["sr_std_source"] == "trial_sharpes"
+        assert s["n_eff"] is not None
+        assert s["n_eff_value"] == 50
+        assert result["sr_std_across_trials"] is not None
+        assert result["n_hpo_trials"] == 50
+
+    def test_sensitivity_band_n1_geq_n_eff_geq_n_upper_with_trials(self):
+        """With increasing N: DSR must be monotonically non-increasing."""
+        from app.ml.evaluation.deflated_sharpe import compute_dsr_and_pbo
+        rng = np.random.default_rng(7)
+        trial_sharpes = rng.normal(0.01, 0.03, 30).astype(np.float64)
+        result = compute_dsr_and_pbo(self._make_paths(), trial_sharpes=trial_sharpes)
+        s = result["dsr_sensitivity"]
+        assert s["n1"] >= s["n_eff"] - 1e-10
+        assert s["n_eff"] >= s["n_upper"] - 1e-10
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -392,3 +483,72 @@ class TestEvaluatorAUCPR:
         metrics = calculate_financial_metrics(pred, fwd, mode="long_short")
         # Short when market goes up → losses → negative total return
         assert metrics["total_return"] < 0.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase-B: XGBoostTrainer per-trial Sharpe instrumentation
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestXGBoostTrainerPhaseB:
+    """Verify that tune_hyperparameters populates self.trial_sharpes correctly."""
+
+    def _make_dataset(self, n: int = 120, seed: int = 0):
+        rng = np.random.default_rng(seed)
+        X = rng.normal(0, 1, (n, 6)).astype(np.float32)
+        y = rng.integers(0, 2, n).astype(np.float32)
+        fwd = rng.normal(0.001, 0.01, n).astype(np.float64)
+        return X, y, fwd
+
+    def test_trial_sharpes_none_without_fwd_ret(self):
+        """Without fwd_ret_val, trial_sharpes must remain None."""
+        from app.ml.training.xgboost_trainer import XGBoostTrainer
+        X, y, _ = self._make_dataset()
+        trainer = XGBoostTrainer()
+        assert trainer.trial_sharpes is None  # initialised to None
+        trainer.tune_hyperparameters(
+            X[:80], y[:80], X[80:], y[80:], n_trials=3, timeout=None, n_jobs=1,
+        )
+        assert trainer.trial_sharpes is None
+
+    def test_trial_sharpes_populated_with_fwd_ret(self):
+        """With fwd_ret_val, trial_sharpes is a float64 array of length ≤ n_trials."""
+        from app.ml.training.xgboost_trainer import XGBoostTrainer
+        X, y, fwd = self._make_dataset()
+        trainer = XGBoostTrainer()
+        trainer.tune_hyperparameters(
+            X[:80], y[:80], X[80:], y[80:],
+            n_trials=4, timeout=None, n_jobs=1,
+            fwd_ret_val=fwd[80:],
+        )
+        ts = trainer.trial_sharpes
+        assert ts is not None
+        assert isinstance(ts, np.ndarray)
+        assert ts.dtype == np.float64
+        assert 1 <= len(ts) <= 4  # at least 1, at most n_trials
+
+    def test_trial_sharpes_are_finite(self):
+        """Each logged trial Sharpe must be a finite float (no NaN / Inf)."""
+        from app.ml.training.xgboost_trainer import XGBoostTrainer
+        X, y, fwd = self._make_dataset()
+        trainer = XGBoostTrainer()
+        trainer.tune_hyperparameters(
+            X[:80], y[:80], X[80:], y[80:],
+            n_trials=3, timeout=None, n_jobs=1,
+            fwd_ret_val=fwd[80:],
+        )
+        if trainer.trial_sharpes is not None:
+            assert np.all(np.isfinite(trainer.trial_sharpes))
+
+    def test_best_params_returned_unchanged(self):
+        """tune_hyperparameters return value must still be the best-params dict."""
+        from app.ml.training.xgboost_trainer import XGBoostTrainer
+        X, y, fwd = self._make_dataset()
+        trainer = XGBoostTrainer()
+        result = trainer.tune_hyperparameters(
+            X[:80], y[:80], X[80:], y[80:],
+            n_trials=2, timeout=None, n_jobs=1,
+            fwd_ret_val=fwd[80:],
+        )
+        assert isinstance(result, dict)
+        assert "max_depth" in result  # spot-check a tuned param
+        assert result is trainer.best_params

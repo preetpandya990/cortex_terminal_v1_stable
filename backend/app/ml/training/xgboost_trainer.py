@@ -19,6 +19,11 @@ from optuna.pruners import MedianPruner
 from optuna.samplers import TPESampler
 from sklearn.metrics import average_precision_score
 
+from app.ml.evaluation.backtest import (
+    TRAINING_DECISION_THRESHOLD,
+    per_period_sharpe,
+    strategy_returns,
+)
 from app.ml.inference.calibrator import ConfidenceCalibrator
 from .evaluator import calculate_classification_metrics, calculate_financial_metrics
 
@@ -52,6 +57,10 @@ class XGBoostTrainer:
         self.best_params: Dict | None = None
         self.feature_importance: Dict | None = None
         self.calibrator: ConfidenceCalibrator | None = None
+        # Per-trial net Sharpe array, populated by tune_hyperparameters when
+        # fwd_ret_val is provided.  Pass to compute_dsr_and_pbo(trial_sharpes=...)
+        # to enable correct V and effective N in the DSR sensitivity band.
+        self.trial_sharpes: Optional[np.ndarray] = None
     
     def train(
         self,
@@ -238,97 +247,162 @@ class XGBoostTrainer:
         y_val: np.ndarray,
         n_trials: int = 50,
         timeout: Optional[int] = 7200,
-        n_jobs: int = 4
+        n_jobs: int = 4,
+        fwd_ret_val: Optional[np.ndarray] = None,
     ) -> Dict:
         """
-        Tune hyperparameters with Optuna
-        
+        Tune hyperparameters with Optuna (AUC-PR objective).
+
         Args:
-            X_train: Training features
-            y_train: Training labels
-            X_val: Validation features
-            y_val: Validation labels
-            n_trials: Number of Optuna trials
-            timeout: Timeout in seconds (None = no limit)
-            n_jobs: Parallel jobs
-            
+            X_train:     Training features.
+            y_train:     Training labels (binary 0/1).
+            X_val:       Validation features (HPO holdout).
+            y_val:       Validation labels.
+            n_trials:    Number of Optuna trials.
+            timeout:     Timeout in seconds (None = no limit).
+            n_jobs:      Parallel jobs.
+            fwd_ret_val: Optional forward returns for the HPO holdout rows
+                         (same length as y_val, dtype float32/float64).
+                         When provided, each trial logs its net-of-cost
+                         per-period Sharpe as a user attribute, which is
+                         collected into ``self.trial_sharpes`` after the
+                         study.  Pass ``self.trial_sharpes`` to
+                         ``compute_dsr_and_pbo(trial_sharpes=...)`` to enable
+                         correct V and effective N in the DSR sensitivity band.
+                         This is the convergent instrumentation fix from the
+                         Validation Remediation Plan Phase-B §3.5.
+
         Returns:
-            Best parameters dict
+            Best parameters dict (unchanged from previous behaviour).
+            Side-effect: sets ``self.trial_sharpes`` (np.ndarray | None).
         """
-        logger.info(f"Starting hyperparameter tuning: {n_trials} trials, {n_jobs} jobs")
-        
+        logger.info(
+            "Starting hyperparameter tuning: %d trials, %d jobs%s",
+            n_trials, n_jobs,
+            " (with per-trial Sharpe logging)" if fwd_ret_val is not None else "",
+        )
+
         # Convert labels to int (binary: 0, 1)
         y_train_idx = y_train.astype(int)
         y_val_idx = y_val.astype(int)
-        
-        # Create DMatrix
+
+        # Precompute DMatrix objects once; shared safely across threads because
+        # xgb.DMatrix is read-only after construction.
         dtrain = xgb.DMatrix(X_train, label=y_train_idx)
         dval = xgb.DMatrix(X_val, label=y_val_idx)
-        
-        def objective(trial):
-            """Optuna objective: maximise AUC-PR (Average Precision Score).
+
+        # Resolve forward returns once so the closure doesn't hold a reference
+        # to the caller's array (avoids accidental mutation).
+        _fwd_ret: Optional[np.ndarray] = (
+            np.asarray(fwd_ret_val, dtype=np.float64)
+            if fwd_ret_val is not None else None
+        )
+        _daily_rfr: float = (1.0 + 0.05) ** (1.0 / 252) - 1.0
+
+        def objective(trial: optuna.Trial) -> float:
+            """Maximise AUC-PR (Average Precision Score).
 
             AUC-PR is the correct optimisation target for imbalanced binary
-            classification.  Accuracy is meaningless here — a model that always
-            predicts the majority class would score high on accuracy but zero on
-            Average Precision.
+            classification.  When ``fwd_ret_val`` was supplied, each trial
+            also computes its net-of-cost per-period Sharpe on the holdout
+            and stores it as a trial user attribute for later DSR use.
             """
             params = {
-                'objective': 'binary:logistic',
-                # aucpr for internal early-stopping; logloss for monotone loss tracking
-                'eval_metric': ['logloss', 'aucpr'],
-                # CPU-only: GPU budget is reserved for TF/GRU to avoid CUDA version
-                # conflicts between tensorflow[and-cuda] (CUDA 12.9) and XGBoost.
-                # hist on CPU handles 4M+ samples efficiently.
-                'tree_method': 'hist',
-                'random_state': self.random_state,
+                "objective":       "binary:logistic",
+                # aucpr for internal early-stopping; logloss for loss tracking
+                "eval_metric":     ["logloss", "aucpr"],
+                # CPU-only: GPU budget reserved for TF/GRU to avoid CUDA
+                # version conflicts between tensorflow and XGBoost.
+                "tree_method":     "hist",
+                "random_state":    self.random_state,
 
-                # Tunable parameters
-                'max_depth': trial.suggest_int('max_depth', 4, 8),
-                'min_child_weight': trial.suggest_int('min_child_weight', 1, 7),
-                'gamma': trial.suggest_float('gamma', 0.0, 0.3),
-                'subsample': trial.suggest_float('subsample', 0.7, 0.9),
-                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.7, 0.9),
-                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
-                'lambda': trial.suggest_float('lambda', 0.5, 2.0),
-                'alpha': trial.suggest_float('alpha', 0.0, 0.5),
+                # ── Tunable parameters ────────────────────────────────────────
+                "max_depth":         trial.suggest_int("max_depth", 4, 8),
+                "min_child_weight":  trial.suggest_int("min_child_weight", 1, 7),
+                "gamma":             trial.suggest_float("gamma", 0.0, 0.3),
+                "subsample":         trial.suggest_float("subsample", 0.7, 0.9),
+                "colsample_bytree":  trial.suggest_float("colsample_bytree", 0.7, 0.9),
+                "learning_rate":     trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+                "lambda":            trial.suggest_float("lambda", 0.5, 2.0),
+                "alpha":             trial.suggest_float("alpha", 0.0, 0.5),
             }
 
             model = xgb.train(
                 params,
                 dtrain,
                 num_boost_round=300,
-                evals=[(dval, 'val')],
+                evals=[(dval, "val")],
                 early_stopping_rounds=30,
                 verbose_eval=False,
             )
 
-            # sklearn's average_precision_score is the canonical AUC-PR
-            # implementation — uses left-rectangle rule (area under PR curve).
+            # sklearn's average_precision_score uses the left-rectangle rule
+            # (area under the PR curve) — canonical AUC-PR implementation.
             preds_proba = model.predict(dval)   # P(UP) ∈ [0, 1]
-            return average_precision_score(y_val_idx, preds_proba)
-        
-        # Create study
+            auc_pr = average_precision_score(y_val_idx, preds_proba)
+
+            # ── Per-trial Sharpe instrumentation (Phase-B §3.5) ───────────────
+            # Compute net-of-cost strategy returns on the HPO holdout for this
+            # trial's model.  Stored as a trial user attribute so it survives
+            # parallel execution and can be collected after study.optimize().
+            if _fwd_ret is not None:
+                pred = (preds_proba >= TRAINING_DECISION_THRESHOLD).astype(np.int8)
+                net_rets = strategy_returns(
+                    pred,
+                    _fwd_ret,
+                    mode="long_only",
+                    notional=100_000.0,
+                    product_type="CNC",
+                    entry_price=1_000.0,
+                    slippage_bps=5.0,
+                ).astype(np.float64)
+                if len(net_rets) >= 2:
+                    trial_sharpe_val = per_period_sharpe(net_rets, daily_rfr=_daily_rfr)
+                    trial.set_user_attr("net_sharpe_oos", float(trial_sharpe_val))
+
+            return auc_pr
+
         study = optuna.create_study(
-            direction='maximize',
+            direction="maximize",
             sampler=TPESampler(seed=self.random_state),
-            pruner=MedianPruner(n_startup_trials=10, n_warmup_steps=5)
+            pruner=MedianPruner(n_startup_trials=10, n_warmup_steps=5),
         )
-        
-        # Optimize
+
         study.optimize(
             objective,
             n_trials=n_trials,
             timeout=timeout,
             n_jobs=n_jobs,
-            show_progress_bar=True
+            show_progress_bar=True,
         )
-        
+
         self.best_params = study.best_params
 
-        logger.info(f"Tuning complete. Best AUC-PR: {study.best_value:.4f}")
-        logger.info(f"Best params: {self.best_params}")
-        
+        # ── Collect per-trial Sharpes for DSR N/V estimation ─────────────────
+        # Only populated when fwd_ret_val was provided; None otherwise so
+        # callers can distinguish "not instrumented" from "zero trials".
+        self.trial_sharpes = None
+        if _fwd_ret is not None:
+            raw = [
+                t.user_attrs["net_sharpe_oos"]
+                for t in study.trials
+                if t.state == optuna.trial.TrialState.COMPLETE
+                and "net_sharpe_oos" in t.user_attrs
+            ]
+            if raw:
+                self.trial_sharpes = np.array(raw, dtype=np.float64)
+                ts = self.trial_sharpes
+                logger.info(
+                    "HPO trial Sharpes: n=%d  mean=%.4f  std=%.4f  "
+                    "range=[%.4f, %.4f]",
+                    len(ts), float(ts.mean()),
+                    float(ts.std(ddof=1)) if len(ts) > 1 else 0.0,
+                    float(ts.min()), float(ts.max()),
+                )
+
+        logger.info("Tuning complete. Best AUC-PR: %.4f", study.best_value)
+        logger.info("Best params: %s", self.best_params)
+
         return self.best_params
     
     def save(self, path: str) -> None:

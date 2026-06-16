@@ -25,7 +25,7 @@ from app.ml.features.ohlcv_features import (
     compute_cross_section_features,
     CROSS_SECTION_FEATURE_NAMES,
 )
-from app.ml.features.target_generator import create_target_variable
+from app.ml.features.target_generator import ATR_MULTIPLIER_DEFAULT, create_target_variable
 from app.ml.training.data_validator import get_data_validator
 
 
@@ -246,7 +246,7 @@ class FeaturePipeline:
         """
         target = create_target_variable(
             ohlcv_df,
-            atr_multiplier=0.5,
+            atr_multiplier=ATR_MULTIPLIER_DEFAULT,
             horizon=self.prediction_horizon,
             price_col='close',
             use_atr_normalization=True,

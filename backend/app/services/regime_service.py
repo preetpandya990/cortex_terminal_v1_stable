@@ -27,6 +27,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
+# Semantic version of the regime classification rules and indicator thresholds.
+# Increment minor on threshold tuning; major on classification logic overhaul.
+# Persisted on every SimulatedTrade and production signal for reproducibility.
+REGIME_DETECTOR_VERSION: str = "1.0.0"
+
 # ── Nifty index definitions ─────────────────────────────────────────────────────
 
 NIFTY_INDICES: dict[str, dict[str, Any]] = {

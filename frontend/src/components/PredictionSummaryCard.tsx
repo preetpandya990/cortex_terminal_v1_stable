@@ -249,65 +249,52 @@ export function PredictionSummaryCard({
             cfg.wrapBorder,
           )}
         >
-          <div className="flex items-center gap-3">
-            {/* Direction badge */}
+          {/* Row 1 — direction badge + conviction label */}
+          <div className="flex items-center justify-between gap-2 mb-2">
             <span
               className={cn(
-                'inline-flex shrink-0 items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-black uppercase tracking-wide',
+                'inline-flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-black uppercase tracking-wide',
                 cfg.badgeBg,
                 cfg.badgeText,
               )}
             >
-              <DirIcon className="h-4 w-4" />
+              <DirIcon className="h-3.5 w-3.5" />
               {dir}
             </span>
+            <p className={cn('text-sm font-bold leading-tight truncate', cfg.labelText)}>
+              {STRENGTH_LABEL[synthesis.signal_strength]}
+            </p>
+          </div>
 
-            {/* Conviction + source dots */}
-            <div className="flex-1 min-w-0">
-              <p className={cn('text-sm font-bold leading-tight', cfg.labelText)}>
-                {STRENGTH_LABEL[synthesis.signal_strength]}
-              </p>
-              <div className="mt-0.5 flex items-center gap-1.5">
-                {(
-                  [
-                    synthesis.ensembleAlignment,
-                    synthesis.patternAlignment,
-                    synthesis.sentimentAlignment,
-                  ] as Alignment[]
-                ).map((al, i) => (
-                  <div
-                    key={i}
-                    className={cn('h-2 w-2 shrink-0 rounded-full', ALIGNMENT_CONFIG[al].dotClass)}
-                  />
-                ))}
-                <span className="text-[11px] text-slate-500">
-                  {synthesis.confirmed_count} of 3 sources confirm
-                </span>
-              </div>
+          {/* Row 2 — source dots + confidence bar */}
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-1.5 min-w-0">
+              {(
+                [
+                  synthesis.ensembleAlignment,
+                  synthesis.patternAlignment,
+                  synthesis.sentimentAlignment,
+                ] as Alignment[]
+              ).map((al, i) => (
+                <div
+                  key={i}
+                  className={cn('h-2 w-2 shrink-0 rounded-full', ALIGNMENT_CONFIG[al].dotClass)}
+                />
+              ))}
+              <span className="text-[11px] text-slate-500 truncate">
+                {synthesis.confirmed_count}/3 confirmed
+              </span>
             </div>
-
-            {/* Confidence */}
-            <div className="shrink-0 text-right">
-              <p className="mb-1 text-[10px] text-slate-500">Confidence</p>
-              <div className="flex items-center gap-1.5">
-                <div className="h-1.5 w-16 overflow-hidden rounded-full bg-slate-200">
-                  <div
-                    className={cn(
-                      'h-full rounded-full transition-all duration-700',
-                      cfg.accentBar,
-                    )}
-                    style={{ width: `${confPct}%` }}
-                  />
-                </div>
-                <span
-                  className={cn(
-                    'text-sm font-bold tabular-nums',
-                    cfg.labelText,
-                  )}
-                >
-                  {confPct}%
-                </span>
+            <div className="shrink-0 flex items-center gap-1.5">
+              <div className="h-1.5 w-14 overflow-hidden rounded-full bg-slate-200">
+                <div
+                  className={cn('h-full rounded-full transition-all duration-700', cfg.accentBar)}
+                  style={{ width: `${confPct}%` }}
+                />
               </div>
+              <span className={cn('w-7 text-right text-xs font-bold tabular-nums', cfg.labelText)}>
+                {confPct}%
+              </span>
             </div>
           </div>
         </div>

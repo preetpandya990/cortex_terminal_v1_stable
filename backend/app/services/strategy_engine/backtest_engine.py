@@ -45,6 +45,7 @@ Output schema (result_metrics JSONB)
   "equity_curve": [{"date": "YYYY-MM-DD", "equity": float}, ...],
   "trades": [{...SimulatedTrade fields...}, ...],
   "per_symbol_stats": {symbol: {wins, losses, net_pnl}, ...},
+  "per_regime_stats": {regime: {n, wins, losses, net_pnl, win_rate_pct}, ...},
 }
 """
 from __future__ import annotations
@@ -65,6 +66,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.ai.fusion.models import AITradingSignal
 from app.ml.features.feature_pipeline import compute_features_for_symbol
 from app.models.strategies import Strategy, StrategyBacktestRun
+from app.services.regime_service import (
+    REGIME_DETECTOR_VERSION,
+    RegimeService as _RegimeService,
+)
 from app.services.strategy_engine.filter_pipeline import (
     StrategyFilterPipeline,
     strategy_filter_pipeline,
@@ -88,13 +93,13 @@ _MIN_LOOKBACK_BARS: int = 10
 @dataclass
 class SimulatedTrade:
     symbol: str
-    direction: str           # "LONG" | "SHORT"
+    direction: str              # "LONG" | "SHORT"
     entry_price: float
     exit_price: float
     quantity: float
     stop_loss: float | None
     take_profit_1: float | None
-    exit_reason: str         # "TP1" | "SL" | "SIGNAL_EXPIRED" | "PERIOD_END"
+    exit_reason: str            # "TP1" | "SL" | "SIGNAL_EXPIRED" | "PERIOD_END"
     entry_at: datetime
     exit_at: datetime
     gross_pnl: float
@@ -102,6 +107,9 @@ class SimulatedTrade:
     net_pnl: float
     pnl_pct: float
     hold_duration_seconds: float
+    # ── Regime provenance (A1) ────────────────────────────────────────────────
+    regime_label: str = "unknown"       # e.g. "bull_trending", "sideways_range"
+    regime_detector_version: str | None = None  # "stored" | REGIME_DETECTOR_VERSION
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -120,6 +128,8 @@ class SimulatedTrade:
             "net_pnl": round(self.net_pnl, 4),
             "pnl_pct": round(self.pnl_pct, 4),
             "hold_duration_seconds": round(self.hold_duration_seconds, 1),
+            "regime_label": self.regime_label,
+            "regime_detector_version": self.regime_detector_version,
         }
 
 
@@ -132,6 +142,8 @@ class _OpenPosition:
     stop_loss: float | None
     take_profit_1: float | None
     entry_at: datetime
+    regime_label: str = "unknown"
+    regime_detector_version: str | None = None
 
 
 @dataclass
@@ -155,6 +167,7 @@ class BacktestResult:
             "equity_curve": _build_equity_curve(self.trades),
             "trades": [t.to_dict() for t in self.trades],
             "per_symbol_stats": _per_symbol_stats(self.trades),
+            "per_regime_stats": _per_regime_stats(self.trades),
         }
 
 
@@ -312,6 +325,32 @@ def _per_symbol_stats(trades: list[SimulatedTrade]) -> dict[str, Any]:
     return stats
 
 
+def _per_regime_stats(trades: list[SimulatedTrade]) -> dict[str, Any]:
+    """
+    Aggregate trade outcomes by regime label.
+
+    Each bucket explicitly surfaces N so thin-regime slices cannot be
+    over-interpreted by callers.  Acceptance criterion: every metric is
+    accompanied by its regime-sample count (A1 parity requirement).
+    """
+    buckets: dict[str, dict[str, Any]] = {}
+    for t in trades:
+        b = buckets.setdefault(
+            t.regime_label,
+            {"n": 0, "wins": 0, "losses": 0, "net_pnl": 0.0},
+        )
+        b["n"] += 1
+        if t.net_pnl > 0:
+            b["wins"] += 1
+        else:
+            b["losses"] += 1
+        b["net_pnl"] = round(b["net_pnl"] + t.net_pnl, 4)
+    for b in buckets.values():
+        n = b["n"]
+        b["win_rate_pct"] = round(100.0 * b["wins"] / n, 2) if n > 0 else None
+    return buckets
+
+
 def _build_simulated_trade(
     pos: _OpenPosition,
     exit_price: float,
@@ -339,6 +378,8 @@ def _build_simulated_trade(
         net_pnl=net,
         pnl_pct=pnl_pct,
         hold_duration_seconds=(exit_at - pos.entry_at).total_seconds(),
+        regime_label=pos.regime_label,
+        regime_detector_version=pos.regime_detector_version,
     )
 
 
@@ -543,6 +584,11 @@ class BacktestEngine:
                 stop_loss=sl,
                 take_profit_1=tp1,
                 entry_at=sig.signal_timestamp,
+                # Regime was computed by the production detector at signal-generation
+                # time and persisted in the DB; "stored" signals we have no live
+                # version available here.
+                regime_label=sig.regime_type or "unknown",
+                regime_detector_version="stored",
             )
 
         # Force-close any position still open at period end
@@ -692,13 +738,31 @@ class BacktestEngine:
             sl = pred.get("stop_loss")
             tp1 = pred.get("take_profit_1") or pred.get("take_profit_targets", [None])[0]
 
+            # Causal regime detection: build a candle list from the OHLCV rows
+            # available up to and including bar i (i.e., no future data).
+            # We use up to 60 bars, matching the production detector's window.
+            if has_ohlcv:
+                candle_start = max(0, i - 59)
+                ohlcv_slice = features_df.iloc[candle_start : i + 1]
+                candles = [
+                    {
+                        "high": float(ohlcv_slice["high"].iloc[k]),
+                        "low": float(ohlcv_slice["low"].iloc[k]),
+                        "close": float(ohlcv_slice["close"].iloc[k]),
+                    }
+                    for k in range(len(ohlcv_slice))
+                ]
+                bar_regime_label = _RegimeService._compute_regime_from_candles(candles)["regime"]
+            else:
+                bar_regime_label = "insufficient_data"
+
             # Build MarketContext to run the full 7-gate pipeline
             ctx = MarketContext(
                 symbol=symbol,
                 action=direction_label,
                 confidence_score=confidence,
                 confidence_score_pct=confidence * 100,
-                regime_type="unknown",
+                regime_type=bar_regime_label,
                 time_horizon="intraday",
                 rsi_14=None,
                 ema_20=None,
@@ -736,6 +800,8 @@ class BacktestEngine:
                 stop_loss=float(sl) if sl else None,
                 take_profit_1=float(tp1) if tp1 else None,
                 entry_at=bar_ts.to_pydatetime() if hasattr(bar_ts, "to_pydatetime") else bar_ts,
+                regime_label=bar_regime_label,
+                regime_detector_version=REGIME_DETECTOR_VERSION,
             )
 
         # Force-close any open position at period end

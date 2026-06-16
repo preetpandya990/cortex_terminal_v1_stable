@@ -1,208 +1,118 @@
 # Cortex AI - Documentation Index
 
-**Quick navigation to all project documentation**
+Current navigation index for the `documentation/` tree.
 
 ---
 
-## 🚀 Getting Started
+## Snapshot
+
+- Total markdown documents: 275
+- Top-level directories: 17
+- Root-level markdown docs: 4
+- Status: mixed set of source-of-truth guides plus historical implementation artifacts
+
+---
+
+## Getting Started
 
 | Document | Description | Location |
 |----------|-------------|----------|
-| **Startup Instructions** | How to start the system | [documentation/guides/STARTUP_INSTRUCTIONS.md](documentation/guides/STARTUP_INSTRUCTIONS.md) |
-| **Architecture Summary** | Quick architecture overview | [documentation/architecture/ARCHITECTURE_SUMMARY.md](documentation/architecture/ARCHITECTURE_SUMMARY.md) |
-| **User FAQ** | 80 common questions answered | [documentation/guides/USER_FAQ_COMMON_QUESTIONS.md](documentation/guides/USER_FAQ_COMMON_QUESTIONS.md) |
-| **Known Issues** | Current issues & fixes | [documentation/troubleshooting/KNOWN_ISSUES_AND_REMEDIATION.md](documentation/troubleshooting/KNOWN_ISSUES_AND_REMEDIATION.md) |
+| Startup Instructions | Lightweight local startup flow | [documentation/guides/STARTUP_INSTRUCTIONS.md](documentation/guides/STARTUP_INSTRUCTIONS.md) |
+| Root README | Full migration and fresh-install guide | [documentation/root/README.md](documentation/root/README.md) |
+| Architecture Summary | High-level system overview | [documentation/architecture/ARCHITECTURE_SUMMARY.md](documentation/architecture/ARCHITECTURE_SUMMARY.md) |
+| Known Issues | Current remediation backlog | [documentation/troubleshooting/KNOWN_ISSUES_AND_REMEDIATION.md](documentation/troubleshooting/KNOWN_ISSUES_AND_REMEDIATION.md) |
 
 ---
 
-## 🏗️ Architecture (5 files)
+## Top-Level Inventory
 
-| Document | Description |
-|----------|-------------|
-| [ARCHITECTURE.md](documentation/architecture/ARCHITECTURE.md) | Complete system architecture — v1.1.1, post-overhaul (updated 2026-06-01) |
-| [ARCHITECTURE_SUMMARY.md](documentation/architecture/ARCHITECTURE_SUMMARY.md) | Quick reference guide |
-| [ARCHITECTURE_DIAGRAMS.md](documentation/architecture/ARCHITECTURE_DIAGRAMS.md) | Visual architecture diagrams |
-| [MERGE_PLAN.md](documentation/architecture/MERGE_PLAN.md) | Original ML + AI merge plan |
-| [MARKET_FEED_ARCHITECTURE.md](documentation/architecture/MARKET_FEED_ARCHITECTURE.md) | Unified real-time market feed architecture, design decisions, before/after |
-
----
-
-## 📡 API Documentation (3 files)
-
-| Document | Description |
-|----------|-------------|
-| [API_ENDPOINTS_DOCUMENTATION.md](documentation/api/API_ENDPOINTS_DOCUMENTATION.md) | Complete API reference (50+ endpoints) |
-| [CURL_COMMANDS.md](documentation/api/CURL_COMMANDS.md) | Example CURL commands for testing |
-| [MARKET_FEED_WEBSOCKET_API.md](documentation/api/MARKET_FEED_WEBSOCKET_API.md) | Market feed WS protocol — connection, auth, all message types, error codes |
-
----
-
-## ⚙️ Configuration (2 files)
-
-| Document | Description |
-|----------|-------------|
-| [UPSTOX_CREDENTIALS_GUIDE.md](documentation/configuration/UPSTOX_CREDENTIALS_GUIDE.md) | Upstox API credentials setup |
-| [DEV_SCRIPTS_README.md](documentation/configuration/DEV_SCRIPTS_README.md) | Development scripts reference |
+| Section | Markdown Files | Purpose | Suggested Entry Point |
+|--------|----------------|---------|------------------------|
+| `architecture/` | 5 | System architecture and major design decisions | [ARCHITECTURE_SUMMARY.md](documentation/architecture/ARCHITECTURE_SUMMARY.md) |
+| `api/` | 3 | REST and WebSocket API reference | [API_ENDPOINTS_DOCUMENTATION.md](documentation/api/API_ENDPOINTS_DOCUMENTATION.md) |
+| `configuration/` | 2 | Credentials and dev script setup | [UPSTOX_CREDENTIALS_GUIDE.md](documentation/configuration/UPSTOX_CREDENTIALS_GUIDE.md) |
+| `guides/` | 6 | Startup, testing, FAQ, handoff | [STARTUP_INSTRUCTIONS.md](documentation/guides/STARTUP_INSTRUCTIONS.md) |
+| `implementation/` | 25 | Feature implementation reports and technical notes | [MARKET_FEED_IMPLEMENTATION.md](documentation/implementation/MARKET_FEED_IMPLEMENTATION.md) |
+| `phases/` | 15 | Phase progress and completion records | [PHASE_10_COMPLETE_SUMMARY.md](documentation/phases/PHASE_10_COMPLETE_SUMMARY.md) |
+| `plans/` | 6 | Forward plans and design proposals | [MARKET_FEED_PLAN.md](documentation/plans/MARKET_FEED_PLAN.md) |
+| `root/` | 5 | Root-level operational guides, plans, and task lists | [README.md](documentation/root/README.md) |
+| `root-artifacts/` | 61 | Historical analyses, fixes, reports, research, and plans | [research/ML_DL_KNOWLEDGE_COMPACT.md](documentation/root-artifacts/research/ML_DL_KNOWLEDGE_COMPACT.md) |
+| `system-status/` | 7 | Status snapshots, audits, and cleanup notes | [ANALYSIS_AND_SOLUTION.md](documentation/system-status/ANALYSIS_AND_SOLUTION.md) |
+| `tasks/` | 34 | Task tracking, validations, and hawk-eye workstreams | [TASK_44_FINAL_SYSTEM_VALIDATION.md](documentation/tasks/TASK_44_FINAL_SYSTEM_VALIDATION.md) |
+| `testing/` | 5 | Test summaries and verification guides | [ML_SYSTEM_VERIFICATION_REPORT.md](documentation/testing/ML_SYSTEM_VERIFICATION_REPORT.md) |
+| `troubleshooting/` | 7 | Issue summaries and remediation guides | [KNOWN_ISSUES_AND_REMEDIATION.md](documentation/troubleshooting/KNOWN_ISSUES_AND_REMEDIATION.md) |
+| `backend/` | 86 | Backend-specific docs, guides, references, testing, and ML notes | [docs/architecture/ML_SYSTEM_ARCHITECTURE.md](documentation/backend/docs/architecture/ML_SYSTEM_ARCHITECTURE.md) |
+| `frontend/` | 4 | Frontend architecture and loading-state guides | [docs/HEALTH_CHECK_ARCHITECTURE.md](documentation/frontend/docs/HEALTH_CHECK_ARCHITECTURE.md) |
+| `tools/` | 0 markdown + PDF assets | External tool setup docs | `documentation/tools/graphify/` |
 
 ---
 
-## 📚 User Guides (6 files)
+## Core References
 
-| Document | Description |
-|----------|-------------|
-| [USER_FAQ_COMMON_QUESTIONS.md](documentation/guides/USER_FAQ_COMMON_QUESTIONS.md) | 80 frequently asked questions |
-| [STARTUP_INSTRUCTIONS.md](documentation/guides/STARTUP_INSTRUCTIONS.md) | How to start the system |
-| [TESTING_WORKFLOW.md](documentation/guides/TESTING_WORKFLOW.md) | Testing procedures |
-| [Guide.md](documentation/guides/Guide.md) | General user guide |
-| [PROJECT_COMPLETION_REPORT.md](documentation/guides/PROJECT_COMPLETION_REPORT.md) | Project completion summary |
-| [FINAL_PROJECT_HANDOFF.md](documentation/guides/FINAL_PROJECT_HANDOFF.md) | Handoff documentation |
+### Architecture
+- [documentation/architecture/ARCHITECTURE.md](documentation/architecture/ARCHITECTURE.md) - full architecture document
+- [documentation/architecture/ARCHITECTURE_SUMMARY.md](documentation/architecture/ARCHITECTURE_SUMMARY.md) - quick reference
+- [documentation/architecture/MARKET_FEED_ARCHITECTURE.md](documentation/architecture/MARKET_FEED_ARCHITECTURE.md) - unified market feed architecture
 
----
+### APIs and runtime
+- [documentation/api/API_ENDPOINTS_DOCUMENTATION.md](documentation/api/API_ENDPOINTS_DOCUMENTATION.md) - main API surface
+- [documentation/api/MARKET_FEED_WEBSOCKET_API.md](documentation/api/MARKET_FEED_WEBSOCKET_API.md) - market feed WS protocol
+- [documentation/root/README.md](documentation/root/README.md) - actual install and migration checklist
 
-## 🔧 Implementation (9 files)
-
-| Document | Description |
-|----------|-------------|
-| [AUTH_LOGIN_AND_ADMIN_USERS.md](documentation/implementation/AUTH_LOGIN_AND_ADMIN_USERS.md) | **Login UI & Admin User Management** — branded login page, auth middleware, BFF routes, CRUD user management, safety guards, session revocation |
-| [CORTEX_AI_UNIFIED_MERGE_COMPLETE.md](documentation/implementation/CORTEX_AI_UNIFIED_MERGE_COMPLETE.md) | Merge completion report |
-| [IMPLEMENTATION_COMPLETE.md](documentation/implementation/IMPLEMENTATION_COMPLETE.md) | Implementation summary |
-| [DRIFT_DETECTION_IMPLEMENTATION.md](documentation/implementation/DRIFT_DETECTION_IMPLEMENTATION.md) | ML drift detection details |
-| [HAWK_EYE_IMPLEMENTATION_COMPLETE.md](documentation/implementation/HAWK_EYE_IMPLEMENTATION_COMPLETE.md) | Market scanner implementation |
-| [SCANNER_FIX_PRODUCTION_GRADE.md](documentation/implementation/SCANNER_FIX_PRODUCTION_GRADE.md) | Scanner production fixes |
-| [FRONTEND_COMPONENTS_SCAN.md](documentation/implementation/FRONTEND_COMPONENTS_SCAN.md) | Frontend component inventory |
-| [POST_MERGE_CLEANUP_CHECKLIST.md](documentation/implementation/POST_MERGE_CLEANUP_CHECKLIST.md) | Post-merge cleanup tasks |
-| [MARKET_FEED_IMPLEMENTATION.md](documentation/implementation/MARKET_FEED_IMPLEMENTATION.md) | **Unified real-time market feed** — problem analysis, solution, all file changes, throttle strategy, monitoring |
+### Operations
+- [documentation/guides/STARTUP_INSTRUCTIONS.md](documentation/guides/STARTUP_INSTRUCTIONS.md) - quick local startup
+- [documentation/guides/TESTING_WORKFLOW.md](documentation/guides/TESTING_WORKFLOW.md) - test workflow
+- [documentation/troubleshooting/KNOWN_ISSUES_AND_REMEDIATION.md](documentation/troubleshooting/KNOWN_ISSUES_AND_REMEDIATION.md) - current known issues
 
 ---
 
-## 📊 Development Phases (15 files)
+## Major Subtrees
 
-| Phase | Document | Status |
-|-------|----------|--------|
-| Phase 1 | [PHASE_1_COMPLETE.md](documentation/phases/PHASE_1_COMPLETE.md) | ✅ Complete |
-| Phase 2 | [PHASE_2_COMPLETE.md](documentation/phases/PHASE_2_COMPLETE.md) | ✅ Complete |
-| Phase 3 | [PHASE_3_COMPLETE.md](documentation/phases/PHASE_3_COMPLETE.md) | ✅ Complete |
-| Phase 4 | [PHASE_4_COMPLETE.md](documentation/phases/PHASE_4_COMPLETE.md) | ✅ Complete |
-| Phase 4 | [PHASE_4_PROGRESS.md](documentation/phases/PHASE_4_PROGRESS.md) | Progress notes |
-| Phase 5 | [PHASE_5_COMPLETE.md](documentation/phases/PHASE_5_COMPLETE.md) | ✅ Complete |
-| Phase 5-6 | [PHASE_5_6_IMPLEMENTATION_STATUS.md](documentation/phases/PHASE_5_6_IMPLEMENTATION_STATUS.md) | Status update |
-| Phase 6 | [PHASE_6_COMPLETE.md](documentation/phases/PHASE_6_COMPLETE.md) | ✅ Complete |
-| Phase 7 | [PHASE_7_COMPLETE.md](documentation/phases/PHASE_7_COMPLETE.md) | ✅ Complete |
-| Phase 8 | [PHASE_8_STATUS.md](documentation/phases/PHASE_8_STATUS.md) | Status update |
-| Phase 9 | [PHASE_9_COMPLETE_SUMMARY.md](documentation/phases/PHASE_9_COMPLETE_SUMMARY.md) | ✅ Complete |
-| Phase 9 | [PHASE_9_IMPLEMENTATION_SUMMARY.md](documentation/phases/PHASE_9_IMPLEMENTATION_SUMMARY.md) | Implementation notes |
-| Phase 9 | [PHASE_9_TASK_9.4_COMPLETE.md](documentation/phases/PHASE_9_TASK_9.4_COMPLETE.md) | Task 9.4 complete |
-| Phase 10 | [PHASE_10_COMPLETE_SUMMARY.md](documentation/phases/PHASE_10_COMPLETE_SUMMARY.md) | ✅ Complete |
-| Phase 10 | [PHASE_10_DOCUMENTATION_SUMMARY.md](documentation/phases/PHASE_10_DOCUMENTATION_SUMMARY.md) | Documentation summary |
+### `documentation/backend/`
+- `docs/` - architecture, security, training, APIs, task summaries
+- `guides/` - observability, health checks, realtime, caching, pagination
+- `reference/` - quick-reference sheets
+- `ml/` - monitoring and ensemble docs
+- `testing/` - backend integration test documentation
 
----
+### `documentation/root-artifacts/`
+- `analysis/` - investigation reports
+- `enhancements/` - enhancement completion records
+- `fixes/` - fix summaries and verification notes
+- `plans/` - implementation and remediation plans
+- `references/` - context and API references
+- `reports/` - audit reports
+- `research/` - ML, LLM, and fundamentals research
+- `status/` - status and recovery notes
+- `tasks/` - older task lists
 
-## 📋 Tasks (9 files)
-
-| Document | Description |
-|----------|-------------|
-| [TASKS_UPDATE_SUMMARY.md](documentation/tasks/TASKS_UPDATE_SUMMARY.md) | Task updates overview |
-| [TASK_39_CHECKPOINT_SUMMARY.md](documentation/tasks/TASK_39_CHECKPOINT_SUMMARY.md) | Task 39 checkpoint |
-| [TASK_39_COMPLETE_REPORT.md](documentation/tasks/TASK_39_COMPLETE_REPORT.md) | Task 39 completion |
-| [TASK_39_EXECUTION_STATUS.md](documentation/tasks/TASK_39_EXECUTION_STATUS.md) | Task 39 execution |
-| [TASK_39_FINAL_COMPREHENSIVE_REPORT.md](documentation/tasks/TASK_39_FINAL_COMPREHENSIVE_REPORT.md) | Task 39 final report |
-| [TASK_39_FINAL_RESULTS.md](documentation/tasks/TASK_39_FINAL_RESULTS.md) | Task 39 results |
-| [TASK_43_TRAINING_GUIDES_SUMMARY.md](documentation/tasks/TASK_43_TRAINING_GUIDES_SUMMARY.md) | Training guides summary |
-| [TASK_44_FINAL_SYSTEM_VALIDATION.md](documentation/tasks/TASK_44_FINAL_SYSTEM_VALIDATION.md) | Final validation |
-| [MARKET_FEED_CHANGE_LOG.md](documentation/tasks/hawk-eye/market-feed/MARKET_FEED_CHANGE_LOG.md) | File-by-file change log for the unified market feed implementation |
+### `documentation/tasks/hawk-eye/`
+- `completion-reports/` - task-by-task completion docs
+- `market-feed/` - market feed change log
+- `planning/` - task planning
+- `tracking/` - task tracker
 
 ---
 
-## 🧪 Testing (4 files)
+## Root-Level Markdown Files
 
-| Document | Description |
-|----------|-------------|
-| [INTEGRATION_TESTS_SUMMARY.md](documentation/testing/INTEGRATION_TESTS_SUMMARY.md) | Integration test results |
-| [PERFORMANCE_TESTS_SUMMARY.md](documentation/testing/PERFORMANCE_TESTS_SUMMARY.md) | Performance test results |
-| [ML_SYSTEM_VERIFICATION_REPORT.md](documentation/testing/ML_SYSTEM_VERIFICATION_REPORT.md) | ML system verification |
-| [MARKET_FEED_TESTING_GUIDE.md](documentation/testing/MARKET_FEED_TESTING_GUIDE.md) | Market feed verification — mock mode, wscat tests, regression checklist, perf validation |
-
----
-
-## 🔍 System Status (3 files)
-
-| Document | Description |
-|----------|-------------|
-| [ANALYSIS_AND_SOLUTION.md](documentation/system-status/ANALYSIS_AND_SOLUTION.md) | System analysis |
-| [SYSTEM_STATUS_DECISION_POINT.md](documentation/system-status/SYSTEM_STATUS_DECISION_POINT.md) | Decision point status |
-| [SYSTEM_STATUS_PRE_BIG_FEATURE.md](documentation/system-status/SYSTEM_STATUS_PRE_BIG_FEATURE.md) | Pre-feature status |
+| File | Purpose |
+|------|---------|
+| [documentation/README.md](documentation/README.md) | Documentation landing page |
+| [documentation/DOCUMENTATION_INDEX.md](documentation/DOCUMENTATION_INDEX.md) | Master index |
+| [documentation/DOCUMENTATION_ORGANIZATION_SUMMARY.md](documentation/DOCUMENTATION_ORGANIZATION_SUMMARY.md) | Organization snapshot |
+| [documentation/TASKS_3_8_IMPLEMENTATION_COMPLETE.md](documentation/TASKS_3_8_IMPLEMENTATION_COMPLETE.md) | Standalone implementation report |
 
 ---
 
-## 🚨 Troubleshooting (5 files)
+## Notes
 
-| Document | Description |
-|----------|-------------|
-| [AUTH_LOGIN_BUGS.md](documentation/troubleshooting/AUTH_LOGIN_BUGS.md) | **Auth & Login bugs** — FastAPI 204 assertion, Pydantic ORM mode 500, role lost on token refresh (root cause + fix for each) |
-| [KNOWN_ISSUES_AND_REMEDIATION.md](documentation/troubleshooting/KNOWN_ISSUES_AND_REMEDIATION.md) | Known issues & fixes |
-| [AUTH_FIX_SUMMARY.md](documentation/troubleshooting/AUTH_FIX_SUMMARY.md) | Authentication fixes |
-| [UPSTOX_FIX_SUMMARY.md](documentation/troubleshooting/UPSTOX_FIX_SUMMARY.md) | Upstox integration fixes |
-| [CORTEX_AI_DASHBOARD_FIX.md](documentation/troubleshooting/CORTEX_AI_DASHBOARD_FIX.md) | Dashboard fixes |
+- The top-level `documentation/` tree is no longer limited to the original 10-11 categories.
+- `root/` and `root-artifacts/` hold a large amount of historical context.
+- For current operational work, prefer `root/README.md`, `guides/`, `architecture/`, `api/`, and `troubleshooting/` before historical completion reports.
 
 ---
 
-## 📊 Documentation Statistics
-
-- **Total Files**: 62 markdown documents
-- **Total Directories**: 11 organized categories
-- **Architecture Docs**: 5 files (including 2,499-line main doc)
-- **Phase Reports**: 15 completion reports
-- **User Guides**: 6 comprehensive guides
-- **API Documentation**: 3 files (50+ endpoints + market feed WS)
-- **Implementation Docs**: 9 files
-- **Troubleshooting Docs**: 5 files
-- **Test Reports**: 4 comprehensive reports
-
----
-
-## 🔗 External Documentation
-
-### Backend Documentation
-- **Location**: `backend/docs/`
-- **Contents**: API guides, runbooks, architecture details
-- **Key Files**:
-  - `backend/docs/api/ML_PREDICTION_API.md`
-  - `backend/docs/runbooks/ML_MODEL_DEPLOYMENT.md`
-  - `backend/docs/guides/ml-feature-engineering.md`
-  - `backend/docs/guides/ml-model-training.md`
-
-### Frontend Documentation
-- **Location**: `frontend/docs/`
-- **Contents**: Component documentation, architecture
-- **Key Files**:
-  - `frontend/docs/HEALTH_CHECK_ARCHITECTURE.md`
-
----
-
-## 📝 Quick Reference
-
-### For New Users
-1. Start with [USER_FAQ_COMMON_QUESTIONS.md](documentation/guides/USER_FAQ_COMMON_QUESTIONS.md)
-2. Read [STARTUP_INSTRUCTIONS.md](documentation/guides/STARTUP_INSTRUCTIONS.md)
-3. Review [ARCHITECTURE_SUMMARY.md](documentation/architecture/ARCHITECTURE_SUMMARY.md)
-
-### For Developers
-1. Read [ARCHITECTURE.md](documentation/architecture/ARCHITECTURE.md)
-2. Check [API_ENDPOINTS_DOCUMENTATION.md](documentation/api/API_ENDPOINTS_DOCUMENTATION.md)
-3. Review [IMPLEMENTATION_COMPLETE.md](documentation/implementation/IMPLEMENTATION_COMPLETE.md)
-
-### For Operations
-1. Check [KNOWN_ISSUES_AND_REMEDIATION.md](documentation/troubleshooting/KNOWN_ISSUES_AND_REMEDIATION.md)
-2. Review [UPSTOX_CREDENTIALS_GUIDE.md](documentation/configuration/UPSTOX_CREDENTIALS_GUIDE.md)
-3. Read [TESTING_WORKFLOW.md](documentation/guides/TESTING_WORKFLOW.md)
-
-### For Project Managers
-1. Review [PROJECT_COMPLETION_REPORT.md](documentation/guides/PROJECT_COMPLETION_REPORT.md)
-2. Check all [Phase Reports](documentation/phases/)
-3. Review [Task Summaries](documentation/tasks/)
-
----
-
-**Last Updated**: June 1, 2026  
-**Documentation Version**: 1.2  
-**Project Status**: Production Ready (v1.1.1)
+**Last Updated**: 2026-06-15  
+**Documentation Version**: 1.3  
+**Project Status**: Production-ready documentation set with historical artifacts retained

@@ -3,17 +3,16 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams, useRouter } from "next/navigation";
-import { Radar, Loader2, AlertCircle, Star } from "lucide-react";
+import { Radar, AlertCircle, Star } from "lucide-react";
 import { tradeSuggestionsAPI, isNetworkError, type CorrelationActivityItem } from "@/lib/api";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { InstrumentSearchCombobox } from "@/components/market/InstrumentSearchCombobox";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { TradeSuggestionCard } from "./components/TradeSuggestionCard";
 import { WatchlistCard } from "./components/WatchlistCard";
 import { DetailPane } from "./components/DetailPane";
 import { SuggestionDetailModal } from "./components/SuggestionDetailModal";
 import { SuggestionFilters } from "./components/SuggestionFilters";
-import { SuggestionStats } from "./components/SuggestionStats";
 import { MLActivityCard } from "./components/MLActivityCard";
+import { KeyboardShortcutsPanel } from "@/components/KeyboardShortcutsPanel";
 import { useWebSocket, type WebSocketMessage } from "@/hooks/useWebSocket";
 import { useMLActivity } from "@/hooks/useMLActivity";
 import { useWatchlist } from "@/hooks/useWatchlist";
@@ -23,6 +22,10 @@ import { usePositions } from "@/hooks/usePaperTrading";
 import type { UpstoxInstrument } from "@/types/upstox";
 import type { TradeSuggestion, SuggestionFilters as Filters } from "@/types/trade_suggestions";
 import type { PositionSide } from "@/types/paper_trading";
+
+function isExpiredSuggestion(s: TradeSuggestion): boolean {
+  return new Date(s.expires_at).getTime() < Date.now();
+}
 
 export default function HawkEyeRadarClient() {
   const searchParams = useSearchParams();
@@ -35,6 +38,10 @@ export default function HawkEyeRadarClient() {
   const [modalSuggestion, setModalSuggestion] = useState<TradeSuggestion | null>(null);
   const [filters, setFilters] = useState<Filters>({ status: "active", page: 1, page_size: 50 });
   const queryClient = useQueryClient();
+
+  // Keyboard navigation state
+  const [focusedCardIndex, setFocusedCardIndex] = useState(0);
+  const [showShortcutsPanel, setShowShortcutsPanel] = useState(false);
 
   // Seed ML Activity feed with recent history from the DB on first load.
   const { data: activitySeed } = useQuery<CorrelationActivityItem[]>({
@@ -121,6 +128,7 @@ export default function HawkEyeRadarClient() {
     queryFn: () => tradeSuggestionsAPI.getSuggestions(filters),
     enabled: isAuthenticated && !authLoading,
     refetchInterval: isConnected ? false : 30000,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     retry: (failureCount, error: any) => {
       if (error?.response?.status === 401) return false;
       return failureCount < 3;
@@ -128,6 +136,20 @@ export default function HawkEyeRadarClient() {
     retryDelay: (attemptIndex) => Math.min(1000 * 2 ** attemptIndex, 30000),
     staleTime: 30000,
   });
+
+  // Stable flat list of suggestions for keyboard navigation.
+  const suggestions = suggestionsData?.suggestions ?? [];
+
+  // Index of the currently open modal suggestion within the suggestions list.
+  const currentModalIndex = useMemo(
+    () =>
+      modalSuggestion
+        ? suggestions.findIndex((s) => s.suggestion_id === modalSuggestion.suggestion_id)
+        : -1,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // suggestions identity changes on every refetch; compare by suggestion_id instead.
+    [modalSuggestion?.suggestion_id, suggestions],
+  );
 
   // Read instrument_key from URL on mount
   useEffect(() => {
@@ -143,6 +165,9 @@ export default function HawkEyeRadarClient() {
   }, [searchParams, suggestionsData, selectedInstrument]);
 
   // Read suggestion_id from URL on mount → open the focused modal (deep linking).
+  // Intentionally excludes modalSuggestion from deps: including it causes the modal
+  // to reopen immediately after close because router.push is async and the URL still
+  // carries suggestion_id during the render cycle where modalSuggestion becomes null.
   useEffect(() => {
     const suggestionId = searchParams.get('suggestion_id');
     if (suggestionId && !modalSuggestion && suggestionsData) {
@@ -153,11 +178,39 @@ export default function HawkEyeRadarClient() {
         setModalSuggestion(suggestion);
       }
     }
-  }, [searchParams, suggestionsData, modalSuggestion]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams, suggestionsData]);
+
+  // Global keyboard shortcuts: ? = shortcuts panel, / = focus filters.
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent): void {
+      // Don't fire when typing in inputs.
+      const tag = (document.activeElement as HTMLElement)?.tagName ?? "";
+      if (["INPUT", "TEXTAREA", "SELECT"].includes(tag)) return;
+      if ((document.activeElement as HTMLElement)?.isContentEditable) return;
+      if (e.ctrlKey || e.altKey || e.metaKey) return;
+
+      if (e.key === "?") {
+        e.preventDefault();
+        setShowShortcutsPanel((v) => !v);
+      }
+
+      if (e.key === "/" && !modalSuggestion) {
+        e.preventDefault();
+        document
+          .getElementById("hawk-eye-filter-bar")
+          ?.querySelector<HTMLElement>('[role="combobox"], button')
+          ?.focus();
+      }
+    }
+
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [modalSuggestion]);
 
   // Suggestion card → open the focused modal (not the full DetailPane).
   // Keyed in the URL by suggestion_id so the view is shareable/deep-linkable.
-  const handleViewDetails = (suggestionId: string) => {
+  const handleViewDetails = useCallback((suggestionId: string) => {
     const suggestion = suggestionsData?.suggestions.find((s) => s.suggestion_id === suggestionId);
     if (suggestion) {
       setModalSuggestion(suggestion);
@@ -166,18 +219,46 @@ export default function HawkEyeRadarClient() {
       params.delete('instrument_key');
       router.push(`?${params.toString()}`, { scroll: false });
     }
-  };
+  }, [suggestionsData?.suggestions, searchParams, router]);
 
-  const handleCloseModal = () => {
+  const handleCloseModal = useCallback(() => {
     setModalSuggestion(null);
     const params = new URLSearchParams(searchParams.toString());
     params.delete('suggestion_id');
     const newUrl = params.toString() ? `?${params.toString()}` : '/hawk-eye-radar';
     router.push(newUrl, { scroll: false });
-  };
+
+    // Restore focus to the originating grid card.
+    requestAnimationFrame(() => {
+      const s = suggestions[focusedCardIndex];
+      if (s) document.getElementById(`card-${s.suggestion_id}`)?.focus();
+    });
+  }, [searchParams, router, suggestions, focusedCardIndex]);
+
+  // Navigate to the previous suggestion while the modal is open.
+  const handleModalPrevious = useCallback(() => {
+    if (currentModalIndex <= 0) return;
+    const prev = suggestions[currentModalIndex - 1];
+    setModalSuggestion(prev);
+    setFocusedCardIndex(currentModalIndex - 1);
+    const params = new URLSearchParams(searchParams.toString());
+    params.set('suggestion_id', prev.suggestion_id);
+    router.push(`?${params.toString()}`, { scroll: false });
+  }, [currentModalIndex, suggestions, searchParams, router]);
+
+  // Navigate to the next suggestion while the modal is open.
+  const handleModalNext = useCallback(() => {
+    if (currentModalIndex >= suggestions.length - 1) return;
+    const next = suggestions[currentModalIndex + 1];
+    setModalSuggestion(next);
+    setFocusedCardIndex(currentModalIndex + 1);
+    const params = new URLSearchParams(searchParams.toString());
+    params.set('suggestion_id', next.suggestion_id);
+    router.push(`?${params.toString()}`, { scroll: false });
+  }, [currentModalIndex, suggestions, searchParams, router]);
 
   // Modal "Open full view" → promote to the DetailPane (chart, live price, trade).
-  const handleOpenFullView = () => {
+  const handleOpenFullView = useCallback(() => {
     if (!modalSuggestion) return;
     setDetailSuggestion(modalSuggestion);
     setModalSuggestion(null);
@@ -185,23 +266,16 @@ export default function HawkEyeRadarClient() {
     params.delete('suggestion_id');
     params.set('instrument_key', modalSuggestion.instrument_key);
     router.push(`?${params.toString()}`, { scroll: false });
-  };
+  }, [modalSuggestion, searchParams, router]);
 
-  const handleManualSelect = (instrument: UpstoxInstrument) => {
-    setSelectedInstrument(instrument);
-    const params = new URLSearchParams(searchParams.toString());
-    params.set('instrument_key', instrument.instrument_key);
-    router.push(`?${params.toString()}`, { scroll: false });
-  };
-
-  const handleCloseDetail = () => {
+  const handleCloseDetail = useCallback(() => {
     setDetailSuggestion(null);
     setSelectedInstrument(null);
     const params = new URLSearchParams(searchParams.toString());
     params.delete('instrument_key');
     const newUrl = params.toString() ? `?${params.toString()}` : '/hawk-eye-radar';
     router.push(newUrl, { scroll: false });
-  };
+  }, [searchParams, router]);
 
   const handleWatchlistItemClick = useCallback((instrumentKey: string) => {
     if (clickPreventedRef.current) return;
@@ -229,23 +303,73 @@ export default function HawkEyeRadarClient() {
     }
   };
 
+  // Arrow-key navigation across the suggestions grid.
+  const handleGridKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "Enter", " "].includes(e.key)) return;
+
+    const total = suggestions.length;
+    if (total === 0) return;
+
+    // Column count from CSS breakpoints (matches md:grid-cols-2 xl:grid-cols-3).
+    const cols =
+      window.innerWidth >= 1280 ? 3 : window.innerWidth >= 768 ? 2 : 1;
+    const col = focusedCardIndex % cols;
+
+    let next = focusedCardIndex;
+
+    switch (e.key) {
+      case "ArrowRight":
+        e.preventDefault();
+        if (col < cols - 1 && focusedCardIndex + 1 < total) next = focusedCardIndex + 1;
+        break;
+      case "ArrowLeft":
+        e.preventDefault();
+        if (col > 0) next = focusedCardIndex - 1;
+        break;
+      case "ArrowDown":
+        e.preventDefault();
+        next = Math.min(focusedCardIndex + cols, total - 1);
+        break;
+      case "ArrowUp":
+        e.preventDefault();
+        next = Math.max(focusedCardIndex - cols, 0);
+        break;
+      case "Home":
+        e.preventDefault();
+        next = 0;
+        break;
+      case "End":
+        e.preventDefault();
+        next = total - 1;
+        break;
+      case "Enter":
+      case " ": {
+        e.preventDefault();
+        const s = suggestions[focusedCardIndex];
+        if (s && !isExpiredSuggestion(s)) handleViewDetails(s.suggestion_id);
+        return;
+      }
+    }
+
+    if (next !== focusedCardIndex) {
+      setFocusedCardIndex(next);
+      requestAnimationFrame(() => {
+        document.getElementById(`card-${suggestions[next].suggestion_id}`)?.focus();
+      });
+    }
+  }, [focusedCardIndex, suggestions, handleViewDetails]);
+
   // Always use the freshest version of detailSuggestion from the live query result.
-  // detailSuggestion is set at click time and never mutated; when React Query
-  // refetches (e.g. after llm_explanation is generated), the updated fields
-  // (llm_summary, llm_explanation) are in suggestionsData but NOT in the stored
-  // state.  This lookup ensures the DetailPane always receives the latest snapshot.
   const currentDetailSuggestion = useMemo(() => {
     if (!detailSuggestion) return null;
     return (
       suggestionsData?.suggestions.find(
         (s) => s.suggestion_id === detailSuggestion.suggestion_id,
-      ) ?? detailSuggestion  // fall back to stored object if not in current list
+      ) ?? detailSuggestion
     );
   }, [detailSuggestion?.suggestion_id, suggestionsData?.suggestions]);
 
-  // Same freshness guarantee for the modal: when React Query refetches after the
-  // explanation worker writes llm_summary / llm_explanation, the modal's embedded
-  // AnalysisCardsSection re-seeds from the updated suggestion snapshot.
+  // Same freshness guarantee for the modal.
   const currentModalSuggestion = useMemo(() => {
     if (!modalSuggestion) return null;
     return (
@@ -351,11 +475,6 @@ export default function HawkEyeRadarClient() {
           </div>
         </div>
 
-        {/*
-          Two-column layout on lg+: suggestions grid (flex-1) + ML Activity sidebar (w-72).
-          On smaller screens the columns stack — ML Activity sits above the grid.
-          CSS `order` controls stacking order without rendering the card twice.
-        */}
         <div className="flex flex-col lg:flex-row lg:items-start gap-6">
 
           {/* ── ML Activity sidebar ── */}
@@ -365,7 +484,7 @@ export default function HawkEyeRadarClient() {
 
           {/* ── Suggestions main column ── */}
           <div className="flex-1 min-w-0 order-last lg:order-first">
-            <div className="mb-6">
+            <div className="mb-6" id="hawk-eye-filter-bar">
               <SuggestionFilters filters={filters} onFiltersChange={setFilters} />
             </div>
 
@@ -411,7 +530,7 @@ export default function HawkEyeRadarClient() {
             )}
 
             {/* Empty State */}
-            {!isLoading && !isError && suggestionsData?.suggestions.length === 0 && (
+            {!isLoading && !isError && suggestions.length === 0 && (
               <Card className="border-slate-200 bg-slate-50">
                 <CardContent className="flex flex-col items-center justify-center py-12 text-center">
                   <Radar className="h-12 w-12 text-slate-400 mb-4" />
@@ -425,13 +544,21 @@ export default function HawkEyeRadarClient() {
             )}
 
             {/* Suggestions Grid */}
-            {!isLoading && !isError && suggestionsData && suggestionsData.suggestions.length > 0 && (
-              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                {suggestionsData.suggestions.map((suggestion) => (
+            {!isLoading && !isError && suggestions.length > 0 && (
+              <div
+                className="grid gap-4 md:grid-cols-2 xl:grid-cols-3"
+                role="grid"
+                aria-label="Trade suggestions"
+                onKeyDown={handleGridKeyDown}
+              >
+                {suggestions.map((suggestion, index) => (
                   <TradeSuggestionCard
                     key={suggestion.suggestion_id}
+                    cardId={`card-${suggestion.suggestion_id}`}
                     suggestion={suggestion}
                     onViewDetails={handleViewDetails}
+                    tabIndex={focusedCardIndex === index ? 0 : -1}
+                    onFocusCapture={() => setFocusedCardIndex(index)}
                   />
                 ))}
               </div>
@@ -440,7 +567,7 @@ export default function HawkEyeRadarClient() {
             {/* Pagination Info */}
             {suggestionsData && suggestionsData.total > 0 && (
               <div className="mt-6 text-center text-sm text-slate-500">
-                Showing {suggestionsData.suggestions.length} of {suggestionsData.total} suggestions
+                Showing {suggestions.length} of {suggestionsData.total} suggestions
               </div>
             )}
           </div>
@@ -454,6 +581,17 @@ export default function HawkEyeRadarClient() {
         open={currentModalSuggestion !== null}
         onClose={handleCloseModal}
         onOpenFullView={handleOpenFullView}
+        onPrevious={handleModalPrevious}
+        onNext={handleModalNext}
+        hasPrevious={currentModalIndex > 0}
+        hasNext={currentModalIndex < suggestions.length - 1}
+        positionLabel={currentModalIndex >= 0 ? `${currentModalIndex + 1} of ${suggestions.length}` : undefined}
+      />
+
+      {/* Keyboard shortcuts cheatsheet */}
+      <KeyboardShortcutsPanel
+        open={showShortcutsPanel}
+        onClose={() => setShowShortcutsPanel(false)}
       />
 
       {/* Detail Pane Overlay — full view (chart, live price, trade) */}

@@ -19,6 +19,12 @@ interface TradeSuggestionCardProps {
   suggestion: TradeSuggestion;
   onViewDetails?: (suggestionId: string) => void;
   className?: string;
+  /** Roving tabindex value from the parent grid. Defaults to -1. */
+  tabIndex?: number;
+  /** Called when this card gains focus so the parent can update focusedCardIndex. */
+  onFocusCapture?: () => void;
+  /** Passed as the root element's `id` for imperative focus from the parent. */
+  cardId?: string;
 }
 
 function toTitleCase(str: string): string {
@@ -224,6 +230,9 @@ function TradeSuggestionCardComponent({
   suggestion,
   onViewDetails,
   className,
+  tabIndex,
+  onFocusCapture,
+  cardId,
 }: TradeSuggestionCardProps) {
   const isBuy = suggestion.signal_direction === "BUY";
 
@@ -242,12 +251,33 @@ function TradeSuggestionCardComponent({
 
   const isExpired = timeRemaining === "Expired";
 
+  const confidenceLabel =
+    suggestion.confidence_level.charAt(0) +
+    suggestion.confidence_level.slice(1).toLowerCase();
+
+  const ariaLabel = `${ticker} ${suggestion.signal_direction} suggestion, ${confidenceLabel} confidence, ${suggestion.consensus_score.toFixed(1)}% consensus`;
+
+  function handleKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+    if ((e.key === "Enter" || e.key === " ") && !isExpired) {
+      e.preventDefault();
+      onViewDetails?.(suggestion.suggestion_id);
+    }
+  }
+
   return (
     <Card
+      id={cardId}
+      role="button"
+      aria-label={ariaLabel}
+      aria-disabled={isExpired}
+      tabIndex={isExpired ? -1 : (tabIndex ?? -1)}
+      onFocusCapture={onFocusCapture}
+      onKeyDown={handleKeyDown}
       onClick={() => !isExpired && onViewDetails?.(suggestion.suggestion_id)}
       className={cn(
         "relative overflow-hidden border border-slate-200 bg-white transition-all duration-200",
         "hover:border-slate-300 hover:shadow-[0_4px_20px_-4px_rgba(0,0,0,0.12)]",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2",
         !isExpired && "cursor-pointer",
         isExpired && "opacity-60",
         className
@@ -307,7 +337,7 @@ function TradeSuggestionCardComponent({
             {isExpired ? "Expired" : `Expires in ${timeRemaining}`}
           </span>
         </div>
-        <span className="flex items-center gap-0.5 text-xs text-slate-400">
+        <span className="flex items-center gap-0.5 text-xs text-slate-400" aria-hidden="true">
           View details
           <ChevronRight className="h-3.5 w-3.5" />
         </span>

@@ -72,6 +72,7 @@ from typing import Any, Literal
 import numpy as np
 
 from app.ml.evaluation.backtest import (
+    TRAINING_DECISION_THRESHOLD,
     binary_to_positions,
     per_period_sharpe,
 )
@@ -319,8 +320,8 @@ def _simulate_sequence(
         empty: np.ndarray = np.zeros(0, dtype=np.float64)
         return empty, empty, []
 
-    # ── Signal → position (A3 threshold: proba ≥ 0.5 → UP/long) ─────────────
-    pred      = (np.asarray(proba, dtype=np.float64) >= 0.5).astype(np.int8)
+    # ── Signal → position ─────────────────────────────────────────────────────
+    pred      = (np.asarray(proba, dtype=np.float64) >= TRAINING_DECISION_THRESHOLD).astype(np.int8)
     positions = binary_to_positions(pred, mode=mode)
 
     # ── Latency shift: signal at bar i executed at bar i + latency_bars ───────
