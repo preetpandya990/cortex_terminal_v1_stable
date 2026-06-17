@@ -344,10 +344,15 @@ class DataIngestionWorker:
 
     @staticmethod
     async def _load_instruments(session: AsyncSession) -> list[tuple[str, str]]:
+        # is_active = true targets the idx_instrument_active partial index — delisted
+        # instruments are excluded at the source so no fetch tasks are ever generated
+        # for them.  Historical OHLCV rows in upstox_ohlcv are preserved and remain
+        # available to the ML pipeline; only the fetch queue is scoped to live instruments.
         result = await session.execute(text(
             "SELECT instrument_key, trading_symbol "
             "FROM instrument_master "
             "WHERE exchange = 'NSE' "
+            "  AND is_active = true "
             "ORDER BY trading_symbol"
         ))
         return result.all()  # type: ignore[return-value]
@@ -427,12 +432,16 @@ class DataIngestionWorker:
 
         except UpstoxInvalidInstrumentError:
             # Permanent error — instrument delisted or key changed in Upstox.
-            # Add to dead letter immediately; no retry, no circuit breaker impact.
+            # 1. Add to in-memory dead-letter so remaining queued tasks for this
+            #    instrument are skipped without any further API or DB calls this run.
+            # 2. Persist the delisting to instrument_master so the next restart
+            #    does not reload this instrument into the fetch queue at all.
             self._dead_letter.add(task.instrument_key)
             logger.warning(
                 "Invalid instrument key — permanently skipping: %s (%s)",
                 task.symbol, task.instrument_key,
             )
+            await self._mark_delisted(task.instrument_key, task.symbol)
             return 0
 
         except UpstoxRateLimitError:
@@ -530,6 +539,40 @@ class DataIngestionWorker:
                 settings.DATA_INGESTION_MAX_RETRIES,
             )
         return 0
+
+    async def _mark_delisted(self, instrument_key: str, symbol: str) -> None:
+        """
+        Persist a newly-discovered delisting to instrument_master.
+
+        The UPDATE is guarded by ``AND is_active = true`` so it is idempotent:
+        if the daily instrument_sync_service has already soft-deleted this row
+        the statement is a no-op.  Failure is non-fatal — the in-memory
+        dead-letter set still prevents retries this run, and the daily sync
+        will reconcile the row on its next fire.
+        """
+        try:
+            async with self._session_factory() as session:
+                await session.execute(
+                    text(
+                        "UPDATE instrument_master "
+                        "SET    is_active   = false, "
+                        "       delisted_at = NOW() "
+                        "WHERE  instrument_key = :key "
+                        "  AND  is_active      = true"
+                    ),
+                    {"key": instrument_key},
+                )
+                await session.commit()
+            logger.info(
+                "Instrument marked delisted in instrument_master: %s (%s)",
+                symbol, instrument_key,
+            )
+        except Exception:
+            logger.warning(
+                "Could not persist delisting for %s (%s) — "
+                "daily instrument sync will reconcile on next run",
+                symbol, instrument_key,
+            )
 
     async def _wait_for_token_refresh(self) -> None:
         """Polls the .env file every 30 s until a new token is found."""

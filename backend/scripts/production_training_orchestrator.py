@@ -481,6 +481,74 @@ class ProductionTrainingOrchestrator:
         except Exception as exc:
             logger.debug("E3 MLflow registration metrics log failed (non-fatal): %s", exc)
 
+    def _log_mlflow_trial_sharpes(
+        self,
+        trial_sharpes: Optional[List[float]],
+    ) -> None:
+        """Log per-trial HPO Sharpe scalars and per-period return series to MLflow.
+
+        Uploads two artifact groups under ``hpo_trial_data/``:
+
+        ``hpo_trial_sharpes.npy``
+            1-D float64 array; one value per retained HPO trial, index-aligned
+            with the per-trial return-series files below.  Enables σ_SR and
+            N_eff in the DSR sensitivity band (Phase-B §3.5).
+
+        ``trial_return_series/trial_NNNN.npy``
+            Per-period net-of-cost return series for each retained trial.
+            Index i corresponds to index i in the Sharpes array.  Required for
+            CSCV matrix construction and effective-N clustering post-hoc
+            (Bailey-Borwein-López de Prado 2017).
+
+        Non-fatal — exceptions are caught and logged at DEBUG so training is
+        never interrupted.  Data is available from the first run after
+        ``fwd_ret_val`` is wired into ``tune_hyperparameters``.
+        """
+        import tempfile
+        try:
+            import mlflow
+            if self._e3_mlflow_run_id is None:
+                return
+            if not trial_sharpes:
+                logger.debug(
+                    "_log_mlflow_trial_sharpes: no trial Sharpes — "
+                    "fwd_ret_val was absent during HPO; skipping artifact upload."
+                )
+                return
+
+            ts_arr = np.asarray(trial_sharpes, dtype=np.float64)
+            return_series = self.xgboost_trainer.trial_return_series  # List[np.ndarray] | None
+            n_series = len(return_series) if return_series is not None else 0
+
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+
+                # ── 1. Scalar Sharpes array ─────────────────────────────────
+                sharpes_file = tmp_path / "hpo_trial_sharpes.npy"
+                np.save(str(sharpes_file), ts_arr)
+                mlflow.log_artifact(str(sharpes_file), artifact_path="hpo_trial_data")
+
+                # ── 2. Per-trial return series (one .npy per trial) ─────────
+                if n_series > 0:
+                    series_dir = tmp_path / "trial_return_series"
+                    series_dir.mkdir()
+                    for i, ret_arr in enumerate(return_series):
+                        np.save(str(series_dir / f"trial_{i:04d}.npy"), ret_arr)
+                    mlflow.log_artifacts(
+                        str(series_dir),
+                        artifact_path="hpo_trial_data/trial_return_series",
+                    )
+
+            logger.info(
+                "E3 MLflow: logged %d HPO trial Sharpes + %d return-series "
+                "artifacts → hpo_trial_data/",
+                len(ts_arr), n_series,
+            )
+        except Exception as exc:
+            logger.debug(
+                "E3 MLflow trial-sharpe artifact upload failed (non-fatal): %s", exc
+            )
+
     def _finalize_mlflow(self, status: str, promotion_report_path: Optional[str] = None) -> None:
         """Log final artifacts, update status tag, and end the MLflow run."""
         # Structured log (always).
@@ -775,6 +843,10 @@ class ProductionTrainingOrchestrator:
                     "xgb_training_samples":   xgboost_results.get("training_samples"),
                     "xgb_best_rounds":        xgboost_results.get("best_rounds"),
                 })
+                # Phase-B §3.5: persist per-trial Sharpes + return series so
+                # CSCV matrix construction and effective-N clustering can be
+                # done post-hoc without re-running the HPO study.
+                self._log_mlflow_trial_sharpes(xgboost_results.get("trial_sharpes"))
 
             # ── Step 6 ────────────────────────────────────────────────────────
             logger.info("\n" + "=" * 100)
@@ -1572,6 +1644,11 @@ class ProductionTrainingOrchestrator:
             n_trials=self.config.xgboost_trials,
             timeout=7200,
             n_jobs=4,
+            # Phase-B §3.5: supply holdout forward returns so each Optuna trial
+            # logs its net-of-cost Sharpe and full return series.  Enables
+            # correct V (variance) and effective N in the DSR sensitivity band,
+            # and populates trial_return_series for the MLflow artifact below.
+            fwd_ret_val=r_all[hpo_va].astype(np.float64),
         )
         logger.info("✓ XGBoost HPO complete  best_params=%s", best_params)
 
@@ -1686,6 +1763,13 @@ class ProductionTrainingOrchestrator:
             'validation_samples': len(hpo_va),      # purged HPO holdout
             'best_rounds':        best_rounds,
             'cpcv_oof':           cpcv_oof,          # → persisted in A2.6 for A3/A4/A5
+            # Phase-B §3.5: scalar Sharpes per completed HPO trial.  None when
+            # fwd_ret_val was not supplied (should not happen — always passed above).
+            # Used by _log_mlflow_trial_sharpes and by compute_dsr_and_pbo.
+            'trial_sharpes': (
+                self.xgboost_trainer.trial_sharpes.tolist()
+                if self.xgboost_trainer.trial_sharpes is not None else None
+            ),
         }
 
     async def _train_gru_with_optimization(self, cv_plan: Dict[str, Any]) -> Dict[str, Any]:
@@ -3115,8 +3199,17 @@ class ProductionTrainingOrchestrator:
 
         # Re-derive vectorized per-period Sharpes so we have a fresh reference
         # for the agreement check.  compute_dsr_and_pbo is fast (NumPy only).
+        # Supply trial_sharpes when available (Phase-B §3.5): collapses the DSR
+        # sensitivity band from (N=1, N_upper) to (N=1, N_eff, N_upper) using
+        # the actual HPO trial distribution.  Degrades gracefully to the
+        # path-proxy if trial_sharpes is None (checkpoint resume or pre-§3.5).
         try:
-            vec_result = compute_dsr_and_pbo(paths, mode="long_only", entry_price=1_000.0)
+            vec_result = compute_dsr_and_pbo(
+                paths,
+                mode="long_only",
+                entry_price=1_000.0,
+                trial_sharpes=self.xgboost_trainer.trial_sharpes,
+            )
             vec_pp_sharpes: List[float] = vec_result["path_sharpes_per_period"]
         except Exception as _vec_exc:
             logger.warning(

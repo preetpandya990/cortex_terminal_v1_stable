@@ -93,7 +93,8 @@ engine = create_async_engine(
     connect_args={
         "server_settings": {
             "timezone": "UTC",
-            "statement_timeout": "30000",  # ms
+            "statement_timeout": "30000",          # 30s hard query ceiling (ms)
+            "idle_in_transaction_session_timeout": "300000",  # 5min — server-side safety net for leaked sessions (ms)
         }
     },
 )
@@ -110,7 +111,8 @@ worker_engine = create_async_engine(
     connect_args={
         "server_settings": {
             "timezone": "UTC",
-            "statement_timeout": "30000",  # ms
+            "statement_timeout": "30000",          # 30s hard query ceiling (ms)
+            "idle_in_transaction_session_timeout": "300000",  # 5min — server-side safety net for leaked sessions (ms)
         }
     },
 )

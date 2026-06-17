@@ -422,11 +422,19 @@ async def _fetch_inflight_correlations(redis_client) -> list[CorrelationActivity
             if raw is None:
                 continue
             d = json.loads(raw)
+            try:
+                trigger_type = TriggerType(d["trigger_type"])
+            except (ValueError, KeyError):
+                logger.debug(
+                    "trade_suggestions: unknown trigger_type %r in inflight correlation — skipping",
+                    d.get("trigger_type"),
+                )
+                continue
             result.append(CorrelationActivityItem(
                 correlation_id = d["correlation_id"],
                 symbol         = d["symbol"],
                 trading_symbol = d.get("trading_symbol"),
-                trigger_type   = TriggerType(d["trigger_type"]),
+                trigger_type   = trigger_type,
                 status         = CorrelationActivityStatus.PROCESSING,
                 started_at     = datetime.fromisoformat(d["started_at"]),
                 resolved_at    = None,
@@ -469,6 +477,7 @@ async def get_recent_correlation_activity(
 
     rejected_stmt = (
         select(EventCorrelation)
+        .options(selectinload(EventCorrelation.suggestion))
         .where(
             EventCorrelation.consensus_reached.is_(False),
             EventCorrelation.scanner_output.isnot(None),
@@ -477,8 +486,12 @@ async def get_recent_correlation_activity(
         .limit(limit)
     )
 
-    (completed_rows, rejected_rows), inflight_items = await asyncio.gather(
-        asyncio.gather(db.execute(completed_stmt), db.execute(rejected_stmt)),
+    # asyncpg does not support concurrent operations on a single connection,
+    # so the two DB queries must run sequentially.  The Redis fetch is
+    # independent and overlaps with the second DB query.
+    completed_rows = await db.execute(completed_stmt)
+    rejected_rows, inflight_items = await asyncio.gather(
+        db.execute(rejected_stmt),
         _fetch_inflight_correlations(get_redis()),
     )
     correlations = [
@@ -493,9 +506,15 @@ async def get_recent_correlation_activity(
         if suggestion is not None:
             symbol      = suggestion.symbol
             trading_sym = suggestion.trading_symbol or suggestion.symbol
-            direction   = SignalDirection(suggestion.signal_direction)
-            score       = float(suggestion.consensus_score)
-            confidence  = ConfidenceLevel(suggestion.confidence_level)
+            try:
+                direction = SignalDirection(suggestion.signal_direction)
+            except ValueError:
+                direction = None
+            score = float(suggestion.consensus_score)
+            try:
+                confidence = ConfidenceLevel(suggestion.confidence_level)
+            except ValueError:
+                confidence = None
         else:
             symbol = (
                 scanner_out.get("instrument_key")
@@ -508,6 +527,15 @@ async def get_recent_correlation_activity(
             score       = None
             confidence  = None
 
+        try:
+            trigger_type = TriggerType(corr.trigger_type)
+        except ValueError:
+            logger.warning(
+                "trade_suggestions: unknown trigger_type %r on correlation %s — skipping item",
+                corr.trigger_type, corr.correlation_id,
+            )
+            return None
+
         raw_reason = corr.rejection_reason
         rejection_reason: str | None = None
         if raw_reason:
@@ -517,7 +545,7 @@ async def get_recent_correlation_activity(
             correlation_id   = corr.correlation_id,
             symbol           = symbol,
             trading_symbol   = trading_sym,
-            trigger_type     = TriggerType(corr.trigger_type),
+            trigger_type     = trigger_type,
             status           = (
                 CorrelationActivityStatus.COMPLETED
                 if corr.consensus_reached

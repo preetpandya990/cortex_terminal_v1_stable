@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import logging
 import joblib
+import threading
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import optuna
@@ -61,6 +62,11 @@ class XGBoostTrainer:
         # fwd_ret_val is provided.  Pass to compute_dsr_and_pbo(trial_sharpes=...)
         # to enable correct V and effective N in the DSR sensitivity band.
         self.trial_sharpes: Optional[np.ndarray] = None
+        # Per-trial net-return series (one array per completed trial, aligned to
+        # the HPO holdout rows).  Logged to MLflow as an artifact so the CSCV
+        # matrix and effective-N clustering can be computed post-hoc without
+        # re-running the HPO study (Phase-B §3.5).
+        self.trial_return_series: Optional[List[np.ndarray]] = None
     
     def train(
         self,
@@ -299,6 +305,12 @@ class XGBoostTrainer:
         )
         _daily_rfr: float = (1.0 + 0.05) ** (1.0 / 252) - 1.0
 
+        # Thread-safe buffer for per-trial return series.  Keyed by trial.number
+        # (unique per trial, even with n_jobs > 1) to avoid stitching artefacts
+        # from concurrent writes.  Only populated when fwd_ret_val is provided.
+        _returns_lock: threading.Lock = threading.Lock()
+        _trial_returns_buf: Dict[int, List[float]] = {}
+
         def objective(trial: optuna.Trial) -> float:
             """Maximise AUC-PR (Average Precision Score).
 
@@ -359,6 +371,10 @@ class XGBoostTrainer:
                 if len(net_rets) >= 2:
                     trial_sharpe_val = per_period_sharpe(net_rets, daily_rfr=_daily_rfr)
                     trial.set_user_attr("net_sharpe_oos", float(trial_sharpe_val))
+                    # Thread-safe capture of the full return series; keyed by
+                    # trial.number which is unique and monotone across workers.
+                    with _returns_lock:
+                        _trial_returns_buf[trial.number] = net_rets.tolist()
 
             return auc_pr
 
@@ -378,10 +394,11 @@ class XGBoostTrainer:
 
         self.best_params = study.best_params
 
-        # ── Collect per-trial Sharpes for DSR N/V estimation ─────────────────
+        # ── Collect per-trial Sharpes + return series for DSR N/V estimation ──
         # Only populated when fwd_ret_val was provided; None otherwise so
         # callers can distinguish "not instrumented" from "zero trials".
         self.trial_sharpes = None
+        self.trial_return_series = None
         if _fwd_ret is not None:
             raw = [
                 t.user_attrs["net_sharpe_oos"]
@@ -399,6 +416,21 @@ class XGBoostTrainer:
                     float(ts.std(ddof=1)) if len(ts) > 1 else 0.0,
                     float(ts.min()), float(ts.max()),
                 )
+            # Build the aligned return series list in ascending trial-number
+            # order so index i in trial_return_series corresponds to index i
+            # in trial_sharpes.  Trials that failed before computing net_rets
+            # are absent from _trial_returns_buf and are silently skipped.
+            ordered_keys = sorted(
+                k for k in _trial_returns_buf
+                if k in {t.number for t in study.trials
+                         if t.state == optuna.trial.TrialState.COMPLETE
+                         and "net_sharpe_oos" in t.user_attrs}
+            )
+            if ordered_keys:
+                self.trial_return_series = [
+                    np.asarray(_trial_returns_buf[k], dtype=np.float64)
+                    for k in ordered_keys
+                ]
 
         logger.info("Tuning complete. Best AUC-PR: %.4f", study.best_value)
         logger.info("Best params: %s", self.best_params)

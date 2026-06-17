@@ -92,6 +92,9 @@ logger = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 2
 _RECONNECT_DELAY_SECS = 5
+# Hard ceiling on the total LLM call duration (queue wait + HTTP) to prevent
+# the worker from stalling indefinitely when the LLM backend is degraded.
+_LLM_CALL_TIMEOUT_SECS = 120.0
 
 # ── Output schema ──────────────────────────────────────────────────────────────
 
@@ -683,54 +686,73 @@ async def _write_audit_entry(
 async def _generate_explanation(
     suggestion_id: str,
     suggestion_db_id: int,
-    db: AsyncSession,
 ) -> None:
     """
     Execute the full explanation pipeline for one suggestion.
+
+    Structured as three distinct phases to eliminate the DB connection leak:
+      Phase 1 — DB read: load suggestion + RAG retrieval; session closed before
+                 the LLM call so no pool connection is held during inference.
+      Phase 2 — LLM call: entirely outside any DB session; bounded by a hard
+                 wall-clock timeout (_LLM_CALL_TIMEOUT_SECS) so the worker
+                 cannot stall indefinitely when the backend is degraded.
+      Phase 3 — DB write: new session for the suggestion update + audit log.
+
     Raises on unrecoverable errors so the caller can track retry count.
     """
     from app.core.database import AsyncSessionLocal
 
     client = get_intelligence_client()
     invocation_id = uuid4()
+    suggestion_uuid = UUID(suggestion_id)
 
-    # ── Load suggestion ───────────────────────────────────────────────────────
-    stmt = select(TradeSuggestion).where(
-        TradeSuggestion.suggestion_id == UUID(suggestion_id)
-    )
-    result = await db.execute(stmt)
-    suggestion = result.scalar_one_or_none()
+    # ── Phase 1: DB read — closed before LLM call ────────────────────────────
+    chunks: list = []
+    prompt: str = ""
+    prompt_hash: str = ""
+    source_refs: list[dict] = []
+    suggestion_symbol: str = ""
 
-    if suggestion is None:
-        logger.warning(
-            "explanation_worker: suggestion %s not found — skipping", suggestion_id
+    async with AsyncSessionLocal() as db:
+        stmt = select(TradeSuggestion).where(
+            TradeSuggestion.suggestion_id == suggestion_uuid
         )
-        return
+        result = await db.execute(stmt)
+        suggestion = result.scalar_one_or_none()
 
-    if suggestion.status != "active":
-        logger.debug(
-            "explanation_worker: suggestion %s is %s — skipping",
-            suggestion_id, suggestion.status,
-        )
-        return
+        if suggestion is None:
+            logger.warning(
+                "explanation_worker: suggestion %s not found — skipping", suggestion_id
+            )
+            return
 
-    # ── RAG retrieval ─────────────────────────────────────────────────────────
-    query = f"{suggestion.symbol} {suggestion.signal_direction} trading signal"
-    try:
-        chunks = await retrieve(db=db, query=query, symbol=suggestion.symbol)
-    except Exception as exc:
-        logger.warning(
-            "explanation_worker: RAG retrieval failed for %s (continuing with no context): %s",
-            suggestion_id, exc,
-        )
-        chunks = []
+        if suggestion.status != "active":
+            logger.debug(
+                "explanation_worker: suggestion %s is %s — skipping",
+                suggestion_id, suggestion.status,
+            )
+            return
 
-    context = format_context(chunks)
-    source_refs = build_retrieval_source_refs(chunks)
-    prompt = _build_explanation_prompt(suggestion, context)
-    prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+        suggestion_symbol = suggestion.symbol
+        query = f"{suggestion.symbol} {suggestion.signal_direction} trading signal"
 
-    # ── LLM call (Gemini native structured output, single call) ──────────────
+        try:
+            chunks = await retrieve(db=db, query=query, symbol=suggestion.symbol)
+        except Exception as exc:
+            logger.warning(
+                "explanation_worker: RAG retrieval failed for %s "
+                "(continuing with no context): %s",
+                suggestion_id, exc,
+            )
+            chunks = []
+
+        context = format_context(chunks)
+        source_refs = build_retrieval_source_refs(chunks)
+        prompt = _build_explanation_prompt(suggestion, context)
+        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+    # ── DB session closed here — pool connection returned before LLM call ─────
+
+    # ── Phase 2: LLM call (no DB session held open) ───────────────────────────
     t0 = time.monotonic()
     error_message: str | None = None
     raw_output: ExplanationOutput | None = None
@@ -739,18 +761,28 @@ async def _generate_explanation(
     model_provider, _, model_id = client.model_id.partition("/")
 
     try:
-        raw_output, usage_info = await client.generate_structured_with_usage(
-            prompt=prompt,
-            response_model=ExplanationOutput,
-            system=_EXPLANATION_SYSTEM_PROMPT,
-            temperature=0.2,
-            max_tokens=1400,
-            priority=Priority.HIGH,
+        raw_output, usage_info = await asyncio.wait_for(
+            client.generate_structured_with_usage(
+                prompt=prompt,
+                response_model=ExplanationOutput,
+                system=_EXPLANATION_SYSTEM_PROMPT,
+                temperature=0.2,
+                max_tokens=1400,
+                priority=Priority.HIGH,
+            ),
+            timeout=_LLM_CALL_TIMEOUT_SECS,
         )
         input_tokens  = usage_info.get("input_tokens")
         output_tokens = usage_info.get("output_tokens")
         model_provider = usage_info.get("provider", model_provider)
         model_id       = usage_info.get("model_id", model_id)
+    except asyncio.TimeoutError:
+        error_message = f"LLMTimeoutError: call exceeded {_LLM_CALL_TIMEOUT_SECS:.0f}s ceiling"
+        logger.error(
+            "explanation_worker: LLM call timed out for suggestion %s "
+            "(%.0fs ceiling exceeded)",
+            suggestion_id, _LLM_CALL_TIMEOUT_SECS,
+        )
     except Exception as exc:
         error_message = f"{type(exc).__name__}: {exc}"
         logger.error(
@@ -777,63 +809,61 @@ async def _generate_explanation(
         for event in guardrail_events:
             llm_guardrail_events_total.labels(guardrail=event).inc()
 
-    # ── Persist explanation to trade_suggestions ──────────────────────────────
-    if final_output is not None:
-        now_utc = datetime.now(timezone.utc)
-        await db.execute(
-            update(TradeSuggestion)
-            .where(TradeSuggestion.suggestion_id == UUID(suggestion_id))
-            .values(
-                llm_summary=final_output.summary,
-                llm_explanation=final_output.full_explanation,
-                explanation_model=f"{model_provider}/{model_id}",
-                explanation_generated_at=now_utc,
-                updated_at=now_utc,
-            )
-        )
-        await db.commit()
-
-        logger.info(
-            "explanation_worker: explanation written for suggestion %s "
-            "symbol=%s latency_ms=%d guardrails=%s",
-            suggestion_id,
-            suggestion.symbol,
-            latency_ms,
-            guardrail_events or "none",
-        )
-
-    # ── Audit log ─────────────────────────────────────────────────────────────
+    # ── Phase 3: DB write — new session for all persistence ──────────────────
     output_preview: str | None = None
     if final_output is not None:
         output_preview = final_output.summary[:500]
 
-    await _write_audit_entry(
-        db,
-        invocation_id=invocation_id,
-        invocation_type="explanation",
-        reference_table="trade_suggestions",
-        reference_id=suggestion_db_id,
-        model_provider=model_provider,
-        model_id=model_id,
-        prompt_hash=prompt_hash,
-        source_refs=source_refs if source_refs else None,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        latency_ms=latency_ms,
-        guardrail_events=guardrail_events,
-        output_preview=output_preview,
-        error_message=error_message,
-    )
+    async with AsyncSessionLocal() as db:
+        if final_output is not None:
+            now_utc = datetime.now(timezone.utc)
+            await db.execute(
+                update(TradeSuggestion)
+                .where(TradeSuggestion.suggestion_id == suggestion_uuid)
+                .values(
+                    llm_summary=final_output.summary,
+                    llm_explanation=final_output.full_explanation,
+                    explanation_model=f"{model_provider}/{model_id}",
+                    explanation_generated_at=now_utc,
+                    updated_at=now_utc,
+                )
+            )
+            await db.commit()
 
-    # ── Publish ready notification ────────────────────────────────────────────
+            logger.info(
+                "explanation_worker: explanation written for suggestion %s "
+                "symbol=%s latency_ms=%d guardrails=%s",
+                suggestion_id,
+                suggestion_symbol,
+                latency_ms,
+                guardrail_events or "none",
+            )
+
+        await _write_audit_entry(
+            db,
+            invocation_id=invocation_id,
+            invocation_type="explanation",
+            reference_table="trade_suggestions",
+            reference_id=suggestion_db_id,
+            model_provider=model_provider,
+            model_id=model_id,
+            prompt_hash=prompt_hash,
+            source_refs=source_refs if source_refs else None,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latency_ms=latency_ms,
+            guardrail_events=guardrail_events,
+            output_preview=output_preview,
+            error_message=error_message,
+        )
+
+    # ── Publish ready notification (Redis only — no DB) ───────────────────────
     if final_output is not None:
         try:
             from app.core.redis import get_redis
             ready_channel = RedisChannels.LLM_EXPLANATION_READY.format(
                 suggestion_id=suggestion_id
             )
-            # Include structured source refs so the SSE stream can render the
-            # sources panel immediately without a follow-up DB query.
             sources_payload = [
                 {
                     "source_name": chunk.source_name,
@@ -857,7 +887,6 @@ async def _generate_explanation(
                 suggestion_id, exc,
             )
 
-    # Raise if LLM failed so the caller can count retries
     if error_message is not None:
         raise RuntimeError(error_message)
 
@@ -868,13 +897,12 @@ async def _generate_instrument_context(
     instrument_key: str,
     symbol: str | None,
     ml_snapshot: dict | None,
-    db: AsyncSession,
 ) -> None:
     """
     Generate a market context summary for an instrument with no active signal.
 
-    Used for Watchlist items — gives the user a news-grounded, ML-annotated
-    market overview instead of a blank explanation panel.
+    Structured as three distinct phases — same pattern as _generate_explanation —
+    to ensure no DB connection is held during the LLM call.
 
     On success:
       - Upserts ai_instrument_context (expires_at = now + 2 h)
@@ -884,54 +912,71 @@ async def _generate_instrument_context(
     Raises RuntimeError on LLM failure so the worker can track retry count.
     """
     from app.ai.fusion.models import AIInstrumentContext
+    from app.core.database import AsyncSessionLocal
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     client = get_intelligence_client()
     invocation_id = uuid4()
 
-    # Derive a usable symbol for RAG when only the instrument key is available.
     eff_symbol: str = symbol or (
         instrument_key.split("|")[-1] if "|" in instrument_key else instrument_key
     )
 
-    # ── RAG retrieval ─────────────────────────────────────────────────────────
-    query = f"{eff_symbol} market analysis news"
-    try:
-        chunks = await retrieve(db=db, query=query, symbol=eff_symbol)
-    except Exception as exc:
-        logger.warning(
-            "explanation_worker: RAG retrieval failed for instrument context %s "
-            "(continuing with no context): %s",
-            instrument_key, exc,
-        )
-        chunks = []
+    # ── Phase 1: DB read — closed before LLM call ────────────────────────────
+    chunks: list = []
+    prompt: str = ""
+    prompt_hash: str = ""
+    source_refs: list[dict] = []
 
-    context    = format_context(chunks)
-    source_refs = build_retrieval_source_refs(chunks)
-    prompt     = _build_context_prompt(instrument_key, eff_symbol, ml_snapshot, context)
-    prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+    async with AsyncSessionLocal() as db:
+        query = f"{eff_symbol} market analysis news"
+        try:
+            chunks = await retrieve(db=db, query=query, symbol=eff_symbol)
+        except Exception as exc:
+            logger.warning(
+                "explanation_worker: RAG retrieval failed for instrument context %s "
+                "(continuing with no context): %s",
+                instrument_key, exc,
+            )
+            chunks = []
 
-    # ── LLM call (Gemini native structured output, single call) ──────────────
+        context     = format_context(chunks)
+        source_refs = build_retrieval_source_refs(chunks)
+        prompt      = _build_context_prompt(instrument_key, eff_symbol, ml_snapshot, context)
+        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+    # ── DB session closed here — pool connection returned before LLM call ─────
+
+    # ── Phase 2: LLM call (no DB session held open) ───────────────────────────
     t0 = time.monotonic()
-    error_message:  str | None               = None
-    raw_output:     ExplanationOutput | None  = None
-    input_tokens:   int | None                = None
-    output_tokens:  int | None                = None
+    error_message:  str | None              = None
+    raw_output:     ExplanationOutput | None = None
+    input_tokens:   int | None               = None
+    output_tokens:  int | None               = None
     model_provider, _, model_id = client.model_id.partition("/")
 
     try:
-        raw_output, usage_info = await client.generate_structured_with_usage(
-            prompt=prompt,
-            response_model=ExplanationOutput,
-            system=_CONTEXT_SYSTEM_PROMPT,
-            temperature=0.2,
-            max_tokens=1400,
-            priority=Priority.LOW,
+        raw_output, usage_info = await asyncio.wait_for(
+            client.generate_structured_with_usage(
+                prompt=prompt,
+                response_model=ExplanationOutput,
+                system=_CONTEXT_SYSTEM_PROMPT,
+                temperature=0.2,
+                max_tokens=1400,
+                priority=Priority.LOW,
+            ),
+            timeout=_LLM_CALL_TIMEOUT_SECS,
         )
         input_tokens  = usage_info.get("input_tokens")
         output_tokens = usage_info.get("output_tokens")
         model_provider = usage_info.get("provider", model_provider)
         model_id       = usage_info.get("model_id", model_id)
+    except asyncio.TimeoutError:
+        error_message = f"LLMTimeoutError: call exceeded {_LLM_CALL_TIMEOUT_SECS:.0f}s ceiling"
+        logger.error(
+            "explanation_worker: LLM context call timed out for %s "
+            "(%.0fs ceiling exceeded)",
+            instrument_key, _LLM_CALL_TIMEOUT_SECS,
+        )
     except Exception as exc:
         error_message = f"{type(exc).__name__}: {exc}"
         logger.error(
@@ -948,7 +993,7 @@ async def _generate_instrument_context(
         llm_explanations_total.labels(status="failure", provider=model_provider).inc()
 
     # ── Guardrails ────────────────────────────────────────────────────────────
-    guardrail_events: list[str]          = []
+    guardrail_events: list[str]           = []
     final_output:     ExplanationOutput | None = None
 
     if raw_output is not None:
@@ -958,83 +1003,83 @@ async def _generate_instrument_context(
         for event in guardrail_events:
             llm_guardrail_events_total.labels(guardrail=event).inc()
 
-    # ── Persist to ai_instrument_context (upsert) ─────────────────────────────
+    # ── Phase 3: DB write — new session for all persistence ──────────────────
     sources_payload: list[dict] = []
-    if final_output is not None:
-        now_utc    = datetime.now(timezone.utc)
-        expires_at = now_utc + timedelta(hours=2)
-        model_str  = f"{model_provider}/{model_id}"
-
-        sources_payload = [
-            {
-                "source_name": chunk.source_name,
-                "as_of":       chunk.as_of_timestamp.isoformat(),
-                "source_url":  chunk.source_url,
-            }
-            for chunk in chunks
-        ]
-
-        upsert_stmt = (
-            pg_insert(AIInstrumentContext)
-            .values(
-                instrument_key=instrument_key,
-                symbol=symbol,
-                context_summary=final_output.summary,
-                context_full=final_output.full_explanation,
-                model_used=model_str,
-                source_refs=sources_payload or None,
-                generated_at=now_utc,
-                expires_at=expires_at,
-            )
-            .on_conflict_do_update(
-                index_elements=["instrument_key"],
-                set_={
-                    "symbol":          symbol,
-                    "context_summary": final_output.summary,
-                    "context_full":    final_output.full_explanation,
-                    "model_used":      model_str,
-                    "source_refs":     sources_payload or None,
-                    "generated_at":    now_utc,
-                    "expires_at":      expires_at,
-                },
-            )
-        )
-        await db.execute(upsert_stmt)
-        await db.commit()
-
-        logger.info(
-            "explanation_worker: instrument context written for %s "
-            "symbol=%s latency_ms=%d guardrails=%s",
-            instrument_key,
-            eff_symbol,
-            latency_ms,
-            guardrail_events or "none",
-        )
-
-    # ── Audit log ─────────────────────────────────────────────────────────────
     output_preview: str | None = None
     if final_output is not None:
         output_preview = final_output.summary[:500]
 
-    await _write_audit_entry(
-        db,
-        invocation_id=invocation_id,
-        invocation_type="instrument_context",
-        reference_table="ai_instrument_context",
-        reference_id=None,  # upsert — no stable row PK to reference
-        model_provider=model_provider,
-        model_id=model_id,
-        prompt_hash=prompt_hash,
-        source_refs=source_refs if source_refs else None,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        latency_ms=latency_ms,
-        guardrail_events=guardrail_events,
-        output_preview=output_preview,
-        error_message=error_message,
-    )
+    async with AsyncSessionLocal() as db:
+        if final_output is not None:
+            now_utc    = datetime.now(timezone.utc)
+            expires_at = now_utc + timedelta(hours=2)
+            model_str  = f"{model_provider}/{model_id}"
 
-    # ── Publish ready notification ────────────────────────────────────────────
+            sources_payload = [
+                {
+                    "source_name": chunk.source_name,
+                    "as_of":       chunk.as_of_timestamp.isoformat(),
+                    "source_url":  chunk.source_url,
+                }
+                for chunk in chunks
+            ]
+
+            upsert_stmt = (
+                pg_insert(AIInstrumentContext)
+                .values(
+                    instrument_key=instrument_key,
+                    symbol=symbol,
+                    context_summary=final_output.summary,
+                    context_full=final_output.full_explanation,
+                    model_used=model_str,
+                    source_refs=sources_payload or None,
+                    generated_at=now_utc,
+                    expires_at=expires_at,
+                )
+                .on_conflict_do_update(
+                    index_elements=["instrument_key"],
+                    set_={
+                        "symbol":          symbol,
+                        "context_summary": final_output.summary,
+                        "context_full":    final_output.full_explanation,
+                        "model_used":      model_str,
+                        "source_refs":     sources_payload or None,
+                        "generated_at":    now_utc,
+                        "expires_at":      expires_at,
+                    },
+                )
+            )
+            await db.execute(upsert_stmt)
+            await db.commit()
+
+            logger.info(
+                "explanation_worker: instrument context written for %s "
+                "symbol=%s latency_ms=%d guardrails=%s",
+                instrument_key,
+                eff_symbol,
+                latency_ms,
+                guardrail_events or "none",
+            )
+
+        await _write_audit_entry(
+            db,
+            invocation_id=invocation_id,
+            invocation_type="instrument_context",
+            reference_table="ai_instrument_context",
+            reference_id=None,
+            model_provider=model_provider,
+            model_id=model_id,
+            prompt_hash=prompt_hash,
+            source_refs=source_refs if source_refs else None,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latency_ms=latency_ms,
+            guardrail_events=guardrail_events,
+            output_preview=output_preview,
+            error_message=error_message,
+        )
+
+    # ── Publish ready notification (Redis only — no DB) ───────────────────────
     if final_output is not None:
         try:
             from app.core.redis import get_redis
@@ -1082,7 +1127,6 @@ async def explanation_worker() -> None:
     Reconnect policy: on Redis errors, waits _RECONNECT_DELAY_SECS then
     re-subscribes (identical to cai_redis_listener and suggestions_redis_listener).
     """
-    from app.core.database import AsyncSessionLocal
     from app.core.redis import get_redis as _get_redis
 
     # Unified retry counter keyed by:
@@ -1145,10 +1189,7 @@ async def explanation_worker() -> None:
                     )
 
                     try:
-                        async with AsyncSessionLocal() as db:
-                            await _generate_explanation(
-                                suggestion_id, suggestion_db_id, db
-                            )
+                        await _generate_explanation(suggestion_id, suggestion_db_id)
                         attempt_counts.pop(suggestion_id, None)
                     except asyncio.CancelledError:
                         raise
@@ -1193,10 +1234,7 @@ async def explanation_worker() -> None:
                     )
 
                     try:
-                        async with AsyncSessionLocal() as db:
-                            await _generate_instrument_context(
-                                instrument_key, sym, ml_snapshot, db
-                            )
+                        await _generate_instrument_context(instrument_key, sym, ml_snapshot)
                         attempt_counts.pop(retry_key, None)
                     except asyncio.CancelledError:
                         raise

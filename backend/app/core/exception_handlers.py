@@ -103,7 +103,14 @@ def register_exception_handlers(app: FastAPI) -> None:
         """
         Catch-all for any unhandled exception.
         Logs full traceback server-side, returns generic message to client.
+
+        Starlette's ServerErrorMiddleware handles this response OUTSIDE
+        CORSMiddleware, so CORS headers are never added by the middleware
+        layer.  We inject them here directly so the browser sees the 500
+        instead of a CORS preflight failure masking the real error.
         """
+        from app.core.config import get_settings as _get_settings
+
         correlation_id = str(uuid.uuid4())
         logger.exception(
             "Unhandled exception [%s] %s %s",
@@ -111,7 +118,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             request.method,
             request.url.path,
         )
-        return JSONResponse(
+        response = JSONResponse(
             status_code=500,
             content={
                 "error": {
@@ -121,3 +128,11 @@ def register_exception_handlers(app: FastAPI) -> None:
                 }
             },
         )
+        origin = request.headers.get("origin")
+        if origin:
+            _settings = _get_settings()
+            if origin in _settings.cors_origins_str:
+                response.headers["Access-Control-Allow-Origin"] = origin
+                response.headers["Access-Control-Allow-Credentials"] = "true"
+                response.headers["Vary"] = "Origin"
+        return response
