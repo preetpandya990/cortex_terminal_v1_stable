@@ -32,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy import text
 
 from app.core.config import get_settings
-from app.exceptions import UpstoxAPIError, UpstoxInvalidInstrumentError, UpstoxRateLimitError, DatabaseError
+from app.exceptions import UpstoxAPIError, UpstoxConnectionError, UpstoxInvalidInstrumentError, UpstoxRateLimitError, DatabaseError
 from app.services.data_ingestion import bulk_upsert_ohlcv
 from app.services.upstox_client import UpstoxClient
 
@@ -510,7 +510,7 @@ class DataIngestionWorker:
         return rows
 
     async def _handle_api_error(self, exc: UpstoxAPIError, task: FetchTask) -> int:
-        # Only genuine infrastructure failures (5xx, timeouts, etc.) reach here.
+        # Only genuine infrastructure failures (5xx, timeouts, network errors) reach here.
         # 400 → UpstoxInvalidInstrumentError (caught above, never reaches here)
         # 429 → UpstoxRateLimitError          (caught above, never reaches here)
         self._circuit.record_failure()
@@ -521,6 +521,17 @@ class DataIngestionWorker:
                 "  → Update UPSTOX_ACCESS_TOKEN in .env; worker will auto-resume."
             )
             await self._wait_for_token_refresh()
+            return 0
+
+        # Network-layer failures (ReadError, ConnectError, etc.) are infrastructure
+        # faults — not instrument-specific.  Record the circuit breaker hit but do not
+        # penalise the instrument's retry counter or dead-letter it.  Gap detection
+        # will re-queue the chunk on the next iteration or maintenance cycle.
+        if isinstance(exc, UpstoxConnectionError):
+            logger.warning(
+                "Network error | %s | %s — circuit recorded; chunk will re-enter gap detection",
+                task.label, exc.message,
+            )
             return 0
 
         self._retry_counts[task.instrument_key] += 1

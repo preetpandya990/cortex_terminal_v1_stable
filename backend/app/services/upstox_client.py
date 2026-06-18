@@ -307,6 +307,18 @@ class UpstoxClient:
                 logger.error("Upstox connection error: %s %s", method, encoded_path)
                 raise UpstoxConnectionError("Cannot reach market data API")
 
+            except httpx.NetworkError as exc:
+                # Covers ReadError, WriteError, RemoteProtocolError — TCP-level
+                # failures that occur after the connection is established.
+                # Treated identically to ConnectError: transient, circuit-breakable.
+                logger.warning(
+                    "Upstox network error (%s): %s %s",
+                    type(exc).__name__, method, encoded_path,
+                )
+                raise UpstoxConnectionError(
+                    f"Network error communicating with market data API ({type(exc).__name__})"
+                )
+
         raise UpstoxConnectionError("Request failed after all retry attempts")  # pragma: no cover
     
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
