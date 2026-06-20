@@ -87,6 +87,26 @@ export interface TradeSuggestion {
   /** Strategy compliance annotation — null when user has no active subscriptions */
   strategy_compliance: StrategyComplianceInfo | null;
 
+  // ── Instrument series metadata ────────────────────────────────────────────
+  // Populated from instrument_master at response build time (not stored on
+  // the suggestion row). Reflects the instrument's *current* NSE series so
+  // the risk disclaimer always tracks live regulatory status.
+  //
+  // null  → instrument_key not found in instrument_master (historical/delisted)
+  // "EQ"  → normal continuous market — no disclaimer
+  // "BE"  → trade-to-trade/surveillance — no disclaimer
+  // "BZ"  → regulatory-action/penalty (active SEBI/NSE order) — disclaimer required
+  // "SM"  → SME main board — disclaimer required
+  // "ST"  → SME trade-to-trade — disclaimer required
+  instrument_series: string | null;
+
+  /**
+   * True when the instrument is in a restricted NSE series (BZ/SM/ST) and a
+   * platform risk disclaimer must be displayed before trade execution.
+   * Computed server-side from instrument_series; always present in the response.
+   */
+  requires_risk_disclaimer: boolean;
+
   // ── LLM explanation ───────────────────────────────────────────────────────
   // Populated asynchronously by the explanation worker after the suggestion is
   // committed to the database.  All four fields are null while generation is

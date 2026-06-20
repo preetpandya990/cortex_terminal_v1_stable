@@ -53,9 +53,25 @@ from app.exceptions import UpstoxAPIError
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# ── Filtering — NSE cash-equity universe (matches the historical sync) ──────────
+# ── NSE cash-equity series taxonomy ────────────────────────────────────────────
+# These constants are the canonical definitions for the NSE tradeable universe.
+# Any change here must be mirrored in:
+#   symbol_validator._ELIGIBLE_INSTRUMENT_TYPES
+#   schemas.trade_suggestions._RESTRICTED_NSE_SERIES
+#
+# Series included in the active trading universe:
+#   EQ  — normal continuous market, T+1 settlement
+#   BE  — trade-to-trade / surveillance, delivery-only
+#   BZ  — regulatory-action / penalty series (active SEBI/NSE order), delivery-only
+#   SM  — SME (Small & Medium Enterprise) main board
+#   ST  — SME trade-to-trade, delivery compulsory
+#
+# Series requiring a platform risk disclaimer before trading (BZ/SM/ST):
+#   delivery-only restrictions, regulatory or SME-specific constraints mean these
+#   instruments carry elevated risk not present in standard EQ/BE instruments.
+
 _ALLOWED_SEGMENT = "NSE_EQ"
-_ALLOWED_TYPES = frozenset({"EQ", "BE"})
+_ALLOWED_TYPES = frozenset({"EQ", "BE", "BZ", "SM", "ST"})
 
 # ── Conditional-GET cache ───────────────────────────────────────────────────────
 # Holds the validators of the last successfully *synced* file. TTL is generous;
@@ -108,7 +124,7 @@ def _normalize_instrument(item: dict[str, Any]) -> dict[str, Any] | None:
         "trading_symbol": trading_symbol,
         "name": item.get("name") or "",
         "exchange": item.get("exchange") or "NSE",
-        "instrument_type": item.get("instrument_type") or "EQ",
+        "instrument_type": item.get("instrument_type"),
     }
 
 

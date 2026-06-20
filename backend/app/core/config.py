@@ -430,7 +430,8 @@ class Settings(BaseSettings):
         True,
         description=(
             "Validate symbols against instrument_master before signal assembly. "
-            "Symbols not found as NSE EQ equities are rejected with a clear error. "
+            "Symbols not found as active NSE instruments (series EQ/BE/BZ/SM/ST) "
+            "are rejected with a clear error. "
             "Disable only for emergency operations or integration testing."
         ),
     )

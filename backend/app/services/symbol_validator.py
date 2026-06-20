@@ -5,12 +5,23 @@ Validates NSE trading symbols against the instrument_master table.
 
 A symbol is eligible if it exists in instrument_master as:
   - exchange = 'NSE'
-  - instrument_type = 'EQ'
+  - instrument_type in {EQ, BE, BZ, SM, ST}  (the full NSE cash-equity universe)
+  - is_active = True
+
+The full series set matches instrument_fetch._ALLOWED_TYPES — any change to the
+tradeable universe must be mirrored there and in schemas.trade_suggestions._RESTRICTED_NSE_SERIES.
+
+NSE series reference:
+  EQ  — normal continuous market, T+1 settlement
+  BE  — trade-to-trade / surveillance, delivery-only
+  BZ  — regulatory-action / penalty (active SEBI/NSE order), delivery-only
+  SM  — SME main board
+  ST  — SME trade-to-trade, delivery compulsory
 
 This is the canonical eligibility check used by all signal generation
 paths — event classification, on-demand assembly, and the correlation engine.
 The source of truth is the Upstox instrument sync, which is tied to real ISIN
-keys for every listed NSE equity.
+keys for every listed NSE instrument.
 
 Caching strategy:
   Positive (eligible)   → Redis TTL 3 600 s  (1 h)
@@ -33,13 +44,17 @@ from app.models.upstox_data import InstrumentMaster
 
 logger = logging.getLogger(__name__)
 
-_ELIGIBLE_TTL    = 3_600   # 1 hour
-_INELIGIBLE_TTL  =   300   # 5 minutes — allows quick recovery on new instruments
-_ELIG_KEY_PFX    = "cortex:sym:elig:"   # cortex:sym:elig:{SYMBOL}
-_NAME_KEY_PFX    = "cortex:sym:name:"   # cortex:sym:name:{SYMBOL}
-_IKEY_KEY_PFX    = "cortex:sym:ikey:"   # cortex:sym:ikey:{SYMBOL}
-_EXCHANGE        = "NSE"
-_INSTRUMENT_TYPE = "EQ"
+_ELIGIBLE_TTL   = 3_600   # 1 hour
+_INELIGIBLE_TTL =   300   # 5 minutes — allows rapid recovery on new instruments
+_ELIG_KEY_PFX   = "cortex:sym:elig:"   # cortex:sym:elig:{SYMBOL}
+_NAME_KEY_PFX   = "cortex:sym:name:"   # cortex:sym:name:{SYMBOL}
+_IKEY_KEY_PFX   = "cortex:sym:ikey:"   # cortex:sym:ikey:{SYMBOL}
+_EXCHANGE       = "NSE"
+
+# Full NSE cash-equity universe — must mirror instrument_fetch._ALLOWED_TYPES.
+# EQ/BE are unrestricted; BZ/SM/ST are tradeable but trigger a risk disclaimer
+# (see schemas.trade_suggestions._RESTRICTED_NSE_SERIES).
+_ELIGIBLE_INSTRUMENT_TYPES: frozenset[str] = frozenset({"EQ", "BE", "BZ", "SM", "ST"})
 
 
 # ── Exception ──────────────────────────────────────────────────────────────────
@@ -57,9 +72,8 @@ class SymbolNotEligibleError(ValueError):
         self.symbol = symbol
         super().__init__(
             f"Symbol '{symbol}' is not eligible: not found in instrument_master "
-            f"as an NSE EQ equity. Only NSE equity instruments covered by the "
-            f"Upstox data feed are supported. Verify the symbol is listed on NSE "
-            f"and has been synced to the platform."
+            f"as an active NSE instrument (series EQ/BE/BZ/SM/ST). "
+            f"Verify the symbol is listed on NSE and has been synced to the platform."
         )
 
 
@@ -86,7 +100,7 @@ class SymbolValidatorService:
 
     async def validate_symbol(self, symbol: str, db: AsyncSession) -> bool:
         """
-        Return ``True`` if *symbol* exists in instrument_master as NSE EQ.
+        Return ``True`` if *symbol* exists in instrument_master as an active NSE instrument.
 
         Flow: Redis cache → DB → write-back to cache.
         Redis failures are silently swallowed; the DB is always the fallback.
@@ -205,7 +219,7 @@ class SymbolValidatorService:
             .where(
                 InstrumentMaster.trading_symbol == symbol,
                 InstrumentMaster.exchange == _EXCHANGE,
-                InstrumentMaster.instrument_type == _INSTRUMENT_TYPE,
+                InstrumentMaster.instrument_type.in_(_ELIGIBLE_INSTRUMENT_TYPES),
             )
             .limit(1)
         )
@@ -249,7 +263,7 @@ class SymbolValidatorService:
             .where(
                 InstrumentMaster.trading_symbol == symbol,
                 InstrumentMaster.exchange == _EXCHANGE,
-                InstrumentMaster.instrument_type == _INSTRUMENT_TYPE,
+                InstrumentMaster.instrument_type.in_(_ELIGIBLE_INSTRUMENT_TYPES),
             )
             .limit(1)
         )
@@ -287,7 +301,7 @@ class SymbolValidatorService:
             .where(
                 InstrumentMaster.trading_symbol.in_(unique),
                 InstrumentMaster.exchange == _EXCHANGE,
-                InstrumentMaster.instrument_type == _INSTRUMENT_TYPE,
+                InstrumentMaster.instrument_type.in_(_ELIGIBLE_INSTRUMENT_TYPES),
                 InstrumentMaster.name.isnot(None),
             )
         )
@@ -305,7 +319,7 @@ class SymbolValidatorService:
                 .where(
                     InstrumentMaster.trading_symbol == symbol,
                     InstrumentMaster.exchange == _EXCHANGE,
-                    InstrumentMaster.instrument_type == _INSTRUMENT_TYPE,
+                    InstrumentMaster.instrument_type.in_(_ELIGIBLE_INSTRUMENT_TYPES),
                     # Eligibility gate: a delisted instrument is not tradeable.
                     InstrumentMaster.is_active.is_(True),
                 )
@@ -327,7 +341,7 @@ class SymbolValidatorService:
             stmt = select(InstrumentMaster.trading_symbol).where(
                 InstrumentMaster.trading_symbol.in_(symbols),
                 InstrumentMaster.exchange == _EXCHANGE,
-                InstrumentMaster.instrument_type == _INSTRUMENT_TYPE,
+                InstrumentMaster.instrument_type.in_(_ELIGIBLE_INSTRUMENT_TYPES),
                 # Eligibility gate: only active (live) instruments are tradeable.
                 InstrumentMaster.is_active.is_(True),
             )

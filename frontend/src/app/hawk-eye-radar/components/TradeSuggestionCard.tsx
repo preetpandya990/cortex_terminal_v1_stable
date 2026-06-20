@@ -9,6 +9,7 @@ import {
   ShieldCheck,
   ShieldX,
   ChevronRight,
+  AlertTriangle,
 } from "lucide-react";
 import { Card, CardContent, CardFooter, CardHeader } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -182,6 +183,45 @@ function PriceGrid({ suggestion }: { suggestion: TradeSuggestion }) {
 }
 
 /**
+ * Inline risk disclaimer rendered on cards for restricted NSE instruments.
+ *
+ * BZ — regulatory action (active SEBI/NSE interim order); delivery-only trading.
+ * SM / ST — SME-listed; lower liquidity, no retail margin product.
+ *
+ * The banner is deliberately compact so it does not dominate the card layout,
+ * but uses a high-contrast amber palette to ensure it is never overlooked.
+ */
+function RestrictedInstrumentBanner({ series }: { series: string | null }) {
+  const isBZ = series === "BZ";
+  return (
+    <div
+      role="alert"
+      className="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2"
+    >
+      <AlertTriangle
+        className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600"
+        aria-hidden="true"
+      />
+      <p className="text-[11px] leading-snug text-amber-800">
+        {isBZ ? (
+          <>
+            <span className="font-semibold">Regulatory action —</span>{" "}
+            under active SEBI/NSE order.
+          </>
+        ) : (
+          <>
+            <span className="font-semibold">SME instrument —</span>{" "}
+            reduced liquidity, elevated risk.
+          </>
+        )}{" "}
+        Any trade is solely at your own risk. The platform assumes no
+        responsibility.
+      </p>
+    </div>
+  );
+}
+
+/**
  * Renders the LLM-generated 2–3 sentence summary beneath the price grid.
  *
  * Rendering contract (mirrors backend nullable semantics):
@@ -317,6 +357,13 @@ function TradeSuggestionCardComponent({
           </div>
         </div>
       </CardHeader>
+
+      {/* ── Risk disclaimer (restricted NSE series only) ── */}
+      {suggestion.requires_risk_disclaimer && (
+        <div className="px-4 pb-0 pt-0">
+          <RestrictedInstrumentBanner series={suggestion.instrument_series} />
+        </div>
+      )}
 
       {/* ── Body ── */}
       <CardContent className="space-y-3 px-4 pb-3">

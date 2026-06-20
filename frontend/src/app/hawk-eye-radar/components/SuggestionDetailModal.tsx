@@ -14,6 +14,7 @@ import {
   X,
   ChevronLeft,
   ChevronRight,
+  AlertTriangle,
 } from "lucide-react";
 import {
   Dialog,
@@ -446,6 +447,33 @@ export function SuggestionDetailModal({
             {/* Signal Details */}
             <TabsContent value="signal">
               <div className="space-y-6">
+                {/* Risk disclaimer — restricted NSE series (BZ/SM/ST) */}
+                {suggestion.requires_risk_disclaimer && (
+                  <div
+                    role="alert"
+                    className="flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3"
+                  >
+                    <AlertTriangle
+                      className="mt-0.5 h-4 w-4 shrink-0 text-amber-600"
+                      aria-hidden="true"
+                    />
+                    <div>
+                      <p className="text-sm font-semibold text-amber-800">
+                        {suggestion.instrument_series === "BZ"
+                          ? "Regulatory Action — SEBI/NSE Interim Order"
+                          : "SME-Listed Instrument — Elevated Risk"}
+                      </p>
+                      <p className="mt-0.5 text-xs text-amber-700">
+                        {suggestion.instrument_series === "BZ"
+                          ? `${suggestion.trading_symbol ?? suggestion.symbol} is subject to an active SEBI/NSE regulatory order. Trading is restricted to delivery only.`
+                          : `${suggestion.trading_symbol ?? suggestion.symbol} is listed on the NSE SME platform with lower liquidity and higher volatility than main-board instruments.`}{" "}
+                        Any trade executed is entirely at your own risk. The platform assumes no
+                        responsibility for trades in restricted instruments.
+                      </p>
+                    </div>
+                  </div>
+                )}
+
                 {/* Consensus Score */}
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">

@@ -107,12 +107,15 @@ def _patch_download(monkeypatch, *, status=200, payload=None, etag=None, last_mo
 # ── Fetch: filtering & de-duplication ─────────────────────────────────────────────
 async def test_fetch_filters_segment_type_and_dedups(monkeypatch):
     payload = [
-        _raw("NSE_EQ|INE001", "AAA"),                      # keep
-        _raw("NSE_EQ|INE002", "BBB", itype="BE"),          # keep (BE allowed)
-        _raw("NSE_EQ|INE003", "CCC", itype="FUT"),         # drop (type)
-        _raw("BSE_EQ|INE004", "DDD", segment="BSE_EQ"),     # drop (segment)
-        _raw("NSE_EQ|INE001", "AAA"),                       # drop (duplicate key)
-        {"segment": "NSE_EQ", "instrument_type": "EQ", "trading_symbol": "EEE"},  # drop (no key)
+        _raw("NSE_EQ|INE001", "AAA"),                           # keep — EQ
+        _raw("NSE_EQ|INE002", "BBB", itype="BE"),              # keep — BE (surveillance)
+        _raw("NSE_EQ|INE003", "CCC", itype="BZ"),              # keep — BZ (regulatory action)
+        _raw("NSE_EQ|INE004", "DDD", itype="SM"),              # keep — SM (SME main board)
+        _raw("NSE_EQ|INE005", "EEE", itype="ST"),              # keep — ST (SME trade-to-trade)
+        _raw("NSE_EQ|INE006", "FFF", itype="FUT"),             # drop — unknown/non-equity type
+        _raw("BSE_EQ|INE007", "GGG", segment="BSE_EQ"),        # drop — wrong segment
+        _raw("NSE_EQ|INE001", "AAA"),                           # drop — duplicate instrument_key
+        {"segment": "NSE_EQ", "instrument_type": "EQ", "trading_symbol": "HHH"},  # drop — no key
     ]
     _patch_download(monkeypatch, payload=payload, etag='"v1"')
 
@@ -120,7 +123,13 @@ async def test_fetch_filters_segment_type_and_dedups(monkeypatch):
 
     assert result.not_modified is False
     keys = sorted(i["instrument_key"] for i in result.instruments)
-    assert keys == ["NSE_EQ|INE001", "NSE_EQ|INE002"]
+    assert keys == [
+        "NSE_EQ|INE001",  # EQ
+        "NSE_EQ|INE002",  # BE
+        "NSE_EQ|INE003",  # BZ
+        "NSE_EQ|INE004",  # SM
+        "NSE_EQ|INE005",  # ST
+    ]
     assert result.etag == '"v1"'
 
 
@@ -181,14 +190,14 @@ async def _clean_slate(session):
     await session.commit()
 
 
-async def _seed(session, key, symbol, *, is_active=True, last_seen=None):
+async def _seed(session, key, symbol, *, is_active=True, last_seen=None, itype="EQ"):
     session.add(
         InstrumentMaster(
             instrument_key=key,
             trading_symbol=symbol,
             name=symbol,
             exchange="NSE",
-            instrument_type="EQ",
+            instrument_type=itype,
             is_active=is_active,
             last_seen_at=last_seen or datetime.now(timezone.utc),
             delisted_at=None if is_active else datetime.now(timezone.utc),
@@ -334,3 +343,35 @@ async def test_eligibility_and_resolvers_respect_is_active(db_session):
     # Resolver default (active-only) hides the delisted symbol; include_inactive reveals it.
     assert await sv.get_instrument_key("DEAD", db_session) is None
     assert await sv.get_instrument_key("DEAD", db_session, include_inactive=True) == "NSE_EQ|INE200"
+
+
+async def test_validator_accepts_all_nse_equity_series(db_session):
+    """
+    Instruments in BZ, SM, and ST series must pass eligibility validation.
+
+    BZ instruments (e.g. RAJESHEXPO after a SEBI interim order) are actively
+    traded under delivery-only restrictions but were previously invisible to the
+    validator because _INSTRUMENT_TYPE was hardcoded to 'EQ'.
+    """
+    from app.services.symbol_validator import symbol_validator as sv
+
+    await _clean_slate(db_session)
+    await _seed(db_session, "NSE_EQ|INE100", "EQSTOCK",  itype="EQ")
+    await _seed(db_session, "NSE_EQ|INE101", "BESTOCK",  itype="BE")
+    await _seed(db_session, "NSE_EQ|INE102", "BZSTOCK",  itype="BZ")
+    await _seed(db_session, "NSE_EQ|INE103", "SMSTOCK",  itype="SM")
+    await _seed(db_session, "NSE_EQ|INE104", "STSTOCK",  itype="ST")
+
+    symbols = ["EQSTOCK", "BESTOCK", "BZSTOCK", "SMSTOCK", "STSTOCK"]
+
+    # Every series must pass the single-symbol eligibility gate.
+    for sym in symbols:
+        assert await sv._db_check_single(sym, db_session) is True, (
+            f"Expected {sym} to be eligible but _db_check_single returned False"
+        )
+
+    # Every series must appear in the batch result.
+    eligible = await sv._db_check_batch(symbols, db_session)
+    assert eligible == set(symbols), (
+        f"Batch check missing: {set(symbols) - eligible}"
+    )

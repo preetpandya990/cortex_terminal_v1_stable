@@ -9,7 +9,7 @@ from enum import Enum
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 
 # ============================================================================
@@ -48,6 +48,15 @@ class TriggerType(str, Enum):
     """Event correlation trigger type."""
     SCANNER_ANOMALY = "SCANNER_ANOMALY"
     NEWS_EVENT = "NEWS_EVENT"
+
+
+# ── NSE restricted series ────────────────────────────────────────────────────
+# Series that are tradeable but require a platform risk disclaimer:
+#   BZ  regulatory-action / penalty (active SEBI/NSE order)
+#   SM  SME main board (lower liquidity, restricted margin)
+#   ST  SME trade-to-trade, delivery compulsory
+# Must mirror instrument_fetch._ALLOWED_TYPES and symbol_validator._ELIGIBLE_INSTRUMENT_TYPES.
+_RESTRICTED_NSE_SERIES: frozenset[str] = frozenset({"BZ", "SM", "ST"})
 
 
 # ============================================================================
@@ -185,6 +194,29 @@ class TradeSuggestionResponse(BaseModel):
             "hard_gate users only see suggestions where passed=True."
         ),
     )
+
+    # ── Instrument series metadata ─────────────────────────────────────────────
+    # Populated by the API layer from instrument_master.instrument_type at response
+    # build time — NOT stored on the trade_suggestions table.  Reflects the
+    # instrument's current NSE series (EQ/BE/BZ/SM/ST); null for historical
+    # suggestions whose instrument_key is no longer in instrument_master.
+    instrument_series: str | None = Field(
+        None,
+        description=(
+            "NSE trading series code for this instrument "
+            "(EQ/BE/BZ/SM/ST). Null when instrument is no longer in instrument_master."
+        ),
+    )
+
+    @computed_field(
+        description=(
+            "True when the instrument is in a restricted NSE series (BZ/SM/ST) "
+            "and the platform must display a risk disclaimer before trade execution."
+        )
+    )
+    @property
+    def requires_risk_disclaimer(self) -> bool:
+        return self.instrument_series in _RESTRICTED_NSE_SERIES
 
     @field_validator("consensus_score", mode="before")
     @classmethod

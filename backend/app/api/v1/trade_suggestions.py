@@ -117,36 +117,51 @@ async def _load_compliance_map(
     return compliance_map
 
 
-async def _load_company_name_map(
+async def _load_instrument_meta_map(
     session: AsyncSession,
     instrument_keys: list[str],
-) -> dict[str, str]:
-    """Batch-fetch company names from instrument_master for the given keys."""
+) -> dict[str, tuple[str | None, str | None]]:
+    """
+    Batch-fetch (name, instrument_type) from instrument_master for the given keys.
+
+    Intentionally NOT filtered on is_active — a suggestion referencing a
+    since-delisted instrument must still render its company name and series code.
+
+    Returns: dict mapping instrument_key → (name, instrument_type).
+    Both values are None when absent from the source row.
+    """
     if not instrument_keys:
         return {}
-    # Identity resolution by explicit key for existing suggestions: intentionally
-    # NOT filtered on is_active so a suggestion in a since-delisted instrument
-    # still renders its name.
-    stmt = select(InstrumentMaster.instrument_key, InstrumentMaster.name).where(
-        InstrumentMaster.instrument_key.in_(instrument_keys)
-    )
+    stmt = select(
+        InstrumentMaster.instrument_key,
+        InstrumentMaster.name,
+        InstrumentMaster.instrument_type,
+    ).where(InstrumentMaster.instrument_key.in_(instrument_keys))
     result = await session.execute(stmt)
-    return {row.instrument_key: row.name for row in result if row.name}
+    return {
+        row.instrument_key: (row.name or None, row.instrument_type)
+        for row in result
+    }
 
 
 def _build_suggestion_response(
     suggestion: TradeSuggestion,
     compliance: "UserSuggestionCompliance | None",
+    *,
     company_name: str | None = None,
+    instrument_type: str | None = None,
 ) -> TradeSuggestionResponse:
     """
-    Build a TradeSuggestionResponse with optional compliance annotation.
+    Build a TradeSuggestionResponse with optional compliance and instrument metadata.
 
     Company name resolution priority:
       1. ``suggestion.company_name`` — populated at creation time by the
          correlation engine via SymbolValidatorService (fast, always correct).
-      2. ``company_name`` arg — live lookup fallback for historical rows that
+      2. ``company_name`` kwarg — live lookup fallback for historical rows that
          predate the denormalized column (migration 0025 backfills most of them).
+
+    ``instrument_type`` is fetched live from instrument_master (reflects current
+    NSE series, e.g. BZ after a regulatory action) and drives ``requires_risk_disclaimer``.
     """
     resp = TradeSuggestionResponse.model_validate(suggestion)
 
@@ -154,6 +169,11 @@ def _build_suggestion_response(
     # that still have a NULL company_name after the backfill migration.
     if resp.company_name is None and company_name is not None:
         resp.company_name = company_name
+
+    # Instrument series — reflects the *current* NSE classification of this
+    # instrument (not what it was at signal generation time), because the
+    # risk disclaimer should track the instrument's live regulatory status.
+    resp.instrument_series = instrument_type
 
     if compliance is not None:
         pr = compliance.pipeline_result or {}
@@ -287,11 +307,11 @@ async def list_suggestions(
         if link_header:
             response.headers["Link"] = link_header
 
-        # ── Compliance annotations + company names ────────────────────────────
+        # ── Compliance annotations + instrument metadata ──────────────────────
         compliance_map = await _load_compliance_map(
             session, uid, [s.suggestion_id for s in suggestions]
         )
-        company_name_map = await _load_company_name_map(
+        instrument_meta_map = await _load_instrument_meta_map(
             session, [s.instrument_key for s in suggestions]
         )
 
@@ -320,7 +340,8 @@ async def list_suggestions(
                 _build_suggestion_response(
                     s,
                     compliance_map.get(str(s.suggestion_id)),
-                    company_name_map.get(s.instrument_key),
+                    company_name=instrument_meta_map.get(s.instrument_key, (None, None))[0],
+                    instrument_type=instrument_meta_map.get(s.instrument_key, (None, None))[1],
                 )
                 for s in suggestions
             ],
@@ -356,11 +377,11 @@ async def list_suggestions(
         result = await session.execute(stmt)
         suggestions = result.scalars().all()
 
-        # ── Compliance annotations + company names ────────────────────────────
+        # ── Compliance annotations + instrument metadata ──────────────────────
         compliance_map = await _load_compliance_map(
             session, uid, [s.suggestion_id for s in suggestions]
         )
-        company_name_map = await _load_company_name_map(
+        instrument_meta_map = await _load_instrument_meta_map(
             session, [s.instrument_key for s in suggestions]
         )
 
@@ -388,7 +409,8 @@ async def list_suggestions(
                 _build_suggestion_response(
                     s,
                     compliance_map.get(str(s.suggestion_id)),
-                    company_name_map.get(s.instrument_key),
+                    company_name=instrument_meta_map.get(s.instrument_key, (None, None))[0],
+                    instrument_type=instrument_meta_map.get(s.instrument_key, (None, None))[1],
                 )
                 for s in suggestions
             ],
@@ -640,11 +662,13 @@ async def get_suggestion(
         }
     )
     
-    company_name_map = await _load_company_name_map(session, [suggestion.instrument_key])
+    instrument_meta_map = await _load_instrument_meta_map(session, [suggestion.instrument_key])
+    name, itype = instrument_meta_map.get(suggestion.instrument_key, (None, None))
     suggestion_resp = _build_suggestion_response(
         suggestion,
         compliance=None,
-        company_name=company_name_map.get(suggestion.instrument_key),
+        company_name=name,
+        instrument_type=itype,
     )
     return SuggestionDetailResponse(
         suggestion=suggestion_resp,
@@ -707,6 +731,10 @@ async def dismiss_suggestion(
         }
     )
     
+    # The dismiss response is a tombstone acknowledged by the client only to
+    # confirm the status transition.  The frontend discards it immediately after
+    # triggering a cache invalidation, so instrument_series/requires_risk_disclaimer
+    # being null/False here is intentional — no instrument_master lookup needed.
     return TradeSuggestionResponse.model_validate(suggestion)
 
 
