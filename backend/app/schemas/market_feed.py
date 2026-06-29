@@ -92,5 +92,5 @@ class HeartbeatEvent(BaseModel):
 
 class ErrorEvent(BaseModel):
     type: Literal["error"] = "error"
-    code: Literal["INVALID_KEY", "AUTH_REQUIRED", "INVALID_MESSAGE", "INTERNAL"]
+    code: Literal["INVALID_KEY", "AUTH_REQUIRED", "AUTH_FAILED", "AUTH_TIMEOUT", "REAUTH_FAILED", "INVALID_MESSAGE", "INTERNAL"]
     message: str

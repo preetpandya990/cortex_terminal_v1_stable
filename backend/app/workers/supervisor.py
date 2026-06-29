@@ -123,6 +123,26 @@ class TriggerToken:
         except asyncio.TimeoutError:
             return False
 
+    def wait(self) -> "asyncio.coroutines":
+        """
+        Return an awaitable that resolves when fire() is called.
+
+        Unlike wait_or_timeout(), this does NOT auto-reset the event — the
+        caller must call consume() after waking to prevent the next waiter
+        from returning immediately.  Intended for use with asyncio.wait()
+        when racing against multiple events (e.g. shutdown + trigger).
+        """
+        return self._event.wait()
+
+    def consume(self) -> None:
+        """
+        Consume (clear) a pending trigger signal.
+
+        Call this after waking via wait() to reset the event so the next
+        wait() / wait_or_timeout() call sleeps normally.  Idempotent.
+        """
+        self._event.clear()
+
     def fire(self) -> None:
         """Wake up the task immediately (idempotent; safe to call mid-cycle)."""
         self._event.set()

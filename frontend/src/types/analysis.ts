@@ -226,6 +226,15 @@ export interface ExplanationSource {
 export interface ExplanationData {
   available:        boolean;
   /**
+   * True when the explanation pipeline failed permanently after MAX_ATTEMPTS
+   * (Gemini quota exhausted, repeated timeouts, or DLQ promotion).  The panel
+   * renders a static "Analysis unavailable" state instead of an eternal skeleton.
+   * Mutually exclusive with ``available: true`` — a failed explanation is never
+   * available.  A skeleton (available=false, failed=false) can still transition
+   * to available=true; a failed one cannot without a server-side requeue.
+   */
+  failed?:          boolean;
+  /**
    * True while the worker is streaming the explanation token-by-token:
    * ``available`` is still false but ``full_explanation`` holds the partial text
    * so the panel renders it progressively instead of showing the skeleton.
@@ -249,6 +258,29 @@ export interface ExplanationData {
 
   /** ISO-8601 UTC timestamp when the underlying signal was created. */
   signal_generated_at: string | null;
+
+  /**
+   * True when the suggestion's consensus_score is below EXPLANATION_CONSENSUS_THRESHOLD.
+   * The correlation engine intentionally skipped the explanation job; this state
+   * persists until the user requests an on-demand explanation via the bypass endpoint.
+   *
+   * Mutually exclusive with ``available: true`` and ``failed: true``.
+   * The panel renders a "confidence below threshold" card with a CTA button.
+   */
+  weak_signal?: boolean;
+
+  /**
+   * UUID of the backing TradeSuggestion.  Populated only when ``weak_signal === true``
+   * so the panel can construct the bypass endpoint URL without an extra lookup.
+   */
+  suggestion_id?: string;
+
+  /**
+   * Composite consensus score (0–100) for the underlying suggestion.
+   * Populated when ``weak_signal === true`` so the panel can display the score
+   * as context ("Consensus score: 68/100").
+   */
+  consensus_score?: number;
 }
 
 /** SSE `analysis_update` event payload */

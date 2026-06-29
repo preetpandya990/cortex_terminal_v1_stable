@@ -57,6 +57,7 @@ from app.services.fundamentals_service import (
     _redis_key,
 )
 from app.services.market_calendar import IST, nse_calendar
+from app.workers.supervisor import PauseToken, TriggerToken
 
 logger   = logging.getLogger(__name__)
 settings = get_settings()
@@ -118,29 +119,70 @@ def _next_deadline(deadlines: tuple[tuple[int, int], ...], after: date) -> date:
     return min(c for c in candidates if c > after)
 
 
-async def _wait_until(target_utc: datetime, shutdown: asyncio.Event) -> bool:
+async def _wait_until(
+    target_utc: datetime,
+    shutdown: asyncio.Event,
+    trigger: TriggerToken | None = None,
+) -> bool:
     """
-    Sleep until `target_utc` or until shutdown fires.
-    Returns True if woke naturally (time to run), False if shutdown.
+    Sleep until ``target_utc``, shutdown, or (optionally) a trigger fires.
+
+    Returns:
+        True  — woke naturally (deadline elapsed) or trigger fired; caller
+                should evaluate its own guard conditions and run if appropriate.
+        False — shutdown was signalled; caller should break its loop.
+
+    When ``trigger`` is provided the coroutine races three events: the wall-
+    clock deadline, the shutdown event, and the trigger token.  The trigger is
+    consumed (cleared) on wakeup so the next sleep cycle starts clean.
     """
     delay = (target_utc - datetime.now(timezone.utc)).total_seconds()
     if delay <= 0:
         return True
+
+    if trigger is None:
+        try:
+            await asyncio.wait_for(shutdown.wait(), timeout=delay)
+            return False
+        except asyncio.TimeoutError:
+            return True
+
+    # Race: timeout vs shutdown vs trigger — asyncio.wait handles all three.
+    shutdown_task = asyncio.ensure_future(shutdown.wait())
+    trigger_task  = asyncio.ensure_future(trigger.wait())
     try:
-        await asyncio.wait_for(shutdown.wait(), timeout=delay)
+        done, pending = await asyncio.wait(
+            {shutdown_task, trigger_task},
+            timeout=delay,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+    if shutdown.is_set():
         return False
-    except asyncio.TimeoutError:
-        return True
+    if trigger_task in done:
+        trigger.consume()   # reset so next wait_or_timeout / wait starts clean
+    return True             # trigger fired or timeout elapsed → caller should check guards
 
 
-async def _wait_until_ist_time(hhmm: str, shutdown: asyncio.Event) -> bool:
+async def _wait_until_ist_time(
+    hhmm: str,
+    shutdown: asyncio.Event,
+    trigger: TriggerToken | None = None,
+) -> bool:
     """Sleep until the next HH:MM IST occurrence (today or tomorrow)."""
     now_ist = datetime.now(IST)
     hh, mm  = map(int, hhmm.split(":"))
     target  = now_ist.replace(hour=hh, minute=mm, second=0, microsecond=0)
     if target <= now_ist:
         target += timedelta(days=1)
-    return await _wait_until(target.astimezone(timezone.utc), shutdown)
+    return await _wait_until(target.astimezone(timezone.utc), shutdown, trigger)
 
 
 def _epoch_key(loop_name: str) -> str:
@@ -341,9 +383,28 @@ class FundamentalsRefreshScheduler:
     """
     Manages six background refresh loops for company fundamentals data.
 
-    Usage in worker.py:
-        scheduler = FundamentalsRefreshScheduler(session_factory, redis_client, shutdown_event)
-        task = asyncio.create_task(scheduler.run(), name="fundamentals_refresh")
+    All six loops are pause/trigger-aware when the optional ``pause`` and
+    ``trigger`` tokens are provided (wired from the worker sidecar control
+    plane via the task registry).
+
+    Control-plane semantics:
+        pause   — each sub-loop blocks at its next checkpoint() call until
+                  resume() is issued.  Sleeping loops wake, hit the checkpoint,
+                  and re-enter their sleep if still paused.
+        trigger — all six sub-loops are woken from their current sleep
+                  immediately.  Each loop then evaluates its own guard
+                  conditions (already_ran_today, ran_within_Xh) and runs only
+                  if its schedule is actually due.  No double-runs occur.
+        restart — CancelledError propagates through asyncio.gather(), which
+                  cancels all sub-tasks; the supervisor restarts the scheduler
+                  coroutine via the factory.
+
+    Usage in registry.py:
+        scheduler = FundamentalsRefreshScheduler(
+            session_factory, redis_client, shutdown_event,
+            pause=task_states["fundamentals_refresh"].pause_token,
+            trigger=task_states["fundamentals_refresh"].trigger_token,
+        )
     """
 
     def __init__(
@@ -351,10 +412,15 @@ class FundamentalsRefreshScheduler:
         session_factory: async_sessionmaker,
         redis: CacheService,
         shutdown: asyncio.Event,
+        *,
+        pause: PauseToken | None = None,
+        trigger: TriggerToken | None = None,
     ) -> None:
         self._sf       = session_factory
         self._redis    = redis
         self._shutdown = shutdown
+        self._pause    = pause
+        self._trigger  = trigger
 
     async def run(self) -> None:
         """Launch all sub-loops; cancel them if this coroutine is cancelled."""
@@ -376,6 +442,13 @@ class FundamentalsRefreshScheduler:
             raise
         finally:
             logger.info("FundamentalsRefreshScheduler stopped")
+
+    # ── Control-plane helpers ──────────────────────────────────────────────────
+
+    async def _checkpoint(self) -> None:
+        """Cooperative pause gate. No-ops when no PauseToken is wired."""
+        if self._pause is not None:
+            await self._pause.checkpoint()
 
     # ── Loop helpers ───────────────────────────────────────────────────────────
 
@@ -414,7 +487,8 @@ class FundamentalsRefreshScheduler:
         logger.info("[%s] Loop started (runs at %s IST on trading days)", loop, t)
 
         while not self._shutdown.is_set():
-            if not await _wait_until_ist_time(t, self._shutdown):
+            await self._checkpoint()
+            if not await _wait_until_ist_time(t, self._shutdown, self._trigger):
                 break
 
             today = datetime.now(IST).date()
@@ -437,7 +511,8 @@ class FundamentalsRefreshScheduler:
         logger.info("[%s] Loop started (runs at %s IST daily)", loop, t)
 
         while not self._shutdown.is_set():
-            if not await _wait_until_ist_time(t, self._shutdown):
+            await self._checkpoint()
+            if not await _wait_until_ist_time(t, self._shutdown, self._trigger):
                 break
             if await self._already_ran_today(loop):
                 logger.info("[%s] Already ran today — skipping", loop)
@@ -454,12 +529,13 @@ class FundamentalsRefreshScheduler:
         logger.info("[%s] Loop started (SEBI Reg 33 quarterly deadlines)", loop)
 
         while not self._shutdown.is_set():
+            await self._checkpoint()
             today    = datetime.now(IST).date()
             deadline = _next_deadline(_SEBI_FINANCIALS_DEADLINES, today)
             target   = datetime(deadline.year, deadline.month, deadline.day, 6, 0, tzinfo=IST)
 
             logger.info("[%s] Next financials refresh on %s at 06:00 IST", loop, deadline)
-            if not await _wait_until(target.astimezone(timezone.utc), self._shutdown):
+            if not await _wait_until(target.astimezone(timezone.utc), self._shutdown, self._trigger):
                 break
 
             if await self._ran_within(loop, 12 * 3600):
@@ -477,12 +553,13 @@ class FundamentalsRefreshScheduler:
         logger.info("[%s] Loop started (SEBI Reg 31 quarterly deadlines)", loop)
 
         while not self._shutdown.is_set():
+            await self._checkpoint()
             today    = datetime.now(IST).date()
             deadline = _next_deadline(_SEBI_HOLDINGS_DEADLINES, today)
             target   = datetime(deadline.year, deadline.month, deadline.day, 9, 0, tzinfo=IST)
 
             logger.info("[%s] Next holdings refresh on %s at 09:00 IST", loop, deadline)
-            if not await _wait_until(target.astimezone(timezone.utc), self._shutdown):
+            if not await _wait_until(target.astimezone(timezone.utc), self._shutdown, self._trigger):
                 break
 
             if await self._ran_within(loop, 12 * 3600):
@@ -500,20 +577,29 @@ class FundamentalsRefreshScheduler:
         logger.info("[%s] Loop started (Tier 1 full refresh every 6 h)", loop)
 
         while not self._shutdown.is_set():
+            await self._checkpoint()
             last = await _last_loop_run(loop, self._redis)
             now  = datetime.now(timezone.utc)
 
             if last:
                 remaining = _PRIORITY_INTERVAL_SECS - (now - last).total_seconds()
                 if remaining > 0:
-                    if not await _wait_until(now + timedelta(seconds=remaining), self._shutdown):
+                    if not await _wait_until(
+                        now + timedelta(seconds=remaining),
+                        self._shutdown,
+                        self._trigger,
+                    ):
                         break
 
             logger.info("[%s] Refreshing Tier 1 instruments (full 9-endpoint)", loop)
             instruments = await _load_tier1_keys(self._sf, settings.FUNDAMENTALS_PRIORITY_LOOKBACK_DAYS)
             if not instruments:
                 logger.info("[%s] No Tier 1 instruments found — sleeping 1 h", loop)
-                await _wait_until(datetime.now(timezone.utc) + timedelta(hours=1), self._shutdown)
+                await _wait_until(
+                    datetime.now(timezone.utc) + timedelta(hours=1),
+                    self._shutdown,
+                    self._trigger,
+                )
                 continue
 
             await self._run(loop, instruments, _full_fetch)
@@ -526,7 +612,8 @@ class FundamentalsRefreshScheduler:
         logger.info("[%s] Loop started (full universe at %s IST, skips live-cached)", loop, t)
 
         while not self._shutdown.is_set():
-            if not await _wait_until_ist_time(t, self._shutdown):
+            await self._checkpoint()
+            if not await _wait_until_ist_time(t, self._shutdown, self._trigger):
                 break
 
             if await self._ran_within(loop, 20 * 3600):

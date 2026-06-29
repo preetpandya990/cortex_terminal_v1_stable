@@ -64,15 +64,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     await init_redis()
 
+    # Create Redis Stream consumer groups for the explanation pipeline.
+    # Idempotent: BUSYGROUP is silently ignored on restart so the groups are
+    # created once and survive process restarts without any state reset.
+    from app.core.redis import init_explanation_streams
+    await init_explanation_streams()
+    logger.info("Explanation stream consumer groups initialized")
+
     # Initialize Gemini Request Manager — central coordinator for all 6 Gemini callers.
     # Pre-loads quota circuit state from Redis so a post-exhaustion restart fast-fails
     # immediately rather than wasting an API round-trip.  Must run AFTER init_redis()
     # (circuit pre-load needs Redis) and BEFORE the LLM client (client calls acquire()).
     try:
         from app.ai.intelligence.request_manager import GeminiRequestManager
+        from app.ai.intelligence.llm_client import _key_id as _gemini_key_id
         from app.core.redis import get_redis
-        await GeminiRequestManager.initialize(redis=get_redis())
-        logger.info("Gemini request manager initialized")
+        _gemini_key_ids = [_gemini_key_id(k) for k in get_settings().gemini_api_key_pool]
+        await GeminiRequestManager.initialize(redis=get_redis(), key_ids=_gemini_key_ids)
+        logger.info("Gemini request manager initialized (keys=%d)", len(_gemini_key_ids))
     except Exception as exc:
         logger.error(
             "Gemini request manager initialization failed (quota coordination degraded): %s", exc
@@ -202,14 +211,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.worker_client = worker_client
     logger.info("Worker sidecar client initialized (base_url=%s)", settings.WORKER_BASE_URL)
 
-    # Start LLM Explanation Worker — generates plain-English trade explanations
-    # asynchronously after each suggestion is committed to the database.
-    from app.ai.intelligence.explanation_worker import explanation_worker
-    explanation_worker_task = asyncio.create_task(
-        explanation_worker(), name="llm_explanation_worker"
+    # Start LLM Explanation Workers — two parallel consumers on the explanation
+    # jobs stream + one context worker, all using XREADGROUP for at-least-once
+    # delivery.  Two explanation workers run in parallel so a slow Gemini call
+    # for one suggestion does not block all subsequent jobs.
+    from app.ai.intelligence.explanation_worker import context_worker, explanation_worker
+    explanation_worker_tasks = [
+        asyncio.create_task(
+            explanation_worker(worker_id=0), name="llm_explanation_worker_0"
+        ),
+        asyncio.create_task(
+            explanation_worker(worker_id=1), name="llm_explanation_worker_1"
+        ),
+    ]
+    context_worker_task = asyncio.create_task(
+        context_worker(), name="llm_context_worker"
     )
-    app.state.explanation_worker_task = explanation_worker_task
-    logger.info("LLM explanation worker started")
+    app.state.explanation_worker_tasks = explanation_worker_tasks
+    app.state.context_worker_task = context_worker_task
+    logger.info("LLM explanation workers started (2 explanation + 1 context)")
 
     # Start RAG corpus refresh worker — incrementally embeds new news events
     # (ai_raw_events → ai_document_embeddings) on startup and every
@@ -264,11 +284,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if hasattr(app.state, "worker_client") and app.state.worker_client:
         await app.state.worker_client.aclose()
 
-    # Cancel LLM explanation worker
-    if hasattr(app.state, "explanation_worker_task") and app.state.explanation_worker_task:
-        app.state.explanation_worker_task.cancel()
+    # Cancel LLM explanation workers (2 explanation + 1 context)
+    for _task in getattr(app.state, "explanation_worker_tasks", []):
+        _task.cancel()
         try:
-            await asyncio.wait_for(app.state.explanation_worker_task, timeout=5.0)
+            await asyncio.wait_for(_task, timeout=5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+    if hasattr(app.state, "context_worker_task") and app.state.context_worker_task:
+        app.state.context_worker_task.cancel()
+        try:
+            await asyncio.wait_for(app.state.context_worker_task, timeout=5.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
 
@@ -280,6 +306,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             await asyncio.wait_for(app.state.rag_refresh_task, timeout=10.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
+
+    # Drain NLP sentiment batch queue — resolves all pending futures with neutral
+    # fallback before the Gemini transport is torn down.  Must run BEFORE
+    # GeminiRequestManager.aclose() so event-pipeline coroutines receive a clean
+    # fallback dict rather than a transport error from a closed LLM client.
+    try:
+        from app.ai.intelligence.nlp_engine import NLPEngine
+        await NLPEngine.aclose()
+    except Exception as exc:
+        logger.debug("NLP engine close failed (non-fatal): %s", exc)
 
     # Shut down Gemini Request Manager — drains the permit queue and cancels all waiting
     # callers before the LLM transport is closed.  Order matters: callers must receive

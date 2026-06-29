@@ -6,12 +6,12 @@ inference, and produces an aggregated impact score for a given instrument.
 
 Architecture:
   1. Check L1 cache (class-level LRU, <1ms)
-  2. Check L2 cache (Redis, 2-min TTL)
+  2. Check L2 cache (Redis, 15-min TTL)
   3. Query events via ai_event_classifications.affected_symbols join (precise)
      → adaptive lookback: extends to 3× window when article count is thin
      → text search fallback for instruments not yet in the NLP pipeline
-  4. Run LLM sentiment inference concurrently via NLPEngine (asyncio.gather safe —
-     no shared DB session; each inference is an independent remote API call)
+  4. Run LLM sentiment inference via NLPEngine.analyze_sentiment_batch() —
+     one batched Gemini call for all event titles, cache hits served inline
   5. Compute weighted impact score and build structured response
   6. Cache and return
 
@@ -24,7 +24,6 @@ Impact score formula:
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import math
@@ -54,7 +53,7 @@ logger = logging.getLogger(__name__)
 # ── Constants ──────────────────────────────────────────────────────────────────
 _RECENCY_HALF_LIFE_HOURS = 12.0
 _MAX_EVENTS_PER_REQUEST = 50   # Cap to bound inference latency
-_L2_TTL = 120                  # 2-minute Redis TTL for sentiment
+_L2_TTL = 900                  # 15-minute Redis TTL for sentiment
 
 # Higher credibility for official exchange feeds
 _SOURCE_WEIGHTS: dict[str, float] = {
@@ -163,10 +162,9 @@ class SentimentAnalysisService:
                 computed_at=computed_at,
             )
 
-        # Run LLM sentiment inference concurrently on all event titles
+        # Run LLM sentiment inference — one batched Gemini call for all titles.
         titles = [self._extract_title(e.extra_data, e.raw_content) for e in events]
-        sentiment_tasks = [self._nlp.analyze_sentiment(t) for t in titles]
-        sentiments = await asyncio.gather(*sentiment_tasks, return_exceptions=True)
+        sentiments = await self._nlp.analyze_sentiment_batch(titles)
 
         # Aggregate
         pos_count = neg_count = neu_count = 0

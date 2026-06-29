@@ -14,7 +14,7 @@ Command:
 
 Design:
     - ``--workers 1`` is mandatory: multiple Uvicorn workers would each spawn
-      their own copy of all 13 task loops, causing duplicate processing.
+      their own copy of all 15 task loops, causing duplicate processing.
     - The TaskGroup runs as a background asyncio.Task so that the lifespan
       ``yield`` (and therefore the control-plane HTTP routes) is available
       immediately after startup — not blocked by task execution.

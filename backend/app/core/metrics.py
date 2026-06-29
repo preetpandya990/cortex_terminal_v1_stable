@@ -384,7 +384,7 @@ gemini_requests_total = Counter(
     'Total Gemini API permit outcomes by operation, priority tier, and status',
     # op:       generate | embed
     # priority: critical | high | medium | low | background
-    # status:   success | error | quota | rate | timeout
+    # status:   success | error | quota | budget | rate | timeout
     ['op', 'priority', 'status'],
 )
 
@@ -411,6 +411,12 @@ gemini_circuit_open = Gauge(
     ['op'],  # generate | embed
 )
 
+gemini_effective_rpm = Gauge(
+    'gemini_effective_rpm',
+    'Effective Gemini requests-per-minute budget after proportional key-dropout scaling',
+    ['op'],  # generate | embed
+)
+
 gemini_permit_wait_seconds = Histogram(
     'gemini_permit_wait_seconds',
     'Time from GeminiRequestManager.acquire() call to permit granted (seconds)',
@@ -419,6 +425,13 @@ gemini_permit_wait_seconds = Histogram(
         0.001, 0.005, 0.01, 0.025, 0.05,
         0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
     ),
+)
+
+gemini_rpd_budget_remaining = Gauge(
+    'gemini_rpd_budget_remaining',
+    'Estimated daily Gemini generate requests remaining before the HIGH-priority '
+    'reservation is breached (budget guard).  Drops to zero when GEMINI_HIGH_PRIORITY_'
+    'RPD_RESERVE is reached; resets to full at midnight Pacific Time.',
 )
 
 
@@ -471,6 +484,131 @@ worker_task_status_gauge = Gauge(
     'worker_task_status',
     'Worker task lifecycle status: 0=starting 1=running 2=paused 3=crashed 4=stopped',
     ['task'],
+)
+
+
+# ── RAG Batch Embedding Metrics ───────────────────────────────────────────────
+
+rag_batch_jobs_total = Counter(
+    'rag_batch_jobs_total',
+    'Total Gemini batch embedding jobs by final status',
+    ['status'],  # submitted | succeeded | failed | timeout | cancelled
+)
+
+rag_batch_job_duration_seconds = Histogram(
+    'rag_batch_job_duration_seconds',
+    'Wall-clock duration from batch job submission to terminal state (seconds)',
+    buckets=(30, 60, 120, 300, 600, 1200, 1800, 3600, 7200),
+)
+
+rag_batch_job_texts_total = Counter(
+    'rag_batch_job_texts_total',
+    'Total texts submitted across all Gemini batch embedding jobs',
+)
+
+
+# ── RAG Corpus Cleanup Metrics ────────────────────────────────────────────────
+
+rag_cleanup_rows_deleted_total = Counter(
+    'rag_cleanup_rows_deleted_total',
+    'Total ai_document_embeddings rows deleted by the daily TTL cleanup job',
+)
+
+rag_cleanup_runs_total = Counter(
+    'rag_cleanup_runs_total',
+    'Total RAG corpus cleanup job runs by final status',
+    ['status'],  # success | error
+)
+
+# ── Fundamentals rate limiter ──────────────────────────────────────────────────
+
+fundamentals_rate_slots_total = Counter(
+    'fundamentals_rate_slots_total',
+    'Fundamentals API rate-limit slots acquired, by rate-limiting backend',
+    ['backend'],  # redis | inprocess
+)
+
+fundamentals_rate_circuit_open = Gauge(
+    'fundamentals_rate_circuit_open',
+    '1 when the Redis GCRA circuit breaker is open (in-process fallback active), 0 otherwise',
+)
+
+
+# ── Explanation Pipeline Reliability Metrics ─────────────────────────────────
+# Visibility into the Redis-Streams-backed explanation pipeline (Gap 4, 7 fixes).
+# These complement the existing llm_* metrics and are scoped to the delivery
+# infrastructure rather than the LLM call itself.
+
+llm_explanation_dlq_total = Counter(
+    'llm_explanation_dlq_total',
+    'LLM explanation jobs moved to the dead-letter queue after exhausting MAX_ATTEMPTS',
+    ['job_type'],  # explanation | context
+)
+
+llm_ready_publish_failures_total = Counter(
+    'llm_ready_publish_failures_total',
+    'Failures publishing the SSE wakeup signal after a successful explanation write '
+    '(browser recovers via 30-second poll cycle)',
+    ['job_type'],  # explanation | context
+)
+
+llm_explanation_dedup_total = Counter(
+    'llm_explanation_dedup_total',
+    'Duplicate LLM explanation calls intercepted before reaching the Gemini API',
+    ['layer'],  # db_idempotency | inflight_key
+)
+
+llm_stream_queue_depth = Gauge(
+    'llm_stream_queue_depth',
+    'Approximate number of pending (unacknowledged) messages in each job stream',
+    ['stream'],  # explanation | context
+)
+
+llm_explanation_worker_active = Gauge(
+    'llm_explanation_worker_active',
+    'Number of explanation worker tasks currently executing an LLM call',
+)
+
+
+# ── Watchlist Context Scheduler Metrics ──────────────────────────────────────
+
+watchlist_scheduler_runs_total = Counter(
+    'watchlist_scheduler_runs_total',
+    'Total watchlist context scheduler batch runs by final status',
+    ['status'],  # success | error | skipped_empty
+)
+
+watchlist_scheduler_instruments_queued_total = Counter(
+    'watchlist_scheduler_instruments_queued_total',
+    'Total instrument context jobs enqueued across all watchlist scheduler runs',
+)
+
+watchlist_scheduler_duration_seconds = Histogram(
+    'watchlist_scheduler_duration_seconds',
+    'Wall-clock duration of each watchlist context scheduler batch run (seconds)',
+    buckets=(0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0),
+)
+
+watchlist_scheduler_last_run_timestamp = Gauge(
+    'watchlist_scheduler_last_run_timestamp',
+    'Unix timestamp of the last successful watchlist context scheduler run',
+)
+
+
+# ── Event Classification Pipeline Metrics ────────────────────────────────────
+# Full visibility across all four classification paths, enabling quota-burn
+# attribution and heuristic coverage measurement in Grafana.
+#
+# Label values (method):
+#   cache              — Redis cache hit; zero Gemini cost
+#   heuristic          — Keyword pre-filter matched; Gemini call skipped
+#   llm                — Live Gemini call made (article fell through to 'general')
+#   rule_based_fallback — Gemini failed; deterministic fallback used (error path)
+
+event_classification_total = Counter(
+    'event_classification_total',
+    'Event classification outcomes by resolution method',
+    ['method'],  # cache | heuristic | llm | rule_based_fallback
 )
 
 

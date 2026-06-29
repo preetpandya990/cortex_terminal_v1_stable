@@ -146,6 +146,14 @@ export function CandlestickChart({
   // Jump-to-Latest — shown whenever the user has scrolled away from the right edge.
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
 
+  // ── Scroll bypass ───────────────────────────────────────────────────────────
+  // Holding Alt while the pointer is over the chart releases lightweight-charts'
+  // wheel-event capture, letting the page scroll normally to reach content below.
+  const wrapperRef            = useRef<HTMLDivElement>(null);
+  const isPointerOverChartRef = useRef(false);
+  const isAltHeldRef          = useRef(false);
+  const [scrollHint, setScrollHint] = useState<"hidden" | "hint" | "active">("hidden");
+
   // Per-indicator series map: each entry is an ordered array of series (some
   // indicators — BB, MACD, STOCH — need more than one series).
   const indicatorSeriesMapRef = useRef<Map<IndicatorId, ISeriesApi<any>[]>>(new Map());
@@ -471,12 +479,76 @@ export function CandlestickChart({
     return () => { timeScale.unsubscribeVisibleLogicalRangeChange(handleVisibleRangeChange); };
   }, [handleVisibleRangeChange]);
 
+  // ── Scroll bypass effect ────────────────────────────────────────────────────
+  // No deps: all mutable state lives in refs, preventing stale closure issues.
+  // applyOptions() is safe to call at any time on a live chart instance.
+
+  useEffect(() => {
+    const wrapper = wrapperRef.current;
+    if (!wrapper) return;
+
+    const reconcile = () => {
+      const active = isPointerOverChartRef.current && isAltHeldRef.current;
+      // Flip both handleScroll and handleScale off together: while bypassing,
+      // the user has no intention of interacting with the chart at all.
+      chartRef.current?.applyOptions({ handleScroll: !active, handleScale: !active });
+      setScrollHint(
+        !isPointerOverChartRef.current ? "hidden" : active ? "active" : "hint",
+      );
+    };
+
+    const onMouseEnter = () => { isPointerOverChartRef.current = true;  reconcile(); };
+    const onMouseLeave = () => { isPointerOverChartRef.current = false; reconcile(); };
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      // Pure Alt only — ignore composites like Alt+Tab or Alt+F4.
+      if (e.key !== "Alt" || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      if (isAltHeldRef.current) return; // already held, skip duplicate events
+      // Suppress the browser's native "Alt activates menu bar" behaviour on Windows
+      // (Chrome/Edge honour preventDefault on keydown; Firefox on keyup — both needed).
+      // Guard ensures we only suppress when the user is actively using Alt for bypass;
+      // Alt pressed anywhere else on the page retains its default browser behaviour.
+      if (isPointerOverChartRef.current) e.preventDefault();
+      isAltHeldRef.current = true;
+      reconcile();
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key !== "Alt") return;
+      // Firefox ignores keydown preventDefault for single-modifier keys but
+      // respects keyup — belt-and-suspenders to cover all Chromium + Gecko engines.
+      if (isPointerOverChartRef.current) e.preventDefault();
+      isAltHeldRef.current = false;
+      reconcile();
+    };
+
+    // Window-blur fires when the user Alt+Tabs away — the keyup never arrives,
+    // so we must reset here to avoid the chart staying locked after focus returns.
+    const onWindowBlur = () => {
+      isAltHeldRef.current = false;
+      reconcile();
+    };
+
+    wrapper.addEventListener("mouseenter", onMouseEnter);
+    wrapper.addEventListener("mouseleave", onMouseLeave);
+    document.addEventListener("keydown",   onKeyDown);
+    document.addEventListener("keyup",     onKeyUp);
+    window.addEventListener("blur",        onWindowBlur);
+
+    return () => {
+      wrapper.removeEventListener("mouseenter", onMouseEnter);
+      wrapper.removeEventListener("mouseleave", onMouseLeave);
+      document.removeEventListener("keydown",   onKeyDown);
+      document.removeEventListener("keyup",     onKeyUp);
+      window.removeEventListener("blur",        onWindowBlur);
+    };
+  }, []);
+
   // ── Render ──────────────────────────────────────────────────────────────────
 
   const isBullish = ohlcvLegend ? ohlcvLegend.close >= ohlcvLegend.open : true;
 
   return (
-    <div className={`relative h-full w-full ${className}`}>
+    <div ref={wrapperRef} className={`relative h-full w-full ${className}`}>
       {/* ── OHLCV crosshair legend ─────────────────────────────────────────── */}
       {ohlcvLegend && (
         <div
@@ -555,6 +627,21 @@ export function CandlestickChart({
           <ChevronsRight className="h-3.5 w-3.5 shrink-0" />
           {isLive ? "Live" : "Latest"}
         </button>
+      )}
+
+      {/* ── Scroll bypass hint — bottom-left, opposite the Jump-to-Latest button */}
+      {scrollHint !== "hidden" && (
+        <div
+          aria-live="polite"
+          aria-atomic="true"
+          className={`pointer-events-none absolute bottom-4 left-4 z-10 flex select-none items-center gap-1.5 rounded-md border px-2.5 py-1.5 font-mono text-[10px] font-medium tracking-wide backdrop-blur-sm transition-all duration-150 ${
+            scrollHint === "active"
+              ? "border-slate-600 bg-slate-800/95 text-slate-100"
+              : "border-slate-700/40 bg-slate-900/50 text-slate-500"
+          }`}
+        >
+          {scrollHint === "active" ? "↕ Scrolling page" : "Hold Alt to scroll page"}
+        </div>
       )}
 
       <div

@@ -67,24 +67,208 @@ _LIVE_FETCH_LOCK_TTL    = 120  # seconds; covers worst-case 9-endpoint fetch tim
 _http_client: httpx.AsyncClient | None = None
 _http_client_lock = asyncio.Lock()
 
-# ── Rate limiter (token bucket / leaky bucket) ─────────────────────────────────
+# ── Distributed GCRA Rate Limiter ──────────────────────────────────────────────
+#
 # Upstox hard limits: 50 req/s burst | 500 req/min | 2000 req/30min.
 # The 30-min window is the binding constraint: 2000 / 1800s = 1.11 req/s max.
-# We target 1.0 req/s (1800 req/30min) so we never exhaust the quota regardless
-# of what previous processes consumed in the same rolling window.
+# We target 1.0 req/s (1800 req/30min) to stay well under the cap.
 #
-# All callers serialise through _rate_lock; each acquires a slot spaced at
-# exactly 1/_RATE_RPS seconds apart. asyncio.sleep() inside the lock yields the
-# event loop so other work continues while this coroutine waits.
-_RATE_RPS     = 1.0  # req/s — 1800 req/30min, safely under Upstox's 2000 cap
-_rate_lock    = asyncio.Lock()
-_rate_next_slot: float = 0.0  # monotonic time when the next HTTP call may start
+# Problem: the previous asyncio.Lock + float was entirely in-process.  With
+# multiple uvicorn workers each running FundamentalsRefreshScheduler, every
+# process applies the 1 req/s limit independently, causing N×_RATE_RPS
+# combined throughput that exhausts the rolling 30-min quota and triggers 429s.
+#
+# Solution: GCRA (Generic Cell Rate Algorithm) via a single Redis key shared
+# across all processes.  A Lua script executes atomically on the Redis server —
+# it reads the Theoretical Arrival Time (TAT), computes the next slot, and
+# writes the new TAT in one round-trip.  redis.call('TIME') inside Lua uses the
+# Redis server's clock, eliminating cross-process NTP / container clock skew.
+#
+# Circuit breaker: after _CB_MAX_FAILURES consecutive Redis errors the circuit
+# opens and all callers fall back to an in-process leaky bucket until Redis
+# recovers.  A Prometheus gauge tracks the circuit state for Grafana alerting.
+#
+# Key:    cai:fundamentals:rate_slot  (single TAT, shared by every process)
+# TTL:    30 s  — auto-expires when processes are idle or crash mid-write.
+# Burst:  50 ms tolerance for Redis round-trip jitter (does not materially
+#         affect the 30-min aggregate quota).
+
+_RATE_RPS           = 1.0                           # target req/s across all processes
+_EMIT_INTERVAL_US   = int(1_000_000 / _RATE_RPS)   # microseconds between consecutive slots
+_BURST_TOLERANCE_US = 50_000                        # 50 ms jitter tolerance
+_GCRA_KEY           = "cai:fundamentals:rate_slot"
+_GCRA_KEY_TTL       = 30                            # seconds
+
+# Lua script: atomic GCRA slot reservation.
+# KEYS[1] = rate-slot key
+# ARGV[1] = emission interval (µs)   ARGV[2] = burst tolerance (µs)   ARGV[3] = key TTL (s)
+# Returns: {1, 0} on grant  |  {0, wait_microseconds} when caller must back off.
+_GCRA_LUA = """\
+local key     = KEYS[1]
+local emit_us = tonumber(ARGV[1])
+local burst   = tonumber(ARGV[2])
+local ttl     = tonumber(ARGV[3])
+
+local t   = redis.call('TIME')
+local now = tonumber(t[1]) * 1000000 + tonumber(t[2])
+
+local raw = redis.call('GET', key)
+local tat = raw and tonumber(raw) or now
+
+if tat > now + burst then
+    return {0, tat - now}
+end
+
+redis.call('SET', key, tostring(math.max(tat, now) + emit_us), 'EX', ttl)
+return {1, 0}
+"""
+
+# In-process leaky-bucket fallback — enforces _RATE_RPS within this process
+# when Redis is unavailable (circuit open).  During outage, each process limits
+# itself independently; aggregate rate may temporarily exceed _RATE_RPS but will
+# be caught by Upstox's own enforcement, which triggers our 429 retry logic.
+_ip_rate_lock      = asyncio.Lock()
+_ip_rate_next_slot: float = 0.0
+
+# GCRA Lua script singleton — registered on first call via redis.asyncio so the
+# SHA is cached server-side and subsequent calls use EVALSHA (one round-trip).
+_gcra_script: Any | None = None
+_gcra_script_lock  = asyncio.Lock()
+
+# Circuit breaker state (per-process; intentionally not shared via Redis so that
+# a Redis failure does not require Redis to recover the circuit).
+_cb_failures:   int   = 0
+_cb_open_until: float = 0.0
+_CB_MAX_FAILURES = 5
+_CB_RESET_SECS   = 30.0
 
 # Retry policy for 429 Too Many Requests.
 # First retry after 60s because a 429 means the rolling window is saturated —
-# 2s/4s retries accomplish nothing; the window won't clear that fast.
+# short retries accomplish nothing; the window won't clear that fast.
 _MAX_RETRIES_429    = 4
 _RETRY_BACKOFF_BASE = 60.0  # seconds; delays are 60, 120, 240, 480 s
+
+
+# ── GCRA rate limiter helpers ──────────────────────────────────────────────────
+
+async def _get_gcra_script() -> Any | None:
+    """
+    Lazily register and cache the GCRA Lua script with the Redis client.
+
+    Uses double-checked locking so only the first caller pays the init cost.
+    Returns None if the Redis client is unavailable at init time; the caller
+    falls through to the in-process fallback.
+    """
+    global _gcra_script
+    if _gcra_script is not None:
+        return _gcra_script
+    async with _gcra_script_lock:
+        if _gcra_script is not None:
+            return _gcra_script
+        try:
+            from app.core.redis import get_cache_service
+            raw_redis = get_cache_service()._redis
+            _gcra_script = raw_redis.register_script(_GCRA_LUA)
+            logger.info(
+                "Fundamentals GCRA rate limiter registered (key=%s, rate=%.1f req/s)",
+                _GCRA_KEY, _RATE_RPS,
+            )
+            return _gcra_script
+        except Exception as exc:
+            logger.warning(
+                "Fundamentals GCRA rate limiter init failed — in-process fallback active: %s",
+                exc,
+            )
+            return None
+
+
+async def _acquire_rate_slot() -> None:
+    """
+    Acquire a global rate-limit slot before each Upstox API call.
+
+    Tries the Redis GCRA path first.  Falls back to the in-process leaky bucket
+    when the Redis circuit is open or the script call fails.  Either path
+    guarantees that this coroutine does not return until a slot is available.
+
+    Emits Prometheus counters on each acquisition and a gauge when the circuit
+    state changes.
+    """
+    global _cb_failures, _cb_open_until, _ip_rate_next_slot
+
+    from app.core.metrics import (
+        fundamentals_rate_circuit_open,
+        fundamentals_rate_slots_total,
+    )
+
+    now_mono = time.monotonic()
+
+    # ── Redis GCRA path ───────────────────────────────────────────────────────
+    if now_mono >= _cb_open_until:
+        script = await _get_gcra_script()
+        if script is not None:
+            try:
+                result = await script(
+                    keys=[_GCRA_KEY],
+                    args=[_EMIT_INTERVAL_US, _BURST_TOLERANCE_US, _GCRA_KEY_TTL],
+                )
+                allowed, wait_us = int(result[0]), int(result[1])
+
+                # Reset circuit on any successful Redis round-trip.
+                if _cb_failures > 0:
+                    _cb_failures = 0
+                    _cb_open_until = 0.0
+                    fundamentals_rate_circuit_open.set(0)
+
+                # Loop until the GCRA grants a slot.  Each iteration the script
+                # returns the exact µs to wait before the next slot opens; we
+                # sleep outside the script so the event loop stays unblocked.
+                # Under high concurrency (up to _BATCH_CONCURRENCY = 5 tasks),
+                # multiple tasks wake simultaneously after each sleep; one wins
+                # the next slot and the others loop back.  Correct termination
+                # is guaranteed: TAT advances by exactly _EMIT_INTERVAL_US per
+                # granted slot, so every waiter is unblocked in strict FIFO
+                # order within at most (n_concurrent × _EMIT_INTERVAL_US)µs.
+                while not allowed:
+                    await asyncio.sleep(wait_us / 1_000_000)
+                    result = await script(
+                        keys=[_GCRA_KEY],
+                        args=[_EMIT_INTERVAL_US, _BURST_TOLERANCE_US, _GCRA_KEY_TTL],
+                    )
+                    allowed, wait_us = int(result[0]), int(result[1])
+
+                fundamentals_rate_slots_total.labels(backend="redis").inc()
+                return
+
+            except Exception as exc:
+                _cb_failures += 1
+                if _cb_failures >= _CB_MAX_FAILURES:
+                    _cb_open_until = time.monotonic() + _CB_RESET_SECS
+                    fundamentals_rate_circuit_open.set(1)
+                    logger.warning(
+                        "Fundamentals rate limiter: Redis circuit opened after %d failures "
+                        "(fallback active for %.0fs): %s",
+                        _cb_failures, _CB_RESET_SECS, exc,
+                    )
+                else:
+                    logger.debug(
+                        "Fundamentals rate limiter: Redis error #%d/%d: %s",
+                        _cb_failures, _CB_MAX_FAILURES, exc,
+                    )
+    else:
+        logger.debug(
+            "Fundamentals rate limiter: circuit open (resets in %.1fs) — in-process fallback",
+            _cb_open_until - time.monotonic(),
+        )
+
+    # ── In-process leaky-bucket fallback ─────────────────────────────────────
+    async with _ip_rate_lock:
+        now = time.monotonic()
+        wait = _ip_rate_next_slot - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _ip_rate_next_slot = time.monotonic() + (1.0 / _RATE_RPS)
+
+    fundamentals_rate_slots_total.labels(backend="inprocess").inc()
 
 
 # ── HTTP client ────────────────────────────────────────────────────────────────
@@ -179,28 +363,21 @@ async def _fetch(
     """
     GET a single fundamentals endpoint with rate-limiting and retry.
 
-    Rate control: acquires the global _rate_lock before each attempt, enforcing
-    a minimum gap of 1/_RATE_RPS seconds between successive HTTP calls across
-    ALL concurrent coroutines. This caps sustained throughput at 1.0 req/s =
-    1800 req/30min, safely under Upstox's 2000 req/30min hard limit.
+    Rate control: calls _acquire_rate_slot() before each attempt, enforcing
+    1.0 req/s globally across all worker processes via Redis GCRA with an
+    in-process leaky-bucket fallback.  See _acquire_rate_slot() for details.
 
-    Retry: on HTTP 429 the slot is released and the coroutine sleeps outside
-    the lock (so other requests can proceed) with exponential backoff starting
-    at 60s (60, 120, 240, 480s). Up to _MAX_RETRIES_429 retries per endpoint.
+    Retry: on HTTP 429 the coroutine sleeps with exponential backoff starting
+    at 60s (60, 120, 240, 480s).  Up to _MAX_RETRIES_429 retries per endpoint.
 
     Other errors are soft-logged and return None so a single failing endpoint
     never aborts the other concurrent fetches for the same instrument.
     """
-    global _rate_next_slot
-
     for attempt in range(_MAX_RETRIES_429 + 1):
-        # Rate gate: serialise calls and enforce minimum inter-request spacing.
-        async with _rate_lock:
-            now = time.monotonic()
-            wait = _rate_next_slot - now
-            if wait > 0:
-                await asyncio.sleep(wait)
-            _rate_next_slot = time.monotonic() + (1.0 / _RATE_RPS)
+        # Rate gate: acquire a globally-coordinated slot before the HTTP call.
+        # Uses Redis GCRA across all worker processes; falls back to in-process
+        # leaky bucket on Redis unavailability.  See _acquire_rate_slot().
+        await _acquire_rate_slot()
 
         try:
             resp = await client.get(path, headers=_auth_headers(), params=params or {})

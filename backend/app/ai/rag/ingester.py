@@ -7,8 +7,7 @@ Design decisions
 ----------------
 No chunking:
     Source events are RSS news items with 12–1,124 character bodies (median 273).
-    All are comfortably below the 512-token limit of nv-embedqa-e5-v5.  Each
-    raw event is treated as a single chunk and produces exactly one embedding row.
+    Each raw event is treated as a single chunk and produces exactly one embedding row.
 
 Symbol assignment:
     Derived from ai_event_classifications.affected_symbols via a LEFT JOIN chain.
@@ -18,14 +17,15 @@ Symbol assignment:
     - All affected symbols are always stored in metadata['affected_symbols'].
 
 Idempotency:
-    The ai_document_embeddings table has a UNIQUE constraint on (source_table,
-    source_id).  The ingester uses INSERT ... ON CONFLICT DO NOTHING, so running
-    a backfill multiple times is safe with zero side effects.
+    Two unique constraints guard the embeddings table:
+    - uq_ai_doc_embeddings_source  (source_table, source_id): prevents re-embedding
+      the same source row.
+    - uq_ai_doc_embeddings_content_hash  (content_hash): prevents duplicate embeddings
+      for articles with identical body text published by different RSS feeds.
 
-NIM requirement:
-    Embeddings must be 1024-dim to match the VECTOR(1024) column.  Only NIM's
-    nv-embedqa-e5-v5 produces the correct dimension.  The ingester fails fast
-    if NVIDIA_NIM_API_KEY is not configured.
+    The fetch query applies both checks as early filters so the Gemini embedding API
+    is not called for content that is already indexed.  The INSERT falls back to
+    ON CONFLICT DO NOTHING to handle any races atomically.
 """
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ from typing import Any
 from sqlalchemy import and_, case, func, null, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.ai.fusion.models import (
     AIDocumentEmbedding,
@@ -54,6 +55,94 @@ _SOURCE_TABLE = "ai_raw_events"
 
 # Maximum events fetched per DB query to avoid loading unbounded result sets.
 _FETCH_LIMIT = 500
+
+# Alias used in the content_hash EXISTS subquery inside _fetch_unembedded_events.
+# A separate alias is required to avoid SQLAlchemy conflating it with the outer
+# LEFT JOIN on AIDocumentEmbedding (which is also in scope for that query).
+_EmbedHash = aliased(AIDocumentEmbedding, name="ade_hash")
+
+
+def _dedup_events(events: list[Any]) -> list[Any]:
+    """
+    Deduplicate a list of raw event rows by content hash.
+
+    Returns events in original order, keeping the first occurrence of each
+    unique body text.  Used as Layer 1 dedup before the embedding API call.
+    """
+    seen: dict[str, Any] = {}
+    for row in events:
+        h = hashlib.sha256(row.raw_content.encode("utf-8")).hexdigest()
+        if h not in seen:
+            seen[h] = row
+    removed = len(events) - len(seen)
+    if removed:
+        logger.debug("rag.ingest batch_dedup removed=%d intra-batch duplicate(s)", removed)
+    return list(seen.values())
+
+
+def _build_embed_rows(
+    deduped: list[Any],
+    vectors: list[list[float]],
+) -> list[dict]:
+    """
+    Build ai_document_embeddings insert dicts from (event, vector) pairs.
+
+    Uses column names (not ORM attribute names) so the result is compatible
+    with Core-level ``pg_insert(AIDocumentEmbedding.__table__)``.
+    """
+    rows: list[dict] = []
+    for row, vector in zip(deduped, vectors):
+        affected_symbols = _flatten_affected_symbols(row.all_affected_symbols)
+        symbol = _assign_symbol(affected_symbols)
+        content_hash = hashlib.sha256(row.raw_content.encode("utf-8")).hexdigest()
+        rows.append(
+            {
+                "source_table":    _SOURCE_TABLE,
+                "source_id":       row.id,
+                "symbol":          symbol,
+                "content_hash":    content_hash,
+                "content_preview": row.raw_content[:200],
+                "embedding":       vector,
+                "as_of_timestamp": row.event_timestamp,
+                # DB column is "metadata"; ORM attribute is "extra_data" to avoid
+                # the SQLAlchemy reserved-name conflict.  Core insert uses column names.
+                "metadata": {
+                    "source_name":      row.source_name,
+                    "source_url":       row.source_url,
+                    "affected_symbols": affected_symbols,
+                },
+            }
+        )
+    return rows
+
+
+async def _insert_embed_rows(db: AsyncSession, rows: list[dict]) -> int:
+    """
+    Insert embedding rows, ignoring conflicts on either unique constraint.
+
+    ON CONFLICT DO NOTHING (no constraint specified) suppresses violations of
+    ANY unique constraint on the table — covers both uq_ai_doc_embeddings_source
+    and uq_ai_doc_embeddings_content_hash atomically.
+
+    Returns the number of rows actually inserted (conflicts excluded).
+    """
+    if not rows:
+        return 0
+    # Use __table__ (Core Table) not the ORM class — see _build_embed_rows docstring.
+    stmt = (
+        pg_insert(AIDocumentEmbedding.__table__)
+        .values(rows)
+        .on_conflict_do_nothing()
+    )
+    result = await db.execute(stmt)
+    await db.commit()
+    inserted = result.rowcount if result.rowcount >= 0 else len(rows)
+    logger.info(
+        "rag.ingest inserted=%d skipped=%d (already embedded or duplicate content)",
+        inserted,
+        len(rows) - inserted,
+    )
+    return inserted
 
 
 def _assign_symbol(affected_symbols: list[str] | None) -> str | None:
@@ -118,7 +207,21 @@ async def _fetch_unembedded_events(
         .outerjoin(AINLPResult, AINLPResult.processed_event_id == AIProcessedEvent.id)
         .outerjoin(AIEventClassification, AIEventClassification.nlp_result_id == AINLPResult.id)
         .where(
-            AIDocumentEmbedding.id.is_(None),  # not yet embedded
+            AIDocumentEmbedding.id.is_(None),  # not yet embedded by (source_table, source_id)
+            # Cross-source content dedup: skip events whose body text is already
+            # indexed (possibly from a different RSS feed).  Uses the B-tree index
+            # on content_hash (uq_ai_doc_embeddings_content_hash) — O(log n) per row.
+            ~(
+                select(_EmbedHash.id)
+                .where(
+                    _EmbedHash.content_hash == func.encode(
+                        func.sha256(func.convert_to(AIRawEvent.raw_content, "UTF8")),
+                        "hex",
+                    )
+                )
+                .correlate(AIRawEvent)
+                .exists()
+            ),
             AIRawEvent.event_timestamp >= cutoff,
         )
         .group_by(
@@ -163,68 +266,28 @@ async def ingest_batch(
     """
     Embed a list of raw event rows and upsert them into ai_document_embeddings.
 
-    This function is idempotent: events already in the embeddings table are
-    silently skipped via ON CONFLICT DO NOTHING.
+    Idempotent: rows already present in the embeddings table are silently
+    skipped.  Two dedup layers protect against duplicate API calls:
+    1. Python-side: events with identical content_hash are deduplicated before
+       calling the Gemini embedding API (via ``_dedup_events``).
+    2. DB-side: INSERT ... ON CONFLICT DO NOTHING suppresses any race between
+       concurrent callers (covers both unique constraints atomically).
 
     Args:
         db:         SQLAlchemy async session.
-        events:     Rows from _fetch_unembedded_events().
-        batch_size: Embedding API batch size (respects NIM's per-request limit).
+        events:     Rows from ``_fetch_unembedded_events()``.
+        batch_size: Embedding API texts-per-request.
 
     Returns:
         Number of rows inserted (conflicts excluded).
     """
     if not events:
         return 0
-
-    texts = [row.raw_content for row in events]
+    deduped = _dedup_events(events)
+    texts = [row.raw_content for row in deduped]
     vectors = await embed_texts(texts, input_type="passage", batch_size=batch_size)
-
-    rows_to_insert: list[dict] = []
-    for row, vector in zip(events, vectors):
-        affected_symbols = _flatten_affected_symbols(row.all_affected_symbols)
-        symbol = _assign_symbol(affected_symbols)
-        content_hash = hashlib.sha256(row.raw_content.encode("utf-8")).hexdigest()
-
-        rows_to_insert.append(
-            {
-                "source_table":    _SOURCE_TABLE,
-                "source_id":       row.id,
-                "symbol":          symbol,
-                "content_hash":    content_hash,
-                "content_preview": row.raw_content[:200],
-                "embedding":       vector,
-                "as_of_timestamp": row.event_timestamp,
-                # DB column is named "metadata"; ORM attr is "extra_data"
-                # (reserved name conflict). The pg_insert() dict uses column names.
-                "metadata": {
-                    "source_name":      row.source_name,
-                    "source_url":       row.source_url,
-                    "affected_symbols": affected_symbols,
-                },
-            }
-        )
-
-    # Use __table__ (Core Table) not the ORM class — the DB column is named
-    # "metadata" but the ORM attribute is "extra_data" to avoid the SQLAlchemy
-    # reserved name conflict.  Core insert maps dict keys to column names
-    # directly; the ORM layer would try to resolve "metadata" as an ORM
-    # attribute name and fail with an AttributeError.
-    stmt = (
-        pg_insert(AIDocumentEmbedding.__table__)
-        .values(rows_to_insert)
-        .on_conflict_do_nothing(constraint="uq_ai_doc_embeddings_source")
-    )
-    result = await db.execute(stmt)
-    await db.commit()
-
-    inserted = result.rowcount if result.rowcount >= 0 else len(rows_to_insert)
-    logger.info(
-        "rag.ingest inserted=%d skipped=%d (already embedded)",
-        inserted,
-        len(rows_to_insert) - inserted,
-    )
-    return inserted
+    rows = _build_embed_rows(deduped, vectors)
+    return await _insert_embed_rows(db, rows)
 
 
 async def run_backfill(
@@ -242,7 +305,7 @@ async def run_backfill(
     Args:
         db:              SQLAlchemy async session.
         window_days:     How many days back to backfill.  Default: 30.
-        embed_batch_size: Embedding API batch size per NIM request.
+        embed_batch_size: Embedding API texts-per-request (Gemini).
         fetch_limit:     Max events loaded per DB fetch cycle.
 
     Returns:

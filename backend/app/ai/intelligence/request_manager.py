@@ -59,6 +59,12 @@ Failure modes for callers
     call, return a cached result, or surface a user-facing message).  The
     circuit auto-closes the moment the new quota period begins.
 
+``GeminiBudgetThrottled`` (subclass of ``GeminiRateLimitError``)
+    The daily generate budget is within the HIGH-priority reservation band.
+    Only MEDIUM / LOW / BACKGROUND callers receive this.  HIGH and CRITICAL
+    are always admitted.  Degrade gracefully — identical handling to
+    ``GeminiRateLimitError``.  Auto-resolves at midnight Pacific Time.
+
 ``GeminiRateLimitError``
     Either the queue is at ``GEMINI_MAX_QUEUE_DEPTH`` capacity (permit rejected
     immediately) or ``GEMINI_PERMIT_TIMEOUT`` elapsed before the dispatcher
@@ -86,12 +92,14 @@ Wiring a new caller
 
     # FastAPI lifespan startup (after init_redis):
     from app.ai.intelligence.request_manager import GeminiRequestManager
-    await GeminiRequestManager.initialize(redis=get_redis())
+    from app.ai.intelligence.llm_client import _key_id
+    key_ids = [_key_id(k) for k in settings.gemini_api_key_pool]
+    await GeminiRequestManager.initialize(redis=get_redis(), key_ids=key_ids)
 
     # Call site:
     from app.ai.intelligence.request_manager import (
         get_request_manager, Priority, Operation,
-        GeminiQuotaExhausted, GeminiRateLimitError,
+        GeminiQuotaExhausted, GeminiRateLimitError, GeminiBudgetThrottled,
     )
     manager = get_request_manager()
     permit = await manager.acquire(Operation.GENERATE, Priority.HIGH)
@@ -148,6 +156,24 @@ class GeminiRateLimitError(Exception):
     """
 
 
+class GeminiBudgetThrottled(GeminiRateLimitError):
+    """
+    Daily Gemini generate budget is within the HIGH-priority reservation band.
+
+    Raised on MEDIUM / LOW / BACKGROUND ``acquire()`` calls when the estimated
+    remaining daily budget falls below ``GEMINI_HIGH_PRIORITY_RPD_RESERVE``.
+    HIGH and CRITICAL priority callers are **never** throttled by the budget
+    guard — the reservation exists specifically to guarantee headroom for them.
+
+    Treat identically to ``GeminiRateLimitError``: degrade gracefully and do
+    not retry.  The throttle auto-resolves at midnight Pacific Time when the
+    Gemini RPD counter resets and the budget guard disengages.
+
+    Inherits from ``GeminiRateLimitError`` so callers that already handle the
+    parent exception need no changes.
+    """
+
+
 # ── Enums ──────────────────────────────────────────────────────────────────────
 
 class Operation(str):
@@ -172,9 +198,9 @@ class Priority(IntEnum):
     Assignment guidelines
     ---------------------
     CRITICAL   — health checks, startup probes (never compete with workloads)
-    HIGH       — user-facing, latency-sensitive (explanation worker)
-    MEDIUM     — live signal pipeline (forecaster, sentiment, event_classifier)
-    LOW        — background supplemental data (instrument context)
+    HIGH       — user-facing, latency-sensitive (trade suggestion explanation)
+    MEDIUM     — user-visible pipeline (forecaster, sentiment, instrument context)
+    LOW        — background classification (event_classifier Gemini path, ~5–10% of articles)
     BACKGROUND — offline batch work (RAG corpus embeddings, eval harness)
     """
     CRITICAL   = 1
@@ -191,15 +217,58 @@ class Priority(IntEnum):
 
 # ── Internal constants ─────────────────────────────────────────────────────────
 
-# Redis key pattern for per-operation circuit state.
-# TTL is set to the seconds remaining until midnight Pacific Time (daily reset).
-_CIRCUIT_REDIS_KEYS: dict[str, str] = {
-    Operation.GENERATE: "cortex:gemini:circuit:generate",
-    Operation.EMBED:    "cortex:gemini:circuit:embed",
-}
-
 # All valid operation strings (used for iteration in initialize/aclose).
 _ALL_OPERATIONS: tuple[str, ...] = (Operation.GENERATE, Operation.EMBED)
+
+
+def _circuit_redis_key(op: str, key_id: str) -> str:
+    """Redis key for the per-key, per-operation circuit breaker.
+
+    The TTL is set to ``seconds until midnight Pacific Time + GEMINI_QUOTA_RESET_BUFFER_MINUTES``
+    so that a Redis expiry acts as a safety net for crash-restart recovery: if the app
+    was down when the quota reset watcher would have fired, the expired key causes the
+    circuit to load as closed on the next startup — no manual action required.
+    """
+    return f"cortex:gemini:circuit:{op}:{key_id}"
+
+
+def _rpd_redis_key() -> str:
+    """Redis key for today's (Pacific Time) generate RPD usage counter.
+
+    The PT date suffix scopes the counter to the correct Gemini quota day —
+    Gemini resets RPD at midnight Pacific Time.  A process restart mid-day
+    loads this key and resumes from the persisted count rather than resetting
+    to zero, preventing a post-restart burst from ignoring already-consumed
+    quota.  The key carries a 25-hour TTL so it expires naturally one hour
+    after the next quota reset, even without an explicit delete.
+    """
+    date_pt = datetime.now(ZoneInfo("America/Los_Angeles")).date().isoformat()
+    return f"cortex:gemini:rpd:generate:{date_pt}"
+
+
+def _seconds_until_quota_reset(buffer_secs: int) -> float:
+    """Seconds until Gemini's daily RPD quota reset + a safety buffer.
+
+    Gemini resets Requests Per Day counters at **midnight Pacific Time** (a fixed
+    wall-clock boundary that shifts with DST: PDT = UTC-7, PST = UTC-8).  Community
+    reports confirm a 0–15 minute propagation lag before the counter actually flips,
+    so a buffer of at least 15 minutes is recommended before re-enabling a key.
+
+    The returned value is always positive.  It is safe to call immediately after a
+    quota trip — at worst the caller sleeps an additional ``buffer_secs`` beyond
+    tomorrow's midnight.
+
+    Args:
+        buffer_secs: Extra seconds to add after midnight PT (absorbs propagation lag).
+    """
+    pt = ZoneInfo("America/Los_Angeles")
+    now_pt = datetime.now(pt)
+    midnight_tomorrow_pt = (now_pt + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    reset_utc = midnight_tomorrow_pt.astimezone(timezone.utc)
+    now_utc = datetime.now(timezone.utc)
+    return max(1.0, (reset_utc - now_utc).total_seconds() + buffer_secs)
 
 
 # ── Permit dataclass ───────────────────────────────────────────────────────────
@@ -308,6 +377,19 @@ class _TokenBucket:
         if tokens > 0.0:
             self._tokens = min(self._capacity, self._tokens + tokens)
 
+    def recalibrate(self, new_capacity: int, new_refill_rate: float) -> None:
+        """
+        Adjust rate parameters when the active key count changes.
+
+        On scale-down the token balance is clamped to the new capacity so a
+        key dropout cannot release an over-budget burst before the refill rate
+        catches up.  On scale-up existing tokens are preserved; the higher
+        capacity simply becomes available for natural refill.
+        """
+        self._capacity = float(new_capacity)
+        self._tokens = min(self._tokens, self._capacity)
+        self._refill_rate = max(new_refill_rate, 1e-9)
+
     # ── Metrics ────────────────────────────────────────────────────────────────
 
     @property
@@ -325,7 +407,8 @@ class GeminiRequestManager:
 
     Do not instantiate directly.  Acquire the singleton via::
 
-        await GeminiRequestManager.initialize(redis=get_redis())
+        key_ids = [_key_id(k) for k in settings.gemini_api_key_pool]
+        await GeminiRequestManager.initialize(redis=get_redis(), key_ids=key_ids)
         manager = get_request_manager()
     """
 
@@ -341,16 +424,20 @@ class GeminiRequestManager:
     # ── Startup ────────────────────────────────────────────────────────────────
 
     @classmethod
-    async def initialize(cls, *, redis: Redis) -> None:
+    async def initialize(cls, *, redis: Redis, key_ids: list[str]) -> None:
         """
         Create the singleton and start the background dispatcher.
 
-        Pre-populates in-process circuit state from Redis so the first call
-        after a quota-exhaustion restart fast-fails rather than wasting an API
-        round-trip.  Safe to call multiple times — subsequent calls are no-ops.
+        Pre-populates per-key circuit state from Redis so the first call after a
+        quota-exhaustion restart fast-fails rather than wasting an API round-trip.
+        Safe to call multiple times — subsequent calls are no-ops.
 
         Args:
-            redis: The application-level Redis client (must already be connected).
+            redis:   The application-level Redis client (must already be connected).
+            key_ids: Stable short identifiers for each Gemini API key in the pool
+                     (typically ``last8(api_key)``).  Determines how many per-key
+                     circuit-breaker slots are allocated.  An empty list is valid
+                     and means no quota tracking — used when no keys are configured.
         """
         if cls._instance is not None:
             return
@@ -359,6 +446,8 @@ class GeminiRequestManager:
         inst: GeminiRequestManager = object.__new__(cls)
         inst._settings = settings
         inst._redis = redis
+        inst._key_ids: list[str] = list(key_ids)
+        inst._quota_reset_buffer_secs: int = settings.GEMINI_QUOTA_RESET_BUFFER_MINUTES * 60
 
         # Monotonically increasing counter — FIFO ordering within each priority tier.
         inst._next_sequence: int = 0
@@ -376,6 +465,12 @@ class GeminiRequestManager:
         inst._active_permits: set[_Permit] = set()
 
         # ── Token buckets ───────────────────────────────────────────────────────
+        # Base RPM values from config — preserved as the scaling baseline so that
+        # _recalibrate_rpm_buckets() always computes from the user's intended total
+        # budget rather than from a previously-scaled value.
+        inst._base_generate_rpm: int = settings.GEMINI_GENERATE_RPM
+        inst._base_embed_rpm: int = settings.GEMINI_EMBED_RPM
+
         # Generate: separate RPM and TPM buckets.
         # burst_cap = min(rpm, 10) — caps tokens that accumulate during a quiet
         # period, preventing a single burst from using a full minute of budget.
@@ -396,34 +491,65 @@ class GeminiRequestManager:
             refill_rate=settings.GEMINI_EMBED_RPM / 60.0,
         )
 
-        # ── Circuit breaker ─────────────────────────────────────────────────────
-        # None  → confirmed closed (no trip, or past reset time)
-        # datetime → open until that UTC timestamp
-        # Key absent → unknown — will be resolved on first access (only happens
-        #               before initialize() populates state, which shouldn't occur
-        #               in practice; treat as closed as a fail-open safety default)
-        inst._circuit_state: dict[str, datetime | None] = {
-            op: None for op in _ALL_OPERATIONS
+        # ── Per-key circuit breaker ─────────────────────────────────────────────
+        # Structure: op → {key_id → is_open: bool}
+        #   False → circuit closed (key is healthy and in rotation)
+        #   True  → circuit open (key's daily quota is exhausted)
+        #
+        # Circuits are automatically reset at midnight Pacific Time +
+        # GEMINI_QUOTA_RESET_BUFFER_MINUTES by the quota reset watcher task.
+        # Redis keys carry a matching TTL so crash-restart recovery works even
+        # when the watcher did not fire (expired key → loads as closed at startup).
+        inst._circuit_state: dict[str, dict[str, bool]] = {
+            op: {kid: False for kid in key_ids}
+            for op in _ALL_OPERATIONS
         }
+
+        # ── Budget guard state ──────────────────────────────────────────────────
+        # Tracks how many successful generate calls have been made today (PT).
+        # Incremented synchronously in release(); persisted to Redis every 10
+        # releases so a mid-day restart resumes from the correct count rather
+        # than resetting to zero and bypassing the guard.
+        inst._generate_rpd_used: int = 0
+        inst._generate_rpd_write_ctr: int = 0  # write to Redis every 10 releases
 
         # Pre-load circuit state from Redis (runs before accepting any calls).
         await inst._load_circuit_state_from_redis()
 
-        # ── Dispatcher task ─────────────────────────────────────────────────────
+        # Load today's RPD counter from Redis (after circuit state, so the
+        # budget metric is accurate from the very first acquire() call).
+        await inst._load_rpd_from_redis()
+
+        # Recalibrate RPM buckets now that circuit state is known — if any keys
+        # were already exhausted before this startup, the buckets must reflect
+        # only the active key count rather than the full configured budget.
+        for op in _ALL_OPERATIONS:
+            inst._recalibrate_rpm_buckets(op)
+
+        # ── Background tasks ────────────────────────────────────────────────────
         inst._dispatcher_task: asyncio.Task[None] = asyncio.create_task(
             inst._run_dispatcher(),
             name="gemini_request_manager_dispatcher",
+        )
+        # Watcher fires at midnight PT + buffer each day, automatically closing
+        # all open per-key circuits and restoring exhausted keys to rotation.
+        inst._quota_reset_watcher_task: asyncio.Task[None] = asyncio.create_task(
+            inst._run_quota_reset_watcher(),
+            name="gemini_quota_reset_watcher",
         )
 
         cls._instance = inst
         logger.info(
             "GeminiRequestManager ready — generate RPM=%d (burst=%d) TPM=%d "
-            "embed RPM=%d (burst=%d) queue_depth_cap=%d permit_timeout=%.1fs",
+            "embed RPM=%d (burst=%d) queue_depth_cap=%d permit_timeout=%.1fs "
+            "key_pool=%d quota_reset_buffer=%dmin",
             settings.GEMINI_GENERATE_RPM, gen_burst_cap,
             settings.GEMINI_GENERATE_TPM,
             settings.GEMINI_EMBED_RPM, embed_burst_cap,
             settings.GEMINI_MAX_QUEUE_DEPTH,
             settings.GEMINI_PERMIT_TIMEOUT,
+            len(key_ids),
+            settings.GEMINI_QUOTA_RESET_BUFFER_MINUTES,
         )
 
     # ── Public API ─────────────────────────────────────────────────────────────
@@ -461,12 +587,32 @@ class GeminiRequestManager:
             GeminiRateLimitError:  Queue is full (``GEMINI_MAX_QUEUE_DEPTH``
                                    reached) or permit timeout elapsed.
         """
-        # Fast-path: circuit already open — zero queue interaction.
-        if self._is_circuit_open(operation):
+        # Fast-path: all keys exhausted — zero queue interaction.
+        if self._all_keys_exhausted(operation):
             self._record_outcome(operation, priority, "quota")
             raise GeminiQuotaExhausted(
-                f"Gemini {operation} quota circuit is open — daily limit exhausted, "
-                f"resets at midnight Pacific Time."
+                f"Gemini {operation} quota circuit is open — all keys exhausted. "
+                f"Circuits auto-reset at midnight Pacific Time + buffer. "
+                f"For immediate recovery: DEL cortex:gemini:circuit:{operation}:* in Redis."
+            )
+
+        # Budget guard: protect the HIGH-priority reservation.
+        #
+        # Applies only to GENERATE calls at MEDIUM priority or lower.  HIGH and
+        # CRITICAL are always admitted — the guard exists specifically to
+        # preserve headroom for them.  Checked before the queue depth cap so
+        # throttled callers never occupy a queue slot.
+        if operation == Operation.GENERATE and self._is_generate_budget_throttled(priority):
+            remaining = self._generate_rpd_budget_remaining()
+            self._record_outcome(operation, priority, "budget")
+            raise GeminiBudgetThrottled(
+                f"Gemini daily generate budget is within the HIGH-priority reservation "
+                f"({self._settings.GEMINI_HIGH_PRIORITY_RPD_RESERVE} calls reserved, "
+                f"~{remaining} estimated remaining).  "
+                f"MEDIUM / LOW / BACKGROUND calls are throttled until midnight Pacific "
+                f"Time.  HIGH and CRITICAL callers are unaffected.  "
+                f"Adjust GEMINI_HIGH_PRIORITY_RPD_RESERVE or GEMINI_GENERATE_RPD in "
+                f".env to tune the guard threshold."
             )
 
         # Backpressure: queue depth cap.
@@ -556,56 +702,95 @@ class GeminiRequestManager:
             if unused > 0:
                 self._generate_tpm.credit(float(unused))
 
+        # Budget guard: track actual daily generate usage.
+        #
+        # Incremented for every non-cancelled GENERATE release — success or
+        # error — because the API counts the request regardless of outcome.
+        # Persisted to Redis every 10 calls (fire-and-forget) so a mid-day
+        # restart resumes from the correct count.
+        if permit.operation == Operation.GENERATE:
+            self._generate_rpd_used += 1
+            self._generate_rpd_write_ctr += 1
+            if self._generate_rpd_write_ctr >= 10:
+                self._generate_rpd_write_ctr = 0
+                asyncio.create_task(
+                    self._write_rpd_to_redis(),
+                    name="gemini_rpd_write",
+                )
+            self._update_rpd_metric()
+
         self._record_outcome(permit.operation, Priority(permit.priority), outcome)
         self._update_utilisation_metrics()
 
-    def open_circuit(self, operation: str) -> None:
+    def open_circuit(self, operation: str, *, key_id: str) -> None:
         """
-        Open the quota circuit for ``operation``.
+        Mark one specific key's quota circuit as open for ``operation``.
 
-        Called by ``llm_client._open_quota_circuit()`` (Phase 2) when a
-        daily-quota 429 is detected.  Immediately cancels all queued permits
-        for this operation so callers unblock with ``GeminiQuotaExhausted``
-        rather than waiting for the dispatcher to reach them.
+        Called by ``llm_client._mark_key_exhausted()`` when a daily-quota 429 is
+        detected for a specific key.  If this is the last available key (all keys
+        are now exhausted), immediately cancels all queued permits so callers
+        unblock with ``GeminiQuotaExhausted`` rather than waiting for the
+        dispatcher to reach them.
 
-        Idempotent — a second call before the reset is a no-op unless the new
-        reset time extends the current one (defensive; normally both are the
-        same midnight).
+        Idempotent — calling again for an already-open key is a no-op.
 
-        Writes the circuit state to Redis asynchronously (fire-and-forget) so
+        Persists the circuit state to Redis asynchronously (fire-and-forget) so
         that the next app restart can skip the first post-quota call.
 
         Args:
             operation: ``Operation.GENERATE`` or ``Operation.EMBED``.
+            key_id:    The short identifier of the exhausted key (``last8(api_key)``).
         """
-        reset_at = _quota_reset_at()
-        current = self._circuit_state.get(operation)
-        if current is not None and current >= reset_at:
-            return  # Already open at least as long — no-op.
+        op_state = self._circuit_state.get(operation)
+        if op_state is None or key_id not in op_state:
+            logger.warning(
+                "request_manager: open_circuit called for unknown key_id=%s op=%s "
+                "— ignored.  Was the manager initialized with this key?",
+                key_id, operation,
+            )
+            return
 
-        self._circuit_state[operation] = reset_at
-        self._emit_circuit_metric(operation, open_=True)
+        if op_state[key_id]:
+            return  # Already open — strict idempotent no-op.
 
-        # Cancel all queued permits for this operation immediately.
-        cancelled_count = self._cancel_queued_permits(operation)
+        op_state[key_id] = True
+        self._recalibrate_rpm_buckets(operation)
+        self._emit_circuit_metric(operation, open_=self._any_circuit_open(operation))
 
-        # Persist to Redis (best-effort; in-process state is the authority).
+        # Persist to Redis with a TTL matching the next quota reset + buffer.
+        # This acts as a crash-restart safety net: if the watcher task never fired
+        # (e.g. the process died), the expired Redis key loads as closed on startup.
         asyncio.create_task(
-            self._write_circuit_to_redis(operation, reset_at),
-            name=f"gemini_circuit_write_{operation}",
+            self._write_circuit_to_redis(operation, key_id),
+            name=f"gemini_circuit_write_{operation}_{key_id}",
         )
 
-        logger.error(
-            "request_manager: Gemini %s circuit OPENED — daily quota exhausted, "
-            "resets at %s UTC. %d queued permits cancelled immediately.",
-            operation,
-            reset_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            cancelled_count,
-        )
+        all_exhausted = self._all_keys_exhausted(operation)
+        if all_exhausted:
+            cancelled_count = self._cancel_queued_permits(operation)
+            logger.error(
+                "request_manager: ALL Gemini %s keys are now quota-exhausted. "
+                "Last key=%s. %d queued permits cancelled. "
+                "Auto-reset fires at midnight PT + buffer. "
+                "For immediate recovery: DEL cortex:gemini:circuit:%s:%s in Redis.",
+                operation, key_id, cancelled_count, operation, key_id,
+            )
+        else:
+            logger.error(
+                "request_manager: Gemini %s circuit OPENED for key=%s — "
+                "daily quota exhausted on this key. Remaining keys still active. "
+                "Auto-reset fires at midnight PT + buffer. "
+                "For immediate recovery: DEL cortex:gemini:circuit:%s:%s in Redis.",
+                operation, key_id, operation, key_id,
+            )
 
     def circuit_open(self, operation: str) -> bool:
-        """Return ``True`` if the quota circuit is currently open for ``operation``."""
-        return self._is_circuit_open(operation)
+        """Return ``True`` if ALL registered keys' quota circuits are open for ``operation``."""
+        return self._all_keys_exhausted(operation)
+
+    def key_circuit_open(self, operation: str, key_id: str) -> bool:
+        """Return ``True`` if this specific key's quota circuit is open for ``operation``."""
+        return self._circuit_state.get(operation, {}).get(key_id, False)
 
     async def aclose(self) -> None:
         """
@@ -615,13 +800,14 @@ class GeminiRequestManager:
         ``GeminiRateLimitError`` rather than hanging indefinitely.  Call once
         from the FastAPI lifespan shutdown handler.
         """
-        task = getattr(self, "_dispatcher_task", None)
-        if task and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        for task_attr in ("_dispatcher_task", "_quota_reset_watcher_task"):
+            task = getattr(self, task_attr, None)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
         # Cancel any permits still tracked as active.
         for permit in list(self._active_permits):
@@ -636,82 +822,150 @@ class GeminiRequestManager:
 
     async def _load_circuit_state_from_redis(self) -> None:
         """
-        Read both operation circuit keys from Redis and populate in-process state.
+        Read per-key, per-operation circuit keys from Redis and populate in-process state.
 
-        Called once during ``initialize()`` so the manager is circuit-aware
-        from the very first ``acquire()`` call, even after a crash-restart mid
-        quota-exhaustion window.
+        Called once during ``initialize()`` so the manager is circuit-aware from
+        the very first ``acquire()`` call, even after a crash-restart mid quota-
+        exhaustion window.  Keys that are absent or have expired are treated as
+        closed (fail-open safety default).
         """
         from app.core.metrics import gemini_circuit_open as _copen
         for op in _ALL_OPERATIONS:
-            key = _CIRCUIT_REDIS_KEYS[op]
-            try:
-                raw = await self._redis.get(key)
-                if raw:
-                    ttl = await self._redis.ttl(key)
-                    if ttl > 0:
-                        reset_at = datetime.now(timezone.utc) + timedelta(seconds=ttl)
-                        self._circuit_state[op] = reset_at
-                        _copen.labels(op=op).set(1)
+            for kid in self._key_ids:
+                redis_key = _circuit_redis_key(op, kid)
+                try:
+                    raw = await self._redis.get(redis_key)
+                    is_open = bool(raw)
+                    self._circuit_state[op][kid] = is_open
+                    # Metric reflects whether ANY key for this op is open.
+                    _copen.labels(op=op).set(1 if self._any_circuit_open(op) else 0)
+                    if is_open:
                         logger.warning(
-                            "request_manager: Gemini %s circuit pre-loaded from Redis "
-                            "— open until ~%s UTC (%ds remaining).",
-                            op, reset_at.strftime("%H:%M:%S"), ttl,
+                            "request_manager: Gemini %s circuit pre-loaded OPEN for "
+                            "key=%s — key was quota-exhausted before last restart. "
+                            "Auto-reset watcher will fire at midnight PT + buffer. "
+                            "For immediate recovery: DEL %s in Redis.",
+                            op, kid, redis_key,
                         )
-                        continue
-                # Key absent or TTL already expired — treat as closed.
-                self._circuit_state[op] = None
-                _copen.labels(op=op).set(0)
-            except Exception as exc:
-                # Redis unavailable during startup — fail open (assume closed).
-                # The circuit will reopen if a 429 is subsequently received.
-                logger.warning(
-                    "request_manager: Redis circuit-state read failed for %s (%s) "
-                    "— assuming closed.  Circuit will reopen on next quota 429.",
-                    op, exc,
-                )
-                self._circuit_state[op] = None
-                _copen.labels(op=op).set(0)
+                except Exception as exc:
+                    # Redis unavailable during startup — fail open (assume closed).
+                    logger.warning(
+                        "request_manager: Redis circuit-state read failed for "
+                        "op=%s key=%s (%s) — assuming closed.",
+                        op, kid, exc,
+                    )
+                    self._circuit_state[op][kid] = False
 
-    def _is_circuit_open(self, operation: str) -> bool:
+    def _all_keys_exhausted(self, operation: str) -> bool:
+        """True only when every registered key's circuit is open for ``operation``.
+
+        Returns ``False`` for an empty key pool (vacuously, all-or-nothing does
+        not apply when there are no keys to exhaust).
         """
-        Check in-process circuit state.  O(1), no I/O.
+        states = self._circuit_state.get(operation, {})
+        return bool(states) and all(states.values())
 
-        Auto-closes the circuit when the reset datetime is reached so callers
-        are unblocked the moment the new quota period begins.
+    def _any_circuit_open(self, operation: str) -> bool:
+        """True when at least one key's circuit is open for ``operation``."""
+        return any(self._circuit_state.get(operation, {}).values())
+
+    async def _write_circuit_to_redis(self, operation: str, key_id: str) -> None:
+        """Persist a single key's circuit open state to Redis.  Best-effort; called as a Task.
+
+        The key is written with TTL = seconds until the next midnight Pacific Time
+        + ``GEMINI_QUOTA_RESET_BUFFER_MINUTES``.  This ensures that a crash-restart
+        while the watcher task would have been sleeping still recovers correctly:
+        an expired key loads as ``False`` (closed) at startup.
         """
-        state = self._circuit_state.get(operation)
-        if state is None:
-            return False
-        if datetime.now(timezone.utc) >= state:
-            self._circuit_state[operation] = None
-            self._emit_circuit_metric(operation, open_=False)
-            logger.info(
-                "request_manager: Gemini %s circuit auto-closed — quota has reset.",
-                operation,
-            )
-            return False
-        return True
-
-    async def _write_circuit_to_redis(
-        self, operation: str, reset_at: datetime
-    ) -> None:
-        """Persist circuit open state to Redis.  Best-effort; called as a Task."""
-        ttl_secs = max(1, int((reset_at - datetime.now(timezone.utc)).total_seconds()))
-        key = _CIRCUIT_REDIS_KEYS[operation]
+        redis_key = _circuit_redis_key(operation, key_id)
+        ttl_secs = max(1, int(_seconds_until_quota_reset(self._quota_reset_buffer_secs)))
         try:
-            # SET … EX atomically overwrites a stale TTL from a previous run.
-            await self._redis.set(key, "1", ex=ttl_secs)
+            await self._redis.set(redis_key, "1", ex=ttl_secs)
             logger.info(
-                "request_manager: Redis circuit key %s written (TTL %ds).",
-                key, ttl_secs,
+                "request_manager: Redis circuit key %s written (TTL=%ds, "
+                "auto-expires at midnight PT + buffer). "
+                "For immediate recovery: DEL %s in Redis.",
+                redis_key, ttl_secs, redis_key,
             )
         except Exception as exc:
             logger.error(
                 "request_manager: Failed to write circuit key %s to Redis: %s "
-                "(in-process state is authoritative; restart recovery may be impaired).",
-                key, exc,
+                "(in-process state is authoritative; auto-reset watcher still active).",
+                redis_key, exc,
             )
+
+    # ── Private — budget guard ─────────────────────────────────────────────────
+
+    async def _load_rpd_from_redis(self) -> None:
+        """Load today's (PT) generate RPD counter from Redis on startup.
+
+        Called once during ``initialize()`` so that a mid-day restart resumes
+        from the correct usage count rather than resetting to zero and
+        silently bypassing the budget guard.  Missing key (new quota day or
+        first run) → start from 0.  Redis failure → fail open (start from 0
+        and log a warning; the guard will be conservative from the restart).
+        """
+        redis_key = _rpd_redis_key()
+        try:
+            raw = await self._redis.get(redis_key)
+            self._generate_rpd_used = int(raw) if raw else 0
+            logger.info(
+                "request_manager: Budget guard RPD counter loaded — "
+                "generate_used=%d (key=%s)",
+                self._generate_rpd_used, redis_key,
+            )
+        except Exception as exc:
+            logger.warning(
+                "request_manager: Redis RPD counter read failed (%s) — "
+                "starting from 0.  Budget guard is conservative from this restart.",
+                exc,
+            )
+            self._generate_rpd_used = 0
+        self._update_rpd_metric()
+
+    async def _write_rpd_to_redis(self) -> None:
+        """Persist the current generate RPD counter to Redis.
+
+        Best-effort, fire-and-forget.  Uses a 25-hour TTL (90 000 s) so the
+        key expires naturally one hour after the next midnight PT reset, acting
+        as a crash-recovery safety net without requiring an explicit delete.
+        """
+        redis_key = _rpd_redis_key()
+        try:
+            await self._redis.set(redis_key, str(self._generate_rpd_used), ex=90_000)
+        except Exception as exc:
+            logger.debug(
+                "request_manager: RPD counter Redis write failed (non-fatal): %s", exc
+            )
+
+    def _generate_rpd_budget_remaining(self) -> int:
+        """Estimated remaining daily generate requests before the HIGH-priority reservation.
+
+        Total budget = ``GEMINI_GENERATE_RPD × total_key_count``.  Uses total
+        (not active) key count intentionally: the guard triggers slightly early
+        as keys circuit-open, which is the correct conservative behaviour for a
+        soft protection layer sitting above the hard circuit breaker.
+        """
+        total = self._settings.GEMINI_GENERATE_RPD * max(len(self._key_ids), 1)
+        return max(0, total - self._generate_rpd_used)
+
+    def _is_generate_budget_throttled(self, priority: Priority) -> bool:
+        """True when the daily budget is within the HIGH-priority reservation band.
+
+        Only MEDIUM, LOW, and BACKGROUND calls are ever throttled.  HIGH and
+        CRITICAL are always admitted — the reservation exists to guarantee
+        headroom for them.
+        """
+        if priority <= Priority.HIGH:
+            return False
+        return self._generate_rpd_budget_remaining() < self._settings.GEMINI_HIGH_PRIORITY_RPD_RESERVE
+
+    def _update_rpd_metric(self) -> None:
+        """Push current budget-remaining estimate to the Prometheus gauge."""
+        from app.core.metrics import gemini_rpd_budget_remaining as _rpd_gauge
+        _rpd_gauge.set(self._generate_rpd_budget_remaining())
+
+    # ── Private — circuit breaker (cancel / emit) ──────────────────────────────
 
     def _cancel_queued_permits(self, operation: str) -> int:
         """
@@ -735,7 +989,162 @@ class GeminiRequestManager:
         from app.core.metrics import gemini_circuit_open as _copen
         _copen.labels(op=operation).set(1 if open_ else 0)
 
+    # ── Private — quota reset watcher ─────────────────────────────────────────
+
+    async def _run_quota_reset_watcher(self) -> None:
+        """Outer loop for the quota reset watcher — handles unexpected crashes.
+
+        Re-schedules itself after a brief delay if the inner loop raises an
+        uncaught exception (should never happen in practice; guards against
+        transient Redis errors or programming mistakes).
+        """
+        while True:
+            try:
+                await self._quota_reset_watcher_loop()
+            except asyncio.CancelledError:
+                raise  # Propagate shutdown cancellation.
+            except Exception as exc:
+                logger.critical(
+                    "request_manager: Quota reset watcher crashed unexpectedly: %s. "
+                    "Restarting in 60 s.",
+                    exc, exc_info=True,
+                )
+                await asyncio.sleep(60.0)
+
+    async def _quota_reset_watcher_loop(self) -> None:
+        """Sleep until midnight Pacific Time + buffer, reset all open circuits, repeat.
+
+        Gemini's RPD counter resets at midnight PT.  Community reports show a
+        0–15 minute propagation lag before the counter actually flips, so we add
+        ``GEMINI_QUOTA_RESET_BUFFER_MINUTES`` (default 15) before re-enabling keys.
+
+        After each reset, the next sleep window is recalculated so DST transitions
+        and long-running processes are handled correctly.
+        """
+        while True:
+            delay = _seconds_until_quota_reset(self._quota_reset_buffer_secs)
+            buffer_min = self._quota_reset_buffer_secs // 60
+            logger.info(
+                "request_manager: Quota reset watcher sleeping %.0f s "
+                "(fires at midnight PT + %d min buffer).",
+                delay, buffer_min,
+            )
+            await asyncio.sleep(delay)
+            await self._reset_all_open_circuits()
+
+    async def _reset_all_open_circuits(self) -> None:
+        """Clear every open per-key circuit from both in-process state and Redis.
+
+        Called by the quota reset watcher at midnight PT + buffer.  After this
+        method returns, all keys are restored to active rotation and
+        ``_circuit_state`` reflects no open circuits for any operation.
+
+        Also emits updated Prometheus metrics so Grafana dashboards reflect the
+        reset without requiring a scrape cycle.
+        """
+        reset_count = 0
+        for op in _ALL_OPERATIONS:
+            for kid in self._key_ids:
+                if not self._circuit_state.get(op, {}).get(kid, False):
+                    continue
+                self._circuit_state[op][kid] = False
+                reset_count += 1
+                redis_key = _circuit_redis_key(op, kid)
+                try:
+                    await self._redis.delete(redis_key)
+                except Exception as exc:
+                    logger.warning(
+                        "request_manager: Failed to delete circuit key %s "
+                        "during quota reset: %s (in-process state already cleared).",
+                        redis_key, exc,
+                    )
+            self._emit_circuit_metric(op, open_=self._any_circuit_open(op))
+            self._recalibrate_rpm_buckets(op)
+
+        # Reset the daily generate RPD counter.  The quota watcher fires at
+        # midnight PT + buffer, which is exactly the Gemini quota boundary.
+        # The old day's Redis key is left to expire naturally (25-hour TTL);
+        # the next release() write will create a fresh key for the new day.
+        prev_rpd = self._generate_rpd_used
+        self._generate_rpd_used = 0
+        self._generate_rpd_write_ctr = 0
+        self._update_rpd_metric()
+
+        if reset_count > 0:
+            logger.info(
+                "request_manager: Gemini quota reset — %d circuit(s) automatically "
+                "cleared across %d key(s). All keys restored to active rotation. "
+                "Daily generate RPD counter reset (was %d).",
+                reset_count, len(self._key_ids), prev_rpd,
+            )
+        else:
+            logger.debug(
+                "request_manager: Gemini quota reset fired — no open circuits to clear. "
+                "Daily generate RPD counter reset (was %d).",
+                prev_rpd,
+            )
+
     # ── Private — token buckets ────────────────────────────────────────────────
+
+    def _recalibrate_rpm_buckets(self, operation: str) -> None:
+        """
+        Scale the RPM token bucket to reflect the current number of active keys.
+
+        Each Gemini API key has an independent per-minute rate limit set by
+        Google (e.g. 10 RPM on the free tier).  The process-level token bucket
+        enforces the *total* budget across all keys, assuming round-robin
+        distribution.  When a key's daily-quota circuit opens, the bucket must
+        be scaled down proportionally so the remaining keys are never asked to
+        carry more than their individual per-key limits.
+
+        Formula:  effective_rpm = round(base_rpm * active_keys / total_keys)
+
+        Example (GEMINI_GENERATE_RPM=30, 3 keys, free tier = 10 RPM/key):
+          All 3 active → effective_rpm = 30  (10 RPM/key  ✓)
+          1 key open   → effective_rpm = 20  (10 RPM/key  ✓)
+          2 keys open  → effective_rpm = 10  (10 RPM/key  ✓)
+
+        Called whenever circuit state changes (open_circuit, _reset_all_open_circuits)
+        and once at startup after loading Redis-persisted state.
+
+        Note: the TPM bucket is not scaled — token-per-minute budget is an
+        aggregate pipeline limit, not a per-key constraint, and remains at the
+        configured value regardless of active key count.
+        """
+        total_keys = len(self._key_ids)
+        if total_keys == 0:
+            return
+
+        active_keys = sum(
+            1 for kid in self._key_ids
+            if not self._circuit_state.get(operation, {}).get(kid, False)
+        )
+
+        from app.core.metrics import gemini_effective_rpm as _eff_rpm
+
+        if operation == Operation.GENERATE:
+            base_rpm = self._base_generate_rpm
+            effective_rpm = max(1, round(base_rpm * active_keys / total_keys))
+            burst_cap = min(effective_rpm, 10)
+            self._generate_rpm.recalibrate(burst_cap, effective_rpm / 60.0)
+            _eff_rpm.labels(op=operation).set(effective_rpm)
+            logger.info(
+                "request_manager: generate RPM recalibrated → %d RPM "
+                "(%d/%d keys active, base=%d, burst_cap=%d)",
+                effective_rpm, active_keys, total_keys, base_rpm, burst_cap,
+            )
+
+        elif operation == Operation.EMBED:
+            base_rpm = self._base_embed_rpm
+            effective_rpm = max(1, round(base_rpm * active_keys / total_keys))
+            burst_cap = min(effective_rpm, 10)
+            self._embed_rpm.recalibrate(burst_cap, effective_rpm / 60.0)
+            _eff_rpm.labels(op=operation).set(effective_rpm)
+            logger.info(
+                "request_manager: embed RPM recalibrated → %d RPM "
+                "(%d/%d keys active, base=%d, burst_cap=%d)",
+                effective_rpm, active_keys, total_keys, base_rpm, burst_cap,
+            )
 
     def _can_satisfy(self, permit: _Permit) -> bool:
         """True if the token buckets have sufficient budget for ``permit``."""
@@ -862,8 +1271,8 @@ class GeminiRequestManager:
                 pending = None
                 continue
 
-            # ── Step 3: Fast-fail if the circuit opened while queued ───────────
-            if self._is_circuit_open(permit.operation):
+            # ── Step 3: Fast-fail if ALL keys exhausted while queued ──────────
+            if self._all_keys_exhausted(permit.operation):
                 permit.cancelled = True
                 permit.ready.set()
                 try:
@@ -901,24 +1310,6 @@ class GeminiRequestManager:
                 # pending stays set — retry satisfying the same permit next iteration.
 
 
-# ── Module helpers ─────────────────────────────────────────────────────────────
-
-def _quota_reset_at() -> datetime:
-    """
-    Return the next Gemini daily quota reset as a UTC datetime.
-
-    Gemini resets daily quotas at midnight Pacific Time.  This function
-    returns the next occurrence of midnight PT converted to UTC so the
-    Redis TTL and in-process reset check use a consistent reference point.
-    """
-    pt = ZoneInfo("America/Los_Angeles")
-    now_pt = datetime.now(pt)
-    midnight_tomorrow_pt = (now_pt + timedelta(days=1)).replace(
-        hour=0, minute=0, second=0, microsecond=0,
-    )
-    return midnight_tomorrow_pt.astimezone(timezone.utc)
-
-
 # ── Singleton accessor ─────────────────────────────────────────────────────────
 
 def get_request_manager() -> GeminiRequestManager:
@@ -932,7 +1323,7 @@ def get_request_manager() -> GeminiRequestManager:
     if inst is None:
         raise RuntimeError(
             "GeminiRequestManager has not been initialized. "
-            "Call `await GeminiRequestManager.initialize(redis=get_redis())` "
+            "Call `await GeminiRequestManager.initialize(redis=get_redis(), key_ids=...)` "
             "in the FastAPI lifespan before serving requests."
         )
     return inst

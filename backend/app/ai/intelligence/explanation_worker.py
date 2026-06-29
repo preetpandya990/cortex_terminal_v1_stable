@@ -1,70 +1,94 @@
 """
 LLM Explanation Worker
 ======================
-Async background task that generates plain-English explanations for two use cases:
+Async background tasks that generate plain-English explanations for two use cases:
 
-  1. Trade suggestion explanations (existing)
-       Triggered by LLM_EXPLANATION_PENDING.  Generates a signal-specific
-       explanation for a committed TradeSuggestion and writes it back to the
-       trade_suggestions table.
+  1. Trade suggestion explanations
+       Triggered via ``cortex:stream:explanation:jobs`` Redis Stream consumer group.
+       Generates a signal-specific explanation for a committed TradeSuggestion and
+       writes it back to the trade_suggestions table.
 
-  2. Instrument market context (new)
-       Triggered by LLM_CONTEXT_PENDING.  Generates an instrument-level market
-       context summary for Watchlist items with no active trade suggestion.
-       Written to ai_instrument_context (upsert) with a 2-hour TTL.
+  2. Instrument market context
+       Triggered via ``cortex:stream:context:jobs`` Redis Stream consumer group.
+       Generates an instrument-level market context summary for Watchlist items
+       with no active trade suggestion.  Written to ai_instrument_context (upsert).
 
 Pipeline — suggestion explanation
 ----------------------------------
-  1. Receive {suggestion_id, id} from cortex:llm:explanation:pending
-  2. Load TradeSuggestion from DB
-  3. RAG retrieve — top-k news chunks for the symbol in the last 24 hours
-  4. Build a structured prompt from signal data + retrieved context
-  5. LLM structured generation → ExplanationOutput (Gemini native structured
-     output via response_schema — single call, no streaming)
-  6. Apply output guardrails (disclaimer injection, price-prediction filter,
-     citation check)
-  7. Write llm_summary + llm_explanation to trade_suggestions
-  8. Append one row to ai_llm_audit_log
-  9. Publish cortex:llm:explanation:ready:{suggestion_id} for the SSE stream
+  1. Receive job from cortex:stream:explanation:jobs (XREADGROUP)
+  2. DB idempotency check — skip if explanation already exists
+  3. In-flight dedup key — skip if another worker is already processing this suggestion
+  4. Load TradeSuggestion from DB (Phase 1)
+  5. RAG retrieve — top-k news chunks for the symbol in the last 24 hours
+  6. LLM structured generation → ExplanationOutput (Phase 2, Gemini native structured output)
+  7. Apply output guardrails (disclaimer injection, price-prediction filter, citation check)
+  8. Write llm_summary + llm_explanation to trade_suggestions (Phase 3)
+  9. Write full payload (with sources) to per-suggestion SSE event store
+ 10. Append one row to ai_llm_audit_log
+ 11. Publish routing signal to cortex:llm:explanation:ready:{suggestion_id}
+ 12. XACK the stream message
 
 Pipeline — instrument market context
 --------------------------------------
-  1. Receive {instrument_key, symbol, prediction_data} from cortex:llm:context:pending
-  2. RAG retrieve — recent news for the symbol
-  3. Build a market-context prompt (news + ML signal snapshot)
-  4. LLM structured generation → ExplanationOutput (same schema, different prompt)
-  5. Apply same guardrails
-  6. Upsert into ai_instrument_context (expires_at = now + 2h)
+  1. Receive job from cortex:stream:context:jobs (XREADGROUP)
+  2. RAG retrieve — recent news for the symbol (Phase 1)
+  3. LLM structured generation → ExplanationOutput (Phase 2)
+  4. Apply same guardrails
+  5. Upsert into ai_instrument_context (Phase 3)
+  6. Write full payload to per-instrument SSE event store
   7. Append one row to ai_llm_audit_log
-  8. Publish cortex:llm:context:ready:{instrument_key} for the SSE stream
+  8. Publish routing signal to cortex:llm:context:ready:{instrument_key}
+  9. XACK the stream message
+
+Delivery architecture
+---------------------
+  The pub/sub job channels (LLM_EXPLANATION_PENDING, LLM_CONTEXT_PENDING) are
+  replaced by Redis Streams consumer groups.  This provides:
+
+  - At-least-once delivery: unACKed messages survive worker restarts (PEL drain).
+  - No message loss during LLM processing: the stream buffers jobs while a worker
+    is busy; the old pub/sub design dropped any PUBLISH fired during the 10–120s
+    LLM call window.
+  - Rate-limit back-pressure without blocking: on GeminiRateLimitError the message
+    is NOT ACKed.  It stays in the PEL; the housekeeping coroutine re-delivers it
+    via XCLAIM after _PEL_IDLE_THRESHOLD_MS.  No asyncio.sleep blocks the consumer
+    loop.
+  - Dead-letter queue: after MAX_ATTEMPTS deliveries the message is moved to
+    cortex:stream:explanation:dlq, a failed-state event is written to the SSE event
+    store, and the browser renders "Analysis unavailable" instead of an eternal
+    skeleton.
+
+  Pub/sub is retained only as a lightweight wakeup signal after successful generation.
+  The actual payload (including RAG source citations) lives in the per-suggestion
+  SSE event store (cortex:sse:events:{suggestion_id}) with a 24-hour TTL.
 
 Design invariants
 -----------------
-  - Failed generations never block indefinitely.  MAX_ATTEMPTS applies per
-    suggestion/instrument; after exhaustion the frontend shows no explanation.
-  - The worker is a single asyncio task (non-concurrent).  At current volume
-    this is sufficient; introduce a semaphore-bounded pool when volume scales.
+  - Failed generations never block indefinitely.  MAX_ATTEMPTS applies per message;
+    after exhaustion the DLQ path fires.
+  - Two explanation workers run in parallel.  The context worker is a single task
+    (context jobs are low-frequency).
   - Every LLM inference — success or failure — writes one ai_llm_audit_log row.
     This is a non-negotiable governance requirement (SR 11-7).
-  - The worker reconnects automatically on Redis errors.
+  - The in-flight dedup key (SET NX EX 150) prevents concurrent workers from
+    duplicating a Gemini call for the same suggestion_id.
 
 Guardrails (CORTEX_LLM_UPGRADE_PLAN.md §8.1)
 ---------------------------------------------
   Disclaimer injection  Always appended to full_explanation.
-  No price predictions  Regex filter on output; violating sentences are removed
-                        and the event is recorded in guardrail_events.
+  No price predictions  Regex filter on output; violating sentences are removed.
   Citation check        If RAG returned context, the explanation must contain at
-                        least one "[Source:" reference.  Violations are logged as
-                        guardrail events but do NOT suppress the explanation —
-                        they flag a quality issue for review.
+                        least one "[Source:" reference.
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import re
+import secrets
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -75,26 +99,83 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.fusion.models import AILLMAuditLog
-from app.ai.intelligence.llm_client import Priority, get_intelligence_client
+from app.ai.intelligence.llm_client import (
+    GeminiQuotaExhausted,
+    GeminiRateLimitError,
+    LLMTransientExhausted,
+    Priority,
+    get_intelligence_client,
+)
 from app.ai.rag.pipeline import build_retrieval_source_refs, format_context, retrieve
 from app.core.metrics import (
     llm_audit_log_writes_total,
+    llm_explanation_dedup_total,
+    llm_explanation_dlq_total,
     llm_explanation_duration_seconds,
+    llm_explanation_worker_active,
     llm_explanations_total,
     llm_guardrail_events_total,
+    llm_ready_publish_failures_total,
 )
-from app.core.redis import RedisChannels
+from app.core.redis import RedisChannels, RedisStreams
 from app.models.trade_suggestions import TradeSuggestion
 
 logger = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-MAX_ATTEMPTS = 2
+# Suggestion explanation: 3 attempts then DLQ + failed-state UI.
+MAX_ATTEMPTS = 3
+# Instrument context: 5 attempts then ACK+abandon (no DLQ — context is best-effort;
+# the user gets a fresh generation on the next watchlist page open).
+_MAX_CONTEXT_ATTEMPTS = 5
 _RECONNECT_DELAY_SECS = 5
-# Hard ceiling on the total LLM call duration (queue wait + HTTP) to prevent
-# the worker from stalling indefinitely when the LLM backend is degraded.
+
+# Hard ceiling on the total LLM call duration (queue wait + HTTP).
 _LLM_CALL_TIMEOUT_SECS = 120.0
+
+# Stream consumer configuration
+_CONSUMER_GROUP = RedisStreams.CONSUMER_GROUP
+_STREAM_BLOCK_MS = 5_000        # block 5s waiting for new messages on each XREADGROUP
+_PEL_IDLE_THRESHOLD_MS = 60_000 # XCLAIM PEL entries idle > 60s
+_PEL_HOUSEKEEPING_INTERVAL_SECS = 30
+
+# In-flight dedup: longer than _LLM_CALL_TIMEOUT_SECS to cover Phase 3 DB write.
+_INFLIGHT_KEY_TTL_SECS = 150
+
+# Context-worker transient backoff: after a 5xx / network exhaustion, skip
+# re-processing the same instrument for this many seconds.  Must be longer than
+# _PEL_IDLE_THRESHOLD_MS so the cooldown expires before housekeeping re-delivers.
+_TRANSIENT_COOLDOWN_TTL_SECS = 180   # 3 min — covers typical Gemini overload spikes
+
+# Post-success dedup window: duplicate stream entries (e.g. scheduler double-enqueue)
+# are XACK'd and skipped when the same instrument was successfully processed recently.
+# 60 s is sufficient: the scheduler runs every ~90 min; only same-batch duplicates fire
+# within this window.
+_RECENT_SUCCESS_TTL_SECS = 60
+
+# Context generation distributed lock
+_CONTEXT_LOCK_INITIAL_TTL_SECS = 45   # extended by heartbeat every 15s
+_LOCK_HEARTBEAT_INTERVAL_SECS = 15
+
+# SSE event store TTLs
+_SSE_EXPLANATION_TTL_SECS = 86_400    # 24 h — matches suggestion lifetime
+_SSE_CONTEXT_TTL_SECS = 3_600         # 1 h — matches watchlist refresh cadence
+_SSE_EVENT_MAXLEN = 20                 # per-key stream depth
+
+# Stream max lengths (approximate trim — O(1) amortised)
+_STREAM_MAXLEN_EXPLANATION = 5_000
+_STREAM_MAXLEN_CONTEXT = 1_000
+
+# Lua script for atomic lock renewal (Section 3.4 of fix design doc).
+# Checks ownership before extending so a re-acquired lock by another process
+# cannot be extended by a stale heartbeat.
+_LOCK_RENEW_SCRIPT = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+    "return redis.call('pexpire', KEYS[1], ARGV[2]) "
+    "else return 0 end"
+)
+
 
 # ── Output schema ──────────────────────────────────────────────────────────────
 
@@ -263,15 +344,12 @@ def _strip_price_predictions(text: str) -> tuple[str, int]:
     Remove sentences matching the price-prediction guardrail, operating per line
     so the markdown section structure (### headers, blank lines) is preserved.
     Returns ``(filtered_text, n_removed)``.
-
-    Used by ``_apply_guardrails`` to strip violating sentences from the final
-    generated output before it is persisted and shown to the client.
     """
     removed = 0
     clean_lines: list[str] = []
     for line in text.split("\n"):
         if not line.strip():
-            clean_lines.append(line)  # preserve blank lines (section breaks)
+            clean_lines.append(line)
             continue
         kept: list[str] = []
         for sentence in re.split(r"(?<=[.!?])\s+", line):
@@ -287,8 +365,6 @@ def _strip_price_predictions(text: str) -> tuple[str, int]:
     return "\n".join(clean_lines), removed
 
 
-# ── Guardrail application ─────────────────────────────────────────────────────
-
 def _apply_guardrails(
     output: ExplanationOutput,
     has_context: bool,
@@ -296,29 +372,19 @@ def _apply_guardrails(
     """
     Apply all output guardrails.  Returns the (possibly modified) output and
     a list of guardrail event names that fired.
-
-    Guardrails:
-      - disclaimer_injection  Always appended (not a violation).
-      - price_prediction_filter  Removes violating sentences; recorded as event.
-      - citation_check  Logs a warning if context was provided but no citation
-                        found; does NOT suppress the explanation.
     """
     events: list[str] = []
 
-    # 1. Price-prediction filter — remove violating sentences while preserving the
-    #    markdown section structure.
     full_explanation, n_removed = _strip_price_predictions(output.full_explanation)
     events.extend(["price_prediction_filter"] * n_removed)
 
-    # Apply the same filter to the summary
     summary_sentences = re.split(r"(?<=[.!?])\s+", output.summary)
     clean_summary = " ".join(
         s for s in summary_sentences if not _PRICE_PREDICTION_RE.search(s)
     )
     if not clean_summary.strip():
-        clean_summary = output.summary  # keep original if everything was stripped
+        clean_summary = output.summary
 
-    # 2. Citation check — log if context was provided but output has no citation
     if has_context and "[" not in full_explanation:
         events.append("citation_missing")
         logger.warning(
@@ -326,7 +392,6 @@ def _apply_guardrails(
             "no [Source] citation found in full_explanation"
         )
 
-    # 3. Disclaimer injection — always appended
     full_explanation_with_disclaimer = full_explanation.rstrip() + _REGULATORY_DISCLAIMER
 
     return (
@@ -339,10 +404,9 @@ def _apply_guardrails(
     )
 
 
-# ── Prompt builder ────────────────────────────────────────────────────────────
+# ── Prompt builders ───────────────────────────────────────────────────────────
 
 def _fmt_pct(value: Any, default: str = "N/A") -> str:
-    """Format a 0–1 float as a whole-number percentage; tolerant of None/non-numeric."""
     try:
         return f"{float(value) * 100:.0f}%"
     except (TypeError, ValueError):
@@ -350,7 +414,6 @@ def _fmt_pct(value: Any, default: str = "N/A") -> str:
 
 
 def _format_probabilities(probs: dict | None) -> str | None:
-    """Render a buy/sell/hold distribution as 'BUY 71% · SELL 8% · HOLD 21%'."""
     if not probs:
         return None
     parts = [
@@ -362,13 +425,6 @@ def _format_probabilities(probs: dict | None) -> str | None:
 
 
 def _render_model_breakdown(models: dict | None) -> list[str]:
-    """
-    Render the per-model (XGBoost / GRU) breakdown shared by both prompt builders.
-
-    Each model dict follows the serialize_prediction_card / gather_ml_signals shape:
-      {direction, confidence, conviction_scale, threshold, probabilities, weight, version}
-    Returns an empty list when no per-model data is available.
-    """
     if not models:
         return []
     lines: list[str] = []
@@ -393,7 +449,6 @@ def _render_model_breakdown(models: dict | None) -> list[str]:
     return lines
 
 
-# Canonical technical-scanner keys surfaced in the prompt (skips identifiers).
 _SCANNER_LABELS: dict[str, str] = {
     "signal":           "Signal",
     "direction":        "Direction",
@@ -408,7 +463,6 @@ _SCANNER_LABELS: dict[str, str] = {
 
 
 def _render_scanner(scanner: dict | None) -> list[str]:
-    """Render known technical-scanner readings, skipping identifiers and empties."""
     if not scanner:
         return []
     lines: list[str] = []
@@ -424,20 +478,7 @@ def _render_scanner(scanner: dict | None) -> list[str]:
     return lines
 
 
-def _build_explanation_prompt(
-    suggestion: TradeSuggestion,
-    context: str,
-) -> str:
-    """
-    Render the explanation prompt from suggestion signal data + RAG context.
-
-    Surfaces the full multi-agent evidence the consensus was built from — the ML
-    ensemble's per-model (XGBoost / GRU) breakdown, the technical scanner readings,
-    and the contributing news events — so the LLM can explain what the models saw
-    and how they processed it, not merely restate the news.
-
-    All values are taken from the committed DB row — no inference, no guessing.
-    """
+def _build_explanation_prompt(suggestion: TradeSuggestion, context: str) -> str:
     ml = suggestion.ml_signal or {}
     ai = suggestion.ai_signal or {}
     scanner = suggestion.scanner_signal or {}
@@ -465,12 +506,9 @@ def _build_explanation_prompt(
             f"Trigger Pathway:  {suggestion.trigger_pathway.replace('_', ' ').title()}"
         )
 
-    # ── ML ensemble detail ────────────────────────────────────────────────────
     if ml.get("available"):
         lines.append("")
         lines.append("## ML Ensemble Output")
-        # Ensemble direction lives in the prediction sub-dict; the top-level dict
-        # has no 'action' key, so fall back to the score sign rather than N/A.
         score = ml.get("score", 0.0) or 0.0
         ens_dir = prediction.get("direction") or (
             "BUY" if score > 0 else "SELL" if score < 0 else "HOLD"
@@ -491,18 +529,12 @@ def _build_explanation_prompt(
             lines.append("Per-model breakdown:")
             lines.extend(model_lines)
 
-    # ── Technical scanner detail ──────────────────────────────────────────────
     scanner_lines = _render_scanner(scanner)
     if scanner_lines:
         lines.append("")
         lines.append("## Technical Scanner Readings")
         lines.extend(scanner_lines)
 
-    # ── News / event signal detail ────────────────────────────────────────────
-    # ai_signal is the Gemini news forecaster's output (Phase 2): its directional
-    # lean + rationale over the same indicators the ML saw, plus the contributing
-    # news events.  Surfacing it keeps the explanation consistent with the
-    # forecaster that actually fed the consensus.
     sentiment_label = ai.get("sentiment_label") or ai.get("sentiment")
     forecast_dir = ai.get("direction")
     forecast_rationale = ai.get("rationale")
@@ -535,7 +567,6 @@ def _build_explanation_prompt(
             suffix = f" ({', '.join(extra)})" if extra else ""
             lines.append(f"  - {title}{suffix}")
 
-    # ── Retrieved news context (RAG) ──────────────────────────────────────────
     if context:
         lines.append("")
         lines.append("## Retrieved News Context")
@@ -562,23 +593,12 @@ def _build_context_prompt(
     ml_snapshot: dict | None,
     context: str,
 ) -> str:
-    """
-    Render the market-context prompt for an instrument with no active suggestion.
-
-    Surfaces the full ML ensemble snapshot (ensemble + per-model XGBoost / GRU
-    breakdown, probabilities, conviction, volatility) so the LLM can describe what
-    the model is currently seeing — giving Watchlist users the same signal-level
-    insight they'd get from an active suggestion, without fabricating a signal
-    that doesn't exist.  ``ml_snapshot`` is the serialize_prediction_card payload.
-    """
     lines = [
         "## Instrument Overview",
         f"Instrument Key: {instrument_key}",
         f"Symbol:         {symbol}",
     ]
 
-    # ML snapshot — included only when the SSE stream has a valid prediction
-    # loaded (ml_snapshot may be None on first poll).
     if ml_snapshot and ml_snapshot.get("available"):
         lines.append("")
         lines.append("## Current ML Ensemble Snapshot")
@@ -645,11 +665,6 @@ async def _write_audit_entry(
     """
     Append one row to ai_llm_audit_log.  Never raises — audit failures are
     logged at ERROR level but must not abort the calling pipeline.
-
-    ``reference_table`` must be provided explicitly by every caller to enforce
-    correct audit-trail attribution:
-      - "trade_suggestions"     → suggestion explanation
-      - "ai_instrument_context" → instrument market context
     """
     try:
         entry = AILLMAuditLog(
@@ -681,6 +696,53 @@ async def _write_audit_entry(
         )
 
 
+# ── SSE event store helpers ───────────────────────────────────────────────────
+
+async def _write_sse_explanation_event(redis: Any, suggestion_id: str, payload: dict) -> None:
+    """
+    Write a full explanation payload to the per-suggestion SSE event store.
+
+    Written BEFORE publishing the routing signal so the SSE watcher always finds
+    the payload waiting when it reads the event store on signal receipt.
+    TTL = 86 400 s (24 h) — matches suggestion lifetime.
+    """
+    key = RedisStreams.sse_explanation_key(suggestion_id)
+    try:
+        await redis.xadd(
+            key,
+            {"data": json.dumps(payload, default=str)},
+            maxlen=_SSE_EVENT_MAXLEN,
+            approximate=True,
+        )
+        await redis.expire(key, _SSE_EXPLANATION_TTL_SECS)
+    except Exception as exc:
+        logger.warning(
+            "explanation_worker: failed to write SSE event store for suggestion %s: %s",
+            suggestion_id, exc,
+        )
+
+
+async def _write_sse_context_event(redis: Any, instrument_key: str, payload: dict) -> None:
+    """
+    Write a full context payload to the per-instrument SSE event store.
+    TTL = 3 600 s (1 h) — matches watchlist card refresh cadence.
+    """
+    key = RedisStreams.sse_context_key(instrument_key)
+    try:
+        await redis.xadd(
+            key,
+            {"data": json.dumps(payload, default=str)},
+            maxlen=_SSE_EVENT_MAXLEN,
+            approximate=True,
+        )
+        await redis.expire(key, _SSE_CONTEXT_TTL_SECS)
+    except Exception as exc:
+        logger.warning(
+            "explanation_worker: failed to write SSE context event store for %s: %s",
+            instrument_key, exc,
+        )
+
+
 # ── Core explanation logic ────────────────────────────────────────────────────
 
 async def _generate_explanation(
@@ -691,17 +753,18 @@ async def _generate_explanation(
     Execute the full explanation pipeline for one suggestion.
 
     Structured as three distinct phases to eliminate the DB connection leak:
-      Phase 1 — DB read: load suggestion + RAG retrieval; session closed before
-                 the LLM call so no pool connection is held during inference.
-      Phase 2 — LLM call: entirely outside any DB session; bounded by a hard
-                 wall-clock timeout (_LLM_CALL_TIMEOUT_SECS) so the worker
-                 cannot stall indefinitely when the backend is degraded.
-      Phase 3 — DB write: new session for the suggestion update + audit log.
+      Phase 1 — DB read + idempotency checks; session closed before LLM call.
+      Phase 2 — LLM call: outside any DB session; bounded by _LLM_CALL_TIMEOUT_SECS.
+      Phase 3 — DB write + SSE event store write + PUBLISH routing signal.
 
-    Raises on unrecoverable errors so the caller can track retry count.
+    Raises on unrecoverable errors so the consumer can decide ACK vs PEL.
+    Raises GeminiRateLimitError so the consumer leaves the message in PEL
+    (no real LLM attempt was made so the delivery counter is not incremented).
     """
     from app.core.database import AsyncSessionLocal
+    from app.core.redis import get_redis
 
+    _redis = get_redis()
     client = get_intelligence_client()
     invocation_id = uuid4()
     suggestion_uuid = UUID(suggestion_id)
@@ -712,6 +775,9 @@ async def _generate_explanation(
     prompt_hash: str = ""
     source_refs: list[dict] = []
     suggestion_symbol: str = ""
+    suggestion_instrument_key: str = ""
+    suggestion_signal_direction: str | None = None
+    suggestion_signal_generated_at: str | None = None
 
     async with AsyncSessionLocal() as db:
         stmt = select(TradeSuggestion).where(
@@ -733,7 +799,23 @@ async def _generate_explanation(
             )
             return
 
+        # DB idempotency check — skip if explanation was already written
+        # (handles XCLAIM redelivery after a crash where Phase 3 completed but ACK failed)
+        if suggestion.llm_summary is not None:
+            logger.info(
+                "explanation_worker: explanation already exists for suggestion %s "
+                "(DB idempotency) — skipping Gemini call",
+                suggestion_id,
+            )
+            llm_explanation_dedup_total.labels(layer="db_idempotency").inc()
+            return
+
         suggestion_symbol = suggestion.symbol
+        suggestion_instrument_key = suggestion.instrument_key
+        suggestion_signal_direction = suggestion.signal_direction
+        suggestion_signal_generated_at = (
+            suggestion.created_at.isoformat() if suggestion.created_at else None
+        )
         query = f"{suggestion.symbol} {suggestion.signal_direction} trading signal"
 
         try:
@@ -750,7 +832,21 @@ async def _generate_explanation(
         source_refs = build_retrieval_source_refs(chunks)
         prompt = _build_explanation_prompt(suggestion, context)
         prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
-    # ── DB session closed here — pool connection returned before LLM call ─────
+    # ── DB session closed — pool connection returned before LLM call ──────────
+
+    # ── In-flight dedup key — prevents concurrent workers from duplicating the call ──
+    inflight_key = RedisStreams.inflight_key(suggestion_id)
+    inflight_acquired = await _redis.set(
+        inflight_key, "1", nx=True, ex=_INFLIGHT_KEY_TTL_SECS
+    )
+    if not inflight_acquired:
+        logger.info(
+            "explanation_worker: in-flight key exists for suggestion %s "
+            "— another worker is processing it, releasing without ACK",
+            suggestion_id,
+        )
+        llm_explanation_dedup_total.labels(layer="inflight_key").inc()
+        return
 
     # ── Phase 2: LLM call (no DB session held open) ───────────────────────────
     t0 = time.monotonic()
@@ -758,30 +854,52 @@ async def _generate_explanation(
     raw_output: ExplanationOutput | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
+    _is_quota_exhausted: bool = False
+    _is_rate_limited: bool = False
     model_provider, _, model_id = client.model_id.partition("/")
 
     try:
-        raw_output, usage_info = await asyncio.wait_for(
-            client.generate_structured_with_usage(
-                prompt=prompt,
-                response_model=ExplanationOutput,
-                system=_EXPLANATION_SYSTEM_PROMPT,
-                temperature=0.2,
-                max_tokens=1400,
-                priority=Priority.HIGH,
-            ),
-            timeout=_LLM_CALL_TIMEOUT_SECS,
-        )
-        input_tokens  = usage_info.get("input_tokens")
-        output_tokens = usage_info.get("output_tokens")
-        model_provider = usage_info.get("provider", model_provider)
-        model_id       = usage_info.get("model_id", model_id)
+        llm_explanation_worker_active.inc()
+        try:
+            raw_output, usage_info = await asyncio.wait_for(
+                client.generate_structured_with_usage(
+                    prompt=prompt,
+                    response_model=ExplanationOutput,
+                    system=_EXPLANATION_SYSTEM_PROMPT,
+                    temperature=0.2,
+                    max_tokens=1400,
+                    priority=Priority.HIGH,
+                ),
+                timeout=_LLM_CALL_TIMEOUT_SECS,
+            )
+            input_tokens  = usage_info.get("input_tokens")
+            output_tokens = usage_info.get("output_tokens")
+            model_provider = usage_info.get("provider", model_provider)
+            model_id       = usage_info.get("model_id", model_id)
+        finally:
+            llm_explanation_worker_active.dec()
     except asyncio.TimeoutError:
         error_message = f"LLMTimeoutError: call exceeded {_LLM_CALL_TIMEOUT_SECS:.0f}s ceiling"
         logger.error(
-            "explanation_worker: LLM call timed out for suggestion %s "
-            "(%.0fs ceiling exceeded)",
-            suggestion_id, _LLM_CALL_TIMEOUT_SECS,
+            "explanation_worker: LLM call timed out for suggestion %s",
+            suggestion_id,
+        )
+    except GeminiRateLimitError as exc:
+        _is_rate_limited = True
+        logger.warning(
+            "explanation_worker: rate-limited for suggestion %s — releasing inflight key, "
+            "message stays in PEL for housekeeping re-delivery: %s",
+            suggestion_id, exc,
+        )
+        with contextlib.suppress(Exception):
+            await _redis.delete(inflight_key)
+        raise  # propagate — consumer must NOT XACK; message stays in PEL
+    except GeminiQuotaExhausted as exc:
+        _is_quota_exhausted = True
+        error_message = f"{type(exc).__name__}: {exc}"
+        logger.error(
+            "explanation_worker: Gemini daily quota exhausted for suggestion %s",
+            suggestion_id,
         )
     except Exception as exc:
         error_message = f"{type(exc).__name__}: {exc}"
@@ -794,7 +912,9 @@ async def _generate_explanation(
 
     if error_message is None:
         llm_explanations_total.labels(status="success", provider=model_provider).inc()
-        llm_explanation_duration_seconds.labels(provider=model_provider).observe(latency_ms / 1000.0)
+        llm_explanation_duration_seconds.labels(provider=model_provider).observe(
+            latency_ms / 1000.0
+        )
     else:
         llm_explanations_total.labels(status="failure", provider=model_provider).inc()
 
@@ -803,16 +923,24 @@ async def _generate_explanation(
     final_output: ExplanationOutput | None = None
 
     if raw_output is not None:
-        final_output, guardrail_events = _apply_guardrails(
-            raw_output, has_context=bool(chunks)
-        )
+        final_output, guardrail_events = _apply_guardrails(raw_output, has_context=bool(chunks))
         for event in guardrail_events:
             llm_guardrail_events_total.labels(guardrail=event).inc()
 
-    # ── Phase 3: DB write — new session for all persistence ──────────────────
+    # ── Phase 3: DB write + event store + publish ─────────────────────────────
     output_preview: str | None = None
+    sources_payload: list[dict] = []
+
     if final_output is not None:
         output_preview = final_output.summary[:500]
+        sources_payload = [
+            {
+                "source_name": chunk.source_name,
+                "as_of":       chunk.as_of_timestamp.isoformat(),
+                "source_url":  chunk.source_url,
+            }
+            for chunk in chunks
+        ]
 
     async with AsyncSessionLocal() as db:
         if final_output is not None:
@@ -857,46 +985,96 @@ async def _generate_explanation(
             error_message=error_message,
         )
 
-    # ── Publish ready notification (Redis only — no DB) ───────────────────────
+    # ── Write to SSE event store BEFORE publishing routing signal ─────────────
     if final_output is not None:
+        sse_payload = {
+            "available":           True,
+            "failed":              False,
+            "summary":             final_output.summary,
+            "full_explanation":    final_output.full_explanation,
+            "model":               f"{model_provider}/{model_id}",
+            "generated_at":        datetime.now(timezone.utc).isoformat(),
+            "sources":             sources_payload,
+            "context_type":        "suggestion_explanation",
+            "signal_direction":    suggestion_signal_direction,
+            "signal_generated_at": suggestion_signal_generated_at,
+        }
+        await _write_sse_explanation_event(_redis, suggestion_id, sse_payload)
+
+        # Publish routing signal only — payload lives in the event store
         try:
-            from app.core.redis import get_redis
             ready_channel = RedisChannels.LLM_EXPLANATION_READY.format(
                 suggestion_id=suggestion_id
             )
-            sources_payload = [
-                {
-                    "source_name": chunk.source_name,
-                    "as_of":       chunk.as_of_timestamp.isoformat(),
-                    "source_url":  chunk.source_url,
-                }
-                for chunk in chunks
-            ]
-            payload = json.dumps({
-                "suggestion_id": suggestion_id,
-                "llm_summary":   final_output.summary,
-                "model":         f"{model_provider}/{model_id}",
-                "generated_at":  datetime.now(timezone.utc).isoformat(),
-                "sources":       sources_payload,
+            routing_signal = json.dumps({
+                "suggestion_id":  suggestion_id,
+                "instrument_key": suggestion_instrument_key,
             }, default=str)
-            await get_redis().publish(ready_channel, payload)
+            await _redis.publish(ready_channel, routing_signal)
         except Exception as exc:
+            llm_ready_publish_failures_total.labels(job_type="explanation").inc()
             logger.warning(
-                "explanation_worker: failed to publish ready notification for %s "
-                "(non-fatal): %s",
+                "explanation_worker: failed to publish ready signal for suggestion %s "
+                "(non-fatal — browser recovers via 30s poll): %s",
                 suggestion_id, exc,
             )
 
+    # ── Clean up inflight key ─────────────────────────────────────────────────
+    with contextlib.suppress(Exception):
+        await _redis.delete(inflight_key)
+
     if error_message is not None:
+        if _is_quota_exhausted:
+            raise GeminiQuotaExhausted(error_message)
         raise RuntimeError(error_message)
 
 
 # ── Instrument context generation ────────────────────────────────────────────
 
+async def _lock_heartbeat(
+    redis: Any,
+    lock_key: str,
+    lock_token: str,
+) -> None:
+    """
+    Renew the context generation distributed lock every _LOCK_HEARTBEAT_INTERVAL_SECS.
+
+    Uses an atomic Lua CAS script: only extends the TTL if we still own the lock.
+    If the lock was re-acquired by another process (token mismatch), the heartbeat
+    logs a warning and exits rather than extending a lock we no longer own.
+    """
+    while True:
+        await asyncio.sleep(_LOCK_HEARTBEAT_INTERVAL_SECS)
+        try:
+            result = await redis.eval(
+                _LOCK_RENEW_SCRIPT,
+                1,
+                lock_key,
+                lock_token,
+                str(_CONTEXT_LOCK_INITIAL_TTL_SECS * 1000),
+            )
+            if result == 0:
+                logger.warning(
+                    "explanation_worker: lock heartbeat — ownership lost for %s "
+                    "(another process re-acquired the lock), stopping heartbeat",
+                    lock_key,
+                )
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "explanation_worker: lock heartbeat failed for %s: %s", lock_key, exc
+            )
+
+
 async def _generate_instrument_context(
     instrument_key: str,
     symbol: str | None,
     ml_snapshot: dict | None,
+    lock_key: str | None = None,
+    lock_token: str | None = None,
+    force: bool = False,
 ) -> None:
     """
     Generate a market context summary for an instrument with no active signal.
@@ -904,17 +1082,16 @@ async def _generate_instrument_context(
     Structured as three distinct phases — same pattern as _generate_explanation —
     to ensure no DB connection is held during the LLM call.
 
-    On success:
-      - Upserts ai_instrument_context (expires_at = now + 2 h)
-      - Appends one ai_llm_audit_log row
-      - Publishes cortex:llm:context:ready:{instrument_key}
-
-    Raises RuntimeError on LLM failure so the worker can track retry count.
+    If ``lock_key`` and ``lock_token`` are provided (from the stream message payload),
+    a heartbeat coroutine extends the distributed lock every 15 seconds so it cannot
+    expire during a slow LLM call and allow duplicate generation.
     """
     from app.ai.fusion.models import AIInstrumentContext
     from app.core.database import AsyncSessionLocal
+    from app.core.redis import get_redis
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+    _redis = get_redis()
     client = get_intelligence_client()
     invocation_id = uuid4()
 
@@ -929,12 +1106,37 @@ async def _generate_instrument_context(
     source_refs: list[dict] = []
 
     async with AsyncSessionLocal() as db:
+        # Idempotency guard — skip if unexpired context already exists.
+        # Handles PEL re-delivery after a crash between Phase 3 DB write and XACK.
+        # Bypassed when force=True (watchlist scheduler controls its own cadence).
+        if not force:
+            existing = await db.execute(
+                select(AIInstrumentContext).where(
+                    AIInstrumentContext.instrument_key == instrument_key,
+                    AIInstrumentContext.expires_at > datetime.now(timezone.utc),
+                )
+            )
+            if existing.scalar_one_or_none() is not None:
+                logger.info(
+                    "explanation_worker: context idempotency — unexpired record exists "
+                    "for %s, skipping Gemini call (PEL re-delivery after Phase-3 crash)",
+                    instrument_key,
+                )
+                llm_explanation_dedup_total.labels(layer="db_idempotency").inc()
+                return
+        else:
+            logger.debug(
+                "explanation_worker: force=True — bypassing idempotency check for %s "
+                "(scheduler-initiated refresh)",
+                instrument_key,
+            )
+
         query = f"{eff_symbol} market analysis news"
         try:
             chunks = await retrieve(db=db, query=query, symbol=eff_symbol)
         except Exception as exc:
             logger.warning(
-                "explanation_worker: RAG retrieval failed for instrument context %s "
+                "explanation_worker: RAG retrieval failed for context %s "
                 "(continuing with no context): %s",
                 instrument_key, exc,
             )
@@ -944,14 +1146,22 @@ async def _generate_instrument_context(
         source_refs = build_retrieval_source_refs(chunks)
         prompt      = _build_context_prompt(instrument_key, eff_symbol, ml_snapshot, context)
         prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
-    # ── DB session closed here — pool connection returned before LLM call ─────
+    # ── DB session closed ─────────────────────────────────────────────────────
 
-    # ── Phase 2: LLM call (no DB session held open) ───────────────────────────
+    # ── Phase 2: LLM call with optional lock heartbeat ───────────────────────
+    heartbeat_task: asyncio.Task | None = None
+    if lock_key and lock_token:
+        heartbeat_task = asyncio.create_task(
+            _lock_heartbeat(_redis, lock_key, lock_token),
+            name=f"context_lock_heartbeat_{instrument_key[:32]}",
+        )
+
     t0 = time.monotonic()
-    error_message:  str | None              = None
-    raw_output:     ExplanationOutput | None = None
-    input_tokens:   int | None               = None
-    output_tokens:  int | None               = None
+    error_message:       str | None              = None
+    raw_output:          ExplanationOutput | None = None
+    input_tokens:        int | None               = None
+    output_tokens:       int | None               = None
+    _is_quota_exhausted: bool                     = False
     model_provider, _, model_id = client.model_id.partition("/")
 
     try:
@@ -962,7 +1172,7 @@ async def _generate_instrument_context(
                 system=_CONTEXT_SYSTEM_PROMPT,
                 temperature=0.2,
                 max_tokens=1400,
-                priority=Priority.LOW,
+                priority=Priority.MEDIUM,
             ),
             timeout=_LLM_CALL_TIMEOUT_SECS,
         )
@@ -973,22 +1183,39 @@ async def _generate_instrument_context(
     except asyncio.TimeoutError:
         error_message = f"LLMTimeoutError: call exceeded {_LLM_CALL_TIMEOUT_SECS:.0f}s ceiling"
         logger.error(
-            "explanation_worker: LLM context call timed out for %s "
-            "(%.0fs ceiling exceeded)",
-            instrument_key, _LLM_CALL_TIMEOUT_SECS,
+            "explanation_worker: context LLM call timed out for %s", instrument_key
+        )
+    except GeminiRateLimitError as exc:
+        logger.warning(
+            "explanation_worker: rate-limited for context %s — message stays in PEL: %s",
+            instrument_key, exc,
+        )
+        raise
+    except GeminiQuotaExhausted as exc:
+        _is_quota_exhausted = True
+        error_message = f"{type(exc).__name__}: {exc}"
+        logger.error(
+            "explanation_worker: quota exhausted for context %s", instrument_key
         )
     except Exception as exc:
         error_message = f"{type(exc).__name__}: {exc}"
         logger.error(
-            "explanation_worker: LLM context generation failed for %s: %s",
+            "explanation_worker: context generation failed for %s: %s",
             instrument_key, exc,
         )
+    finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await heartbeat_task
 
     latency_ms = int((time.monotonic() - t0) * 1000)
 
     if error_message is None:
         llm_explanations_total.labels(status="success", provider=model_provider).inc()
-        llm_explanation_duration_seconds.labels(provider=model_provider).observe(latency_ms / 1000.0)
+        llm_explanation_duration_seconds.labels(provider=model_provider).observe(
+            latency_ms / 1000.0
+        )
     else:
         llm_explanations_total.labels(status="failure", provider=model_provider).inc()
 
@@ -997,32 +1224,29 @@ async def _generate_instrument_context(
     final_output:     ExplanationOutput | None = None
 
     if raw_output is not None:
-        final_output, guardrail_events = _apply_guardrails(
-            raw_output, has_context=bool(chunks)
-        )
+        final_output, guardrail_events = _apply_guardrails(raw_output, has_context=bool(chunks))
         for event in guardrail_events:
             llm_guardrail_events_total.labels(guardrail=event).inc()
 
-    # ── Phase 3: DB write — new session for all persistence ──────────────────
+    # ── Phase 3: DB write + event store + publish ─────────────────────────────
     sources_payload: list[dict] = []
     output_preview: str | None = None
     if final_output is not None:
         output_preview = final_output.summary[:500]
+        sources_payload = [
+            {
+                "source_name": chunk.source_name,
+                "as_of":       chunk.as_of_timestamp.isoformat(),
+                "source_url":  chunk.source_url,
+            }
+            for chunk in chunks
+        ]
 
     async with AsyncSessionLocal() as db:
         if final_output is not None:
             now_utc    = datetime.now(timezone.utc)
             expires_at = now_utc + timedelta(hours=2)
             model_str  = f"{model_provider}/{model_id}"
-
-            sources_payload = [
-                {
-                    "source_name": chunk.source_name,
-                    "as_of":       chunk.as_of_timestamp.isoformat(),
-                    "source_url":  chunk.source_url,
-                }
-                for chunk in chunks
-            ]
 
             upsert_stmt = (
                 pg_insert(AIInstrumentContext)
@@ -1079,195 +1303,779 @@ async def _generate_instrument_context(
             error_message=error_message,
         )
 
-    # ── Publish ready notification (Redis only — no DB) ───────────────────────
+    # ── Write to SSE event store BEFORE publishing routing signal ─────────────
     if final_output is not None:
+        ctx_payload = {
+            "available":        True,
+            "failed":           False,
+            "summary":          final_output.summary,
+            "full_explanation": final_output.full_explanation,
+            "model":            f"{model_provider}/{model_id}",
+            "generated_at":     datetime.now(timezone.utc).isoformat(),
+            "sources":          sources_payload,
+            "context_type":     "instrument_context",
+            "signal_direction":   None,
+            "signal_generated_at": None,
+        }
+        await _write_sse_context_event(_redis, instrument_key, ctx_payload)
+
         try:
-            from app.core.redis import get_redis
             ready_channel = RedisChannels.LLM_CONTEXT_READY.format(
                 instrument_key=instrument_key
             )
-            payload = json.dumps({
-                "instrument_key":  instrument_key,
-                "context_summary": final_output.summary,
-                "context_full":    final_output.full_explanation,
-                "model":           f"{model_provider}/{model_id}",
-                "generated_at":    datetime.now(timezone.utc).isoformat(),
-                "sources":         sources_payload,
+            routing_signal = json.dumps({
+                "instrument_key": instrument_key,
             }, default=str)
-            await get_redis().publish(ready_channel, payload)
+            await _redis.publish(ready_channel, routing_signal)
         except Exception as exc:
+            llm_ready_publish_failures_total.labels(job_type="context").inc()
             logger.warning(
-                "explanation_worker: failed to publish context ready for %s "
+                "explanation_worker: failed to publish context ready signal for %s "
                 "(non-fatal): %s",
                 instrument_key, exc,
             )
 
     if error_message is not None:
+        if _is_quota_exhausted:
+            raise GeminiQuotaExhausted(error_message)
         raise RuntimeError(error_message)
 
 
-# ── Worker task ───────────────────────────────────────────────────────────────
+# ── DLQ and PEL helpers ───────────────────────────────────────────────────────
 
-async def explanation_worker() -> None:
+async def _publish_failed_state(
+    redis: Any,
+    suggestion_id: str,
+    instrument_key: str,
+) -> None:
     """
-    Persistent application-level background task.
-
-    Subscribes to:
-      - RedisChannels.LLM_EXPLANATION_PENDING  → _generate_explanation
-      - RedisChannels.LLM_CONTEXT_PENDING      → _generate_instrument_context
-
-    Processes requests sequentially.  Registered in main.py lifespan —
-    one instance for the lifetime of the process.
-
-    Retry policy: each key (suggestion_id or instrument_key) is attempted at
-    most MAX_ATTEMPTS times.  After exhaustion the failure is recorded in
-    ai_llm_audit_log and the frontend shows no explanation rather than a
-    broken skeleton.
-
-    Reconnect policy: on Redis errors, waits _RECONNECT_DELAY_SECS then
-    re-subscribes (identical to cai_redis_listener and suggestions_redis_listener).
+    Write a permanent-failure event to the SSE event store and publish the
+    wakeup signal so the browser renders "Analysis unavailable" rather than
+    an eternal skeleton.
     """
-    from app.core.redis import get_redis as _get_redis
+    failed_payload: dict = {
+        "available":           False,
+        "failed":              True,
+        "summary":             None,
+        "full_explanation":    None,
+        "model":               None,
+        "generated_at":        datetime.now(timezone.utc).isoformat(),
+        "sources":             [],
+        "context_type":        "suggestion_explanation",
+        "signal_direction":    None,
+        "signal_generated_at": None,
+    }
+    await _write_sse_explanation_event(redis, suggestion_id, failed_payload)
 
-    # Unified retry counter keyed by:
-    #   suggestion_id (str UUID) for explanation requests
-    #   f"ctx:{instrument_key}"  for instrument context requests
-    attempt_counts: dict[str, int] = {}
+    try:
+        ready_channel = RedisChannels.LLM_EXPLANATION_READY.format(
+            suggestion_id=suggestion_id
+        )
+        await redis.publish(ready_channel, json.dumps({
+            "suggestion_id":  suggestion_id,
+            "instrument_key": instrument_key,
+            "failed":         True,
+        }, default=str))
+    except Exception as exc:
+        logger.warning(
+            "explanation_worker: failed to publish failed state for suggestion %s: %s",
+            suggestion_id, exc,
+        )
 
-    while True:
-        redis = _get_redis()
-        pubsub = redis.pubsub()
-        try:
-            await pubsub.subscribe(
-                RedisChannels.LLM_EXPLANATION_PENDING,
-                RedisChannels.LLM_CONTEXT_PENDING,
-            )
-            logger.info(
-                "explanation_worker: subscribed to %s and %s",
-                RedisChannels.LLM_EXPLANATION_PENDING,
-                RedisChannels.LLM_CONTEXT_PENDING,
-            )
 
-            while True:
-                raw = await pubsub.get_message(
-                    ignore_subscribe_messages=True, timeout=0.1
+async def _move_to_dlq(
+    redis: Any,
+    stream: str,
+    group: str,
+    msg_id: str,
+    consumer_name: str,
+    reason: str,
+    fields: dict,
+) -> None:
+    """
+    Move a message to the explanation DLQ, publish a failed-state SSE event,
+    and XACK to remove it from the PEL.
+    """
+    try:
+        dlq_entry = {
+            "original_stream": stream,
+            "original_msg_id": msg_id,
+            "consumer":        consumer_name,
+            "reason":          reason,
+            "fields":          json.dumps(fields, default=str),
+            "moved_at":        datetime.now(timezone.utc).isoformat(),
+        }
+        await redis.xadd(
+            RedisStreams.EXPLANATION_DLQ,
+            dlq_entry,
+            maxlen=1000,
+            approximate=True,
+        )
+        await redis.xack(stream, group, msg_id)
+        llm_explanation_dlq_total.labels(job_type="explanation").inc()
+        logger.error(
+            "explanation_worker: message %s moved to DLQ (reason=%s consumer=%s)",
+            msg_id, reason, consumer_name,
+        )
+    except Exception as exc:
+        logger.error(
+            "explanation_worker: DLQ write failed for message %s: %s", msg_id, exc
+        )
+        return
+
+    # Publish failed state if we have enough routing information
+    suggestion_id  = fields.get("suggestion_id", "")
+    instrument_key = fields.get("instrument_key", "")
+    if suggestion_id:
+        await _publish_failed_state(redis, suggestion_id, instrument_key)
+
+
+async def _drain_pel(
+    redis: Any,
+    stream: str,
+    group: str,
+    consumer_name: str,
+) -> None:
+    """
+    Re-deliver all PEL entries for this consumer (handles pre-crash unACKed messages).
+
+    Called once at startup before entering the main XREADGROUP `>` loop.
+    Messages with delivery_count > MAX_ATTEMPTS are moved to DLQ.
+    Messages within the retry budget are XCLAIM'd back to this consumer and processed.
+    """
+    try:
+        pending_entries = await redis.xpending_range(
+            name=stream,
+            groupname=group,
+            min="-",
+            max="+",
+            count=200,
+            consumername=consumer_name,
+        )
+    except Exception as exc:
+        logger.warning(
+            "explanation_worker: PEL drain query failed for %s (continuing): %s",
+            consumer_name, exc,
+        )
+        return
+
+    if not pending_entries:
+        return
+
+    logger.info(
+        "explanation_worker: draining %d PEL entries for consumer %s",
+        len(pending_entries), consumer_name,
+    )
+
+    for entry in pending_entries:
+        msg_id         = entry["message_id"]
+        delivery_count = entry["times_delivered"]
+
+        if delivery_count > MAX_ATTEMPTS:
+            # Need to XCLAIM first to get the fields, then move to DLQ
+            try:
+                claimed = await redis.xclaim(
+                    name=stream,
+                    groupname=group,
+                    consumername=consumer_name,
+                    min_idle_time=0,
+                    message_ids=[msg_id],
                 )
-                if raw is None:
-                    await asyncio.sleep(0)
+                for _, fields in claimed:
+                    await _move_to_dlq(
+                        redis, stream, group, msg_id, consumer_name,
+                        "max_attempts_exceeded_on_startup_drain", fields or {},
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "explanation_worker: PEL drain — DLQ move failed for %s: %s",
+                    msg_id, exc,
+                )
+            continue
+
+        # Re-claim and re-process
+        try:
+            claimed = await redis.xclaim(
+                name=stream,
+                groupname=group,
+                consumername=consumer_name,
+                min_idle_time=0,
+                message_ids=[msg_id],
+            )
+            for claim_id, fields in claimed:
+                if not fields:
+                    continue
+                await _process_explanation_message(
+                    redis, consumer_name, claim_id, fields,
+                    group, stream, delivery_count=delivery_count,
+                )
+        except Exception as exc:
+            logger.warning(
+                "explanation_worker: PEL drain — process failed for %s: %s",
+                msg_id, exc,
+            )
+
+
+async def _pel_housekeeping(
+    redis: Any,
+    stream: str,
+    group: str,
+    consumer_name: str,
+) -> None:
+    """
+    Periodically scan the PEL for entries idle > _PEL_IDLE_THRESHOLD_MS and
+    re-claim them for this consumer.  This handles rate-limited messages that
+    were not ACKed (they sit in PEL until re-claimed).
+
+    Entries that exceed MAX_ATTEMPTS are moved to DLQ.
+    """
+    while True:
+        try:
+            await asyncio.sleep(_PEL_HOUSEKEEPING_INTERVAL_SECS)
+
+            pending_entries = await redis.xpending_range(
+                name=stream,
+                groupname=group,
+                min="-",
+                max="+",
+                count=50,
+                consumername=consumer_name,
+                idle=_PEL_IDLE_THRESHOLD_MS,
+            )
+
+            if not pending_entries:
+                continue
+
+            for entry in pending_entries:
+                msg_id         = entry["message_id"]
+                delivery_count = entry["times_delivered"]
+
+                if delivery_count > MAX_ATTEMPTS:
+                    try:
+                        claimed = await redis.xclaim(
+                            name=stream,
+                            groupname=group,
+                            consumername=consumer_name,
+                            min_idle_time=_PEL_IDLE_THRESHOLD_MS,
+                            message_ids=[msg_id],
+                        )
+                        for _, fields in claimed:
+                            await _move_to_dlq(
+                                redis, stream, group, msg_id, consumer_name,
+                                "max_attempts_exceeded_in_housekeeping", fields or {},
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "explanation_worker: housekeeping DLQ move failed for %s: %s",
+                            msg_id, exc,
+                        )
                     continue
 
-                channel: str = raw.get("channel", "")
-
-                # ── Route: suggestion explanation ──────────────────────────
-                if channel == RedisChannels.LLM_EXPLANATION_PENDING:
-                    try:
-                        data = json.loads(raw["data"])
-                        suggestion_id:    str = data["suggestion_id"]
-                        suggestion_db_id: int = data["id"]
-                    except (json.JSONDecodeError, KeyError, TypeError) as exc:
-                        logger.warning(
-                            "explanation_worker: malformed message on explanation "
-                            "pending channel: %s",
-                            exc,
-                        )
-                        continue
-
-                    attempts = attempt_counts.get(suggestion_id, 0)
-                    if attempts >= MAX_ATTEMPTS:
-                        logger.error(
-                            "explanation_worker: suggestion %s exhausted %d/%d "
-                            "attempts — abandoning (llm_summary will remain NULL)",
-                            suggestion_id, attempts, MAX_ATTEMPTS,
-                        )
-                        attempt_counts.pop(suggestion_id, None)
-                        continue
-
-                    attempt_counts[suggestion_id] = attempts + 1
-                    logger.info(
-                        "explanation_worker: processing suggestion %s (attempt %d/%d)",
-                        suggestion_id, attempts + 1, MAX_ATTEMPTS,
+                try:
+                    claimed = await redis.xclaim(
+                        name=stream,
+                        groupname=group,
+                        consumername=consumer_name,
+                        min_idle_time=_PEL_IDLE_THRESHOLD_MS,
+                        message_ids=[msg_id],
                     )
-
-                    try:
-                        await _generate_explanation(suggestion_id, suggestion_db_id)
-                        attempt_counts.pop(suggestion_id, None)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        logger.error(
-                            "explanation_worker: attempt %d/%d failed for "
-                            "suggestion %s: %s",
-                            attempts + 1, MAX_ATTEMPTS, suggestion_id, exc,
+                    for claim_id, fields in claimed:
+                        if not fields:
+                            continue
+                        logger.info(
+                            "explanation_worker: housekeeping re-claiming message %s "
+                            "(delivery_count=%d) for consumer %s",
+                            claim_id, delivery_count, consumer_name,
                         )
-
-                # ── Route: instrument market context ───────────────────────
-                elif channel == RedisChannels.LLM_CONTEXT_PENDING:
-                    try:
-                        data = json.loads(raw["data"])
-                        instrument_key: str       = data["instrument_key"]
-                        sym: str | None           = data.get("symbol")
-                        ml_snapshot: dict | None  = data.get("prediction_data")
-                    except (json.JSONDecodeError, KeyError, TypeError) as exc:
-                        logger.warning(
-                            "explanation_worker: malformed message on context "
-                            "pending channel: %s",
-                            exc,
+                        await _process_explanation_message(
+                            redis, consumer_name, claim_id, fields,
+                            group, stream, delivery_count=delivery_count,
                         )
-                        continue
-
-                    retry_key = f"ctx:{instrument_key}"
-                    attempts  = attempt_counts.get(retry_key, 0)
-                    if attempts >= MAX_ATTEMPTS:
-                        logger.error(
-                            "explanation_worker: instrument context for %s "
-                            "exhausted %d/%d attempts — abandoning",
-                            instrument_key, attempts, MAX_ATTEMPTS,
-                        )
-                        attempt_counts.pop(retry_key, None)
-                        continue
-
-                    attempt_counts[retry_key] = attempts + 1
-                    logger.info(
-                        "explanation_worker: generating context for %s "
-                        "(attempt %d/%d)",
-                        instrument_key, attempts + 1, MAX_ATTEMPTS,
-                    )
-
-                    try:
-                        await _generate_instrument_context(instrument_key, sym, ml_snapshot)
-                        attempt_counts.pop(retry_key, None)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        logger.error(
-                            "explanation_worker: attempt %d/%d failed for "
-                            "instrument context %s: %s",
-                            attempts + 1, MAX_ATTEMPTS, instrument_key, exc,
-                        )
-
-                else:
-                    # Unexpected channel — ignore silently
-                    logger.debug(
-                        "explanation_worker: message on unexpected channel %s — skipping",
-                        channel,
+                except Exception as exc:
+                    logger.warning(
+                        "explanation_worker: housekeeping re-claim failed for %s: %s",
+                        msg_id, exc,
                     )
 
         except asyncio.CancelledError:
-            logger.info("explanation_worker: cancelled — shutting down")
             raise
         except Exception as exc:
-            logger.error(
-                "explanation_worker: Redis error: %s — reconnecting in %ds",
-                exc, _RECONNECT_DELAY_SECS,
-                exc_info=True,
-            )
-            await asyncio.sleep(_RECONNECT_DELAY_SECS)
-        finally:
+            logger.warning("explanation_worker: PEL housekeeping error: %s", exc)
+
+
+# ── Message processors ────────────────────────────────────────────────────────
+
+async def _process_explanation_message(
+    redis: Any,
+    consumer_name: str,
+    msg_id: str,
+    fields: dict,
+    group: str,
+    stream: str,
+    delivery_count: int = 1,
+) -> None:
+    """Process a single explanation job from the stream."""
+    try:
+        suggestion_id  = fields.get("suggestion_id", "")
+        suggestion_db_id = int(fields.get("id", 0))
+        instrument_key = fields.get("instrument_key", "")
+        if not suggestion_id:
+            raise ValueError("missing suggestion_id")
+    except (ValueError, TypeError) as exc:
+        logger.warning(
+            "explanation_worker[%s]: malformed message %s: %s", consumer_name, msg_id, exc
+        )
+        await redis.xack(stream, group, msg_id)
+        return
+
+    if delivery_count > MAX_ATTEMPTS:
+        await _move_to_dlq(
+            redis, stream, group, msg_id, consumer_name,
+            "max_attempts_exceeded", fields,
+        )
+        return
+
+    logger.info(
+        "explanation_worker[%s]: processing suggestion %s (delivery=%d/%d)",
+        consumer_name, suggestion_id, delivery_count, MAX_ATTEMPTS,
+    )
+
+    try:
+        await _generate_explanation(suggestion_id, suggestion_db_id)
+        await redis.xack(stream, group, msg_id)
+
+    except asyncio.CancelledError:
+        raise
+
+    except GeminiRateLimitError:
+        # Not ACKing — message stays in PEL for housekeeping to re-deliver
+        logger.warning(
+            "explanation_worker[%s]: rate-limited for suggestion %s "
+            "— not ACKing, housekeeping will re-deliver after %ds idle",
+            consumer_name, suggestion_id, _PEL_IDLE_THRESHOLD_MS // 1000,
+        )
+
+    except GeminiQuotaExhausted:
+        # Daily quota exhausted — move straight to DLQ
+        await _move_to_dlq(
+            redis, stream, group, msg_id, consumer_name,
+            "gemini_quota_exhausted", fields,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "explanation_worker[%s]: attempt failed for suggestion %s "
+            "(delivery=%d/%d): %s",
+            consumer_name, suggestion_id, delivery_count, MAX_ATTEMPTS, exc,
+        )
+        # Not ACKing — stays in PEL; housekeeping will re-deliver for retry
+
+
+async def _process_context_message(
+    redis: Any,
+    consumer_name: str,
+    msg_id: str,
+    fields: dict,
+    group: str,
+    stream: str,
+    delivery_count: int = 1,
+) -> None:
+    """Process a single instrument context generation job from the stream.
+
+    ``delivery_count`` is the number of times this message has been delivered
+    (sourced from the PEL at re-claim time or from xpending_range at startup).
+    New messages delivered via XREADGROUP '>' always start at 1.
+
+    Retry policy:
+      - GeminiRateLimitError: NOT ACKed — stays in PEL, housekeeping retries after 60 s idle.
+      - GeminiQuotaExhausted: ACK + abandon — daily quota is exhausted; retrying is pointless.
+      - Other errors: NOT ACKed up to _MAX_CONTEXT_ATTEMPTS, then ACK + abandon.
+      - delivery_count > _MAX_CONTEXT_ATTEMPTS: ACK + abandon immediately.
+    Context jobs have no DLQ: they are best-effort and the user gets a fresh generation
+    the next time the watchlist item is opened (Stage 3 re-triggers via ai_stream.py).
+    """
+    # ── Parse fields ──────────────────────────────────────────────────────────
+    try:
+        instrument_key = fields.get("instrument_key", "")
+        sym = fields.get("symbol") or None
+        if sym == "":
+            sym = None
+        lock_key   = fields.get("lock_key") or None
+        lock_token = fields.get("lock_token") or None
+        prediction_data_raw = fields.get("prediction_data", "")
+
+        ml_snapshot: dict | None = None
+        if prediction_data_raw:
             try:
-                await pubsub.unsubscribe(
-                    RedisChannels.LLM_EXPLANATION_PENDING,
-                    RedisChannels.LLM_CONTEXT_PENDING,
-                )
-                await pubsub.aclose()
-            except Exception:
+                ml_snapshot = json.loads(prediction_data_raw)
+            except (json.JSONDecodeError, TypeError):
                 pass
+
+        force  = fields.get("force",  "0") == "1"
+        source = fields.get("source", "on_demand")
+
+        if not instrument_key:
+            raise ValueError("missing instrument_key")
+    except (ValueError, TypeError) as exc:
+        logger.warning(
+            "context_worker[%s]: malformed message %s: %s", consumer_name, msg_id, exc
+        )
+        await redis.xack(stream, group, msg_id)
+        return
+
+    # ── Delivery cap — ACK and abandon to prevent unbounded retries ───────────
+    if delivery_count > _MAX_CONTEXT_ATTEMPTS:
+        logger.error(
+            "context_worker[%s]: abandoning context job %s for instrument=%s "
+            "after %d/%d deliveries — ACKing to clear PEL "
+            "(user will get fresh context on next watchlist open)",
+            consumer_name, msg_id, instrument_key, delivery_count, _MAX_CONTEXT_ATTEMPTS,
+        )
+        await redis.xack(stream, group, msg_id)
+        return
+
+    # ── Per-instrument guard keys ──────────────────────────────────────────────
+    # Defined before the try block so both guard clauses and exception handlers
+    # share the same key names without repeated f-string construction.
+    recent_key   = f"cortex:context:recent:{instrument_key}"
+    cooldown_key = f"cortex:context:cooldown:{instrument_key}"
+
+    # Post-success dedup: if this instrument was successfully processed within
+    # _RECENT_SUCCESS_TTL_SECS, the current message is a duplicate (e.g. scheduler
+    # double-enqueue).  ACK and skip so the PEL stays clean.
+    if await redis.exists(recent_key):
+        logger.info(
+            "context_worker[%s]: skipping duplicate job for %s "
+            "(successfully processed within last %ds) — ACKing",
+            consumer_name, instrument_key, _RECENT_SUCCESS_TTL_SECS,
+        )
+        await redis.xack(stream, group, msg_id)
+        return
+
+    # Transient cooldown: if a 5xx / network exhaustion was recorded for this
+    # instrument, leave the message in PEL and wait for the backoff to expire
+    # before retrying.  This prevents a burst of duplicate messages from hammering
+    # an overloaded Gemini endpoint back-to-back.
+    if await redis.exists(cooldown_key):
+        ttl = await redis.ttl(cooldown_key)
+        logger.debug(
+            "context_worker[%s]: %s in transient cooldown (%ds remaining) — "
+            "not ACKing, housekeeping will re-deliver after cooldown lifts",
+            consumer_name, instrument_key, max(ttl, 0),
+        )
+        return
+
+    logger.info(
+        "context_worker[%s]: processing context for %s "
+        "(delivery=%d/%d, force=%s, source=%s)",
+        consumer_name, instrument_key, delivery_count, _MAX_CONTEXT_ATTEMPTS,
+        force, source,
+    )
+
+    try:
+        await _generate_instrument_context(
+            instrument_key, sym, ml_snapshot, lock_key, lock_token, force=force
+        )
+        await redis.xack(stream, group, msg_id)
+        # Record success so duplicate queued jobs are skipped within the dedup window.
+        await redis.set(recent_key, "1", ex=_RECENT_SUCCESS_TTL_SECS)
+
+    except asyncio.CancelledError:
+        raise
+
+    except LLMTransientExhausted:
+        # 5xx / network / timeout — Gemini is temporarily overloaded.  Set a cooldown
+        # so subsequent duplicate messages for this instrument are skipped until the
+        # endpoint recovers, then leave this message in PEL for housekeeping to
+        # re-deliver once both the cooldown and PEL idle threshold have elapsed.
+        await redis.set(cooldown_key, "1", ex=_TRANSIENT_COOLDOWN_TTL_SECS)
+        logger.warning(
+            "context_worker[%s]: transient LLM failure for %s (delivery=%d/%d) — "
+            "cooldown set for %ds, not ACKing",
+            consumer_name, instrument_key, delivery_count, _MAX_CONTEXT_ATTEMPTS,
+            _TRANSIENT_COOLDOWN_TTL_SECS,
+        )
+
+    except GeminiRateLimitError:
+        logger.warning(
+            "context_worker[%s]: rate-limited for %s (delivery=%d/%d) — "
+            "not ACKing, housekeeping will re-deliver after %ds idle",
+            consumer_name, instrument_key, delivery_count, _MAX_CONTEXT_ATTEMPTS,
+            _PEL_IDLE_THRESHOLD_MS // 1000,
+        )
+
+    except GeminiQuotaExhausted:
+        await redis.xack(stream, group, msg_id)
+        logger.error(
+            "context_worker[%s]: quota exhausted for %s — ACKing and abandoning "
+            "until quota resets at midnight PT",
+            consumer_name, instrument_key,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "context_worker[%s]: attempt %d/%d failed for %s: %s",
+            consumer_name, delivery_count, _MAX_CONTEXT_ATTEMPTS, instrument_key, exc,
+        )
+        # Not ACKing — stays in PEL; housekeeping re-delivers after _PEL_IDLE_THRESHOLD_MS
+
+
+# ── Worker entry points ───────────────────────────────────────────────────────
+
+async def explanation_worker(worker_id: int = 0) -> None:
+    """
+    Persistent Redis Streams consumer for LLM explanation jobs.
+
+    Reads from ``cortex:stream:explanation:jobs`` using XREADGROUP for
+    at-least-once delivery.  Two instances run in parallel (worker_id 0 and 1)
+    spawned by ``main.py`` lifespan.
+
+    Startup sequence:
+      1. PEL drain — re-process any unACKed messages from before the last restart.
+      2. Main loop — XREADGROUP `>` with 5s BLOCK; processes one message at a time.
+      3. PEL housekeeping — separate background coroutine reclaims idle PEL entries.
+
+    Retry policy:
+      - GeminiRateLimitError: NOT ACKed, stays in PEL, housekeeping re-delivers after 60s.
+      - GeminiQuotaExhausted: moved straight to DLQ with failed-state UI notification.
+      - Other errors: NOT ACKed, PEL retry, DLQ after MAX_ATTEMPTS deliveries.
+    """
+    from app.core.redis import get_redis as _get_redis
+
+    consumer_name = f"explanation-worker-{worker_id}"
+    stream = RedisStreams.EXPLANATION_JOBS
+    group  = _CONSUMER_GROUP
+
+    _redis = _get_redis()
+
+    # PEL drain before entering the main loop
+    await _drain_pel(_redis, stream, group, consumer_name)
+
+    logger.info(
+        "explanation_worker[%d]: consumer=%s ready", worker_id, consumer_name
+    )
+
+    housekeeping_task = asyncio.create_task(
+        _pel_housekeeping(_redis, stream, group, consumer_name),
+        name=f"explanation_pel_housekeeping_{worker_id}",
+    )
+
+    try:
+        while True:
+            try:
+                messages = await _redis.xreadgroup(
+                    groupname=group,
+                    consumername=consumer_name,
+                    streams={stream: ">"},
+                    count=1,
+                    block=_STREAM_BLOCK_MS,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "explanation_worker[%d]: Redis read error: %s — reconnecting in %ds",
+                    worker_id, exc, _RECONNECT_DELAY_SECS,
+                    exc_info=True,
+                )
+                await asyncio.sleep(_RECONNECT_DELAY_SECS)
+                _redis = _get_redis()
+                continue
+
+            if not messages:
+                continue
+
+            for _stream_name, entries in messages:
+                for msg_id, fields in entries:
+                    await _process_explanation_message(
+                        _redis, consumer_name, msg_id, fields, group, stream,
+                    )
+
+    except asyncio.CancelledError:
+        logger.info("explanation_worker[%d]: cancelled — shutting down", worker_id)
+        raise
+    finally:
+        housekeeping_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await housekeeping_task
+
+
+async def _context_pel_housekeeping(
+    redis: Any,
+    stream: str,
+    group: str,
+    consumer_name: str,
+) -> None:
+    """
+    Periodically re-claim context PEL entries idle > _PEL_IDLE_THRESHOLD_MS.
+
+    Mirrors _pel_housekeeping for explanation jobs but without a DLQ path:
+    context jobs are best-effort and idempotent.  After _MAX_CONTEXT_ATTEMPTS
+    the re-claimed message is ACKed and abandoned by _process_context_message.
+
+    The current delivery count from xpending_range is passed through to
+    _process_context_message so the processor can enforce the retry cap and
+    include accurate attempt numbers in structured log output.
+    """
+    while True:
+        try:
+            await asyncio.sleep(_PEL_HOUSEKEEPING_INTERVAL_SECS)
+
+            pending_entries = await redis.xpending_range(
+                name=stream,
+                groupname=group,
+                min="-",
+                max="+",
+                count=50,
+                consumername=consumer_name,
+                idle=_PEL_IDLE_THRESHOLD_MS,
+            )
+
+            if not pending_entries:
+                continue
+
+            for entry in pending_entries:
+                msg_id         = entry["message_id"]
+                delivery_count = entry["times_delivered"]
+                try:
+                    claimed = await redis.xclaim(
+                        name=stream,
+                        groupname=group,
+                        consumername=consumer_name,
+                        min_idle_time=_PEL_IDLE_THRESHOLD_MS,
+                        message_ids=[msg_id],
+                    )
+                    for claim_id, fields in claimed:
+                        if not fields:
+                            continue
+                        logger.info(
+                            "context_worker: housekeeping re-claiming message %s "
+                            "(delivery_count=%d/%d) for consumer %s",
+                            claim_id, delivery_count, _MAX_CONTEXT_ATTEMPTS, consumer_name,
+                        )
+                        await _process_context_message(
+                            redis, consumer_name, claim_id, fields, group, stream,
+                            delivery_count=delivery_count,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "context_worker: housekeeping re-claim failed for %s: %s",
+                        msg_id, exc,
+                    )
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("context_worker: PEL housekeeping error: %s", exc)
+
+
+async def context_worker() -> None:
+    """
+    Persistent Redis Streams consumer for instrument context generation jobs.
+
+    Reads from ``cortex:stream:context:jobs`` using XREADGROUP.  A single instance
+    is sufficient because context jobs are low-frequency and already protected by
+    the distributed lock in ai_stream.py Stage 3.
+
+    Startup sequence:
+      1. PEL drain — re-process any unACKed messages from before the last restart,
+         passing the PEL delivery_count through so the processor can enforce the
+         retry cap and skip redundant LLM calls via the DB idempotency check.
+      2. Main loop — XREADGROUP '>' with 5 s BLOCK; processes one message at a time.
+      3. PEL housekeeping — background coroutine reclaims idle PEL entries every 30 s.
+
+    Retry policy:
+      - GeminiRateLimitError: NOT ACKed — housekeeping re-delivers after 60 s idle.
+      - GeminiQuotaExhausted: ACK + abandon — no point retrying an exhausted quota.
+      - Other failures: NOT ACKed, up to _MAX_CONTEXT_ATTEMPTS (5), then ACK + abandon.
+      - No DLQ: context is best-effort; the user gets fresh context on the next
+        watchlist page open (Stage 3 in ai_stream.py re-triggers generation).
+    """
+    from app.core.redis import get_redis as _get_redis
+
+    consumer_name = "context-worker-0"
+    stream = RedisStreams.CONTEXT_JOBS
+    group  = _CONSUMER_GROUP
+
+    _redis = _get_redis()
+
+    # ── PEL drain on startup ──────────────────────────────────────────────────
+    # Re-process any messages that were delivered but not ACKed before the last
+    # restart (e.g. process killed between Phase 3 completion and XACK).
+    # delivery_count from xpending_range is passed through so the processor can
+    # enforce the retry cap and avoid redundant LLM calls via the idempotency check.
+    try:
+        pending_entries = await _redis.xpending_range(
+            name=stream, groupname=group, min="-", max="+", count=50,
+            consumername=consumer_name,
+        )
+        if pending_entries:
+            logger.info(
+                "context_worker: draining %d PEL entries on startup", len(pending_entries)
+            )
+            for entry in pending_entries:
+                msg_id         = entry["message_id"]
+                delivery_count = entry["times_delivered"]
+                try:
+                    claimed = await _redis.xclaim(
+                        name=stream, groupname=group, consumername=consumer_name,
+                        min_idle_time=0, message_ids=[msg_id],
+                    )
+                    for claim_id, fields in claimed:
+                        if fields:
+                            await _process_context_message(
+                                _redis, consumer_name, claim_id, fields, group, stream,
+                                delivery_count=delivery_count,
+                            )
+                except Exception as exc:
+                    logger.warning(
+                        "context_worker: PEL drain failed for message %s: %s", msg_id, exc
+                    )
+    except Exception as exc:
+        logger.warning("context_worker: PEL drain query failed (continuing): %s", exc)
+
+    logger.info("context_worker: consumer=%s ready", consumer_name)
+
+    housekeeping_task = asyncio.create_task(
+        _context_pel_housekeeping(_redis, stream, group, consumer_name),
+        name="context_pel_housekeeping",
+    )
+
+    try:
+        while True:
+            try:
+                messages = await _redis.xreadgroup(
+                    groupname=group,
+                    consumername=consumer_name,
+                    streams={stream: ">"},
+                    count=1,
+                    block=_STREAM_BLOCK_MS,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "context_worker: Redis read error: %s — reconnecting in %ds",
+                    exc, _RECONNECT_DELAY_SECS,
+                    exc_info=True,
+                )
+                await asyncio.sleep(_RECONNECT_DELAY_SECS)
+                _redis = _get_redis()
+                continue
+
+            if not messages:
+                continue
+
+            for _stream_name, entries in messages:
+                for msg_id, fields in entries:
+                    await _process_context_message(
+                        _redis, consumer_name, msg_id, fields, group, stream
+                    )
+
+    except asyncio.CancelledError:
+        logger.info("context_worker: cancelled — shutting down")
+        raise
+    finally:
+        housekeeping_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await housekeeping_task

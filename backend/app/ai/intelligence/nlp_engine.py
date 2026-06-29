@@ -1,58 +1,89 @@
 """
 NLP Engine — LLM-Backed Financial Sentiment Analysis
 =====================================================
-Financial sentiment scoring via NVIDIA NIM (CortexIntelligenceClient).
+Financial sentiment scoring via CortexIntelligenceClient (Google Gemini).
 
 Architecture
 ------------
-  Primary:   CortexIntelligenceClient.generate_structured()
-             Reads the full article body (not a truncated headline).
-             Produces SentimentOutput via Instructor + Pydantic.
+  Batch queue (event pipeline / background callers):
+      analyze_sentiment(text) → _analyze_with_audit_meta(text)
+        → enqueues a _BatchEntry with an asyncio.Future
+        → the flusher loop (_flusher_loop) accumulates up to
+          SENTIMENT_BATCH_SIZE articles or waits SENTIMENT_BATCH_WINDOW_SECS,
+          then calls the LLM once for the whole group (_call_batch_llm).
+        Reduces steady-state Gemini generate calls by ~87% at batch size 8.
 
-  Audit:     Every LLM call — success or failure — writes one row to
-             ai_llm_audit_log via process_event().
+  Immediate path (SSE / on-demand callers):
+      analyze_sentiment_batch(texts)
+        → checks cache per text, fires ONE batched LLM call for misses,
+          returns results in the original input order.
+        Bypasses the queue entirely — no accumulation wait.
+
+  Audit:
+      Every process_event() call — regardless of batch vs single-item path —
+      writes exactly one row to ai_llm_audit_log.  The race condition that
+      existed in the previous _last_* instance-attribute pattern is eliminated:
+      _analyze_with_audit_meta() returns metadata as a return value, never as
+      mutable shared state.
 
   Backward compatibility:
-             analyze_sentiment() returns the same dict shape as the legacy engine:
-             {label, score, confidence, model}.  process_event() writes to
-             AINLPResult with identical field names and numeric scale.
-             The ML feature pipeline (SentimentFeatureExtractor) is unchanged.
+      analyze_sentiment() public signature and return dict shape are unchanged.
+      process_event() public signature and return type are unchanged.
+      All existing callers work without modification.
 
 Phase history
 -------------
-Phase 0 (completed 2026-06-06): FinBERT dual-write ran concurrently with LLM
-scoring to validate calibration.  Pearson r = 0.995 on 10-item comparison
-dataset (gate ≥ 0.80 — passed).  FinBERT removed; R9 GPU contention resolved.
+Phase 0 (completed 2026-06-06): FinBERT dual-write validated LLM calibration
+  (Pearson r=0.995).  FinBERT removed; R9 GPU contention resolved.
+
+Batch accumulator (completed 2026-06-27): N articles → 1 Gemini call.
+  ~87% call-count reduction at SENTIMENT_BATCH_SIZE=8.  Option A chosen
+  (reasoning field omitted from batch schema) — 2025 research on financial
+  sentiment LLMs found CoT reasoning degrades, not improves, classification
+  accuracy on short financial news (arxiv:2506.04574).
 
 Startup
 -------
 Call `await NLPEngine.initialize()` once from the FastAPI lifespan.
+Call `await NLPEngine.aclose()` during lifespan shutdown, BEFORE
+GeminiRequestManager.aclose(), so pending futures receive neutral fallback
+before the LLM transport is torn down.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import time
+from dataclasses import dataclass
 from typing import Any, Literal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
-# Sentiment results are cached in Redis keyed by prompt SHA-256.  One hour
-# covers the active news cycle: the same article may re-appear across several
-# consecutive event-processing batches, but its sentiment does not change within
-# that window.  Only successful LLM results are cached — fallback
-# ``model=unavailable`` responses are never written to the cache.
-_SENTIMENT_CACHE_TTL_SECS = 3600
+# Sentiment results cached by prompt SHA-256.  24 hours spans the full trading
+# day: article sentiment is immutable, so one LLM call per article per day is
+# the correct target.  Only successful LLM results are cached — neutral/
+# model=unavailable fallbacks are never written.
+_SENTIMENT_CACHE_TTL_SECS = 86_400
+
+# Canonical graceful-degradation sentinel returned when all LLM paths fail.
+# Copied (never mutated in place) so each caller owns its own dict.
+_NEUTRAL_FALLBACK: dict[str, Any] = {
+    "label":      "neutral",
+    "score":      0.0,
+    "confidence": 0.0,
+    "model":      "unavailable",
+}
 
 
-# ── Pydantic output schema ─────────────────────────────────────────────────────
+# ── Pydantic output schemas ────────────────────────────────────────────────────
 
 class SentimentOutput(BaseModel):
-    """Structured sentiment result produced by the LLM."""
+    """Structured result for single-article LLM calls (single-item path)."""
 
     label: Literal["positive", "negative", "neutral"] = Field(
         description="Sentiment direction of the news article."
@@ -77,7 +108,54 @@ class SentimentOutput(BaseModel):
     )
 
 
-# ── System prompts (per CORTEX_LLM_UPGRADE_PLAN.md §8.2) ──────────────────────
+class _SentimentBatchItem(BaseModel):
+    """One article's result within a batch LLM response.
+
+    No ``reasoning`` field (Option A): saves ~100 output tokens per item
+    (~800/batch at size 8).  Reasoning is never stored or displayed; its only
+    potential benefit is chain-of-thought accuracy improvement — which 2025
+    research found absent for financial classification tasks (arxiv:2506.04574).
+    """
+
+    index: int = Field(
+        description="Zero-based position matching the article's input order."
+    )
+    label: Literal["positive", "negative", "neutral"]
+    score: float = Field(ge=-1.0, le=1.0)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class _SentimentBatchOutput(BaseModel):
+    """Batch LLM response envelope."""
+
+    results: list[_SentimentBatchItem]
+
+
+# ── Internal state dataclasses ─────────────────────────────────────────────────
+
+@dataclass
+class _SentimentAuditMeta:
+    """Per-call metadata captured for audit log population.
+
+    Returned by _analyze_with_audit_meta() so process_event() can build the
+    AILLMAuditLog row without touching any shared mutable state.
+    """
+    invocation_id: UUID
+    prompt_hash: str
+    latency_ms: int
+    error: str | None
+    is_cache_hit: bool
+
+
+@dataclass
+class _BatchEntry:
+    """A single article waiting in the sentiment batch accumulation queue."""
+    prompt_hash: str
+    text: str
+    future: asyncio.Future  # resolves to dict[str, Any]
+
+
+# ── System prompts ─────────────────────────────────────────────────────────────
 
 _SENTIMENT_SYSTEM_PROMPT = """\
 You are a financial news sentiment analysis tool for the Cortex trading platform.
@@ -104,8 +182,6 @@ Rules:
    Do NOT use speculative phrases like "will rise" or "should buy".\
 """
 
-# Used by generate_safety_response() — tested by the Phase 0 eval harness to
-# verify the LLM handles speculative, advisory, and adversarial queries correctly.
 _SAFETY_SYSTEM_PROMPT = """\
 You are a financial information assistant for the Cortex algorithmic trading platform.
 You are NOT a licensed financial advisor and must not provide investment advice.
@@ -125,42 +201,100 @@ Always respond in a professional, concise, and factual manner within these bound
 """
 
 
-# ── NLPEngine singleton ────────────────────────────────────────────────────────
+# ── NLPEngine ──────────────────────────────────────────────────────────────────
 
 class NLPEngine:
     """
-    Singleton NLP engine for financial sentiment analysis.
+    LLM-backed financial sentiment engine with batch accumulation.
 
-    Backed by CortexIntelligenceClient (NVIDIA NIM primary, Ollama fallback).
-    No local model weights are loaded — all inference is remote.
+    Class-level queue and flusher task are shared across all instances —
+    creating multiple NLPEngine() instances (as event_processor.py and
+    sentiment_analysis_service.py do) is safe; all route to the same queue.
 
     Usage:
-        # At startup:
+        # At startup (once):
         await NLPEngine.initialize()
 
-        # Per call:
+        # At shutdown (once, before GeminiRequestManager.aclose()):
+        await NLPEngine.aclose()
+
+        # Per-call (event pipeline path):
         engine = NLPEngine()
         result = await engine.analyze_sentiment(full_article_text)
+
+        # Per-call (SSE / on-demand path):
+        results = await engine.analyze_sentiment_batch(texts)
     """
 
     _initialized: bool = False
+    # Class-level batch state — set by initialize(), shared across all instances.
+    _queue: asyncio.Queue          # Queue[_BatchEntry]
+    _flush_trigger: asyncio.Event
+    _flusher_task: asyncio.Task | None = None
 
-    # ── Startup ────────────────────────────────────────────────────────────────
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     @classmethod
     async def initialize(cls) -> None:
         """
-        Prepare the NLP engine.  Safe to call multiple times — no-op if already
-        initialized.
+        Start the batch accumulator.  Safe to call multiple times — no-op after
+        the first call.
 
         CortexIntelligenceClient must be initialized before this is called
-        (handled by main.py lifespan ordering).  No local model weights are
-        loaded; all inference is delegated to the provider-agnostic LLM client.
+        (guaranteed by main.py lifespan ordering).
         """
         if cls._initialized:
             return
+        cls._queue = asyncio.Queue()          # unbounded — backpressure is the budget guard
+        cls._flush_trigger = asyncio.Event()
+        cls._flusher_task = asyncio.create_task(
+            cls._flusher_loop(), name="nlp_sentiment_flusher"
+        )
         cls._initialized = True
-        logger.info("NLPEngine initialized: provider=CortexIntelligenceClient")
+        logger.info("NLPEngine initialized: provider=CortexIntelligenceClient, batch_accumulator=enabled")
+
+    @classmethod
+    async def aclose(cls) -> None:
+        """
+        Gracefully shut down the batch accumulator.
+
+        1. Cancels the flusher task (gives it 3 s to acknowledge).
+        2. Drains any remaining queue items with neutral fallback so event-pipeline
+           coroutines awaiting their futures unblock cleanly before the Gemini
+           transport is torn down.
+
+        Must be called BEFORE GeminiRequestManager.aclose().
+        """
+        if not cls._initialized:
+            return
+
+        if cls._flusher_task is not None and not cls._flusher_task.done():
+            cls._flusher_task.cancel()
+            try:
+                # shield() prevents wait_for() from re-cancelling the already-
+                # cancelled task on timeout; the task is still being cancelled by
+                # our cancel() call above.
+                await asyncio.wait_for(asyncio.shield(cls._flusher_task), timeout=3.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+
+        abandoned = 0
+        while not cls._queue.empty():
+            try:
+                entry = cls._queue.get_nowait()
+                if not entry.future.done():
+                    entry.future.set_result(_NEUTRAL_FALLBACK.copy())
+                    abandoned += 1
+            except asyncio.QueueEmpty:
+                break
+
+        if abandoned:
+            logger.warning(
+                "NLPEngine shutdown: %d pending batch items resolved with neutral fallback",
+                abandoned,
+            )
+
+        cls._initialized = False
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -168,14 +302,12 @@ class NLPEngine:
         """
         Classify the financial sentiment of a news article.
 
-        Results are cached in Redis by prompt SHA-256 for
-        ``_SENTIMENT_CACHE_TTL_SECS`` seconds.  The same article surfacing
-        across multiple event-processing batches hits the cache on the second
-        and subsequent calls, consuming zero Gemini quota.
+        Routes through the batch accumulator queue.  Cache hits are served
+        immediately; cache misses wait for the flusher to assemble and fire
+        a batched Gemini call (up to SENTIMENT_BATCH_WINDOW_SECS).
 
         Args:
-            text: Full article body.  No length truncation — the LLM reads the
-                  complete text.
+            text: Full article body (no truncation — the LLM reads it complete).
 
         Returns:
             {
@@ -185,85 +317,8 @@ class NLPEngine:
                 "model":      str    — serving model identifier,
             }
         """
-        from app.ai.intelligence.llm_client import (
-            LLMFallbackExhausted,
-            Priority,
-            get_intelligence_client,
-        )
-        from app.core.redis import get_cache_service
-
-        client = get_intelligence_client()
-        prompt = f"Classify the financial sentiment of the following news article:\n\n{text}"
-        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
-        cache_key = f"nlp:sentiment:{prompt_hash}"
-
-        # ── Cache check ────────────────────────────────────────────────────────
-        # Non-fatal: a Redis error falls through to a live LLM call.
-        try:
-            cached = await get_cache_service().get(cache_key)
-            if cached is not None and isinstance(cached, dict):
-                logger.debug("nlp: sentiment cache hit hash=%.12s", prompt_hash)
-                self._last_invocation_id = uuid4()
-                self._last_prompt_hash   = prompt_hash
-                self._last_latency_ms    = 0
-                self._last_error         = None
-                return cached
-        except Exception as _cache_exc:
-            logger.debug("nlp: sentiment cache read failed (non-fatal): %s", _cache_exc)
-
-        # ── Live LLM call ──────────────────────────────────────────────────────
-        invocation_id = uuid4()
-        t0 = time.monotonic()
-
-        llm_result: SentimentOutput | None = None
-        error_message: str | None = None
-
-        try:
-            llm_result = await client.generate_structured(
-                prompt=prompt,
-                response_model=SentimentOutput,
-                system=_SENTIMENT_SYSTEM_PROMPT,
-                temperature=0.1,
-                max_tokens=256,
-                priority=Priority.MEDIUM,
-            )
-        except LLMFallbackExhausted as exc:
-            error_message = f"{type(exc).__name__}: {exc}"
-            logger.error("NLPEngine: LLM sentiment failed: %s", exc)
-        except Exception as exc:
-            error_message = f"{type(exc).__name__}: {exc}"
-            logger.error("NLPEngine: unexpected error in sentiment: %s", exc, exc_info=True)
-
-        latency_ms = int((time.monotonic() - t0) * 1000)
-
-        # Store invocation metadata for process_event() to include in the audit log.
-        self._last_invocation_id = invocation_id
-        self._last_prompt_hash   = prompt_hash
-        self._last_latency_ms    = latency_ms
-        self._last_error         = error_message
-
-        if llm_result is not None:
-            model_tag = client.model_id
-            result: dict[str, Any] = {
-                "label":      llm_result.label,
-                "score":      round(float(llm_result.score), 4),
-                "confidence": round(float(llm_result.confidence), 4),
-                "model":      model_tag,
-            }
-            # ── Cache write ────────────────────────────────────────────────────
-            # Non-fatal: a Redis error must never suppress a successful result.
-            try:
-                await get_cache_service().set(cache_key, result, ttl=_SENTIMENT_CACHE_TTL_SECS)
-                logger.debug(
-                    "nlp: sentiment cached hash=%.12s ttl=%ds",
-                    prompt_hash, _SENTIMENT_CACHE_TTL_SECS,
-                )
-            except Exception as _cache_exc:
-                logger.debug("nlp: sentiment cache write failed (non-fatal): %s", _cache_exc)
-            return result
-
-        # Graceful degradation — return neutral/0.0 so the event pipeline continues.
-        return {"label": "neutral", "score": 0.0, "confidence": 0.0, "model": "unavailable"}
+        result, _ = await self._analyze_with_audit_meta(text)
+        return result
 
     async def process_event(
         self,
@@ -272,15 +327,17 @@ class NLPEngine:
         content: str,
     ) -> Any:
         """
-        Full NLP pipeline for a processed event: sentiment → AINLPResult.
+        Full NLP pipeline for a processed event: sentiment → AINLPResult + audit row.
 
-        Passes the FULL content to analyze_sentiment (not title-truncated).
-        Writes one row to ai_llm_audit_log for the LLM inference.
-        Maintains backward-compatibility with the existing event processing flow.
+        Calls _analyze_with_audit_meta() and consumes the returned
+        _SentimentAuditMeta directly for the audit log row — no shared mutable
+        state, no race condition between the LLM call and the DB flush.
+
+        Maintains backward-compatibility: same public signature, same return type.
         """
         from app.ai.fusion.models import AILLMAuditLog, AINLPResult
 
-        sentiment = await self.analyze_sentiment(content)
+        sentiment, audit_meta = await self._analyze_with_audit_meta(content)
 
         nlp_result = AINLPResult(
             processed_event_id=processed_event_id,
@@ -292,25 +349,33 @@ class NLPEngine:
             confidence_score=sentiment["confidence"],
         )
         db.add(nlp_result)
-        await db.flush()  # obtain nlp_result.id before audit log insert
+        await db.flush()  # obtain nlp_result.id before the audit log insert
 
         audit = AILLMAuditLog(
-            invocation_id=self._last_invocation_id,
+            invocation_id=audit_meta.invocation_id,
             invocation_type="sentiment",
             reference_table="ai_nlp_results",
             reference_id=nlp_result.id,
-            model_provider=sentiment["model"].split("/", 1)[0] if "/" in sentiment["model"] else "gemini",
-            model_id=sentiment["model"].split("/", 1)[-1] if "/" in sentiment["model"] else sentiment["model"],
-            prompt_hash=self._last_prompt_hash,
+            model_provider=(
+                sentiment["model"].split("/", 1)[0]
+                if "/" in sentiment["model"]
+                else "gemini"
+            ),
+            model_id=(
+                sentiment["model"].split("/", 1)[-1]
+                if "/" in sentiment["model"]
+                else sentiment["model"]
+            ),
+            prompt_hash=audit_meta.prompt_hash,
             retrieved_source_ids=None,
-            latency_ms=self._last_latency_ms,
+            latency_ms=audit_meta.latency_ms,
             guardrail_events=[],
             output_preview=(
                 f"label={sentiment['label']} "
                 f"score={sentiment['score']} "
                 f"confidence={sentiment['confidence']}"
             )[:500],
-            error_message=self._last_error,
+            error_message=audit_meta.error,
         )
         db.add(audit)
         await db.commit()
@@ -325,6 +390,69 @@ class NLPEngine:
             sentiment["model"],
         )
         return nlp_result
+
+    async def analyze_sentiment_batch(
+        self, texts: list[str]
+    ) -> list[dict[str, Any]]:
+        """
+        Classify a list of articles in a single immediate LLM call.
+
+        Intended for the SSE path (SentimentAnalysisService._compute) where the
+        caller needs all results before it can render the card and latency matters.
+        Bypasses the queue entirely — no accumulation wait.
+
+        Cache hits are served without touching the LLM; misses are batched into
+        one Gemini call and cached individually on return.
+
+        Args:
+            texts: Article texts to classify (order preserved in output).
+
+        Returns:
+            Results in the same order as ``texts``.  Never raises — errors
+            produce neutral fallback dicts for affected positions.
+        """
+        if not texts:
+            return []
+
+        from app.core.redis import get_cache_service
+
+        cache_service = get_cache_service()
+        results: list[dict[str, Any] | None] = [None] * len(texts)
+        misses: list[tuple[int, str, str]] = []  # (original_index, text, prompt_hash)
+
+        for i, text in enumerate(texts):
+            prompt = (
+                f"Classify the financial sentiment of the following news article:\n\n{text}"
+            )
+            prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+            try:
+                cached = await cache_service.get(f"nlp:sentiment:{prompt_hash}")
+                if cached is not None and isinstance(cached, dict):
+                    results[i] = cached
+                    continue
+            except Exception as exc:
+                logger.debug("nlp: SSE batch cache read failed (non-fatal): %s", exc)
+            misses.append((i, text, prompt_hash))
+
+        if misses:
+            batch_results = await NLPEngine._call_batch_llm(
+                [(text, ph) for _, text, ph in misses]
+            )
+            for (orig_idx, _, prompt_hash), result in zip(misses, batch_results):
+                results[orig_idx] = result
+                if result.get("model") != "unavailable":
+                    try:
+                        await cache_service.set(
+                            f"nlp:sentiment:{prompt_hash}",
+                            result,
+                            ttl=_SENTIMENT_CACHE_TTL_SECS,
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "nlp: SSE batch cache write failed (non-fatal): %s", exc
+                        )
+
+        return [r if r is not None else _NEUTRAL_FALLBACK.copy() for r in results]
 
     async def generate_safety_response(self, text: str) -> str:
         """
@@ -365,8 +493,300 @@ class NLPEngine:
             )
             return ""
 
-    # ── spaCy entity extraction (retained for backward compat, non-critical) ───
-
     async def extract_entities(self, text: str) -> dict[str, list[str]]:
         """Stub — entity extraction is no longer used by the primary pipeline."""
         return {"companies": [], "people": [], "locations": []}
+
+    # ── Private implementation ─────────────────────────────────────────────────
+
+    async def _analyze_with_audit_meta(
+        self, text: str
+    ) -> tuple[dict[str, Any], _SentimentAuditMeta]:
+        """
+        Sentiment classification with full audit metadata returned as a value.
+
+        Cache hit  → returns immediately; latency_ms=0, is_cache_hit=True.
+        Cache miss → enqueues the article and suspends until the batch flusher
+                     resolves the future (size trigger or window timeout).
+
+        Latency is measured end-to-end including queue accumulation time —
+        accurate for the audit log's latency_ms column.
+        """
+        from app.core.redis import get_cache_service
+
+        prompt = (
+            f"Classify the financial sentiment of the following news article:\n\n{text}"
+        )
+        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+        cache_key = f"nlp:sentiment:{prompt_hash}"
+
+        # ── L2 cache check ─────────────────────────────────────────────────────
+        try:
+            cached = await get_cache_service().get(cache_key)
+            if cached is not None and isinstance(cached, dict):
+                logger.debug("nlp: sentiment cache hit hash=%.12s", prompt_hash)
+                return cached, _SentimentAuditMeta(
+                    invocation_id=uuid4(),
+                    prompt_hash=prompt_hash,
+                    latency_ms=0,
+                    error=None,
+                    is_cache_hit=True,
+                )
+        except Exception as exc:
+            logger.debug("nlp: sentiment cache read failed (non-fatal): %s", exc)
+
+        # ── Enqueue for batch accumulation ─────────────────────────────────────
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        invocation_id = uuid4()
+
+        NLPEngine._queue.put_nowait(_BatchEntry(
+            prompt_hash=prompt_hash,
+            text=text,
+            future=future,
+        ))
+
+        from app.core.config import get_settings
+        if NLPEngine._queue.qsize() >= get_settings().SENTIMENT_BATCH_SIZE:
+            NLPEngine._flush_trigger.set()
+
+        t0 = time.monotonic()
+        result: dict[str, Any] = await future
+        latency_ms = int((time.monotonic() - t0) * 1000)
+
+        return result, _SentimentAuditMeta(
+            invocation_id=invocation_id,
+            prompt_hash=prompt_hash,
+            latency_ms=latency_ms,
+            error=(
+                None
+                if result.get("model") != "unavailable"
+                else "batch LLM call failed — neutral fallback applied"
+            ),
+            is_cache_hit=False,
+        )
+
+    @classmethod
+    async def _flusher_loop(cls) -> None:
+        """
+        Background task: drain the batch queue on a size trigger or time window.
+
+        Clears the flush trigger BEFORE draining so that items arriving during
+        the drain are captured in the trigger for the next iteration — preventing
+        a delayed-flush race where an item sits unprocessed until the next window
+        timeout (up to SENTIMENT_BATCH_WINDOW_SECS).
+
+        CancelledError propagates naturally out of the wait_for() call and exits
+        the loop cleanly when aclose() cancels this task.
+        """
+        from app.core.config import get_settings
+        settings = get_settings()
+
+        while True:
+            try:
+                await asyncio.wait_for(
+                    cls._flush_trigger.wait(),
+                    timeout=settings.SENTIMENT_BATCH_WINDOW_SECS,
+                )
+            except asyncio.TimeoutError:
+                pass
+            # CancelledError propagates here → exits the while loop cleanly.
+
+            cls._flush_trigger.clear()  # clear BEFORE drain — see docstring
+
+            while not cls._queue.empty():
+                await cls._flush_batch()
+
+    @classmethod
+    async def _flush_batch(cls) -> None:
+        """
+        Pop up to SENTIMENT_BATCH_SIZE articles from the queue and call the LLM.
+
+        Single-item shortcut: a lone article uses the single-item schema
+        (SentimentOutput, which includes the reasoning field) to preserve
+        chain-of-thought quality when there's no batching benefit.
+
+        Multi-item: delegates to _call_batch_llm() which handles validation,
+        gap-filling, and result ordering.  All exceptions are caught; pending
+        futures are always resolved (never left dangling).
+        """
+        from app.ai.intelligence.llm_client import (
+            LLMFallbackExhausted,
+            Priority,
+            get_intelligence_client,
+        )
+        from app.core.config import get_settings
+        from app.core.redis import get_cache_service
+
+        batch_size = get_settings().SENTIMENT_BATCH_SIZE
+
+        # Pop up to batch_size items; skip any whose callers were already cancelled.
+        active: list[_BatchEntry] = []
+        for _ in range(batch_size):
+            try:
+                entry = cls._queue.get_nowait()
+                if not entry.future.cancelled():
+                    active.append(entry)
+            except asyncio.QueueEmpty:
+                break
+
+        if not active:
+            return
+
+        # ── Single-item shortcut ───────────────────────────────────────────────
+        if len(active) == 1:
+            entry = active[0]
+            client = get_intelligence_client()
+            prompt = (
+                f"Classify the financial sentiment of the following news article:\n\n"
+                f"{entry.text}"
+            )
+            result: dict[str, Any] = _NEUTRAL_FALLBACK.copy()
+            try:
+                llm_out = await client.generate_structured(
+                    prompt=prompt,
+                    response_model=SentimentOutput,
+                    system=_SENTIMENT_SYSTEM_PROMPT,
+                    temperature=0.1,
+                    max_tokens=256,
+                    priority=Priority.BACKGROUND,
+                )
+                result = {
+                    "label":      llm_out.label,
+                    "score":      round(float(llm_out.score), 4),
+                    "confidence": round(float(llm_out.confidence), 4),
+                    "model":      client.model_id,
+                }
+                try:
+                    await get_cache_service().set(
+                        f"nlp:sentiment:{entry.prompt_hash}",
+                        result,
+                        ttl=_SENTIMENT_CACHE_TTL_SECS,
+                    )
+                except Exception as cache_exc:
+                    logger.debug(
+                        "nlp: single-item cache write failed (non-fatal): %s", cache_exc
+                    )
+            except LLMFallbackExhausted as exc:
+                logger.error(
+                    "NLPEngine single-item flush: all providers exhausted: %s", exc
+                )
+            except Exception as exc:
+                logger.error(
+                    "NLPEngine single-item flush: unexpected error: %s", exc, exc_info=True
+                )
+
+            if not entry.future.done():
+                entry.future.set_result(result)
+            return
+
+        # ── Multi-item batch call ──────────────────────────────────────────────
+        batch_results = await cls._call_batch_llm(
+            [(e.text, e.prompt_hash) for e in active]
+        )
+
+        cache_service = get_cache_service()
+        for entry, result in zip(active, batch_results):
+            if not entry.future.done():
+                entry.future.set_result(result)
+            if result.get("model") != "unavailable":
+                try:
+                    await cache_service.set(
+                        f"nlp:sentiment:{entry.prompt_hash}",
+                        result,
+                        ttl=_SENTIMENT_CACHE_TTL_SECS,
+                    )
+                except Exception as cache_exc:
+                    logger.debug(
+                        "nlp: batch cache write failed (non-fatal): %s", cache_exc
+                    )
+
+    @classmethod
+    async def _call_batch_llm(
+        cls,
+        items: list[tuple[str, str]],  # (text, prompt_hash)
+    ) -> list[dict[str, Any]]:
+        """
+        Execute one batched Gemini call for multiple articles.
+
+        Builds a numbered multi-article prompt and validates the LLM's response:
+        - Out-of-range indices are discarded with a warning.
+        - Duplicate indices keep the first occurrence.
+        - Missing indices are filled with _NEUTRAL_FALLBACK.
+
+        Returns results in the same order as ``items``.
+        Never raises — all error paths return a full neutral list.
+        """
+        from app.ai.intelligence.llm_client import (
+            LLMFallbackExhausted,
+            Priority,
+            get_intelligence_client,
+        )
+
+        client = get_intelligence_client()
+        n = len(items)
+        neutral_list = [_NEUTRAL_FALLBACK.copy() for _ in items]
+
+        lines = [
+            "Analyze the financial sentiment of each numbered article below.",
+            "Return one result per article in the SAME ORDER as input.",
+            "Set the 'index' field to match the article number (0-based).",
+        ]
+        for i, (text, _) in enumerate(items):
+            lines.append(f"\n[{i}]\n{text}")
+        prompt = "\n".join(lines)
+
+        try:
+            response = await client.generate_structured(
+                prompt=prompt,
+                response_model=_SentimentBatchOutput,
+                system=_SENTIMENT_SYSTEM_PROMPT,
+                temperature=0.1,
+                max_tokens=256 * n,
+                priority=Priority.BACKGROUND,
+            )
+        except LLMFallbackExhausted as exc:
+            logger.error(
+                "NLPEngine batch LLM call failed (all providers exhausted): %s", exc
+            )
+            return neutral_list
+        except Exception as exc:
+            logger.error(
+                "NLPEngine batch LLM call unexpected error: %s", exc, exc_info=True
+            )
+            return neutral_list
+
+        model_tag = client.model_id
+
+        # Validate response: deduplicate indices, reject out-of-range, fill gaps.
+        index_map: dict[int, _SentimentBatchItem] = {}
+        for item in response.results:
+            if item.index < 0 or item.index >= n:
+                logger.warning(
+                    "nlp: batch response out-of-range index %d (batch_size=%d) — discarding",
+                    item.index, n,
+                )
+                continue
+            if item.index in index_map:
+                logger.warning(
+                    "nlp: batch response duplicate index %d — keeping first occurrence",
+                    item.index,
+                )
+                continue
+            index_map[item.index] = item
+
+        results: list[dict[str, Any]] = []
+        for i in range(n):
+            batch_item = index_map.get(i)
+            if batch_item is None:
+                logger.warning("nlp: batch response missing index %d — neutral fallback", i)
+                results.append(_NEUTRAL_FALLBACK.copy())
+            else:
+                results.append({
+                    "label":      batch_item.label,
+                    "score":      round(float(batch_item.score), 4),
+                    "confidence": round(float(batch_item.confidence), 4),
+                    "model":      model_tag,
+                })
+
+        return results

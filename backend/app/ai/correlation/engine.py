@@ -1059,24 +1059,41 @@ class EventCorrelationEngine:
             ml_output=ml_signal,
         )
 
-        # Trigger async LLM explanation generation — fire-and-forget.
-        # The explanation_worker subscribes to this channel and generates the
-        # plain-English explanation independently of the suggestion creation path.
-        # A failure here must never block or roll back the committed suggestion.
+        # Trigger async LLM explanation generation — gated by consensus_score.
+        # Only enqueue when the signal is strong enough to warrant a Gemini call;
+        # weak signals surface a placeholder in the AI panel with a user-driven
+        # refresh button (bypass endpoint, Phase 2-B).  XADD failure is non-fatal:
+        # it must never block or roll back the committed suggestion.
         try:
-            await self.redis.publish(
-                RedisChannels.LLM_EXPLANATION_PENDING,
-                json.dumps({
-                    "suggestion_id": str(suggestion.suggestion_id),
-                    "id":            suggestion.id,
-                }, default=str),
-            )
-            logger.debug(
-                "explanation trigger published for suggestion %s", suggestion.suggestion_id
-            )
+            from app.core.config import get_settings as _get_settings
+            from app.core.redis import RedisStreams
+            _threshold = _get_settings().EXPLANATION_CONSENSUS_THRESHOLD
+            if float(suggestion.consensus_score) >= _threshold:
+                await self.redis.xadd(
+                    RedisStreams.EXPLANATION_JOBS,
+                    {
+                        "suggestion_id":  str(suggestion.suggestion_id),
+                        "id":             str(suggestion.id),
+                        "instrument_key": suggestion.instrument_key,
+                    },
+                    maxlen=5000,
+                    approximate=True,
+                )
+                logger.debug(
+                    "explanation job enqueued: suggestion=%s consensus_score=%.1f",
+                    suggestion.suggestion_id, float(suggestion.consensus_score),
+                )
+            else:
+                logger.info(
+                    "explanation job skipped (weak signal): suggestion=%s "
+                    "consensus_score=%.1f < threshold=%.1f",
+                    suggestion.suggestion_id,
+                    float(suggestion.consensus_score),
+                    _threshold,
+                )
         except Exception as exc:
             logger.warning(
-                "Failed to trigger explanation for suggestion %s (non-fatal): %s",
+                "Failed to enqueue explanation job for suggestion %s (non-fatal): %s",
                 suggestion.suggestion_id, exc,
             )
 

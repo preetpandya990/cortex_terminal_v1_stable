@@ -363,6 +363,83 @@ class RedisChannels:
         return RedisChannels.REGIME_SYMBOL.format(symbol=symbol)
 
 
+# ── Redis Streams ──────────────────────────────────────────────────────────────
+class RedisStreams:
+    """
+    Redis Streams key constants for the durable LLM explanation pipeline.
+
+    Replaces the fire-and-forget pub/sub job channels (LLM_EXPLANATION_PENDING,
+    LLM_CONTEXT_PENDING) with XADD/XREADGROUP consumer groups for at-least-once,
+    crash-safe delivery.  Pub/sub is retained only as a lightweight wakeup signal;
+    all payload data lives in the per-suggestion SSE event stores.
+
+    Key namespaces
+    --------------
+    cortex:stream:*           Durable job streams (consumer groups)
+    cortex:sse:events:*       Per-job SSE event stores (TTL-bound, full payloads)
+    cortex:llm:inflight:*     In-flight dedup keys (TTL=150s, SET NX)
+    """
+
+    # ── Job streams (XREADGROUP consumer groups) ───────────────────────────────
+    EXPLANATION_JOBS = "cortex:stream:explanation:jobs"
+    """Durable explanation job queue. Max stream length ~5 000 (approximate trim)."""
+
+    CONTEXT_JOBS = "cortex:stream:context:jobs"
+    """Durable instrument-context job queue. Max stream length ~1 000."""
+
+    EXPLANATION_DLQ = "cortex:stream:explanation:dlq"
+    """Dead-letter queue for explanation jobs that exhausted MAX_ATTEMPTS."""
+
+    # ── Consumer group ─────────────────────────────────────────────────────────
+    CONSUMER_GROUP = "cortex-explanation-workers"
+    """Shared consumer group name for both explanation and context streams."""
+
+    # ── SSE event stores (per-job, TTL-bound) ──────────────────────────────────
+
+    @staticmethod
+    def sse_explanation_key(suggestion_id: str) -> str:
+        """Stream key for the per-suggestion SSE event store. TTL: 86 400 s (24 h)."""
+        return f"cortex:sse:events:{suggestion_id}"
+
+    @staticmethod
+    def sse_context_key(instrument_key: str) -> str:
+        """Stream key for the per-instrument context event store. TTL: 3 600 s (1 h)."""
+        return f"cortex:sse:events:ctx:{instrument_key}"
+
+    # ── In-flight dedup ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def inflight_key(suggestion_id: str) -> str:
+        """SET NX key that prevents concurrent workers from duplicating an LLM call."""
+        return f"cortex:llm:inflight:{suggestion_id}"
+
+
+async def init_explanation_streams() -> None:
+    """
+    Create consumer groups for the explanation pipeline streams.
+
+    Safe to call multiple times: MKSTREAM creates the stream if it does not yet
+    exist; BUSYGROUP (group already exists) is silently ignored on restart.
+    The cursor ``$`` means workers consume only messages published after startup;
+    the PEL drain in each worker re-delivers any pre-crash unacknowledged entries.
+    """
+    redis = get_redis()
+    for stream in (RedisStreams.EXPLANATION_JOBS, RedisStreams.CONTEXT_JOBS):
+        try:
+            await redis.xgroup_create(
+                stream,
+                RedisStreams.CONSUMER_GROUP,
+                id="$",
+                mkstream=True,
+            )
+            logger.info("Created consumer group %s on stream %s", RedisStreams.CONSUMER_GROUP, stream)
+        except Exception as exc:
+            if "BUSYGROUP" in str(exc):
+                logger.debug("Consumer group already exists on %s — skipping creation", stream)
+            else:
+                logger.warning("Failed to create consumer group for stream %s: %s", stream, exc)
+
+
 # ── Lifecycle ──────────────────────────────────────────────────────────────────
 async def init_redis() -> None:
     """Initialize Redis connection pool."""

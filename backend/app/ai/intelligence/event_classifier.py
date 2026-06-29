@@ -1,11 +1,14 @@
 """
 Event Classifier
 ================
-Classifies financial events using a three-level fallback chain:
+Classifies financial events using a four-level pipeline with aggressive quota shielding:
 
-  1. LLM (NIM primary → Ollama fallback)  — highest accuracy, structured output
-  2. GPT-4o  (reserved for future wiring)
-  3. Rule-based  (final fallback — deterministic, always succeeds)
+  1. Redis cache       — zero-cost; 30-min TTL; keyed by SHA-256 of content[:1500]
+  2. Heuristic filter  — deterministic keyword match; skips Gemini for unambiguous
+                         event types (~90–95% of articles after Q3-2026 expansion)
+  3. Gemini (LOW)      — full structured classification for genuinely ambiguous
+                         articles that fall through to 'general' (~5–10% of volume)
+  4. Rule-based        — deterministic fallback on any Gemini failure (error path only)
 
 Symbol extraction is deliberately decoupled from classification confidence.
 The LLM may correctly identify affected companies even when uncertain about
@@ -30,6 +33,7 @@ Combined decay: 0.7 · 0.5^(t/fast_hl) + 0.3 · 0.5^(t/slow_hl)
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from decimal import Decimal
@@ -41,6 +45,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.fusion.models import AINLPResult, AIEventClassification
 from app.ai.intelligence.llm_client import Priority, get_ollama_client
+from app.core.metrics import event_classification_total
 from app.models.upstox_data import InstrumentMaster
 from app.services.symbol_validator import symbol_validator
 
@@ -66,6 +71,13 @@ _DEFAULT_FAST_HL = 12
 _DEFAULT_SLOW_HL = 48
 
 _VALID_EVENT_TYPES = frozenset(_DECAY_HALF_LIVES.keys())
+
+# LLM classification cache — keyed by SHA-256 of event content[:1500].
+# Events do not change after ingestion; a 30-min TTL eliminates duplicate
+# Gemini calls across worker restarts and pipeline re-runs.
+# Both heuristic (keyword-matched) and Gemini results are cached unconditionally.
+# The error-path fallback (confidence=0.0) is never cached.
+_EVENT_CLASS_CACHE_TTL_SECS: int = 1800
 
 
 def _half_lives_for(event_type: str) -> tuple[int, int]:
@@ -494,18 +506,84 @@ class EventClassifier:
         entities: dict[str, Any],
     ) -> dict[str, Any]:
         """
-        Primary LLM classification using generate_structured (Instructor + Pydantic).
+        Four-path classification pipeline with quota shielding.
 
-        Switching from generate_json to generate_structured eliminates JSON-parse
-        errors as a failure mode: Instructor retries up to 2× on validation
-        failure before raising, so malformed model output no longer silently
-        returns confidence=0.0 and falls through to the rule-based path.
+        1. Redis cache       — zero-cost; returns immediately on hit.
+        2. Heuristic filter  — deterministic keyword match via _detect_event_type();
+                               skips Gemini entirely for ~90–95% of articles.
+                               Result is cached unconditionally at the standard TTL.
+        3. Gemini (LOW)      — live structured call, reserved for articles that fall
+                               through to 'general'.  Result cached unconditionally.
+        4. Error fallback    — confidence=0.0; never cached; triggers the rule-based
+                               path in classify() for any Gemini failure.
+
+        Heuristic confidence is 0.75: above the < 0.7 GPT-4o gate in classify(),
+        honest about weaker symbol extraction vs. a full LLM pass.
         """
         if not self.use_llm or not self.ollama_client:
             return self._classify_rule_based(content, entities)
 
+        # ── 1. Cache check ─────────────────────────────────────────────────────
+        from app.core.redis import get_cache_service
+        content_hash = hashlib.sha256(content[:1500].encode()).hexdigest()
+        cache_key    = f"cortex:event_class:{content_hash}"
         try:
-            companies = (entities.get("companies") or [])[:5]
+            cached = await get_cache_service().get(cache_key)
+            if cached is not None and isinstance(cached, dict):
+                logger.debug(
+                    "event_classifier: cache hit hash=%.12s confidence=%.2f",
+                    content_hash, cached.get("confidence", 0),
+                )
+                event_classification_total.labels(method="cache").inc()
+                return cached
+        except Exception as _cache_exc:
+            logger.debug("event_classifier: cache read failed (non-fatal): %s", _cache_exc)
+
+        # ── 2. Heuristic pre-filter ────────────────────────────────────────────
+        # _detect_event_type returns 'general' only when none of the keyword
+        # groups match.  For all resolved types the classification is reliable
+        # and the Gemini call adds quota cost without proportionate accuracy gain.
+        content_lower = content.lower()
+        event_type    = self._detect_event_type(content_lower)
+
+        if event_type != "general":
+            impact_score        = self._score_impact(event_type, content_lower)
+            sentiment           = self._detect_sentiment(content_lower)
+            fast_hl, slow_hl   = _half_lives_for(event_type)
+
+            result: dict[str, Any] = {
+                "event_type":       event_type,
+                "impact_score":     impact_score,
+                "confidence":       0.75,
+                "affected_symbols": (entities.get("companies") or [])[:3],
+                "sentiment":        sentiment,
+                "reasoning":        (
+                    f"Heuristic: keyword match for {event_type} — Gemini call skipped"
+                ),
+                "decay_hours":      fast_hl,
+                "decay_slow_hours": slow_hl,
+            }
+
+            try:
+                await get_cache_service().set(
+                    cache_key, result, ttl=_EVENT_CLASS_CACHE_TTL_SECS
+                )
+                logger.debug(
+                    "event_classifier: heuristic cached hash=%.12s type=%s ttl=%ds",
+                    content_hash, event_type, _EVENT_CLASS_CACHE_TTL_SECS,
+                )
+            except Exception as _cache_exc:
+                logger.debug(
+                    "event_classifier: heuristic cache write failed (non-fatal): %s",
+                    _cache_exc,
+                )
+
+            event_classification_total.labels(method="heuristic").inc()
+            return result
+
+        # ── 3. Gemini call (LOW priority — genuinely ambiguous articles only) ──
+        try:
+            companies   = (entities.get("companies") or [])[:5]
             entity_hint = (
                 f"\nExtracted entities — companies: {companies}"
                 if companies else ""
@@ -535,10 +613,10 @@ class EventClassifier:
                     "names. If you are not certain of a symbol, omit it rather than guessing."
                 ),
                 temperature=0.1,
-                priority=Priority.MEDIUM,
+                priority=Priority.LOW,
             )
 
-            return {
+            result = {
                 "event_type":       schema.event_type,
                 "impact_score":     schema.impact_score,
                 "confidence":       schema.confidence,
@@ -548,8 +626,29 @@ class EventClassifier:
                 "decay_slow_hours": schema.decay_slow_hours,
             }
 
+            # Cache all successful Gemini results unconditionally (uniform 1800s TTL).
+            # Content does not change after ingestion — a re-call within the window
+            # is overwhelmingly likely to produce the same result regardless of confidence.
+            try:
+                await get_cache_service().set(
+                    cache_key, result, ttl=_EVENT_CLASS_CACHE_TTL_SECS
+                )
+                logger.debug(
+                    "event_classifier: Gemini cached hash=%.12s confidence=%.2f ttl=%ds",
+                    content_hash, schema.confidence, _EVENT_CLASS_CACHE_TTL_SECS,
+                )
+            except Exception as _cache_exc:
+                logger.debug(
+                    "event_classifier: Gemini cache write failed (non-fatal): %s",
+                    _cache_exc,
+                )
+
+            event_classification_total.labels(method="llm").inc()
+            return result
+
         except Exception as exc:
             logger.warning("LLM classification failed: %s — falling back to rule-based", exc)
+            event_classification_total.labels(method="rule_based_fallback").inc()
             return {
                 "confidence":       0.0,
                 "event_type":       "general",
@@ -621,8 +720,26 @@ class EventClassifier:
             "merger", "acquisition", "takeover", "buyout", "demerger",
         )):
             return "merger_acquisition"
+        # IPO / capital-market issuances (company-specific; checked before
+        # generic regulatory to avoid misclassifying listing events as SEBI news)
+        if any(w in content_lower for w in (
+            "ipo", "fpo", "initial public offering", "follow-on offering",
+            "subscri", "allotment", "listing gains", "grey market premium",
+        )):
+            return "company_news"
+        # Corporate actions: dividends, buybacks, bonus issues, board decisions
+        if any(w in content_lower for w in (
+            "dividend", "buyback", "buy-back", "bonus share", "bonus issue",
+            "agm", "egm", "board meeting", "board approved", "board declared",
+        )):
+            return "company_news"
         if any(w in content_lower for w in (
             "sebi", "regulatory", "compliance", "investigation", "penalty", "sec",
+            # Credit-rating agencies and rating-action events (SEBI-adjacent oversight)
+            "credit rating", "rating downgrade", "rating upgrade",
+            "crisil", "icra", "care ratings", "fitch", "moody",
+            # Insider-trading and significant stake-change disclosures
+            "insider trading", "bulk deal", "block deal", "promoter pledge",
         )):
             return "regulatory"
         if any(w in content_lower for w in (

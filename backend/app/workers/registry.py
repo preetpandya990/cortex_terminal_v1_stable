@@ -2,7 +2,7 @@
 Cortex AI — Worker Task Registry
 =================================
 
-Single source of truth for all 14 background tasks that run inside the worker
+Single source of truth for all 16 background tasks that run inside the worker
 sidecar.  Each entry is a zero-argument factory (a closure) so that:
 
   - The supervisor can call factory() to obtain a *fresh* coroutine on restart
@@ -12,24 +12,32 @@ sidecar.  Each entry is a zero-argument factory (a closure) so that:
 
 Task inventory
 ──────────────
-  Native (4)  — defined in worker.py; receive PauseToken + TriggerToken so the
-                control plane can pause, resume, and trigger them remotely:
-    heartbeat          Writes worker:heartbeat to Redis every 30s (liveness).
-    cache_invalidation  Pub/sub listener; invalidates suggestion list caches.
-    suggestion_expiry  Batch-marks expired TradeSuggestions every 60s.
-    correlation_engine  Bidirectional scanner→AI + news→AI consensus engine.
+  Native (6)  — receive PauseToken + TriggerToken so the control plane can
+                pause, resume, and trigger them remotely:
+    heartbeat              Writes worker:heartbeat to Redis every 30s (liveness).
+    cache_invalidation     Pub/sub listener; invalidates suggestion list caches.
+    suggestion_expiry      Batch-marks expired TradeSuggestions every 60s.
+    correlation_engine     Bidirectional scanner→AI + news→AI consensus engine.
+    fundamentals_refresh   Six-sub-loop fundamentals scheduler (see below).
+    watchlist_scheduler    Pre-warms AI context for watchlist instruments 4×/day.
 
-  Imported (10) — respond to CancelledError only; pause/trigger is Phase 2:
+  Imported (10) — respond to CancelledError only:
     rss_ingestion       RSS news feed ingestion.
     event_processing    ML event classification pipeline.
     regime_detection    Post-market regime labelling.
     drift_detection     Model drift monitoring.
     safety_monitoring   Portfolio risk safety checks.
     data_ingestion      OHLCV historical / live gap-fill.
-    fundamentals_refresh  Key-ratios / corp-actions nightly scheduler.
     feature_refresh     Daily ML feature store refresh at 16:00 IST.
+    rag_cleanup         Daily TTL eviction of stale RAG embeddings (>7 days).
     pnl_worker          Paper trading P&L recompute (migrated from main.py).
     sl_tp_worker        Strategy SL/TP FSM monitor (migrated from main.py).
+
+  fundamentals_refresh control-plane semantics:
+    pause   — all six sub-loops block at their next checkpoint() call.
+    trigger — all six sub-loops wake from their current sleep; each evaluates
+              its own guard conditions and runs only if its schedule is due.
+    restart — CancelledError cancels all sub-tasks; supervisor restarts.
 
 Usage:
     from app.workers.registry import build_task_registry, TASK_NAMES
@@ -68,9 +76,12 @@ TASK_NAMES: tuple[str, ...] = (
     "data_ingestion",
     "fundamentals_refresh",
     "feature_refresh",
+    "rag_cleanup",
     # ── Migrated from main.py ────────────────────────────────────────────────
     "pnl_worker",
     "sl_tp_worker",
+    # ── Watchlist pre-warmer (pause/trigger-aware) ────────────────────────────
+    "watchlist_scheduler",
 )
 
 
@@ -103,6 +114,7 @@ def build_task_registry(
     """
     # Lazy imports keep module-level import time fast and avoid circular deps.
     from app.ai.ingestion.rss_fetcher import rss_ingestion_loop
+    from app.workers.rag_cleanup import rag_cleanup_loop
     from app.ai.intelligence.event_processor import event_processing_loop
     from app.ai.safety.safety_trigger_engine import safety_monitoring_loop
     from app.ai.strategy.regime_detector import regime_detection_loop
@@ -119,20 +131,33 @@ def build_task_registry(
         heartbeat_loop,
     )
 
-    # FundamentalsRefreshScheduler holds a reference to the shutdown event so
-    # it can respect it during its internal sleep cycles.  Instantiated once;
-    # the factory calls .run() to obtain a fresh coroutine each time.
+    def _state(name: str) -> TaskState:
+        return task_states[name]
+
+    # FundamentalsRefreshScheduler is instantiated once; the factory calls
+    # .run() to get a fresh coroutine on each supervisor restart so stale
+    # sessions / connections are never reused.  PauseToken and TriggerToken
+    # are wired from TaskState so the control plane can pause, resume, and
+    # trigger all six sub-loops via the standard /tasks/{name}/* endpoints.
     fundamentals_scheduler = FundamentalsRefreshScheduler(
         session_factory=session_factory,
         redis=redis_client,
         shutdown=shutdown,
+        pause=_state("fundamentals_refresh").pause_token,
+        trigger=_state("fundamentals_refresh").trigger_token,
     )
 
-    def _state(name: str) -> TaskState:
-        return task_states[name]
+    from app.workers.watchlist_context_scheduler import WatchlistContextScheduler
+    watchlist_scheduler_instance = WatchlistContextScheduler(
+        session_factory=session_factory,
+        redis=redis_client._redis,
+        shutdown=shutdown,
+        pause=_state("watchlist_scheduler").pause_token,
+        trigger=_state("watchlist_scheduler").trigger_token,
+    )
 
     registry: dict[str, Callable[[], Coroutine]] = {
-        # ── Native loops — pause/trigger tokens injected from TaskState ───────
+        # ── Native loops — pause/trigger tokens injected from TaskState ──────
         "heartbeat": lambda: heartbeat_loop(
             pause=_state("heartbeat").pause_token,
             trigger=_state("heartbeat").trigger_token,
@@ -160,6 +185,8 @@ def build_task_registry(
             trigger=_state("correlation_engine").trigger_token,
             shutdown=shutdown,
         ),
+        # ── Fundamentals — pause/trigger-aware via FundamentalsRefreshScheduler
+        "fundamentals_refresh": lambda: fundamentals_scheduler.run(),
         # ── Imported loops — respond to CancelledError from the supervisor ────
         "rss_ingestion": lambda: rss_ingestion_loop(session_factory),
         "event_processing": lambda: event_processing_loop(
@@ -171,13 +198,19 @@ def build_task_registry(
         "drift_detection": lambda: drift_detection_loop(session_factory),
         "safety_monitoring": lambda: safety_monitoring_loop(session_factory, redis_client._redis),
         "data_ingestion": lambda: data_ingestion_loop(session_factory, upstox_client),
-        "fundamentals_refresh": lambda: fundamentals_scheduler.run(),
         "feature_refresh": lambda: feature_refresh_loop(shutdown=shutdown),
+        "rag_cleanup": lambda: rag_cleanup_loop(
+            session_factory=session_factory,
+            redis=redis_client,
+            shutdown=shutdown,
+        ),
         # ── Migrated from main.py ─────────────────────────────────────────────
         # pnl_worker uses WorkerSessionLocal internally — correct pool.
         # sl_tp_worker was updated to use WorkerSessionLocal (was AsyncSessionLocal).
         "pnl_worker": lambda: run_pnl_worker(redis_client._redis),
         "sl_tp_worker": lambda: run_sl_tp_worker(redis_client._redis),
+        # ── Watchlist pre-warmer — pause/trigger-aware via WatchlistContextScheduler
+        "watchlist_scheduler": lambda: watchlist_scheduler_instance.run(),
     }
 
     if set(registry.keys()) != set(TASK_NAMES):

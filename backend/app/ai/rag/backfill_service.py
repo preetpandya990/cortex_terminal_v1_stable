@@ -42,7 +42,14 @@ from sqlalchemy import func, select
 
 from app.ai.fusion.models import AIDocumentEmbedding, AIRawEvent
 from app.ai.intelligence.llm_client import LLMFallbackExhausted
-from app.ai.rag.ingester import _SOURCE_TABLE, _fetch_unembedded_events, ingest_batch
+from app.ai.rag.ingester import (
+    _SOURCE_TABLE,
+    _build_embed_rows,
+    _dedup_events,
+    _fetch_unembedded_events,
+    _insert_embed_rows,
+    ingest_batch,
+)
 from app.core.config import get_settings
 from app.core.database import AsyncSessionLocal
 
@@ -315,6 +322,152 @@ class RagBackfillService:
                 delay = min(delay * 2, 30.0)
         return 0
 
+    # ── Batch-API run ─────────────────────────────────────────────────────────
+    async def run_batch(self) -> BackfillProgress:
+        """
+        Corpus embedding via the Gemini Batch API (paid tier, 50% cost saving).
+
+        Fetches unembedded events in chunks of ``RAG_BATCH_JOB_SIZE``, submits
+        each chunk as an async Gemini batch embedding job, polls for completion
+        (30–90 min typical per job), then inserts the results.
+
+        Compared with ``run()``:
+        - **Cost**: 50% cheaper ($0.075 vs $0.15 per 1M tokens).
+        - **Latency**: Results arrive in 30–90 min (not seconds).
+        - **Rate limits**: No per-minute cap; the Batch API processes the entire
+          job server-side at Google's pace.
+
+        Use for overnight corpus rebuilds or large-scale re-embeds.  Use ``run()``
+        for near-real-time corpus freshness.
+
+        Requires a billing-enabled Gemini API key — free tier does not support
+        the Batch API (``google-genai >= 2.8``, experimental surface).
+        """
+        from app.ai.rag.embedder import embed_texts_batch
+        from app.core.metrics import (
+            rag_backfill_remaining,
+            rag_backfill_running,
+            rag_documents_embedded_total,
+        )
+
+        # Single-runner lock (shared with synchronous backfill — cannot run both
+        # at the same time; the lock key is the same so they mutually exclude).
+        got = await self._redis.set(_LOCK_KEY, "1", nx=True, ex=_LOCK_TTL_SECS)
+        if not got:
+            existing = await self.read_status(self._redis) or {}
+            raise RuntimeError(
+                f"A RAG backfill is already running (state={existing.get('state')}). "
+                "Use the status command to monitor it."
+            )
+        await self._redis.delete(_CANCEL_KEY)
+
+        s = get_settings()
+        batch_job_size = s.RAG_BATCH_JOB_SIZE
+        poll_interval = float(s.RAG_BATCH_POLL_INTERVAL_SECS)
+        timeout = float(s.RAG_BATCH_JOB_TIMEOUT_SECS)
+
+        p = BackfillProgress(
+            state="running",
+            rpm_limit=0,  # not applicable for Batch API mode
+            window_days=self._window_days,
+            started_at=datetime.now(timezone.utc).isoformat(),
+        )
+        t0 = monotonic()
+        rag_backfill_running.set(1)
+
+        try:
+            p.total = await self._count_remaining()
+            await self._publish(p)
+            logger.info(
+                "rag.batch_backfill start: total=%d job_size=%d window_days=%d "
+                "poll_interval=%.0fs timeout=%.0fs",
+                p.total, batch_job_size, self._window_days, poll_interval, timeout,
+            )
+
+            while True:
+                if await self._cancelled():
+                    p.state = "cancelled"
+                    break
+
+                async with AsyncSessionLocal() as db:
+                    events = await _fetch_unembedded_events(
+                        db, self._cutoff, limit=batch_job_size
+                    )
+                if not events:
+                    p.state = "completed"
+                    break
+
+                deduped = _dedup_events(events)
+                texts = [row.raw_content for row in deduped]
+
+                await self._refresh_lock()
+                await self._publish(p)
+                logger.info(
+                    "rag.batch_backfill: submitting batch job texts=%d (raw=%d deduped=%d)",
+                    len(texts), len(events), len(events) - len(deduped),
+                )
+
+                try:
+                    vectors = await embed_texts_batch(
+                        texts,
+                        input_type="passage",
+                        poll_interval_secs=poll_interval,
+                        timeout_secs=timeout,
+                    )
+                except (LLMFallbackExhausted, RuntimeError, asyncio.TimeoutError) as exc:
+                    p.errors += 1
+                    p.last_error = f"{type(exc).__name__}: {exc}"
+                    p.state = "failed"
+                    logger.error(
+                        "rag.batch_backfill: batch job failed — %s",
+                        exc,
+                        exc_info=True,
+                    )
+                    break
+
+                async with AsyncSessionLocal() as db:
+                    rows = _build_embed_rows(deduped, vectors)
+                    inserted = await _insert_embed_rows(db, rows)
+
+                skipped = len(rows) - inserted
+                p.embedded += inserted
+                p.skipped += skipped
+                p.processed = p.embedded + p.skipped
+                elapsed = max(monotonic() - t0, 1e-6)
+                p.rate_per_min = round(p.processed / elapsed * 60.0, 1)
+                remaining = max(p.total - p.processed, 0)
+                p.pct = round(p.processed / p.total * 100.0, 1) if p.total else 100.0
+                p.eta_seconds = (
+                    int(remaining / (p.rate_per_min / 60.0))
+                    if p.rate_per_min > 0 else None
+                )
+                rag_documents_embedded_total.inc(inserted)
+                rag_backfill_remaining.set(remaining)
+                await self._publish(p)
+                await self._refresh_lock()
+
+        except asyncio.CancelledError:
+            p.state = "cancelled"
+            raise
+        except Exception as exc:
+            p.state = "failed"
+            p.last_error = f"{type(exc).__name__}: {exc}"
+            logger.error("rag.batch_backfill failed: %s", exc, exc_info=True)
+        finally:
+            p.finished_at = datetime.now(timezone.utc).isoformat()
+            await self._publish(p)
+            rag_backfill_running.set(0)
+            try:
+                await self._redis.delete(_LOCK_KEY)
+            except Exception:
+                pass
+
+        logger.info(
+            "rag.batch_backfill end: state=%s embedded=%d skipped=%d errors=%d",
+            p.state, p.embedded, p.skipped, p.errors,
+        )
+        return p
+
 
 # ── Lifespan background worker ───────────────────────────────────────────────────
 
@@ -339,19 +492,25 @@ async def run_rag_refresh_worker(redis: Any) -> None:
     settings = get_settings()
     interval_secs = settings.RAG_REFRESH_INTERVAL_HOURS * 3600
 
+    use_batch = settings.RAG_BATCH_EMBED_ENABLED
     logger.info(
-        "rag.refresh_worker: started (interval=%dh window=%dd rpm=%d sub_batch=%d)",
+        "rag.refresh_worker: started (interval=%dh window=%dd rpm=%d sub_batch=%d "
+        "batch_api=%s)",
         settings.RAG_REFRESH_INTERVAL_HOURS,
         settings.RAG_BACKFILL_WINDOW_DAYS,
         settings.RAG_BACKFILL_RPM,
         settings.RAG_BACKFILL_SUB_BATCH,
+        use_batch,
     )
 
     while True:
         try:
-            progress = await RagBackfillService(redis).run()
+            svc = RagBackfillService(redis)
+            progress = await (svc.run_batch() if use_batch else svc.run())
             logger.info(
-                "rag.refresh_worker: cycle complete — state=%s embedded=%d skipped=%d errors=%d",
+                "rag.refresh_worker: cycle complete — mode=%s state=%s "
+                "embedded=%d skipped=%d errors=%d",
+                "batch" if use_batch else "sync",
                 progress.state,
                 progress.embedded,
                 progress.skipped,

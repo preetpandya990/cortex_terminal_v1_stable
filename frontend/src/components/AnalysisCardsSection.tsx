@@ -264,33 +264,95 @@ export function AnalysisCardsSection({
     refetchInterval: sseConnected ? false : 120_000,
   });
 
+  // Explanation REST fallback — the fourth query.
+  //
+  // Fires immediately on mount (enabled: canQuery, not gated on !sseConnected) so
+  // the React Query cache is populated before SSE might fail — the cached result
+  // is then instantly available on modal reopen without a network request.
+  //
+  // staleTime matches the backend AIInstrumentContext TTL (2 h): explanation text
+  // is stable within that window, so background refetches on window focus or
+  // remount are suppressed while data is fresh.
+  //
+  // refetchInterval at 5 min (SSE-down only): a REST poll at 30 s would be
+  // 120 requests/hour per tab per instrument. 5 min is aggressive enough to catch
+  // a completed explanation (workers finish in 15–30 s) without excess load.
+  const explanationQuery = useQuery({
+    queryKey: ['ai-explanation', instrumentKey, symbol],
+    queryFn: async () => {
+      const res = await api.get('/ai/explanation', {
+        params: {
+          instrument_key: instrumentKey,
+          ...(symbol ? { symbol } : {}),
+        },
+      });
+      return res.data as ExplanationData;
+    },
+    enabled: canQuery,
+    staleTime:                  2 * 60 * 60 * 1000,   // 2 hours — matches backend cache TTL
+    refetchInterval:            sseConnected ? false : 5 * 60 * 1000,
+    refetchIntervalInBackground: false,
+  });
+
+  // ── On-demand explanation bypass ───────────────────────────────────────────
+  // A ref captures the latest explanationData so the callback is stable across
+  // renders (deps=[accessToken] only), which keeps AIExplanationPanel's memo
+  // effective when prediction/sentiment SSE ticks arrive but explanation hasn't changed.
+  const explanationDataRef = useRef<ExplanationData | null>(null);
+
+  const handleRequestExplanation = useCallback(async () => {
+    const exp = explanationDataRef.current;
+    if (!exp?.suggestion_id || !accessToken) return;
+    await api.post(
+      `/ai/explanation/${exp.suggestion_id}/request`,
+      null,
+      { params: { token: accessToken } },
+    );
+  }, [accessToken]);
+
   if (!instrumentKey) return null;
 
   // SSE data takes priority; React Query fills in until SSE fires
   const predictionData  = ssePrediction  ?? predictionQuery.data  ?? null;
   const patternData     = ssePattern     ?? patternQuery.data     ?? null;
   const sentimentData   = sseSentiment   ?? sentimentQuery.data   ?? null;
-  // Priority logic for explanation data:
-  //   1. SSE with available:true  → authoritative (carries structured source citations)
-  //   2. REST seed with available:true → use immediately (push notification may have been
-  //      missed if explanation was pre-generated before SSE watcher subscribed)
-  //   3. Either side with available:false → skeleton (explanation genuinely pending)
-  //   4. Both null → hide panel (no active suggestion)
+  // Explanation merge priority — five tiers, evaluated in order:
   //
-  // The naive `sseExplanation ?? suggestionExplanation` breaks because SSE can fire
-  // a transient { available: false } payload (first poll hits DB before commit, or
-  // returns a newer explanation-less suggestion for the same instrument_key). That
+  //   1. SSE with available:true  → authoritative; carries structured RAG source
+  //      citations from the push path that are not stored in DB or returned by REST.
+  //
+  //   2. REST suggestion seed with available:true → use immediately; this covers
+  //      explanations pre-generated before the SSE watcher subscribed (push missed).
+  //
+  //   3. REST fallback query with available:true → activates when SSE proxy is
+  //      unavailable or degraded; populated within ~200 ms of component mount.
+  //
+  //   4. SSE streaming partial → available:false but full_explanation has token
+  //      text flowing in; beat the static skeleton so the panel renders progressively.
+  //
+  //   5. Final fallback → any non-null value, including REST available:false skeleton,
+  //      so the panel shows "Generating…" rather than being hidden entirely.
+  //      REST fallback data is included so the generating state from the first REST
+  //      call is surfaced while SSE is still connecting.
+  //
+  // Rationale for NOT using `sseExplanation ?? suggestionExplanation`: SSE fires a
+  // transient { available: false } on its first poll before the DB commit lands, or
+  // when a newer explanation-less suggestion exists for the same instrument_key. That
   // truthy-but-unavailable object wins ?? and permanently blocks the REST seed.
   const explanationData: ExplanationData | null = (() => {
-    if (sseExplanation?.available) return sseExplanation;
+    if (sseExplanation?.available)        return sseExplanation;
     if (suggestionExplanation?.available) return suggestionExplanation;
-    // A streaming partial from SSE (available:false but with text flowing in)
-    // beats the skeleton seed so the panel renders progressively.
+    if (explanationQuery.data?.available) return explanationQuery.data;
+    // SSE streaming partial — render progressively while tokens flow in.
     if (sseExplanation && !sseExplanation.available && sseExplanation.full_explanation) {
       return sseExplanation;
     }
-    return sseExplanation ?? suggestionExplanation ?? null;
+    return sseExplanation ?? explanationQuery.data ?? suggestionExplanation ?? null;
   })();
+
+  // Keep the ref current so handleRequestExplanation always reads the latest
+  // suggestion_id without the callback needing to re-create on every render.
+  explanationDataRef.current = explanationData;
 
   const isPredictionLoading  = sseLoading && !predictionData  && predictionQuery.isLoading;
   const isPatternLoading     = sseLoading && !patternData     && patternQuery.isLoading;
@@ -335,6 +397,11 @@ export function AnalysisCardsSection({
       <AIExplanationPanel
         data={explanationData}
         isLoading={isExplanationLoading}
+        onRequestExplanation={
+          explanationData?.weak_signal && explanationData.suggestion_id
+            ? handleRequestExplanation
+            : undefined
+        }
       />
     </div>
   );

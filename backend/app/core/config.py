@@ -136,9 +136,24 @@ class Settings(BaseSettings):
     # fake-news detection, and RAG embeddings.  Obtain a key from Google AI
     # Studio (https://aistudio.google.com/apikey) and set GEMINI_API_KEY in .env.
     #
+    # Multi-key load balancing (paid tier only): set GEMINI_API_KEYS to a JSON
+    # array of additional keys, each from a separate GCP project with its own
+    # independent quota pool.  The client round-robins across all keys; exhausted
+    # keys are circuit-broken per-key and removed from rotation until manually
+    # re-enabled via Redis (DEL cortex:gemini:circuit:<op>:<last8>).
+    #
     # The NIM / Groq / Ollama settings above/below are legacy and no longer wired
     # into the client; they are retained only for reference and rollback.
     GEMINI_API_KEY: str | None = None
+    GEMINI_API_KEYS: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Additional Gemini API keys for multi-key load balancing (paid tier only). "
+            "Parsed as a JSON array: '[\"AIzaSy...key2...\", \"AIzaSy...key3...\"]'. "
+            "Combined with GEMINI_API_KEY to form the key pool. "
+            "Each key must belong to a separate GCP project for independent quota."
+        ),
+    )
     # gemini-2.5-flash: stable, low-latency, best price-performance for the
     # high-volume reliability-critical paths (the forecaster gates suggestions).
     # gemini-3.5-flash was capacity-constrained (503) at cutover; revisit when its
@@ -152,8 +167,10 @@ class Settings(BaseSettings):
     # Embeddings — gemini-embedding-001.  output_dimensionality pins the pgvector
     # column dimension (see ai_document_embeddings).  Vectors below 3072 are
     # L2-normalized by the embedder.  Recommended values: 768, 1536, 3072.
+    # Default is 768 (halfvec storage, migration 0048).  Changing this requires
+    # a new migration + full corpus re-embed via scripts/reembed_rag_corpus.py.
     GEMINI_EMBED_MODEL: str = "gemini-embedding-001"
-    GEMINI_EMBED_DIM: int = Field(1536, ge=128, le=3072)
+    GEMINI_EMBED_DIM: int = Field(768, ge=128, le=3072)
 
     # ── Gemini Request Manager — quota budgets and queue tuning ───────────────
     # These values must match your API key's tier.  Upgrading tiers is a single
@@ -186,12 +203,66 @@ class Settings(BaseSettings):
             "backpressure prevents unbounded memory growth under sustained overload."
         ),
     )
+    # Buffer (minutes) added to midnight Pacific Time before re-enabling exhausted keys.
+    # Gemini's RPD counter resets at midnight PT but occasionally lags by up to
+    # 15 minutes in practice (community-reported; Google does not publish an SLA).
+    # At the reset point the watcher task automatically clears all open circuits
+    # and restores every exhausted key to active rotation — no operator action or
+    # app restart required.  Raise above 15 only if your keys are regularly
+    # re-exhausted within the first few minutes of a new quota day.
+    GEMINI_QUOTA_RESET_BUFFER_MINUTES: int = Field(
+        15, ge=1, le=60,
+        description=(
+            "Minutes after midnight Pacific Time before auto-resetting exhausted "
+            "Gemini key circuits.  Absorbs the observed 0–15 min reset lag. "
+            "Default 15 min is the safe community-validated choice."
+        ),
+    )
+
     GEMINI_PERMIT_TIMEOUT: float = Field(
-        30.0, ge=5.0, le=120.0,
+        60.0, ge=5.0, le=120.0,
         description=(
             "Maximum seconds a caller blocks waiting for a Gemini API permit. "
             "On timeout the caller receives GeminiRateLimitError and should degrade "
-            "gracefully.  Must be less than LLM_REQUEST_TIMEOUT."
+            "gracefully.  Must be less than LLM_REQUEST_TIMEOUT. "
+            "60s gives the explanation worker (120s ceiling) room to absorb queue "
+            "pressure without burning a retry attempt."
+        ),
+    )
+
+    # ── Budget Guard ───────────────────────────────────────────────────────────
+    # Soft daily-budget layer below the hard circuit breaker.  When estimated
+    # remaining quota falls within the HIGH-priority reservation, MEDIUM / LOW /
+    # BACKGROUND callers are throttled immediately so that explanations and
+    # other HIGH+ calls always have headroom — even after a heavy background
+    # sentiment / forecaster burst consumes the bulk of the daily allowance.
+    #
+    # GEMINI_GENERATE_RPD: set to the RPD limit on your Google AI Studio quota
+    # page (per-key value; pool total = this × active key count):
+    #   Free tier  (gemini-2.5-flash) : 1 500 RPD/key
+    #   Tier 1                        : check your quota dashboard
+    #
+    # GEMINI_HIGH_PRIORITY_RPD_RESERVE: the minimum headroom kept for HIGH+
+    # callers.  200 covers a worst-case trading day of 200 explanation calls;
+    # raise it if you expect higher suggestion throughput.
+    GEMINI_GENERATE_RPD: int = Field(
+        1_500, ge=100, le=100_000,
+        description=(
+            "Daily Gemini generate quota per API key (requests per day). "
+            "Pool total = this × key_count.  Used by the budget guard to "
+            "estimate remaining headroom; does not affect the hard circuit "
+            "breaker, which is still triggered by actual 429 responses.  Set "
+            "to the value shown on your Google AI Studio quota dashboard."
+        ),
+    )
+    GEMINI_HIGH_PRIORITY_RPD_RESERVE: int = Field(
+        200, ge=10, le=5_000,
+        description=(
+            "Daily generate requests reserved exclusively for HIGH and CRITICAL "
+            "priority callers (trade-suggestion explanations, instrument context). "
+            "When estimated remaining budget falls below this threshold, MEDIUM / "
+            "LOW / BACKGROUND callers receive GeminiBudgetThrottled and degrade "
+            "gracefully.  HIGH+ callers are never throttled by the budget guard."
         ),
     )
 
@@ -207,12 +278,109 @@ class Settings(BaseSettings):
     # because the forecaster reasons over the ML's indicators).  Lifted from the
     # legacy 5s so a legitimate ML+forecast is never rejected as a timeout.
     CONSENSUS_GATHER_TIMEOUT: float = Field(6.0, ge=3.0, le=15.0)
+
+    # ── Explanation Confidence Gate ────────────────────────────────────────────
+    # Minimum consensus_score (0–100) required before the correlation engine
+    # enqueues an LLM explanation job.  consensus_score is a deterministic
+    # composite: scanner×0.30 + AI×0.40 + ML×0.30.  Live-data max ≈ 89.7;
+    # 75.0 gates the 60–74 band (~56% of current signals).  Signals below the
+    # threshold surface a "weak signal" placeholder with a user-driven refresh
+    # button that fires an on-demand explanation at Priority.HIGH.
+    # Raise toward 80 via .env as model scores normalise over time.
+    EXPLANATION_CONSENSUS_THRESHOLD: float = Field(
+        75.0,
+        ge=50.0,
+        le=95.0,
+        description=(
+            "Minimum consensus_score for automatic LLM explanation generation. "
+            "Signals below this threshold render a weak-signal placeholder in the "
+            "AI panel with a user-driven refresh button that triggers an on-demand "
+            "explanation at Priority.HIGH."
+        ),
+    )
+
+    # ── Watchlist Context Scheduler ────────────────────────────────────────────
+    # Pre-warms AI market context for all watchlist instruments on a fixed
+    # intraday schedule.  Fires 4× per NSE trading day; only instruments whose
+    # context expires within WATCHLIST_SCHEDULER_FRESHNESS_MARGIN_MINUTES are
+    # re-enqueued, preventing redundant Gemini calls for recently generated context.
+    WATCHLIST_SCHEDULER_RUN_TIMES_IST: list[str] = Field(
+        default=["09:30", "11:00", "13:00", "14:30"],
+        description=(
+            "IST wall-clock times (HH:MM) at which the watchlist context scheduler "
+            "runs.  Must be within NSE market hours.  Provide as a JSON array in "
+            ".env: '[\"09:30\", \"11:00\", \"13:00\", \"14:30\"]'."
+        ),
+    )
+    WATCHLIST_SCHEDULER_FRESHNESS_MARGIN_MINUTES: int = Field(
+        80,
+        ge=10,
+        le=180,
+        description=(
+            "Re-enqueue an instrument's context only when it expires within this "
+            "many minutes.  80 min aligns with the ~90-min gap between scheduled "
+            "runs, ensuring every instrument is fresh at each firing without "
+            "redundant Gemini calls for recently generated context."
+        ),
+    )
+    WATCHLIST_SCHEDULER_BATCH_CAP: int = Field(
+        200,
+        ge=10,
+        le=500,
+        description=(
+            "Maximum unique instruments enqueued per scheduler run.  Instruments "
+            "beyond the cap are deferred to the next run.  200 comfortably fits "
+            "within a single batch window at default Gemini Tier-1 quotas."
+        ),
+    )
+
     # Per-symbol forecast cache; busted when the news/event set changes.
-    NEWS_FORECAST_CACHE_TTL: int = Field(30, ge=5, le=300)
+    # 300s (5 min): at 100 symbols, 30s meant ~200 RPM from the forecaster alone.
+    # 5-minute TTL cuts forecast calls by ~80% with negligible freshness impact.
+    NEWS_FORECAST_CACHE_TTL: int = Field(300, ge=5, le=3600)
     # Circuit breaker: after N consecutive Gemini failures, short-circuit to the
     # NLP fallback for COOLDOWN seconds instead of paying the timeout every call.
     NEWS_FORECAST_BREAKER_THRESHOLD: int = Field(4, ge=1, le=20)
     NEWS_FORECAST_BREAKER_COOLDOWN: float = Field(60.0, ge=5.0, le=600.0)
+
+    # ── Sentiment Batch Accumulator ────────────────────────────────────────────
+    # The NLP engine accumulates incoming articles in a queue and fires one
+    # Gemini call per batch instead of one call per article.  At batch size 15
+    # this reduces steady-state sentiment calls by ~93%.
+    #
+    # SENTIMENT_BATCH_SIZE: articles per batched call.  Research on LLM batch
+    #   classification reliability (arxiv:2506.04574, 2025) places the safe
+    #   ceiling at 10–15 items.  15 is the production default — at the upper
+    #   end of the validated range, cutting event-pipeline Gemini calls by ~47%
+    #   vs the prior default of 8.  A lone article in the queue uses the
+    #   single-item schema path (no batch prompt overhead) regardless.
+    #
+    # SENTIMENT_BATCH_WINDOW_SECS: maximum wait before flushing an incomplete
+    #   batch.  60 s reduces flush frequency during low-traffic windows while
+    #   remaining well within the 900 s service-level L2 cache window.  The SSE
+    #   path bypasses the queue entirely via analyze_sentiment_batch().
+    SENTIMENT_BATCH_SIZE: int = Field(
+        15,
+        ge=1,
+        le=20,
+        description=(
+            "Maximum articles per batched Gemini sentiment call. "
+            "Research (arxiv:2506.04574, 2025) validates up to 10–15 items; "
+            "15 is the production default. A lone queued article bypasses the "
+            "batch prompt path entirely."
+        ),
+    )
+    SENTIMENT_BATCH_WINDOW_SECS: float = Field(
+        60.0,
+        ge=1.0,
+        le=120.0,
+        description=(
+            "Maximum seconds the batch accumulator waits before flushing an "
+            "incomplete batch. 60 s reduces flush frequency during low-traffic "
+            "windows while remaining well inside the 900 s service L2 TTL. "
+            "The SSE path bypasses the queue via analyze_sentiment_batch()."
+        ),
+    )
 
     # ── Live data freshness guard ─────────────────────────────────────────────
     # The daily OHLCV sync refreshes ~2,400 instruments incrementally, so for a
@@ -231,13 +399,21 @@ class Settings(BaseSettings):
     STALENESS_FRONTIER_CACHE_SECS: int = Field(60, ge=5, le=600)
 
     # ── Intelligence Layer — LLM Behaviour ────────────────────────────────────
-    LLM_MAX_RETRIES: int = Field(3, ge=1, le=5)
+    # 2 retries: reduces quota amplification by 33% on burst 429s while still
+    # tolerating a single transient failure per request.
+    LLM_MAX_RETRIES: int = Field(2, ge=1, le=5)
     LLM_REQUEST_TIMEOUT: float = Field(30.0, ge=5.0, le=120.0)
 
     # ── Intelligence Layer — RAG ───────────────────────────────────────────────
     RAG_TOP_K: int = Field(5, ge=1, le=20)
     RAG_WINDOW_HOURS: int = Field(24, ge=1, le=168)
-    RAG_EMBED_BATCH_SIZE: int = Field(32, ge=1, le=128)
+    # 96 texts/call: 3× throughput vs. default 32, stays within gemini-embedding-001
+    # input limits. Reduces embed API calls proportionally for the same corpus size.
+    RAG_EMBED_BATCH_SIZE: int = Field(96, ge=1, le=128)
+    # TTL for the RAG corpus cleanup job.  Embeddings older than this are deleted
+    # daily.  Lower-bound matches the retriever's max window (168h = 7 days) so
+    # that no live retrieval window ever extends past the cleanup boundary.
+    RAG_EMBEDDING_TTL_DAYS: int = Field(7, ge=7, le=90)
 
     # ── RAG corpus backfill (paced, monitorable background job) ────────────────
     # Outbound embedding pace (texts/min).  Free-tier gemini-embedding-001 allows
@@ -257,6 +433,24 @@ class Settings(BaseSettings):
     # rate → ~780 embed texts/day, safely under the free-tier 1000/day cap.
     # Lower to 1–2h on a billing-enabled key for near-real-time corpus freshness.
     RAG_REFRESH_INTERVAL_HOURS: int = Field(4, ge=1, le=168)
+
+    # ── RAG Batch Embedding (Gemini Batch API — paid tier only) ───────────────
+    # Enables 50% cost savings on corpus ingestion ($0.075 vs $0.15 per 1M
+    # tokens) by routing backfill embedding through the Gemini async Batch API.
+    # The Batch API returns results in 30–90 minutes (SLO: 24 h), so new
+    # articles are not retrievable until the job completes.  Set to True only
+    # on billing-enabled API keys; free-tier keys do not support Batch API.
+    RAG_BATCH_EMBED_ENABLED: bool = Field(False)
+    # Max texts submitted in one batch job.  Practical ceiling is 5 000 (avoids
+    # 20 MB inline limit and 429s on large file uploads).  Corpus exceeding
+    # this will be split into multiple sequential jobs automatically.
+    RAG_BATCH_JOB_SIZE: int = Field(2000, ge=10, le=5000)
+    # Polling cadence while waiting for a batch job to complete.  30 s is the
+    # recommended minimum — polling more frequently does not speed up the job.
+    RAG_BATCH_POLL_INTERVAL_SECS: int = Field(30, ge=10, le=300)
+    # Hard timeout per batch job.  3 h is well inside the 48 h expiry window
+    # but short enough to surface hung jobs promptly.
+    RAG_BATCH_JOB_TIMEOUT_SECS: int = Field(10_800, ge=300, le=172_800)
 
     # ── Observability — Explanation-pipeline diagnostics log ──────────────────
     # When enabled, routes the explanation worker + LLM client + RAG loggers at
@@ -437,6 +631,23 @@ class Settings(BaseSettings):
     )
 
     # ── Computed Properties ────────────────────────────────────────────────────
+
+    @property
+    def gemini_api_key_pool(self) -> list[str]:
+        """Ordered, deduplicated list of all configured Gemini API keys (primary first).
+
+        Single-key deployments (only GEMINI_API_KEY set) return a 1-element list
+        and behave identically to the pre-multi-key implementation.  Returns an
+        empty list when no keys are configured — callers should degrade gracefully.
+        """
+        seen: set[str] = set()
+        pool: list[str] = []
+        for k in ([self.GEMINI_API_KEY] if self.GEMINI_API_KEY else []) + list(self.GEMINI_API_KEYS):
+            if k and k not in seen:
+                seen.add(k)
+                pool.append(k)
+        return pool
+
     @property
     def is_production(self) -> bool:
         return self.ENVIRONMENT == "production"

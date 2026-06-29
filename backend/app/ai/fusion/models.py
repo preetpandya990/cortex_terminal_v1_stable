@@ -4,15 +4,42 @@ Import from migration 0005 table definitions.
 """
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 from uuid import UUID
 
-from pgvector.sqlalchemy import Vector
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, LargeBinary, Numeric, String, Text, UniqueConstraint, text
+from pgvector.sqlalchemy import HALFVEC
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, LargeBinary, Numeric, String, Text, TypeDecorator, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.config import get_settings
 from app.core.database import Base
+
+
+class _HalfVecFloatList(TypeDecorator):
+    """
+    HALFVEC(n) column that always surfaces as list[float] in Python.
+
+    pgvector's HALFVEC SQLAlchemy type returns HalfVector objects on reads,
+    not plain lists — breaking the list[float] contract that model annotations
+    and callers expect.  This decorator converts transparently at the ORM
+    boundary so consumers never need to handle HalfVector directly:
+
+        DB halfvec text → HalfVector (pgvector impl) → list[float] (here)
+
+    The write path is unaffected: HALFVEC.bind_processor already accepts
+    list[float] and encodes it to the halfvec text representation.
+    """
+
+    impl = HALFVEC
+    cache_ok = True
+
+    def process_result_value(self, value: Any, dialect: Any) -> list[float] | None:
+        if value is None:
+            return None
+        if isinstance(value, list):
+            return value
+        return value.to_list()  # HalfVector.to_list() → list[float]
 
 
 class AIRawEvent(Base):
@@ -232,8 +259,13 @@ class AIDocumentEmbedding(Base):
 
     One row per source document (ai_raw_events).  The embedding dimension is
     owned by GEMINI_EMBED_DIM (gemini-embedding-001) and kept in lock-step with
-    the pgvector column by migration 0046.  Changing the embedding model or
+    the pgvector column by migration 0048.  Changing the embedding model or
     dimension requires a full re-ingestion and a new migration.
+
+    Storage: halfvec(GEMINI_EMBED_DIM) — FP16 per dimension, 50% smaller than
+    FP32 vector at the same dimension count.  Python retrieval paths receive
+    list[float] (FP16 upcast to float64 by the driver); no changes to ranking
+    or cosine math are needed.
 
     Symbol assignment:
       - Single-symbol events → symbol = that trading symbol.
@@ -241,8 +273,8 @@ class AIDocumentEmbedding(Base):
         included in every symbol-scoped retrieval pass).
       - All affected symbols are always stored in metadata['affected_symbols'].
 
-    Indexes (created by migration 0041):
-      - HNSW on embedding (cosine, m=16, ef_construction=64) for ANN search.
+    Indexes (migration 0048):
+      - HNSW on embedding (halfvec_cosine_ops, m=16, ef_construction=64).
       - B-tree on (symbol, as_of_timestamp DESC) for time-window filtering.
     """
 
@@ -263,9 +295,12 @@ class AIDocumentEmbedding(Base):
     # First 200 characters of the chunk for debugging / audit.
     content_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Passage embedding (gemini-embedding-001), GEMINI_EMBED_DIM dimensions,
-    # L2-normalized for cosine search.  Dimension is pinned by migration 0046.
-    embedding: Mapped[list] = mapped_column(
-        Vector(get_settings().GEMINI_EMBED_DIM), nullable=False
+    # L2-normalized for cosine search.  Stored as HALFVEC (FP16, 2 bytes/dim)
+    # to halve storage vs FP32 at identical retrieval quality.  Dimension and
+    # type are pinned by migration 0048.
+    # _HalfVecFloatList wraps HALFVEC so Python callers always receive list[float].
+    embedding: Mapped[list[float]] = mapped_column(
+        _HalfVecFloatList(get_settings().GEMINI_EMBED_DIM), nullable=False
     )
     # As-of timestamp of the source event (not ingestion time) — used for
     # the time-window freshness filter in retrieval.

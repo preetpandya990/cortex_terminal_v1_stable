@@ -85,7 +85,43 @@ async def worker_lifespan() -> AsyncGenerator[tuple[async_sessionmaker, AsyncSes
     # Initialize Redis
     await init_redis()
     redis_client = get_cache_service()
-    
+
+    # Initialize Gemini Request Manager — must run after init_redis() (circuit
+    # pre-load reads Redis) and before LLM client / NLPEngine (both call acquire()).
+    try:
+        from app.ai.intelligence.request_manager import GeminiRequestManager
+        from app.ai.intelligence.llm_client import _key_id as _gemini_key_id
+        from app.core.redis import get_redis
+        _gemini_key_ids = [_gemini_key_id(k) for k in settings.gemini_api_key_pool]
+        await GeminiRequestManager.initialize(redis=get_redis(), key_ids=_gemini_key_ids)
+        logger.info("Gemini request manager initialized (keys=%d)", len(_gemini_key_ids))
+    except Exception as exc:
+        logger.error(
+            "Gemini request manager initialization failed (quota coordination degraded): %s", exc
+        )
+
+    # Initialize LLM Intelligence Client — probes backends, logs active transport.
+    try:
+        from app.ai.intelligence.llm_client import CortexIntelligenceClient
+        await CortexIntelligenceClient.initialize()
+        logger.info("LLM intelligence client initialized")
+    except Exception as exc:
+        logger.error(
+            "LLM intelligence client initialization failed (LLM features degraded): %s", exc
+        )
+
+    # Initialize NLP engine — requires CortexIntelligenceClient to be initialized first.
+    # Without this, NLPEngine._queue is never set and every event_processing_loop
+    # iteration crashes with AttributeError on the first Redis cache miss.
+    try:
+        from app.ai.intelligence.nlp_engine import NLPEngine
+        await NLPEngine.initialize()
+        logger.info("NLP engine initialized")
+    except Exception as exc:
+        logger.warning(
+            "NLP engine initialization failed (sentiment analysis degraded): %s", exc
+        )
+
     # Initialize ML components via registry (same path as the API)
     ml_components = {}
     try:
@@ -145,6 +181,32 @@ async def worker_lifespan() -> AsyncGenerator[tuple[async_sessionmaker, AsyncSes
         yield session_factory, redis_client, ml_components, upstox_client
     finally:
         logger.info("Cleaning up worker resources...")
+
+        # Drain NLP batch queue first — resolves pending futures with a neutral
+        # fallback before the Gemini transport is torn down so event-pipeline
+        # coroutines receive a clean result rather than a transport error.
+        try:
+            from app.ai.intelligence.nlp_engine import NLPEngine
+            await NLPEngine.aclose()
+        except Exception as exc:
+            logger.debug("NLP engine close failed (non-fatal): %s", exc)
+
+        # Drain Gemini permit queue — waiting callers get GeminiRateLimitError,
+        # not a transport error, which is the correct failure mode at shutdown.
+        try:
+            from app.ai.intelligence.request_manager import GeminiRequestManager
+            if GeminiRequestManager._instance is not None:
+                await GeminiRequestManager._instance.aclose()
+        except Exception as exc:
+            logger.debug("Gemini request manager close failed (non-fatal): %s", exc)
+
+        # Close LLM transport after the permit queue is drained.
+        try:
+            from app.ai.intelligence.llm_client import close_intelligence_client
+            await close_intelligence_client()
+        except Exception as exc:
+            logger.debug("LLM client close failed (non-fatal): %s", exc)
+
         await upstox_client.stop()
         await close_redis()
         await engine.dispose()

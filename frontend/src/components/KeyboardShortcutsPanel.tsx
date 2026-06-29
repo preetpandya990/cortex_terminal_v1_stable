@@ -107,6 +107,13 @@ export function KeyboardShortcutsPanel({ open, onClose }: KeyboardShortcutsPanel
               { keys: ["?"], description: "Toggle this panel" },
             ]}
           />
+
+          <ShortcutGroup
+            title="Chart"
+            shortcuts={[
+              { keys: ["Alt"], description: "Hold to scroll page while over chart" },
+            ]}
+          />
         </div>
 
         {/* Footer note */}

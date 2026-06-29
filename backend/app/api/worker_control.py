@@ -6,7 +6,7 @@ FastAPI router mounted on the worker sidecar (:8001).
 Routes:
     GET  /health              Liveness — no auth (Docker healthcheck + Prometheus)
     GET  /metrics             Prometheus scrape — no auth; syncs Gauges from TaskState
-    GET  /tasks               All 13 task states — requires X-Internal-Token
+    GET  /tasks               All 15 task states — requires X-Internal-Token
     GET  /tasks/{name}        Single task detail — requires X-Internal-Token
     POST /tasks/{name}/pause  Cooperative pause at next safepoint
     POST /tasks/{name}/resume Lift pause; task continues at next checkpoint
@@ -159,7 +159,7 @@ async def metrics(request: Request) -> Response:
 
 @router.get("/tasks")
 async def list_tasks(_: InternalAuth, request: Request) -> dict[str, Any]:
-    """Return status of all 13 supervised tasks."""
+    """Return status of all 15 supervised tasks."""
     states = _get_states(request)
     return {
         "count": len(states),

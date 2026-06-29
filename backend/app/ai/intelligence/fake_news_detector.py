@@ -7,6 +7,7 @@ Detects fake news using:
 3. Sentiment consistency (20%)
 4. LLM reasoning (25%)
 """
+import hashlib
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
@@ -23,6 +24,12 @@ from app.ai.fusion.models import (
 from app.ai.intelligence.llm_client import get_ollama_client
 
 logger = logging.getLogger(__name__)
+
+# LLM credibility score cache — keyed by SHA-256 of article URL (preferred)
+# or content[:500] (fallback when URL is absent/non-unique).
+# Article credibility is static within a trading session; 1-hour TTL eliminates
+# redundant LLM calls when the same article appears across multiple RSS feeds.
+_FAKENEWS_CACHE_TTL_SECS: int = 3600
 
 
 class FakeNewsDetector:
@@ -290,28 +297,46 @@ class FakeNewsDetector:
         if not self.use_llm or not self.ollama_client:
             return 0.5  # Neutral if LLM disabled
 
+        # ── Cache check ────────────────────────────────────────────────────────
+        # Prefer URL as the cache key (stable, compact); fall back to content
+        # fingerprint when the source is a non-URL identifier or empty.
+        from app.core.redis import get_cache_service
+        cache_input = source if (source and source.startswith("http")) else content[:500]
+        cache_hash = hashlib.sha256(cache_input.encode()).hexdigest()
+        cache_key = f"cortex:fakenews:{cache_hash}"
         try:
-            prompt = f"""
-Analyze this financial news for credibility:
+            cached = await get_cache_service().get(cache_key)
+            if cached is not None and isinstance(cached, dict):
+                score = float(cached.get("credibility_score", 0.5))
+                logger.debug(
+                    "fake_news_detector: cache hit hash=%.12s score=%.2f",
+                    cache_hash, score,
+                )
+                return score
+        except Exception as _cache_exc:
+            logger.debug(
+                "fake_news_detector: cache read failed (non-fatal): %s", _cache_exc
+            )
 
-Content: {content}
-Source: {source}
-Event Type: {classification.event_type}
-Impact Score: {classification.impact_score}
-
-Check for:
-- Sensationalist language
-- Unrealistic claims
-- Missing key details
-- Logical inconsistencies
-- Source reliability indicators
-
-Return JSON with:
-- is_credible: boolean
-- credibility_score: float 0-1 (1=highly credible, 0=fake)
-- red_flags: list of concerns
-- reasoning: explanation
-"""
+        try:
+            prompt = (
+                f"Analyze this financial news for credibility:\n\n"
+                f"Content: {content}\n"
+                f"Source: {source}\n"
+                f"Event Type: {classification.event_type}\n"
+                f"Impact Score: {classification.impact_score}\n\n"
+                f"Check for:\n"
+                f"- Sensationalist language\n"
+                f"- Unrealistic claims\n"
+                f"- Missing key details\n"
+                f"- Logical inconsistencies\n"
+                f"- Source reliability indicators\n\n"
+                f"Return JSON with:\n"
+                f"- is_credible: boolean\n"
+                f"- credibility_score: float 0-1 (1=highly credible, 0=fake)\n"
+                f"- red_flags: list of concerns\n"
+                f"- reasoning: explanation"
+            )
 
             result = await self.ollama_client.generate_json(
                 prompt=prompt,
@@ -319,8 +344,26 @@ Return JSON with:
                 temperature=0.3,
             )
 
-            return float(result.get("credibility_score", 0.5))
+            score = float(result.get("credibility_score", 0.5))
 
-        except Exception as e:
-            logger.warning(f"LLM reasoning failed: {e}")
+            # ── Cache write ────────────────────────────────────────────────────
+            try:
+                await get_cache_service().set(
+                    cache_key,
+                    {"credibility_score": score},
+                    ttl=_FAKENEWS_CACHE_TTL_SECS,
+                )
+                logger.debug(
+                    "fake_news_detector: cached hash=%.12s score=%.2f ttl=%ds",
+                    cache_hash, score, _FAKENEWS_CACHE_TTL_SECS,
+                )
+            except Exception as _cache_exc:
+                logger.debug(
+                    "fake_news_detector: cache write failed (non-fatal): %s", _cache_exc
+                )
+
+            return score
+
+        except Exception as exc:
+            logger.warning("LLM reasoning failed: %s", exc)
             return 0.5  # Neutral on failure

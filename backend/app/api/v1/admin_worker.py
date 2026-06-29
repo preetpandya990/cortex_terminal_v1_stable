@@ -10,7 +10,7 @@ if the worker is temporarily unreachable, all endpoints return 503 with
 
 Routes (prefix: /api/v1/admin/worker):
     GET  /health              Worker liveness
-    GET  /tasks               All 13 task states
+    GET  /tasks               All 15 task states
     GET  /tasks/{name}        Single task detail
     POST /tasks/{name}/pause  Pause task at next safepoint
     POST /tasks/{name}/resume Resume a paused task
@@ -62,7 +62,7 @@ async def worker_health(_: AdminUserID, request: Request) -> JSONResponse:
 
 @router.get("/tasks")
 async def list_tasks(_: AdminUserID, request: Request) -> JSONResponse:
-    """Return status of all 13 supervised tasks."""
+    """Return status of all 15 supervised tasks."""
     return _proxy(await _client(request).get_tasks())
 
 

@@ -273,7 +273,7 @@ async def _load_candidates(
             source_name=row.source_name,
             source_url=row.source_url,
             as_of_timestamp=row.as_of_timestamp,
-            embedding=row.embedding if isinstance(row.embedding, list) else list(row.embedding),
+            embedding=row.embedding,
             symbol=row.symbol,
         )
         for row in rows

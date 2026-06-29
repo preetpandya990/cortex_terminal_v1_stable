@@ -8,11 +8,14 @@
  * items with no current signal.
  *
  * Display states:
- *  1. Skeleton  — initial SSE load, or data.available === false (worker generating)
- *  2. Content   — data.available === true, full narrative + optional staleness
- *                 banner + source citations + regulatory disclaimer
- *  3. (never hidden) — the SSE 3-stage lookup always returns a payload; the
- *                 panel only hides if the parent passes data === null explicitly
+ *  1. Skeleton     — initial SSE load, or data.available === false (worker generating)
+ *  2. Weak signal  — data.weak_signal === true; consensus_score below threshold.
+ *                    Renders score context + "Request AI Explanation" CTA button.
+ *                    Transitions to Content when the bypass job completes (via SSE push).
+ *  3. Content      — data.available === true; full narrative + optional staleness
+ *                    banner + source citations + regulatory disclaimer
+ *  4. (never hidden) — the SSE 3-stage lookup always returns a payload; the
+ *                    panel only hides if the parent passes data === null explicitly
  *
  * Context types (data.context_type):
  *  'suggestion_explanation' → AI explanation of a specific ML signal.  If the
@@ -31,7 +34,7 @@
  *  from the narrative text and rendered in its own styled box.
  */
 
-import { memo } from 'react';
+import { memo, useState, useCallback } from 'react';
 import { Brain, Clock, ExternalLink, AlertTriangle, Sparkles } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { cn } from '@/lib/utils';
@@ -139,6 +142,112 @@ function PanelSkeleton() {
         <div className="flex items-center gap-2 pt-2 text-xs text-slate-400">
           <Sparkles className="h-3.5 w-3.5 animate-pulse text-violet-400" />
           <span>Generating explanation from recent news…</span>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * Rendered when the explanation pipeline exhausted all retries and moved the
+ * job to the dead-letter queue (``data.failed === true``).  Shows a static
+ * non-animated state so the user is not left with an eternal skeleton.
+ */
+function PanelFailed() {
+  return (
+    <Card className="border-slate-200/80 bg-white/90">
+      <CardHeader className="pb-3">
+        <CardTitle className="flex items-center gap-2 text-base font-semibold text-slate-700">
+          <Brain className="h-5 w-5 text-slate-400" />
+          AI Analysis
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div
+          className="flex items-center gap-3 rounded-md border border-slate-200 bg-slate-50/80 px-4 py-3"
+          role="status"
+          aria-label="Analysis unavailable"
+        >
+          <AlertTriangle className="h-4 w-4 shrink-0 text-slate-400" />
+          <p className="text-sm text-slate-500">
+            Analysis unavailable for this signal.
+          </p>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// ── Weak-signal card ──────────────────────────────────────────────────────────
+
+interface PanelWeakSignalProps {
+  data:       ExplanationData;
+  onRefresh:  () => void;
+  refreshing: boolean;
+}
+
+/**
+ * Rendered when the suggestion's consensus_score is below
+ * EXPLANATION_CONSENSUS_THRESHOLD and the explanation pipeline was intentionally
+ * bypassed.  Shows score context and a user-driven CTA that fires the bypass
+ * endpoint — the result arrives asynchronously via SSE push.
+ */
+function PanelWeakSignal({ data, onRefresh, refreshing }: PanelWeakSignalProps) {
+  const score = data.consensus_score != null ? Math.round(data.consensus_score) : null;
+
+  return (
+    <Card className="border-slate-200/80 bg-white/90">
+      <CardHeader className="pb-3">
+        <CardTitle className="flex items-center gap-2 text-base font-semibold text-slate-700">
+          <Brain className="h-5 w-5 text-slate-400" />
+          AI Analysis
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div
+          className="flex flex-col gap-3 rounded-md border border-amber-100 bg-amber-50/60 px-4 py-3"
+          role="status"
+          aria-label="Signal confidence below AI analysis threshold"
+        >
+          <div className="flex items-start gap-3">
+            <AlertTriangle
+              className="mt-0.5 h-4 w-4 shrink-0 text-amber-500"
+              aria-hidden
+            />
+            <div className="space-y-1">
+              <p className="text-sm font-medium text-slate-700">
+                Signal detected — confidence below AI analysis threshold
+              </p>
+              <p className="text-xs leading-relaxed text-slate-500">
+                {score != null ? `Consensus score: ${score}/100. ` : ''}
+                AI explanations are reserved for high-conviction signals. You can
+                request a full explanation if this signal looks valid to you.
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={onRefresh}
+            disabled={refreshing}
+            aria-label="Request AI explanation for this signal"
+            aria-busy={refreshing}
+            className={cn(
+              'self-start flex items-center gap-1.5 rounded-md px-3 py-1.5',
+              'text-xs font-medium transition-colors',
+              'focus-visible:outline-none focus-visible:ring-2',
+              'focus-visible:ring-violet-500 focus-visible:ring-offset-1',
+              refreshing
+                ? 'cursor-not-allowed bg-slate-100 text-slate-400'
+                : 'border border-violet-200 bg-violet-50 text-violet-700 hover:bg-violet-100 active:bg-violet-200',
+            )}
+          >
+            <Sparkles
+              className={cn('h-3.5 w-3.5', refreshing && 'animate-pulse')}
+              aria-hidden
+            />
+            {refreshing ? 'Requesting…' : 'Request AI Explanation'}
+          </button>
         </div>
       </CardContent>
     </Card>
@@ -311,40 +420,78 @@ function ExplanationContent({ data }: ContentProps) {
 // ── Public component ───────────────────────────────────────────────────────────
 
 interface AIExplanationPanelProps {
-  data: ExplanationData | null;
+  data:      ExplanationData | null;
   isLoading: boolean;
   className?: string;
+  /**
+   * Called when the user clicks "Request AI Explanation" on the weak-signal card.
+   * The parent constructs this callback (capturing the access token and suggestion_id)
+   * and passes it only when ``data.weak_signal === true``.  Passing ``undefined``
+   * suppresses the CTA so the panel is a pure presentation component with no
+   * direct auth or network dependencies.
+   */
+  onRequestExplanation?: () => Promise<void>;
 }
 
 function AIExplanationPanelComponent({
   data,
   isLoading,
   className,
+  onRequestExplanation,
 }: AIExplanationPanelProps) {
+  const [refreshing, setRefreshing] = useState(false);
+
+  const handleWeakSignalRefresh = useCallback(async () => {
+    if (!onRequestExplanation || refreshing) return;
+    setRefreshing(true);
+    try {
+      await onRequestExplanation();
+    } catch {
+      // Non-fatal: the backend deletes the debounce key on all error paths,
+      // so the user can retry immediately.  The button resets to its idle state.
+    } finally {
+      setRefreshing(false);
+    }
+  }, [onRequestExplanation, refreshing]);
+
   // Nothing to show — no active suggestion for this instrument.
   if (!isLoading && data === null) return null;
 
   // Initial SSE load before first event.
   if (isLoading && data === null) {
+    return <div className={cn(className)}><PanelSkeleton /></div>;
+  }
+
+  // Permanent failure — explanation pipeline exhausted all retries (DLQ fired).
+  // Render a static "unavailable" state so the user is not left with an eternal skeleton.
+  if (data !== null && data.failed) {
+    return <div className={cn(className)}><PanelFailed /></div>;
+  }
+
+  // Weak signal — consensus_score below threshold; explanation was intentionally
+  // skipped.  Render the CTA card so the user can request analysis on demand.
+  // This check must precede the generic skeleton branch: weak_signal payloads
+  // have available=false and full_explanation=null, matching the skeleton guard.
+  if (data !== null && data.weak_signal) {
     return (
       <div className={cn(className)}>
-        <PanelSkeleton />
+        <PanelWeakSignal
+          data={data}
+          onRefresh={handleWeakSignalRefresh}
+          refreshing={refreshing}
+        />
       </div>
     );
   }
 
-  // Active suggestion/context exists but no explanation text has streamed yet —
-  // show the skeleton until the first token arrives.
+  // Active suggestion/context — no explanation text has arrived yet.
+  // Show the generating skeleton until the first token streams in.
   if (data !== null && !data.available && !data.full_explanation) {
-    return (
-      <div className={cn(className)}>
-        <PanelSkeleton />
-      </div>
-    );
+    return <div className={cn(className)}><PanelSkeleton /></div>;
   }
 
-  // Streaming partial OR finished explanation — render the content (the
-  // "Generating" affordance is shown while data.available is still false).
+  // Streaming partial OR finished explanation.  ExplanationContent renders the
+  // "Generating" affordance while data.available is still false (streaming phase).
   if (data !== null && data.full_explanation) {
     return (
       <div className={cn(className)}>
