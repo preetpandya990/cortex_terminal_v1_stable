@@ -41,6 +41,15 @@ settings = get_settings()
 logger = logging.getLogger(__name__)
 
 
+class WorkerDispatchError(Exception):
+    """
+    Raised by dispatch_ai_processing() — a deliberate exception to this
+    module's fail-open contract. An admin explicitly clicked "Dispatch" on
+    the Worker Control Panel; if that dispatch doesn't actually run, the
+    admin needs to see a real error, not a silently-degraded no-op.
+    """
+
+
 class WorkerClient:
     """
     Async HTTP client for the worker sidecar control-plane.
@@ -72,17 +81,12 @@ class WorkerClient:
             name="worker_sidecar",
         )
 
-    async def _request(
-        self,
-        method: str,
-        path: str,
-        **kwargs: Any,
-    ) -> dict[str, Any] | None:
+    async def _call(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         """
-        Execute a control-plane request through the retry + circuit-breaker stack.
-
-        Returns:
-            Parsed JSON dict on success, None on any failure (fail-open).
+        Execute one control-plane request through the retry + circuit-breaker
+        stack. Raises CircuitBreakerError or httpx.HTTPError on failure —
+        callers decide whether to fail open (_request) or fail closed
+        (dispatch_ai_processing).
         """
         # Inner function captures method/path/kwargs in a closure so the
         # retry decorator can call it without arguments.
@@ -100,8 +104,24 @@ class WorkerClient:
             reraise=True,
         )(_do_request)
 
+        return await self._breaker.call_async(_do_request_with_retry)
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        **kwargs: Any,
+    ) -> dict[str, Any] | None:
+        """
+        Fail-open wrapper around _call(): the main API must never fail
+        readiness checks or block user traffic because the worker is
+        temporarily restarting.
+
+        Returns:
+            Parsed JSON dict on success, None on any failure (fail-open).
+        """
         try:
-            response = await self._breaker.call_async(_do_request_with_retry)
+            response = await self._call(method, path, **kwargs)
         except CircuitBreakerError:
             logger.warning(
                 "WorkerClient: circuit OPEN — skipping %s %s (worker likely restarting)",
@@ -164,6 +184,59 @@ class WorkerClient:
     async def restart_task(self, name: str) -> dict[str, Any] | None:
         """Cancel and restart a task via the supervisor."""
         return await self._request("POST", f"/tasks/{name}/restart")
+
+    async def get_ai_processing_status(self) -> dict[str, Any] | None:
+        """
+        Return pending queue depth + auto-dispatch flag for each of the 3
+        demand-driven AI processing categories. Fail-open, like every other
+        read in this client.
+        """
+        return await self._request("GET", "/ai-processing/status")
+
+    async def dispatch_ai_processing(self, category: str) -> dict[str, Any]:
+        """
+        Dispatch a Tier-2 AI processing category's pending queue right now.
+
+        Deliberate exception to this client's fail-open contract (see module
+        docstring): an admin explicitly triggered this from the Worker
+        Control Panel and needs to know whether it actually ran — raises
+        WorkerDispatchError instead of silently returning None.
+
+        Args:
+            category: "sentiment" | "forecast" | "classification".
+
+        Raises:
+            WorkerDispatchError: on circuit-open, network failure, or a
+                non-2xx response (including the sidecar's 502 for a failed
+                in-progress drain).
+        """
+        path = f"/ai-processing/{category}/dispatch"
+        try:
+            response = await self._call("POST", path)
+        except CircuitBreakerError as exc:
+            raise WorkerDispatchError(
+                f"worker sidecar circuit open — cannot dispatch {category}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise WorkerDispatchError(
+                f"worker sidecar unreachable — cannot dispatch {category}: {exc}"
+            ) from exc
+
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            reason: str | None = None
+            try:
+                body = response.json()
+                reason = body.get("reason") or body.get("detail")
+            except Exception:
+                pass
+            raise WorkerDispatchError(
+                f"{category} dispatch failed: HTTP {exc.response.status_code}"
+                + (f" — {reason}" if reason else "")
+            ) from exc
+
+        return response.json()
 
     async def aclose(self) -> None:
         """Close the underlying httpx connection pool."""

@@ -34,14 +34,16 @@ Combined decay: 0.7 · 0.5^(t/fast_hl) + 0.3 · 0.5^(t/slow_hl)
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.ai.fusion.models import AINLPResult, AIEventClassification
 from app.ai.intelligence.llm_client import Priority, get_ollama_client
@@ -78,6 +80,12 @@ _VALID_EVENT_TYPES = frozenset(_DECAY_HALF_LIVES.keys())
 # Both heuristic (keyword-matched) and Gemini results are cached unconditionally.
 # The error-path fallback (confidence=0.0) is never cached.
 _EVENT_CLASS_CACHE_TTL_SECS: int = 1800
+
+# Deferred-classification queue — used when EVENT_CLASSIFIER_AUTO_DISPATCH is
+# False: 'general' articles enqueue here instead of calling Gemini inline, and
+# flush_pending_classifications() drains it on explicit admin dispatch or the
+# daily safety net.
+_PENDING_QUEUE_KEY = "cortex:event:classifier:pending"
 
 
 def _half_lives_for(event_type: str) -> tuple[int, int]:
@@ -360,7 +368,7 @@ class EventClassifier:
         validate-against-instrument_master pass.  Runs the full fallback chain and
         persists the result.  Always returns a valid record.
         """
-        llm_result = await self._classify_with_ollama(content, entities)
+        llm_result = await self._classify_with_ollama(content, entities, nlp_result_id)
 
         # ── Capture LLM symbols before any confidence-based replacement ────────
         # The LLM may correctly identify affected companies even when its
@@ -417,20 +425,14 @@ class EventClassifier:
         # the canonical lookup table to ensure consistency across the ensemble.
         fast_hl = classification_result.get("decay_hours", fast_hl)
 
-        classification = AIEventClassification(
-            nlp_result_id=nlp_result_id,
-            event_type=classification_result["event_type"],
-            impact_score=Decimal(str(classification_result["impact_score"])),
-            affected_symbols=validated_symbols,
-            classification_confidence=Decimal(str(classification_result["confidence"])),
-            reasoning=classification_result.get("reasoning", ""),
-            decay_half_life_hours=fast_hl,
-            decay_slow_half_life_hours=slow_hl,
+        classification = await self._persist_classification(
+            db,
+            nlp_result_id,
+            classification_result,
+            validated_symbols,
+            fast_hl,
+            slow_hl,
         )
-
-        db.add(classification)
-        await db.commit()
-        await db.refresh(classification)
 
         logger.info(
             "Classified nlp_result_id=%d: type=%s impact=%.1f conf=%.2f "
@@ -444,6 +446,163 @@ class EventClassifier:
             slow_hl,
         )
         return classification
+
+    async def _persist_classification(
+        self,
+        db: AsyncSession,
+        nlp_result_id: int,
+        classification_result: dict[str, Any],
+        validated_symbols: list[str],
+        fast_hl: int,
+        slow_hl: int,
+        *,
+        existing: AIEventClassification | None = None,
+    ) -> AIEventClassification:
+        """
+        Insert a new AIEventClassification row, or update one in place when
+        ``existing`` is provided (the deferred-flush upgrade path).
+
+        Reusing this for both insert and update keeps the exact same
+        symbol-merge/decay-assignment logic behind whichever path wrote the
+        row — there is no second, drifting copy of these field assignments.
+        """
+        if existing is None:
+            classification = AIEventClassification(
+                nlp_result_id=nlp_result_id,
+                event_type=classification_result["event_type"],
+                impact_score=Decimal(str(classification_result["impact_score"])),
+                affected_symbols=validated_symbols,
+                classification_confidence=Decimal(str(classification_result["confidence"])),
+                reasoning=classification_result.get("reasoning", ""),
+                decay_half_life_hours=fast_hl,
+                decay_slow_half_life_hours=slow_hl,
+            )
+            db.add(classification)
+        else:
+            classification = existing
+            classification.event_type = classification_result["event_type"]
+            classification.impact_score = Decimal(str(classification_result["impact_score"]))
+            classification.affected_symbols = validated_symbols
+            classification.classification_confidence = Decimal(
+                str(classification_result["confidence"])
+            )
+            classification.reasoning = classification_result.get("reasoning", "")
+            classification.decay_half_life_hours = fast_hl
+            classification.decay_slow_half_life_hours = slow_hl
+
+        await db.commit()
+        await db.refresh(classification)
+        return classification
+
+    # ── Demand-driven dispatch (admin/safety-net entry points) ────────────────
+
+    async def pending_classification_count(self, redis: Any) -> int:
+        """Current deferred-classification queue depth (Worker Control Panel)."""
+        return await redis.llen(_PENDING_QUEUE_KEY)
+
+    async def flush_pending_classifications(
+        self,
+        db_factory: async_sessionmaker,
+        redis: Any,
+    ) -> dict[str, int]:
+        """
+        Drain the deferred-classification queue right now, regardless of
+        EVENT_CLASSIFIER_AUTO_DISPATCH. Called by an explicit admin dispatch
+        or the daily safety net.
+
+        Pops one item at a time (LPOP without count — bounds blast radius per
+        item so a Gemini failure mid-drain loses at most the one in-flight
+        item, not a whole popped batch). For each item: re-runs the full
+        three-source symbol merge (content-level extraction + the Gemini
+        call's own symbols — mirroring classify()'s merge logic minus the
+        pre-confidence-fallback LLM-symbol capture, since there is no
+        separate GPT-4o pass in the deferred path), calls _gemini_classify(),
+        looks up the existing row by nlp_result_id (guaranteed unique post
+        migration 0049), and upgrades it via _persist_classification(existing=row).
+
+        Returns:
+            {"dispatched": N, "calls_made": N} — 1:1, no batching for
+            classification (unlike sentiment/forecast).
+
+        Raises:
+            RuntimeError: the moment a popped item's Gemini call fails (the
+            shared _gemini_classify() fallback contract signals this via
+            confidence == 0.0), so a quota outage during the drain fails
+            loudly instead of silently discarding the rest of the queue. The
+            failed item's existing row is left untouched (not overwritten
+            with the fallback) and is not returned to the queue. The caller
+            (worker sidecar router) maps this to HTTP 502.
+        """
+        dispatched = 0
+        calls_made = 0
+
+        while True:
+            raw = await redis.lpop(_PENDING_QUEUE_KEY)
+            if raw is None:
+                break
+
+            try:
+                payload = json.loads(raw)
+                content = payload["content"]
+                entities = payload["entities"]
+                nlp_result_id = payload["nlp_result_id"]
+            except Exception as exc:
+                logger.warning(
+                    "event_classifier: dropping malformed pending-classification "
+                    "payload — %s", exc,
+                )
+                continue
+
+            dispatched += 1
+
+            async with db_factory() as db:
+                llm_result = await self._gemini_classify(content, entities)
+                calls_made += 1
+
+                if llm_result["confidence"] == 0.0:
+                    raise RuntimeError(
+                        f"classification dispatch stopped early: Gemini call "
+                        f"failed for nlp_result_id={nlp_result_id}; "
+                        f"{dispatched} items drained, {calls_made} Gemini "
+                        f"calls made so far"
+                    )
+
+                content_symbols = await self._extract_symbols_from_content(db, content)
+                raw_symbols: list[str] = list(llm_result.get("affected_symbols") or [])
+                for sym in content_symbols:
+                    if sym not in raw_symbols:
+                        raw_symbols.append(sym)
+                validated_symbols = await normalize_and_validate_symbols(db, raw_symbols)
+
+                fast_hl, slow_hl = _half_lives_for(llm_result["event_type"])
+                fast_hl = llm_result.get("decay_hours", fast_hl)
+
+                row = (
+                    await db.execute(
+                        select(AIEventClassification).where(
+                            AIEventClassification.nlp_result_id == nlp_result_id
+                        )
+                    )
+                ).scalar_one_or_none()
+
+                if row is None:
+                    logger.warning(
+                        "event_classifier: no existing row for nlp_result_id=%d "
+                        "during flush — inserting a new row instead of upgrading",
+                        nlp_result_id,
+                    )
+
+                await self._persist_classification(
+                    db,
+                    nlp_result_id,
+                    llm_result,
+                    validated_symbols,
+                    fast_hl,
+                    slow_hl,
+                    existing=row,
+                )
+
+        return {"dispatched": dispatched, "calls_made": calls_made}
 
     # ── Content-level symbol extraction ───────────────────────────────────────
 
@@ -504,6 +663,7 @@ class EventClassifier:
         self,
         content: str,
         entities: dict[str, Any],
+        nlp_result_id: int,
     ) -> dict[str, Any]:
         """
         Four-path classification pipeline with quota shielding.
@@ -581,7 +741,72 @@ class EventClassifier:
             event_classification_total.labels(method="heuristic").inc()
             return result
 
-        # ── 3. Gemini call (LOW priority — genuinely ambiguous articles only) ──
+        # ── 3. Gemini call (LOW priority) — or deferred enqueue ────────────────
+        from app.core.config import get_settings
+        if not get_settings().EVENT_CLASSIFIER_AUTO_DISPATCH:
+            await self._enqueue_pending_classification(content, entities, nlp_result_id)
+            # classify()'s synchronous flow is never blocked — the immediate
+            # rule-based result is persisted now and upgraded later by
+            # flush_pending_classifications() once this item is dispatched.
+            # Documented, accepted limitation: an upgraded classification that
+            # arrives later does not retroactively regenerate AITradingSignal
+            # rows for this event — the synchronous event_processor.py flow
+            # already ran on this rule-based result.
+            return self._classify_rule_based(content, entities)
+
+        return await self._gemini_classify(content, entities)
+
+    async def _enqueue_pending_classification(
+        self,
+        content: str,
+        entities: dict[str, Any],
+        nlp_result_id: int,
+    ) -> None:
+        """
+        LPUSH a deferred-classification payload instead of calling Gemini
+        inline. Never raises — a Redis failure here just means this article
+        never gets upgraded past the rule-based classification classify()
+        already persisted; it must not block the caller.
+        """
+        from app.core.redis import get_redis
+
+        content_hash = hashlib.sha256(content[:1500].encode()).hexdigest()
+        payload = {
+            "content_hash": content_hash,
+            "content": content[:1500],
+            "entities": entities,
+            "nlp_result_id": nlp_result_id,
+            "enqueued_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            await get_redis().lpush(_PENDING_QUEUE_KEY, json.dumps(payload))
+        except Exception as exc:
+            logger.warning(
+                "event_classifier: failed to enqueue deferred classification "
+                "for nlp_result_id=%d — %s", nlp_result_id, exc,
+            )
+
+    async def _gemini_classify(
+        self,
+        content: str,
+        entities: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Fire the Gemini structured classification call for a genuinely
+        ambiguous ('general') article and cache the result.
+
+        Shared verbatim by the inline path (_classify_with_ollama, step 3
+        above) and the deferred flush path (flush_pending_classifications) —
+        one place owns the prompt, schema, cache-write, and error-fallback
+        logic, so there is zero duplicated prompt logic between them.
+
+        Returns a confidence=0.0 fallback dict (never raises) on any LLM
+        failure — callers rely on this to trigger the rule-based path.
+        """
+        from app.core.redis import get_cache_service
+        content_hash = hashlib.sha256(content[:1500].encode()).hexdigest()
+        cache_key    = f"cortex:event_class:{content_hash}"
+
         try:
             companies   = (entities.get("companies") or [])[:5]
             entity_hint = (

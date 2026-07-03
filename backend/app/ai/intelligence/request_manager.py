@@ -114,6 +114,7 @@ Wiring a new caller
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -507,11 +508,53 @@ class GeminiRequestManager:
 
         # ── Budget guard state ──────────────────────────────────────────────────
         # Tracks how many successful generate calls have been made today (PT).
-        # Incremented synchronously in release(); persisted to Redis every 10
-        # releases so a mid-day restart resumes from the correct count rather
-        # than resetting to zero and bypassing the guard.
+        # Persisted to Redis every N releases (adaptive — see below) so a mid-day
+        # restart resumes from the correct count rather than resetting to zero.
         inst._generate_rpd_used: int = 0
-        inst._generate_rpd_write_ctr: int = 0  # write to Redis every 10 releases
+        inst._generate_rpd_write_ctr: int = 0
+
+        # Adaptive Redis persistence cadence: flush at most every 5 % of the
+        # total daily budget so crash-recovery is accurate within that margin.
+        #   Free tier (10 RPD/key × 5 keys =  50 total) → flush every  2 calls
+        #   Paid Tier1 (1k RPD/key × 5 keys = 5000 total) → flush every 250 calls
+        # Floor of 1 ensures at least every call is persisted on tiny quotas.
+        _total_daily_budget = settings.GEMINI_GENERATE_RPD * max(len(key_ids), 1)
+        inst._rpd_flush_threshold: int = max(1, _total_daily_budget // 20)
+
+        # ── Startup budget coherence guard ─────────────────────────────────────
+        # Detects operator misconfiguration early — before the first API call —
+        # so quota exhaustion cannot silently disable explanations for days.
+        _reserve = settings.GEMINI_HIGH_PRIORITY_RPD_RESERVE
+
+        if _total_daily_budget <= _reserve:
+            logger.critical(
+                "request_manager: BUDGET MISCONFIGURATION — total daily budget "
+                "(%d calls = GEMINI_GENERATE_RPD %d × %d keys) is ≤ the "
+                "HIGH-priority reserve (%d).  MEDIUM/LOW/BACKGROUND callers will "
+                "be permanently throttled from the first call.  Fix in backend/.env: "
+                "raise GEMINI_GENERATE_RPD or lower GEMINI_HIGH_PRIORITY_RPD_RESERVE "
+                "so that reserve < 20 %% of total budget.",
+                _total_daily_budget, settings.GEMINI_GENERATE_RPD, max(len(key_ids), 1),
+                _reserve,
+            )
+        elif _total_daily_budget < _reserve * 3:
+            logger.warning(
+                "request_manager: Budget guard over-reserved — GEMINI_HIGH_PRIORITY_"
+                "RPD_RESERVE (%d) exceeds 33 %% of total daily budget (%d).  "
+                "Background callers will be throttled very early.  Consider raising "
+                "GEMINI_GENERATE_RPD or reducing the reserve in backend/.env.",
+                _reserve, _total_daily_budget,
+            )
+
+        if settings.GEMINI_GENERATE_RPD == 1_500 and len(key_ids) > 0:
+            logger.warning(
+                "request_manager: GEMINI_GENERATE_RPD is at the unchecked default "
+                "(1 500).  This is correct only for paid-tier deployments.  Free-tier "
+                "AI Studio keys have ~10 RPD/key — leaving the default disables the "
+                "budget guard entirely (configured budget: %d, likely real budget: %d).  "
+                "Override GEMINI_GENERATE_RPD in backend/.env.",
+                _total_daily_budget, 10 * max(len(key_ids), 1),
+            )
 
         # Pre-load circuit state from Redis (runs before accepting any calls).
         await inst._load_circuit_state_from_redis()
@@ -542,7 +585,8 @@ class GeminiRequestManager:
         logger.info(
             "GeminiRequestManager ready — generate RPM=%d (burst=%d) TPM=%d "
             "embed RPM=%d (burst=%d) queue_depth_cap=%d permit_timeout=%.1fs "
-            "key_pool=%d quota_reset_buffer=%dmin",
+            "key_pool=%d quota_reset_buffer=%dmin | budget: RPD/key=%d "
+            "total=%d reserve=%d rpd_flush_every=%d",
             settings.GEMINI_GENERATE_RPM, gen_burst_cap,
             settings.GEMINI_GENERATE_TPM,
             settings.GEMINI_EMBED_RPM, embed_burst_cap,
@@ -550,6 +594,10 @@ class GeminiRequestManager:
             settings.GEMINI_PERMIT_TIMEOUT,
             len(key_ids),
             settings.GEMINI_QUOTA_RESET_BUFFER_MINUTES,
+            settings.GEMINI_GENERATE_RPD,
+            _total_daily_budget,
+            _reserve,
+            inst._rpd_flush_threshold,
         )
 
     # ── Public API ─────────────────────────────────────────────────────────────
@@ -706,12 +754,12 @@ class GeminiRequestManager:
         #
         # Incremented for every non-cancelled GENERATE release — success or
         # error — because the API counts the request regardless of outcome.
-        # Persisted to Redis every 10 calls (fire-and-forget) so a mid-day
-        # restart resumes from the correct count.
+        # Persisted to Redis every _rpd_flush_threshold calls (adaptive: ~5% of
+        # daily budget) so a mid-day crash restart resumes within that margin.
         if permit.operation == Operation.GENERATE:
             self._generate_rpd_used += 1
             self._generate_rpd_write_ctr += 1
-            if self._generate_rpd_write_ctr >= 10:
+            if self._generate_rpd_write_ctr >= self._rpd_flush_threshold:
                 self._generate_rpd_write_ctr = 0
                 asyncio.create_task(
                     self._write_rpd_to_redis(),
@@ -756,6 +804,7 @@ class GeminiRequestManager:
         op_state[key_id] = True
         self._recalibrate_rpm_buckets(operation)
         self._emit_circuit_metric(operation, open_=self._any_circuit_open(operation))
+        self._emit_all_exhausted_metric(operation)
 
         # Persist to Redis with a TTL matching the next quota reset + buffer.
         # This acts as a crash-restart safety net: if the watcher task never fired
@@ -829,7 +878,10 @@ class GeminiRequestManager:
         exhaustion window.  Keys that are absent or have expired are treated as
         closed (fail-open safety default).
         """
-        from app.core.metrics import gemini_circuit_open as _copen
+        from app.core.metrics import (
+            gemini_circuit_open as _copen,
+            gemini_all_keys_exhausted as _all_ex,
+        )
         for op in _ALL_OPERATIONS:
             for kid in self._key_ids:
                 redis_key = _circuit_redis_key(op, kid)
@@ -837,8 +889,9 @@ class GeminiRequestManager:
                     raw = await self._redis.get(redis_key)
                     is_open = bool(raw)
                     self._circuit_state[op][kid] = is_open
-                    # Metric reflects whether ANY key for this op is open.
+                    # Reflect any-open and all-exhausted metrics after each load.
                     _copen.labels(op=op).set(1 if self._any_circuit_open(op) else 0)
+                    _all_ex.labels(op=op).set(1 if self._all_keys_exhausted(op) else 0)
                     if is_open:
                         logger.warning(
                             "request_manager: Gemini %s circuit pre-loaded OPEN for "
@@ -989,6 +1042,17 @@ class GeminiRequestManager:
         from app.core.metrics import gemini_circuit_open as _copen
         _copen.labels(op=operation).set(1 if open_ else 0)
 
+    def _emit_all_exhausted_metric(self, operation: str) -> None:
+        """Update the gemini_all_keys_exhausted gauge for ``operation``.
+
+        Set to 1 only when EVERY registered key is quota-exhausted (i.e. the
+        circuit fast-path activates and explanations stop).  This is the CRITICAL
+        alert signal — distinct from gemini_circuit_open which fires when ANY key
+        is exhausted.
+        """
+        from app.core.metrics import gemini_all_keys_exhausted as _all_ex
+        _all_ex.labels(op=operation).set(1 if self._all_keys_exhausted(operation) else 0)
+
     # ── Private — quota reset watcher ─────────────────────────────────────────
 
     async def _run_quota_reset_watcher(self) -> None:
@@ -1059,6 +1123,7 @@ class GeminiRequestManager:
                         redis_key, exc,
                     )
             self._emit_circuit_metric(op, open_=self._any_circuit_open(op))
+            self._emit_all_exhausted_metric(op)
             self._recalibrate_rpm_buckets(op)
 
         # Reset the daily generate RPD counter.  The quota watcher fires at
@@ -1069,6 +1134,28 @@ class GeminiRequestManager:
         self._generate_rpd_used = 0
         self._generate_rpd_write_ctr = 0
         self._update_rpd_metric()
+
+        # Signal the explanation worker to auto-requeue any DLQ entries from the
+        # previous quota day.  Best-effort — if Redis pub/sub is unavailable, the
+        # worker's boot-time DLQ scan on the next restart handles recovery instead.
+        try:
+            from app.core.redis import RedisChannels as _RC
+            payload = json.dumps({
+                "reset_at": datetime.now(timezone.utc).isoformat(),
+                "keys_reset": reset_count,
+            })
+            await self._redis.publish(_RC.GEMINI_QUOTA_RESET, payload)
+            logger.debug(
+                "request_manager: Published quota reset signal to %s "
+                "(keys_reset=%d).",
+                _RC.GEMINI_QUOTA_RESET, reset_count,
+            )
+        except Exception as exc:
+            logger.warning(
+                "request_manager: Failed to publish quota reset signal: %s "
+                "— DLQ recovery will occur on next explanation worker restart.",
+                exc,
+            )
 
         if reset_count > 0:
             logger.info(

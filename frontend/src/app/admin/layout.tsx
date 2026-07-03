@@ -3,7 +3,7 @@
 import { useEffect } from "react";
 import { useRouter, usePathname } from "next/navigation";
 import Link from "next/link";
-import { BarChart3, Brain, FlaskConical, Layers, Users, ShieldAlert } from "lucide-react";
+import { BarChart3, Brain, Cpu, FlaskConical, Layers, Users, ShieldAlert } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 
 const NAV_ITEMS = [
@@ -36,6 +36,12 @@ const NAV_ITEMS = [
     label: "User Management",
     icon: Users,
     description: "Create, manage roles & access",
+  },
+  {
+    href: "/admin/workers",
+    label: "Worker Control",
+    icon: Cpu,
+    description: "Monitor & control background tasks",
   },
 ];
 

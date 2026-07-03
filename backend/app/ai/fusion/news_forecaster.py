@@ -255,6 +255,122 @@ class CircuitBreaker:
 
 # ── Timed Gemini call ───────────────────────────────────────────────────────────
 
+# ── Batch forecast schemas ──────────────────────────────────────────────────────
+# Used by the forecast_batch_worker to fire one Gemini call per group of symbols
+# instead of one call per symbol on the signal-assembly hot path.
+#
+# Reliability constraints (from structured-output bug research):
+#   - Batch size ≤ 5 for complex schemas (15 indicators + 6 events per symbol).
+#     Community-validated safe ceiling for multi-item structured output.
+#   - Each SymbolForecast is validated independently — invalid items are silently
+#     dropped; callers receive the NLP fallback for that symbol.
+#   - symbol echo-back required for item-mixing detection (confirmed Gemini bug).
+#   - max_output_tokens set generously (1 000) to prevent silent None returns.
+#   - Never use the Gemini Async Batch API — confirmed ~70% hallucination rate.
+
+class SymbolForecast(BaseModel):
+    """Single symbol result within a batch forecast response."""
+
+    symbol: str = Field(
+        description="Exact symbol string from the request — echo back verbatim.",
+    )
+    rationale: str = Field(
+        description=(
+            "ONE or TWO short sentences (≤45 words) grounding the call in the "
+            "specific indicator values and news provided. No advice, no price "
+            "targets, no fabricated figures."
+        ),
+    )
+    direction: Literal["BUY", "SELL", "HOLD"] = Field(
+        description=(
+            "Net directional lean once the technical indicators and the news are "
+            "combined. HOLD when they conflict or signal is weak."
+        ),
+    )
+    confidence: float = Field(
+        ge=0.0, le=1.0,
+        description=(
+            "Calibrated confidence in `direction`, 0.0–1.0. Be conservative: "
+            "reserve >0.8 for strong agreement; use ≤0.5 when evidence is thin."
+        ),
+    )
+
+
+class NewsForecastBatchOutput(BaseModel):
+    """Batch forecast response — one SymbolForecast entry per requested symbol."""
+
+    forecasts: list[SymbolForecast] = Field(
+        description=(
+            "One forecast per symbol, in the same order as the input. "
+            "Echo the symbol name exactly as given. If evidence is thin for a "
+            "symbol, use HOLD with confidence ≤ 0.4 rather than omitting the entry."
+        ),
+    )
+
+
+# System prompt for batch calls (multi-symbol context).
+_BATCH_FORECAST_SYSTEM_PROMPT = """\
+You are the news-aware forecasting module of the Cortex trading platform.
+You are forecasting for MULTIPLE symbols in a single call.
+
+For EACH symbol provided:
+- Reason over its technical indicators and news events INDEPENDENTLY.
+- Output direction (BUY/SELL/HOLD), calibrated confidence (0–1), and a
+  1–2 sentence rationale (≤45 words) grounded in the provided data.
+- Echo the symbol name EXACTLY as given in the request (verbatim).
+- If evidence is thin, use HOLD with confidence ≤ 0.4 rather than omitting.
+
+Rules:
+- Never fabricate figures, prices, events, or sources.
+- No price targets, no investment advice ("buy now", "you should…").
+- Confidence >0.8 only on strong, corroborated agreement.
+- Treat each symbol INDEPENDENTLY — do not cross-contaminate signals between symbols.\
+"""
+
+# Fields extracted from raw event dicts for the batch queue payload.
+# Limits payload size while retaining all data needed by _render_events().
+_BATCH_EVENT_FIELDS: frozenset[str] = frozenset({
+    "id", "article_title", "type", "event_type",
+    "impact", "sentiment", "sentiment_label", "source_name",
+})
+
+
+def build_batch_forecast_prompt(
+    payloads: list[dict[str, Any]],
+) -> tuple[str, list[str]]:
+    """Build a multi-symbol forecast prompt from a list of queue payloads.
+
+    Returns ``(prompt_text, valid_symbols)`` where ``valid_symbols`` mirrors
+    the order of symbols written into the prompt.  Payloads without a
+    ``symbol`` field are skipped silently.
+    """
+    sections: list[str] = []
+    valid_symbols: list[str] = []
+
+    for payload in payloads:
+        symbol = payload.get("symbol")
+        if not symbol:
+            continue
+        indicators = payload.get("indicators") or {}
+        events     = payload.get("events") or []
+        regime     = payload.get("regime")
+
+        per_symbol = build_forecast_prompt(symbol, indicators, events, regime=regime)
+        sections.append(f"## {symbol}\n\n{per_symbol}")
+        valid_symbols.append(symbol)
+
+    if not sections:
+        return "", []
+
+    header = (
+        f"Forecast for {len(valid_symbols)} symbol(s): "
+        f"{', '.join(valid_symbols)}\n\n"
+        "Provide one SymbolForecast entry per symbol.\n\n"
+        "---\n\n"
+    )
+    return header + "\n\n---\n\n".join(sections), valid_symbols
+
+
 async def generate_news_forecast(
     client: Any,
     *,
@@ -264,7 +380,7 @@ async def generate_news_forecast(
     regime: str | None,
     timeout: float,
     max_tokens: int,
-    priority: Priority = Priority.MEDIUM,
+    priority: Priority = Priority.LOW,
 ) -> tuple[NewsForecastOutput, dict[str, Any]]:
     """Run the timeout-bounded Gemini structured forecast.
 

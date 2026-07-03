@@ -37,15 +37,13 @@ from app.ai.fusion.models import (
 )
 from app.ai.fusion.news_forecaster import (
     CircuitBreaker,
-    generate_news_forecast,
-    score_from_direction,
+    _BATCH_EVENT_FIELDS,
 )
 from app.ai.fusion.serializers import serialise_signal
-from app.ai.intelligence.llm_client import Priority, get_intelligence_client
 from app.core.config import get_settings
 from app.core.metrics import (
-    llm_news_forecast_duration_seconds,
     llm_news_forecasts_total,
+    news_forecast_queue_depth,
     signal_generation_total,
     signal_staleness_abstentions_total,
 )
@@ -370,59 +368,15 @@ class SignalAssembler:
             llm_news_forecasts_total.labels(outcome="cache_hit").inc()
             return cached
 
-        settings = get_settings()
-        client = get_intelligence_client()
-        invocation_id = uuid4()
-        prompt_hash = cache_key.rsplit(":", 1)[-1]
-        t0 = monotonic()
-        try:
-            out, usage = await generate_news_forecast(
-                client,
-                symbol=symbol,
-                indicators=indicators,
-                events=events,
-                regime=regime,
-                timeout=settings.GEMINI_FORECAST_TIMEOUT,
-                max_tokens=settings.GEMINI_FORECAST_MAX_TOKENS,
-                priority=Priority.MEDIUM,
-            )
-        except Exception as exc:  # incl. asyncio.TimeoutError, LLMFallbackExhausted
-            self._forecast_breaker.record_failure()
-            llm_news_forecasts_total.labels(outcome="fallback").inc()
-            err = f"{type(exc).__name__}: {exc}"
-            logger.warning(
-                "news_forecaster: forecast failed for %s (%s) — NLP fallback",
-                symbol, err,
-            )
-            await self._write_forecast_audit(
-                invocation_id=invocation_id, prompt_hash=prompt_hash,
-                model_id=client.model_id, latency_ms=int((monotonic() - t0) * 1000),
-                output=None, error=err, usage=None,
-            )
-            return _fallback(err)
-
-        self._forecast_breaker.record_success()
-        latency_ms = int((monotonic() - t0) * 1000)
-        result = {
-            "score":           score_from_direction(out.direction, out.confidence),
-            "confidence":      float(out.confidence),
-            "available":       True,
-            "events":          events,
-            "event_count":     event_signals.get("event_count", len(events)),
-            "direction":       out.direction,
-            "rationale":       out.rationale,
-            "forecast_source": "gemini",
-            "model":           usage.get("model_id", client.model_id),
-        }
-        llm_news_forecasts_total.labels(outcome="success").inc()
-        llm_news_forecast_duration_seconds.labels(provider="gemini").observe(latency_ms / 1000.0)
-        await self._forecast_cache_set(cache_key, result, settings.NEWS_FORECAST_CACHE_TTL)
-        await self._write_forecast_audit(
-            invocation_id=invocation_id, prompt_hash=prompt_hash,
-            model_id=usage.get("model_id", client.model_id), latency_ms=latency_ms,
-            output=out, error=None, usage=usage,
-        )
-        return result
+        # Cache miss — enqueue for background batch processing; return NLP fallback
+        # immediately so the hot path (signal assembly, consensus) never blocks on
+        # Gemini.  The forecast_batch_worker drains this queue asynchronously,
+        # fires one Gemini call per batch of symbols, and writes results to the
+        # same cache keys.  The NEXT signal for this symbol within the 5-minute
+        # TTL will hit cache and return the Gemini result with zero latency.
+        await self._enqueue_for_batch_forecast(symbol, events, indicators, regime, cache_key)
+        llm_news_forecasts_total.labels(outcome="batch_enqueued").inc()
+        return _fallback("batch_pending")
 
     def _forecast_cache_key(
         self, symbol: str, events: list[dict], indicators: dict[str, Any]
@@ -461,6 +415,64 @@ class SignalAssembler:
             await self._ml_cache.setex(key, ttl, json.dumps(value, default=str))
         except Exception as exc:
             logger.debug("news_forecaster: cache write failed (non-fatal): %s", exc)
+
+    async def _enqueue_for_batch_forecast(
+        self,
+        symbol: str,
+        events: list[dict],
+        indicators: dict[str, Any],
+        regime: str | None,
+        cache_key: str,
+    ) -> None:
+        """Push a forecast request onto the batch worker queue (fire-and-forget).
+
+        Idempotent: a dedup key (TTL=10 min) prevents the same (symbol, news-set)
+        from flooding the queue within one accumulation window.  Queue depth is
+        bounded to prevent unbounded memory growth under sustained load.
+        """
+        if self._ml_cache is None:
+            return
+
+        dedup_key = f"cortex:forecast:batch:dedup:{cache_key}"
+        try:
+            acquired = await self._ml_cache.set(dedup_key, "1", nx=True, ex=600)
+            if not acquired:
+                return  # Already queued for this (symbol, news-set) combination
+        except Exception as exc:
+            logger.debug("news_forecaster: dedup check failed for %s — %s", symbol, exc)
+            return
+
+        # Slim events to only the fields needed for prompt rendering.
+        slim_events = [
+            {k: v for k, v in ev.items() if k in _BATCH_EVENT_FIELDS}
+            for ev in events[:6]
+        ]
+        # Slim indicators to only numeric values (non-numeric are not rendered).
+        slim_indicators = {
+            k: float(v) for k, v in indicators.items() if isinstance(v, (int, float))
+        }
+
+        payload = json.dumps({
+            "symbol":     symbol,
+            "events":     slim_events,
+            "indicators": slim_indicators,
+            "regime":     regime,
+            "cache_key":  cache_key,
+        }, default=str)
+
+        try:
+            await self._ml_cache.lpush("cortex:forecast:batch:queue", payload)
+
+            # Bound queue depth — remove the oldest (rightmost) item when the
+            # queue exceeds NEWS_FORECAST_BATCH_SIZE × 5 (a full 5-batch backlog).
+            settings = get_settings()
+            max_depth = settings.NEWS_FORECAST_BATCH_SIZE * 5
+            depth = await self._ml_cache.llen("cortex:forecast:batch:queue")
+            news_forecast_queue_depth.set(depth)
+            if depth > max_depth:
+                await self._ml_cache.rpop("cortex:forecast:batch:queue")
+        except Exception as exc:
+            logger.debug("news_forecaster: enqueue failed for %s — %s", symbol, exc)
 
     async def _write_forecast_audit(
         self,

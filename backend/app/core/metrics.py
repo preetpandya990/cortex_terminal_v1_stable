@@ -434,6 +434,83 @@ gemini_rpd_budget_remaining = Gauge(
     'RPD_RESERVE is reached; resets to full at midnight Pacific Time.',
 )
 
+gemini_all_keys_exhausted = Gauge(
+    'gemini_all_keys_exhausted',
+    'Whether ALL keys in the Gemini pool have open quota circuits — 1=all exhausted '
+    '(explanations dead), 0=at least one key active.  Distinct from gemini_circuit_open '
+    'which fires when ANY single key is exhausted.',
+    ['op'],  # generate | embed
+)
+
+gemini_dlq_requeue_total = Counter(
+    'gemini_dlq_requeue_total',
+    'Total explanation DLQ entries automatically requeued after a Gemini quota reset',
+    ['trigger'],  # boot | quota_reset
+)
+
+# ── Forecast Batch Worker Metrics ─────────────────────────────────────────────
+# Visibility into the async batch forecaster: batch sizes, call outcomes, and
+# queue backlog.  Used by the GeminiForecastBatchLagging alert and the Gemini
+# Daily Budget burn-down Grafana panel to detect stalled batch workers.
+
+news_forecast_batch_size_histogram = Histogram(
+    'news_forecast_batch_size',
+    'Number of symbols per batched Gemini news-forecast call',
+    buckets=(1, 2, 3, 4, 5, 6, 7, 8, 10),
+)
+
+news_forecast_batch_calls_total = Counter(
+    'news_forecast_batch_calls_total',
+    'Batched Gemini news-forecast call outcomes',
+    # outcome: success | validation_partial | budget_throttled | error
+    ['outcome'],
+)
+
+news_forecast_queue_depth = Gauge(
+    'news_forecast_queue_depth',
+    'Number of symbols currently pending in the forecast batch queue '
+    '(cortex:forecast:batch:queue).  Sustained high values indicate a '
+    'stalled batch worker or sustained quota exhaustion.',
+)
+
+
+# ── AI Processing Queue Control Metrics ───────────────────────────────────────
+# Visibility into the demand-driven Tier-2 dispatch layer (sentiment/forecast/
+# classification): who triggered a drain and what it did, plus live queue
+# depth per category for the Worker Control Panel and Grafana.
+
+ai_processing_dispatch_total = Counter(
+    'ai_processing_dispatch_total',
+    'Dispatch calls by category/trigger/outcome',
+    # category: sentiment | forecast | classification
+    # trigger_source: manual | scheduled
+    # outcome: success | error
+    ['category', 'trigger_source', 'outcome'],
+)
+
+ai_processing_pending_gauge = Gauge(
+    'ai_processing_pending',
+    'Pending queue depth per AI processing category',
+    ['category'],  # sentiment | forecast | classification
+)
+
+ai_processing_safety_net_runs_total = Counter(
+    'ai_processing_safety_net_runs_total',
+    'Total AI processing safety-net sweep runs by final status',
+    ['status'],  # success | error
+)
+
+ai_processing_safety_net_duration_seconds = Histogram(
+    'ai_processing_safety_net_duration_seconds',
+    'Wall-clock duration of each AI processing safety-net sweep (seconds)',
+    buckets=(0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0),
+)
+
+ai_processing_safety_net_last_run_timestamp = Gauge(
+    'ai_processing_safety_net_last_run_timestamp',
+    'Unix timestamp of the last AI processing safety-net sweep',
+)
+
 
 # ── Instrument Sync Metrics ─────────────────────────────────────────────────────
 instrument_sync_total = Counter(

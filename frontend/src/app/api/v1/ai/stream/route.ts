@@ -13,18 +13,19 @@
  *   passed as the `token` query parameter. This proxy forwards all query
  *   params to the backend verbatim.
  *
- * Buffering — three mechanisms, all addressed:
+ * Buffering — four mechanisms, all addressed:
  *
- *   1. Async handler timing (decisive):
- *      `await fetch(...)` blocks the handler body before any Response is
- *      returned. Next.js cannot flush a single byte until GET() resolves, but
- *      a live SSE stream never terminates, so the handler never returns and the
- *      browser receives nothing. Fix: construct and return a Response wrapping
- *      the readable end of a TransformStream BEFORE the upstream fetch begins.
- *      The fetch + byte-forwarding runs in a detached fire-and-forget IIFE that
- *      outlives GET()'s return, piping into the writable end concurrently.
- *      Confirmed by GitHub issue #66263 ("when server proxy SSE request, browser
- *      receives data until response end").
+ *   1. Async handler timing:
+ *      Awaiting the upstream call blocks the handler body before any Response
+ *      is returned. Next.js cannot flush a single byte until GET() resolves,
+ *      but a live SSE stream never terminates, so the handler would never
+ *      return and the browser would receive nothing. Fix: construct and
+ *      return a Response wrapping the readable end of a TransformStream
+ *      BEFORE the upstream request begins. The request + byte-forwarding runs
+ *      in a detached fire-and-forget IIFE that outlives GET()'s return,
+ *      piping into the writable end concurrently. Confirmed by GitHub issue
+ *      #66263 ("when server proxy SSE request, browser receives data until
+ *      response end").
  *
  *   2. Gzip compression middleware:
  *      Next.js accumulates gzip/brotli chunks looking for a minimum payload to
@@ -33,19 +34,45 @@
  *      for this response only — safer than `compress: false` in next.config.js,
  *      which breaks middleware in dev (Next.js issues #48503/#48713/#50320).
  *
- *   3. Undici fetch cache:
+ *   3. WHATWG `fetch()` body delivery (decisive — found 2026-07-03):
+ *      The upstream call was originally made with the global `fetch()`, which
+ *      in Node.js is backed by undici's WHATWG-spec-compliant implementation.
+ *      That implementation negotiates `Accept-Encoding: gzip, deflate, br` by
+ *      default and routes the response body through a decompression-aware
+ *      `ReadableStream` bridge. For this backend's response — chunked
+ *      transfer-encoding, no `Content-Encoding`, arriving in small, irregular
+ *      SSE keep-alive frames — that bridge never yields a chunk to the
+ *      reader; `response.body.getReader().read()` (and `for await` iteration)
+ *      hang indefinitely, even though the raw TCP bytes are flowing.
+ *      Reproduced directly: Node's core `http.get()` against the same
+ *      backend URL streams the first chunk in <20 ms; `fetch()` against the
+ *      identical URL never resolves a single read. Undici's own lower-level
+ *      `request()` API — which the WHATWG `fetch()` wrapper is built on top
+ *      of, but without the spec-mandated compression-negotiation layer —
+ *      streams correctly and is undici's documented recommendation for
+ *      server-side proxying. Fix: use `undici.request()` for the upstream
+ *      call instead of `fetch()`. Its `body` (`BodyReadable`) is a Node.js
+ *      `Readable`, not a WHATWG stream — bridged via `Readable.toWeb()` (Node
+ *      core, stable) into a real `ReadableStream` before entering the same
+ *      `getReader()` loop used below, with no other structural change.
+ *
+ *   4. Undici fetch cache:
  *      Next.js wraps `fetch` with an undici-backed cache that can partially
  *      materialise a response body before handing it to the handler's stream.
- *      `cache: 'no-store'` opts out of this layer (confirmed silently broken in
- *      production builds without this flag — GitHub issue #73589).
+ *      This no longer applies now that the upstream call uses `undici.request()`
+ *      directly rather than the wrapped global `fetch()`, but is noted here
+ *      for context (GitHub issue #73589 — silently broken in production
+ *      builds without `cache: 'no-store'` on `fetch()`).
  *
  * Client disconnect propagation:
- *   `signal: request.signal` on the upstream fetch aborts the backend SSE
+ *   `signal: request.signal` on the upstream request aborts the backend SSE
  *   connection when the browser closes (modal unmount → EventSource.close()).
  *   Without this, every closed tab leaks a backend asyncio task + Redis
  *   pub/sub subscription indefinitely.
  */
 import { type NextRequest } from 'next/server';
+import { request as undiciRequest } from 'undici';
+import { Readable } from 'node:stream';
 
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8000';
 
@@ -83,7 +110,7 @@ export async function GET(request: NextRequest): Promise<Response> {
   if (clientIp) forwardHeaders['X-Forwarded-For'] = clientIp;
 
   // TransformStream bridges the upstream reader and the browser writer.
-  // We return a Response wrapping `readable` BEFORE the upstream fetch begins —
+  // We return a Response wrapping `readable` BEFORE the upstream request begins —
   // this is what allows Next.js to flush response headers immediately and start
   // delivering bytes as they arrive. The fire-and-forget IIFE below feeds
   // `writable` concurrently after GET() returns.
@@ -104,25 +131,33 @@ export async function GET(request: NextRequest): Promise<Response> {
     },
   });
 
-  // ── Upstream fetch + pipe (fire-and-forget) ──────────────────────────────────
+  // ── Upstream request + pipe (fire-and-forget) ────────────────────────────────
   // `request.signal` propagates the browser's disconnect: when the modal unmounts
   // and EventSource.close() fires, the AbortSignal aborts the upstream connection
   // — no leaked backend SSE tasks or Redis pub/sub subscriptions.
+  //
+  // Uses undici's low-level `request()` rather than the global `fetch()` — see
+  // note 3 above. `body` is a Node `Readable`, bridged to a Web `ReadableStream`
+  // just before the read loop.
   void (async () => {
     try {
-      const upstream = await fetch(backendUrl.toString(), {
+      const upstream = await undiciRequest(backendUrl.toString(), {
         method:  'GET',
         headers: forwardHeaders,
-        cache:   'no-store',      // Bypass Next.js undici fetch cache (see note 3)
         signal:  request.signal,  // Propagate client disconnect to backend
       });
 
-      if (!upstream.ok || !upstream.body) {
+      if (upstream.statusCode < 200 || upstream.statusCode >= 300) {
         // Non-SSE backend error (e.g. 401 invalid token) — emit an SSE error
         // event so the client's `es.addEventListener('error', ...)` handler fires
         // cleanly instead of the connection silently hanging.
-        const text = await upstream.text().catch(() => upstream.statusText);
-        await writer.write(buildSseErrorChunk(`backend error ${upstream.status}: ${text}`));
+        // BodyReadable (undici's Node `Readable` subclass) ships its own
+        // fetch-spec-shaped `.text()` convenience method — no need to bridge
+        // to a Web stream just to read an error body.
+        const text = await upstream.body.text().catch(() => '');
+        await writer.write(
+          buildSseErrorChunk(`backend error ${upstream.statusCode}: ${text}`),
+        );
         return;
       }
 
@@ -131,11 +166,16 @@ export async function GET(request: NextRequest): Promise<Response> {
       // if the upstream closes mid-stream or the client disconnects, pipeTo's
       // rejection can propagate asynchronously and miss the finally block.
       // The manual loop with try/catch/finally guarantees writer.close() in all paths.
-      const reader = upstream.body.getReader();
+      //
+      // `upstream.body` is a Node `Readable` (see note 3) — bridge it to a Web
+      // `ReadableStream` via Node's own `Readable.toWeb()` to get a real
+      // `getReader()`, rather than relying on Node-stream async-iteration
+      // semantics for cleanup guarantees.
+      const reader = Readable.toWeb(upstream.body).getReader();
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        await writer.write(value);
+        await writer.write(value as Uint8Array);
       }
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') {

@@ -211,6 +211,20 @@ class RedisChannels:
     """
 
 
+    # ── Gemini Quota ──────────────────────────────────────────────────────────
+    GEMINI_QUOTA_RESET = "cai:gemini:quota:reset"
+    """
+    Published by GeminiRequestManager after midnight PT quota reset clears all
+    open circuits.  The explanation worker subscribes and auto-requeues any
+    ``gemini_quota_exhausted`` DLQ entries from the previous quota day.
+
+    Payload:
+        {
+            "reset_at":    "2026-06-30T00:15:00Z",   # UTC timestamp of the reset
+            "keys_reset":  3                          # number of circuits cleared
+        }
+    """
+
     # ── Market Feed ────────────────────────────────────────────────────────────
     MARKET_FEED_LTPC = "cai:market-feed:ltpc"
     """

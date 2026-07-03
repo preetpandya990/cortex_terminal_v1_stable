@@ -90,7 +90,7 @@ class AIEventClassification(Base):
     __tablename__ = "ai_event_classifications"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    nlp_result_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    nlp_result_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True, index=True)
     event_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     impact_score: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)
     affected_symbols: Mapped[list[str] | None] = mapped_column(ARRAY(String(20)), index=True)
@@ -406,8 +406,12 @@ class AIInstrumentContext(Base):
     Lifecycle
     ---------
     generated_at  When the LLM finished writing this context.
-    expires_at    generated_at + 2 hours.  The SSE poll path checks this field;
-                  an expired row triggers a new generation (same as a missing row).
+    expires_at    generated_at + 2 hours.  Used by watchlist_context_scheduler.py
+                  to gate intraday re-enqueue decisions (stale when expires_at is
+                  within WATCHLIST_SCHEDULER_FRESHNESS_MARGIN_MINUTES of now).
+                  NOT used by the SSE serve path — Stage 2 in ai_stream.py checks
+                  generated_at against WATCHLIST_CONTEXT_SERVE_MAX_AGE_HOURS (24 h)
+                  so overnight content is served without triggering Stage 3.
 
     Audit trail
     -----------

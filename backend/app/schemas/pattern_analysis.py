@@ -31,11 +31,12 @@ class PatternAnalysisRequest(BaseModel):
 
 class PatternDetection(BaseModel):
     """Individual pattern detection result."""
-    
-    name: str = Field(..., description="Pattern name (e.g., HAMMER, DOJI)")
-    timestamp: str = Field(..., description="ISO timestamp when pattern occurred")
-    confidence: int = Field(..., ge=0, le=200, description="Pattern confidence (100 or 200)")
-    direction: Literal["bullish", "bearish"] = Field(..., description="Pattern direction")
+
+    name:            str                       = Field(..., description="Pattern name (e.g., HAMMER, DOJI)")
+    timestamp:       str                       = Field(..., description="ISO timestamp when pattern occurred")
+    confidence:      int                       = Field(..., ge=0, le=200, description="TA-Lib raw confidence (100 or 200)")
+    direction:       Literal["bullish", "bearish"] = Field(..., description="Pattern direction")
+    composite_score: float                     = Field(..., ge=0.0, description="Quality score: reliability × signal_strength × recency_decay × volume_factor")
 
 
 class HistoricalStats(BaseModel):

@@ -61,10 +61,11 @@ export interface VerdictResponse {
 // New types for the revamped AnalysisCardsSection (ML Pattern + AI Sentiment + Synthesis)
 
 export interface PatternDetection {
-  name: string;           // e.g. "HAMMER", "ENGULFING"
-  timestamp: string;      // ISO 8601
-  confidence: number;     // 100 or 200 (TA-Lib values)
+  name: string;            // e.g. "HAMMER", "ENGULFING"
+  timestamp: string;       // ISO 8601
+  confidence: number;      // 100 or 200 (TA-Lib values)
   direction: 'bullish' | 'bearish';
+  composite_score?: number; // reliability × signal_strength × recency_decay × volume_factor
 }
 
 export interface HistoricalStats {

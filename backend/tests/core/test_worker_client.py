@@ -7,14 +7,14 @@ times out, or the server returns an error status.
 """
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 from aiobreaker import CircuitBreakerError
 
-from app.core.worker_client import WorkerClient
+from app.core.worker_client import WorkerClient, WorkerDispatchError
 
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
@@ -152,6 +152,81 @@ class TestSuccess:
         call_args = mock_req.call_args
         assert call_args[0][0] == "POST"
         assert "/tasks/heartbeat/pause" in call_args[0][1]
+
+
+# ── dispatch_ai_processing: deliberate exception to fail-open ─────────────────
+
+class TestDispatchAIProcessing:
+    """
+    dispatch_ai_processing() is a deliberate exception to this client's
+    fail-open contract — it must raise WorkerDispatchError (never return
+    None) on any failure, so the admin dispatch action surfaces a real error.
+    """
+
+    @pytest.mark.asyncio
+    async def test_raises_on_circuit_open(self, worker_client):
+        worker_client._breaker = MagicMock()
+        worker_client._breaker.call_async = AsyncMock(
+            side_effect=CircuitBreakerError("open", datetime.now(timezone.utc) + timedelta(seconds=30))
+        )
+        with pytest.raises(WorkerDispatchError, match="circuit open"):
+            await worker_client.dispatch_ai_processing("sentiment")
+
+    @pytest.mark.asyncio
+    async def test_raises_on_network_error(self, worker_client):
+        with patch.object(
+            worker_client._client,
+            "request",
+            side_effect=httpx.ConnectError("connection refused"),
+        ):
+            with pytest.raises(WorkerDispatchError, match="unreachable"):
+                await worker_client.dispatch_ai_processing("forecast")
+
+    @pytest.mark.asyncio
+    async def test_raises_on_502_with_reason(self, worker_client):
+        response = _mock_response(502, {"detail": "dispatch_failed", "reason": "quota exhausted"})
+        with patch.object(worker_client._client, "request", return_value=response):
+            with pytest.raises(WorkerDispatchError, match="quota exhausted"):
+                await worker_client.dispatch_ai_processing("classification")
+
+    @pytest.mark.asyncio
+    async def test_returns_dict_on_success(self, worker_client):
+        expected = {"dispatched": 5, "calls_made": 1}
+        with patch.object(
+            worker_client._client,
+            "request",
+            return_value=_mock_response(200, expected),
+        ) as mock_req:
+            result = await worker_client.dispatch_ai_processing("sentiment")
+
+        assert result == expected
+        call_args = mock_req.call_args
+        assert call_args[0][0] == "POST"
+        assert "/ai-processing/sentiment/dispatch" in call_args[0][1]
+
+    @pytest.mark.asyncio
+    async def test_get_ai_processing_status_is_fail_open(self, worker_client):
+        """Unlike dispatch, the status read follows the normal fail-open contract."""
+        with patch.object(
+            worker_client._client,
+            "request",
+            side_effect=httpx.ConnectError("connection refused"),
+        ):
+            result = await worker_client.get_ai_processing_status()
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_get_ai_processing_status_returns_dict_on_success(self, worker_client):
+        expected = {
+            "sentiment": {"pending": 0, "auto_flush": True},
+            "forecast": {"pending": 0, "auto_flush": True},
+            "classification": {"pending": 0, "auto_flush": True},
+        }
+        with patch.object(
+            worker_client._client, "request", return_value=_mock_response(200, expected)
+        ):
+            result = await worker_client.get_ai_processing_status()
+        assert result == expected
 
 
 # ── aclose ─────────────────────────────────────────────────────────────────────

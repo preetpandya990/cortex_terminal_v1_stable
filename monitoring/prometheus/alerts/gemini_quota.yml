@@ -1,0 +1,106 @@
+groups:
+  - name: gemini_quota
+    interval: 60s
+    rules:
+
+      # ── Warning: daily budget running low ─────────────────────────────────────
+      # Fires when estimated remaining generate calls drops below 2× the
+      # HIGH-priority reserve.  This gives operators actionable early notice
+      # before the budget guard kicks in and blocks background sentiment/forecasting.
+      # Expected: background callers will be throttled; explanations still work.
+      # Action: check Grafana 07-llm-intelligence "Gemini Daily Budget" panel.
+      - alert: GeminiRPDBudgetLow
+        expr: gemini_rpd_budget_remaining < 2 * scalar(gemini_rpd_budget_remaining offset 1d >= bool 0)
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Gemini daily generate budget is critically low"
+          description: >
+            gemini_rpd_budget_remaining={{ $value | printf "%.0f" }} calls remaining.
+            MEDIUM/LOW/BACKGROUND callers are being or will soon be throttled
+            (budget guard fires below the HIGH-priority reserve).
+            Trade-suggestion explanations are unaffected.
+            Check the Gemini Daily Budget burn-down panel in Grafana dashboard 07.
+
+      # Simpler fallback alert that fires unconditionally below a fixed threshold
+      # (covers the case where offset 1d data is unavailable, e.g. first run).
+      - alert: GeminiRPDBudgetCritical
+        expr: gemini_rpd_budget_remaining <= 5
+        for: 2m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Gemini daily generate budget near exhaustion"
+          description: >
+            gemini_rpd_budget_remaining={{ $value | printf "%.0f" }} calls remaining.
+            Circuits may trip within minutes.  Background callers are throttled.
+            Explanation generation is protected but has minimal headroom.
+
+      # ── Critical: all Gemini circuits open — explanations dead ────────────────
+      # Fires when EVERY key in the pool has its daily quota circuit open.
+      # At this point no generate calls can succeed; explanation jobs go straight
+      # to the DLQ.  Auto-resolves at midnight Pacific Time + buffer when
+      # GeminiRequestManager resets circuits and triggers DLQ recovery.
+      # Action: verify quota state in Google AI Studio; if confirmed reset,
+      # circuits clear automatically — no manual intervention required.
+      - alert: GeminiAllCircuitsOpen
+        expr: gemini_all_keys_exhausted{op="generate"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "ALL Gemini generate keys quota-exhausted — explanations dead"
+          description: >
+            All keys in the Gemini pool have open quota circuits for the generate
+            operation.  Trade-suggestion explanations are failing immediately with
+            GeminiQuotaExhausted and being moved to the DLQ.  The explanation worker
+            will automatically requeue DLQ entries at midnight Pacific Time + 15 min
+            buffer when the quota resets.  To recover immediately: verify quota has
+            reset in Google AI Studio, then DEL cortex:gemini:circuit:generate:*
+            in Redis.
+
+      # ── Info: at least one key circuit open (early warning) ───────────────────
+      # Fires when any single key is exhausted.  Usually resolves without
+      # intervention — the manager round-robins to other keys.  Escalates to
+      # GeminiAllCircuitsOpen if all keys exhaust.
+      - alert: GeminiKeyCircuitOpen
+        expr: gemini_circuit_open{op="generate"} == 1
+        for: 5m
+        labels:
+          severity: info
+          team: platform
+        annotations:
+          summary: "At least one Gemini generate key has an open quota circuit"
+          description: >
+            One or more Gemini API keys are quota-exhausted for the generate
+            operation.  The manager is routing around the exhausted key(s).
+            Monitor gemini_all_keys_exhausted — if it reaches 1, explanations stop.
+            Circuits auto-reset at midnight Pacific Time + 15 min buffer.
+
+      # ── Warning: forecast batch queue backed up ────────────────────────────
+      # Fires when the async forecast queue has > 20 symbols pending for > 5 min.
+      # Expected cause A: budget guard is blocking the batch worker (correct
+      #   behaviour near quota exhaustion) — check news_forecast_batch_calls_total
+      #   {outcome="budget_throttled"}.
+      # Expected cause B: batch worker crashed — check news_forecast_batch_calls_total
+      #   {outcome="error"} rising, or worker process logs.
+      - alert: GeminiForecastBatchLagging
+        expr: news_forecast_queue_depth > 20
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Forecast batch queue backed up — batch worker may be stalled"
+          description: >
+            news_forecast_queue_depth={{ $value | printf "%.0f" }} symbols queued
+            and not draining.
+            If news_forecast_batch_calls_total{outcome="budget_throttled"} is
+            rising, the budget guard is blocking the worker (expected and correct
+            near quota exhaustion — no action needed until quota resets).
+            If news_forecast_batch_calls_total{outcome="error"} is rising, the
+            batch worker may have crashed — check worker process logs and restart.

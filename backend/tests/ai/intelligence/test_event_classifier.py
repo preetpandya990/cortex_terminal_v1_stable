@@ -12,6 +12,7 @@ have been corrected to match:
   geopolitical:    fast_hl=8    (was 72)
   general:         impact=45.0  (was 50.0)
 """
+import json
 import pytest
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,6 +22,7 @@ from app.ai.intelligence.event_classifier import (
     _ALLCAPS_RE,
     _CORP_NAME_RE,
     _NON_TICKER_WORDS,
+    _PENDING_QUEUE_KEY,
     _ClassificationSchema,
 )
 
@@ -374,3 +376,161 @@ def test_classification_schema_defaults():
     assert s.affected_symbols == []
     assert 4 <= s.decay_hours <= 48
     assert 24 <= s.decay_slow_hours <= 168
+
+
+# ── Demand-driven dispatch tests ────────────────────────────────────────────────
+
+def _db_factory(db_mock):
+    """Build a db_factory(): async with db_factory() as db yields db_mock."""
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=db_mock)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    return MagicMock(return_value=ctx)
+
+
+@pytest.mark.asyncio
+async def test_general_event_enqueues_when_auto_dispatch_disabled(classifier_with_mock):
+    """
+    event_type='general' (no heuristic match) + EVENT_CLASSIFIER_AUTO_DISPATCH=False
+    must enqueue a deferred payload and return the rule-based result immediately —
+    Gemini must never be called inline.
+    """
+    mock_settings = MagicMock(EVENT_CLASSIFIER_AUTO_DISPATCH=False)
+    mock_redis = AsyncMock()
+
+    with patch("app.core.config.get_settings", return_value=mock_settings):
+        with patch("app.core.redis.get_redis", return_value=mock_redis):
+            with patch("app.core.redis.get_cache_service") as mock_cache_getter:
+                mock_cache_getter.return_value.get = AsyncMock(return_value=None)
+                result = await classifier_with_mock._classify_with_ollama(
+                    content="Some random news that doesn't match any category",
+                    entities={"companies": ["RELIANCE"]},
+                    nlp_result_id=42,
+                )
+
+    classifier_with_mock.ollama_client.generate_structured.assert_not_called()
+    mock_redis.lpush.assert_awaited_once()
+    key, raw_payload = mock_redis.lpush.call_args[0]
+    assert key == _PENDING_QUEUE_KEY
+    payload = json.loads(raw_payload)
+    assert payload["nlp_result_id"] == 42
+    assert result["event_type"] == "general"
+    assert result["confidence"] == 0.6  # rule-based confidence
+
+
+@pytest.mark.asyncio
+async def test_general_event_calls_gemini_when_auto_dispatch_enabled(classifier_with_mock):
+    """event_type='general' + EVENT_CLASSIFIER_AUTO_DISPATCH=True calls Gemini inline."""
+    classifier_with_mock.ollama_client.generate_structured.return_value = _ClassificationSchema(
+        event_type="general",
+        impact_score=50.0,
+        confidence=0.8,
+        affected_symbols=[],
+        reasoning="ambiguous",
+        decay_hours=12,
+        decay_slow_hours=48,
+    )
+    mock_settings = MagicMock(EVENT_CLASSIFIER_AUTO_DISPATCH=True)
+
+    with patch("app.core.config.get_settings", return_value=mock_settings):
+        with patch("app.core.redis.get_cache_service") as mock_cache_getter:
+            mock_cache_getter.return_value.get = AsyncMock(return_value=None)
+            mock_cache_getter.return_value.set = AsyncMock(return_value=None)
+            result = await classifier_with_mock._classify_with_ollama(
+                content="Some random news that doesn't match any category",
+                entities={},
+                nlp_result_id=7,
+            )
+
+    classifier_with_mock.ollama_client.generate_structured.assert_called_once()
+    assert result["confidence"] == 0.8
+
+
+@pytest.mark.asyncio
+async def test_flush_pending_classifications_upgrades_existing_row(classifier_with_mock):
+    """flush_pending_classifications() looks up the row by nlp_result_id and upgrades it."""
+    payload = json.dumps({
+        "content_hash": "abc123",
+        "content": "Vedanta Hindustan Zinc news",
+        "entities": {"companies": []},
+        "nlp_result_id": 99,
+        "enqueued_at": "2026-07-01T00:00:00+00:00",
+    })
+    mock_redis = AsyncMock()
+    mock_redis.lpop.side_effect = [payload.encode(), None]
+
+    existing_row = MagicMock()
+    db_mock = AsyncMock()
+    db_mock.execute.return_value = MagicMock(
+        scalar_one_or_none=MagicMock(return_value=existing_row)
+    )
+    db_mock.commit = AsyncMock()
+    db_mock.refresh = AsyncMock()
+
+    gemini_result = {
+        "event_type": "regulatory",
+        "impact_score": 80.0,
+        "confidence": 0.9,
+        "affected_symbols": ["VEDL"],
+        "reasoning": "SEBI action",
+        "decay_hours": 24,
+        "decay_slow_hours": 168,
+    }
+
+    with patch.object(classifier_with_mock, "_gemini_classify", AsyncMock(return_value=gemini_result)):
+        with patch.object(classifier_with_mock, "_extract_symbols_from_content", AsyncMock(return_value=[])):
+            with patch(
+                "app.ai.intelligence.event_classifier.normalize_and_validate_symbols",
+                AsyncMock(return_value=["VEDL"]),
+            ):
+                result = await classifier_with_mock.flush_pending_classifications(
+                    _db_factory(db_mock), mock_redis
+                )
+
+    assert result == {"dispatched": 1, "calls_made": 1}
+    assert existing_row.event_type == "regulatory"
+    assert existing_row.affected_symbols == ["VEDL"]
+    db_mock.commit.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_flush_pending_classifications_stops_on_gemini_failure(classifier_with_mock):
+    """
+    A Gemini call failure (confidence=0.0 fallback from _gemini_classify) stops
+    the drain and raises — the failed item's row is left untouched.
+    """
+    payload = json.dumps({
+        "content_hash": "abc123",
+        "content": "content",
+        "entities": {},
+        "nlp_result_id": 5,
+        "enqueued_at": "2026-07-01T00:00:00+00:00",
+    })
+    mock_redis = AsyncMock()
+    mock_redis.lpop.side_effect = [payload.encode(), payload.encode()]  # 2 items queued
+
+    db_mock = AsyncMock()
+    failure_result = {
+        "event_type": "general",
+        "impact_score": 50.0,
+        "confidence": 0.0,  # sentinel for Gemini failure
+        "affected_symbols": [],
+        "reasoning": "",
+        "decay_hours": 12,
+        "decay_slow_hours": 48,
+    }
+
+    with patch.object(classifier_with_mock, "_gemini_classify", AsyncMock(return_value=failure_result)):
+        with pytest.raises(RuntimeError, match="nlp_result_id=5"):
+            await classifier_with_mock.flush_pending_classifications(_db_factory(db_mock), mock_redis)
+
+    # Only the first item was popped and attempted — the second stays queued.
+    assert mock_redis.lpop.await_count == 1
+    db_mock.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pending_classification_count_calls_llen(classifier_with_mock):
+    mock_redis = AsyncMock()
+    mock_redis.llen.return_value = 12
+    assert await classifier_with_mock.pending_classification_count(mock_redis) == 12

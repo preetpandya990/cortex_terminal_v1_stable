@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import AsyncGenerator
 
 from fastapi import FastAPI
@@ -81,6 +82,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.task_states   = task_states
         app.state.shutdown_event = shutdown_event
 
+        # Stored for worker_ai_processing.py's demand-driven dispatch routes,
+        # which need direct access to the forecast/classification queues'
+        # Redis client and DB session factory (the sentiment queue is
+        # in-process and needs neither).
+        app.state.session_factory = session_factory
+        app.state.redis_client     = redis_client
+
         # Closure-based task factories — produce a fresh coroutine on each call
         # so that the supervisor can restart a crashed task without holding stale
         # DB sessions or closed connections from a previous coroutine.
@@ -129,6 +137,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         )
         app.state.task_group = task_group_bg
 
+        app.state.started_at = datetime.now(timezone.utc)
         logger.info(
             "Worker sidecar ready — %d tasks running, control plane active on :8001",
             len(task_registry),
@@ -188,6 +197,10 @@ def create_app() -> FastAPI:
     # Control-plane routes: /health, /metrics, /tasks, /tasks/{name}/*
     from app.api.worker_control import router as control_router
     app.include_router(control_router)
+
+    # Demand-driven AI processing routes: /ai-processing/status, /ai-processing/*/dispatch
+    from app.api.worker_ai_processing import router as ai_processing_router
+    app.include_router(ai_processing_router)
 
     return app
 

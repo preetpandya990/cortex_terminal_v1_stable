@@ -134,6 +134,12 @@
   }
 }
 
+/* Indeterminate progress bar — inner runner slides left-to-right */
+@keyframes progress-slide {
+  0%   { transform: translateX(-250%); }
+  100% { transform: translateX(500%);  }
+}
+
 /* Hide TradingView watermark link from lightweight-charts */
 a[href*="tradingview.com"] {
   display: none !important;

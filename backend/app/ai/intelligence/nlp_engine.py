@@ -547,8 +547,17 @@ class NLPEngine:
         ))
 
         from app.core.config import get_settings
-        if NLPEngine._queue.qsize() >= get_settings().SENTIMENT_BATCH_SIZE:
+        settings = get_settings()
+        if (
+            settings.SENTIMENT_AUTO_FLUSH
+            and NLPEngine._queue.qsize() >= settings.SENTIMENT_BATCH_SIZE
+        ):
             NLPEngine._flush_trigger.set()
+        # When SENTIMENT_AUTO_FLUSH is False, the item above is still enqueued
+        # and this call still awaits `future` below — nothing wakes the flusher
+        # until an explicit dispatch (flush_pending_sentiment()) drains the
+        # queue directly. A large backlog therefore stalls this coroutine's
+        # caller (event_processing_loop), not just sentiment enrichment.
 
         t0 = time.monotonic()
         result: dict[str, Any] = await future
@@ -594,11 +603,19 @@ class NLPEngine:
 
             cls._flush_trigger.clear()  # clear BEFORE drain — see docstring
 
+            # When SENTIMENT_AUTO_FLUSH is False, items keep accumulating in
+            # the queue (in-memory asyncio.Queue — a worker restart before an
+            # explicit dispatch silently drops them via aclose()'s neutral-
+            # fallback drain) but this loop never drains them itself; only an
+            # explicit flush_pending_sentiment() call does.
+            if not settings.SENTIMENT_AUTO_FLUSH:
+                continue
+
             while not cls._queue.empty():
                 await cls._flush_batch()
 
     @classmethod
-    async def _flush_batch(cls) -> None:
+    async def _flush_batch(cls) -> int:
         """
         Pop up to SENTIMENT_BATCH_SIZE articles from the queue and call the LLM.
 
@@ -609,6 +626,11 @@ class NLPEngine:
         Multi-item: delegates to _call_batch_llm() which handles validation,
         gap-filling, and result ordering.  All exceptions are caught; pending
         futures are always resolved (never left dangling).
+
+        Returns:
+            0 if the queue had nothing to pop (no Gemini call made), else 1 —
+            exactly one Gemini call is attempted per invocation regardless of
+            which branch (single-item or multi-item) runs.
         """
         from app.ai.intelligence.llm_client import (
             LLMFallbackExhausted,
@@ -631,7 +653,7 @@ class NLPEngine:
                 break
 
         if not active:
-            return
+            return 0
 
         # ── Single-item shortcut ───────────────────────────────────────────────
         if len(active) == 1:
@@ -678,7 +700,7 @@ class NLPEngine:
 
             if not entry.future.done():
                 entry.future.set_result(result)
-            return
+            return 1
 
         # ── Multi-item batch call ──────────────────────────────────────────────
         batch_results = await cls._call_batch_llm(
@@ -700,6 +722,32 @@ class NLPEngine:
                     logger.debug(
                         "nlp: batch cache write failed (non-fatal): %s", cache_exc
                     )
+        return 1
+
+    # ── Demand-driven dispatch (admin/safety-net entry points) ──────────────────
+
+    @classmethod
+    async def pending_sentiment_count(cls) -> int:
+        """Current sentiment batch queue depth (for the Worker Control Panel)."""
+        return cls._queue.qsize()
+
+    @classmethod
+    async def flush_pending_sentiment(cls) -> dict[str, int]:
+        """
+        Drain the entire sentiment batch queue right now, regardless of
+        SENTIMENT_AUTO_FLUSH.  Called by an explicit admin dispatch or the
+        daily safety net.
+
+        Returns:
+            {"dispatched": N, "calls_made": M} — N is the queue depth observed
+            at entry (articles drained), M is the number of Gemini calls made
+            (each _flush_batch() call makes at most one).
+        """
+        dispatched = cls._queue.qsize()
+        calls_made = 0
+        while not cls._queue.empty():
+            calls_made += await cls._flush_batch()
+        return {"dispatched": dispatched, "calls_made": calls_made}
 
     @classmethod
     async def _call_batch_llm(

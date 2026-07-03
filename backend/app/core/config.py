@@ -237,32 +237,48 @@ class Settings(BaseSettings):
     # other HIGH+ calls always have headroom — even after a heavy background
     # sentiment / forecaster burst consumes the bulk of the daily allowance.
     #
-    # GEMINI_GENERATE_RPD: set to the RPD limit on your Google AI Studio quota
-    # page (per-key value; pool total = this × active key count):
-    #   Free tier  (gemini-2.5-flash) : 1 500 RPD/key
-    #   Tier 1                        : check your quota dashboard
+    # GEMINI_GENERATE_RPD: set to the actual per-key daily quota shown in
+    # Google AI Studio (aistudio.google.com → your API key → Usage / Quota).
+    # Pool total = this value × number of keys in GEMINI_API_KEYS.
     #
-    # GEMINI_HIGH_PRIORITY_RPD_RESERVE: the minimum headroom kept for HIGH+
-    # callers.  200 covers a worst-case trading day of 200 explanation calls;
-    # raise it if you expect higher suggestion throughput.
+    #   AI Studio free tier (gemini-2.5-flash) : ~10 RPD/key (empirically confirmed;
+    #                                             not shown in Cloud Console for
+    #                                             AI Studio–managed keys)
+    #   Paid Tier 1                             : check your quota dashboard
+    #
+    # IMPORTANT: the default (1 500) is a placeholder suited only for paid-tier
+    # deployments.  On free-tier AI Studio keys this value is ~150× the real limit,
+    # which disables the budget guard entirely.  Always override in backend/.env.
+    #
+    # GEMINI_HIGH_PRIORITY_RPD_RESERVE: calls kept exclusively for HIGH/CRITICAL
+    # callers (trade-suggestion explanations).  Must be strictly less than
+    # GEMINI_GENERATE_RPD × key_count or the budget guard permanently throttles
+    # ALL background traffic.  A good rule of thumb: ~10–20 % of total daily budget.
+    #   Free tier example (10 RPD/key × 5 keys = 50 total) → reserve = 5
+    #   Paid Tier 1 (10 000 RPD/key × 5 keys = 50 000 total) → reserve = 200
     GEMINI_GENERATE_RPD: int = Field(
-        1_500, ge=100, le=100_000,
+        1_500, ge=1, le=100_000,
         description=(
             "Daily Gemini generate quota per API key (requests per day). "
             "Pool total = this × key_count.  Used by the budget guard to "
             "estimate remaining headroom; does not affect the hard circuit "
-            "breaker, which is still triggered by actual 429 responses.  Set "
-            "to the value shown on your Google AI Studio quota dashboard."
+            "breaker, which is still triggered by actual 429 responses from Google. "
+            "MUST be overridden in backend/.env — the default suits paid-tier only. "
+            "Free-tier AI Studio keys: set to the empirically observed per-key limit "
+            "(~10 for gemini-2.5-flash as of 2026-06). "
+            "GeminiRequestManager.initialize() logs CRITICAL if this value causes "
+            "reserve >= total budget, and WARNING if still at the unchecked default."
         ),
     )
     GEMINI_HIGH_PRIORITY_RPD_RESERVE: int = Field(
-        200, ge=10, le=5_000,
+        200, ge=1, le=5_000,
         description=(
             "Daily generate requests reserved exclusively for HIGH and CRITICAL "
             "priority callers (trade-suggestion explanations, instrument context). "
             "When estimated remaining budget falls below this threshold, MEDIUM / "
             "LOW / BACKGROUND callers receive GeminiBudgetThrottled and degrade "
-            "gracefully.  HIGH+ callers are never throttled by the budget guard."
+            "gracefully.  HIGH+ callers are never throttled by the budget guard. "
+            "Must be < GEMINI_GENERATE_RPD × key_count; ~10–20 % of total is recommended."
         ),
     )
 
@@ -333,6 +349,20 @@ class Settings(BaseSettings):
             "within a single batch window at default Gemini Tier-1 quotas."
         ),
     )
+    WATCHLIST_CONTEXT_SERVE_MAX_AGE_HOURS: int = Field(
+        24,
+        ge=2,
+        le=48,
+        description=(
+            "Maximum age in hours for serving cached watchlist instrument context "
+            "to users (Stage 2 of the SSE explanation lookup).  Intentionally "
+            "decoupled from the 2-hour DB expires_at TTL, which is used solely to "
+            "gate the scheduler's intraday re-enqueue decisions.  24 h covers the "
+            "full overnight post-market gap (last run 14:30 IST → first run next "
+            "day 09:30 IST = ~19 h) and prevents redundant Stage 3 on-demand "
+            "Gemini calls during that window."
+        ),
+    )
 
     # Per-symbol forecast cache; busted when the news/event set changes.
     # 300s (5 min): at 100 symbols, 30s meant ~200 RPM from the forecaster alone.
@@ -342,6 +372,47 @@ class Settings(BaseSettings):
     # NLP fallback for COOLDOWN seconds instead of paying the timeout every call.
     NEWS_FORECAST_BREAKER_THRESHOLD: int = Field(4, ge=1, le=20)
     NEWS_FORECAST_BREAKER_COOLDOWN: float = Field(60.0, ge=5.0, le=600.0)
+
+    # ── Forecast Batch Accumulator ─────────────────────────────────────────────
+    # The signal assembler no longer calls Gemini synchronously for news forecasts.
+    # Instead it enqueues the (symbol, context) to a Redis list and returns the
+    # NLP fallback immediately — keeping the hot path latency constant.  The
+    # forecast_batch_worker drains the queue in batches of N symbols, fires one
+    # Gemini call per batch, and writes results to the same 5-minute cache keys
+    # that gather_news_forecast already reads.  The NEXT signal for the same
+    # symbol (within the cache TTL) receives the Gemini result with zero latency.
+    #
+    # NEWS_FORECAST_BATCH_SIZE: symbols per batched Gemini call.  Structured-output
+    #   reliability research places the safe ceiling at 5–8 items for complex schemas
+    #   (15 indicators + 6 events per symbol).  5 is the production default — at the
+    #   lower end of the validated range for maximum output stability.  Each item is
+    #   validated independently; failures fall back to NLP silently.
+    #
+    # NEWS_FORECAST_BATCH_WINDOW_SECS: max wait before flushing an incomplete batch.
+    #   60 s matches the sentiment batch window.  The 15-minute signal scheduler
+    #   cycle ensures subsequent signals for the same symbol hit the populated cache.
+    NEWS_FORECAST_BATCH_SIZE: int = Field(
+        5,
+        ge=1,
+        le=10,
+        description=(
+            "Symbols per batched Gemini forecast call. "
+            "Validated safe ceiling for complex multi-item structured output "
+            "(15 indicators + 6 events per symbol) is 5–8 items. "
+            "Each item validated individually; failures fall back to NLP."
+        ),
+    )
+    NEWS_FORECAST_BATCH_WINDOW_SECS: float = Field(
+        60.0,
+        ge=5.0,
+        le=120.0,
+        description=(
+            "Maximum seconds the batch accumulator waits before flushing an "
+            "incomplete batch.  60 s matches the sentiment batch window. "
+            "The 15-minute signal scheduler cycle ensures the cache is populated "
+            "before the same symbol's next signal assembly run."
+        ),
+    )
 
     # ── Sentiment Batch Accumulator ────────────────────────────────────────────
     # The NLP engine accumulates incoming articles in a queue and fires one
@@ -380,6 +451,73 @@ class Settings(BaseSettings):
             "windows while remaining well inside the 900 s service L2 TTL. "
             "The SSE path bypasses the queue via analyze_sentiment_batch()."
         ),
+    )
+
+    # ── Demand-Driven AI Processing (Tier-2 Gemini dispatch gating) ───────────
+    # Sentiment batching, event classification, and news-forecast batching are
+    # the 3 Tier-2 Gemini callers — they run continuously and, at market open
+    # (~09:30 UTC) when RSS floods in, can exhaust the daily RPD quota before
+    # the HIGH-priority user-facing callers (trade explanations, watchlist
+    # context) get a turn. These flags convert each path to demand-driven:
+    # work keeps accumulating in a queue, but Gemini is only called when an
+    # admin explicitly dispatches from the Worker Control Panel, or when the
+    # daily safety net (below) sweeps a category that has crossed its
+    # threshold. All 3 default True (today's continuous-auto-fire behavior) —
+    # flipping any to False is a deliberate, separate operator action.
+    SENTIMENT_AUTO_FLUSH: bool = Field(
+        True,
+        description=(
+            "When False, the sentiment batch queue only drains on explicit "
+            "admin dispatch or the daily safety net — articles still enqueue "
+            "and their callers still await the result, but nothing wakes the "
+            "flusher automatically."
+        ),
+    )
+    FORECAST_AUTO_DISPATCH: bool = Field(
+        True,
+        description=(
+            "When False, the news-forecast batch queue only drains on "
+            "explicit admin dispatch or the daily safety net; the batch loop "
+            "still polls queue depth for the pending-count gauge."
+        ),
+    )
+    EVENT_CLASSIFIER_AUTO_DISPATCH: bool = Field(
+        True,
+        description=(
+            "When False, general-event classifications enqueue for later "
+            "Gemini classification instead of calling inline; the immediate "
+            "heuristic result is used and persisted, then replaced when the "
+            "queued item is later dispatched."
+        ),
+    )
+
+    # AI_SAFETY_NET_RUN_TIME_IST: once-daily scheduled sweep (HH:MM, IST) that
+    #   dispatches any of the 3 categories above whose pending count has
+    #   crossed its configured threshold — a fallback so a queue never grows
+    #   unbounded if no admin dispatches manually. 09:00 IST is ahead of the
+    #   09:30 UTC (~15:00 IST) market-open RSS flood, clearing overnight backlog
+    #   before it hits.
+    AI_SAFETY_NET_RUN_TIME_IST: str = Field(
+        "09:00",
+        description=(
+            "Daily HH:MM (IST) safety-net sweep time. Dispatches any Tier-2 "
+            "AI processing category whose pending count exceeds its threshold."
+        ),
+    )
+    AI_SAFETY_NET_SENTIMENT_THRESHOLD: int = Field(
+        100,
+        ge=1,
+        description="Pending sentiment queue depth above which the safety net dispatches it.",
+    )
+    AI_SAFETY_NET_EVENTS_THRESHOLD: int = Field(
+        50,
+        ge=1,
+        description="Pending event-classification queue depth above which the safety net dispatches it.",
+    )
+    AI_SAFETY_NET_FORECAST_THRESHOLD: int = Field(
+        20,
+        ge=1,
+        description="Pending news-forecast queue depth above which the safety net dispatches it.",
     )
 
     # ── Live data freshness guard ─────────────────────────────────────────────

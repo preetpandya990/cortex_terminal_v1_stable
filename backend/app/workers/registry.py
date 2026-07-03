@@ -2,7 +2,7 @@
 Cortex AI — Worker Task Registry
 =================================
 
-Single source of truth for all 16 background tasks that run inside the worker
+Single source of truth for all 18 background tasks that run inside the worker
 sidecar.  Each entry is a zero-argument factory (a closure) so that:
 
   - The supervisor can call factory() to obtain a *fresh* coroutine on restart
@@ -20,6 +20,8 @@ Task inventory
     correlation_engine     Bidirectional scanner→AI + news→AI consensus engine.
     fundamentals_refresh   Six-sub-loop fundamentals scheduler (see below).
     watchlist_scheduler    Pre-warms AI context for watchlist instruments 4×/day.
+    ai_processing_safety_net  Daily fallback dispatch for the 3 demand-driven
+                              Tier-2 Gemini queues (sentiment/forecast/classification).
 
   Imported (10) — respond to CancelledError only:
     rss_ingestion       RSS news feed ingestion.
@@ -82,6 +84,15 @@ TASK_NAMES: tuple[str, ...] = (
     "sl_tp_worker",
     # ── Watchlist pre-warmer (pause/trigger-aware) ────────────────────────────
     "watchlist_scheduler",
+    # ── Async batch news forecaster ───────────────────────────────────────────
+    # Drains cortex:forecast:batch:queue; fires one Gemini call per batch of
+    # symbols (≤NEWS_FORECAST_BATCH_SIZE) rather than one call per signal-assembly
+    # hot path.  Results are written to the same 5-min forecast cache keys.
+    "forecast_batch",
+    # ── Demand-driven AI processing safety net (pause/trigger-aware) ─────────
+    # Daily 09:00 IST fallback sweep — dispatches sentiment/forecast/
+    # classification queues independently when any crosses its threshold.
+    "ai_processing_safety_net",
 )
 
 
@@ -148,12 +159,22 @@ def build_task_registry(
     )
 
     from app.workers.watchlist_context_scheduler import WatchlistContextScheduler
+    from app.ai.fusion.forecast_batch_worker import forecast_batch_loop
     watchlist_scheduler_instance = WatchlistContextScheduler(
         session_factory=session_factory,
         redis=redis_client._redis,
         shutdown=shutdown,
         pause=_state("watchlist_scheduler").pause_token,
         trigger=_state("watchlist_scheduler").trigger_token,
+    )
+
+    from app.workers.ai_processing_safety_net import AIProcessingSafetyNet
+    ai_processing_safety_net_instance = AIProcessingSafetyNet(
+        session_factory=session_factory,
+        redis=redis_client._redis,
+        shutdown=shutdown,
+        pause=_state("ai_processing_safety_net").pause_token,
+        trigger=_state("ai_processing_safety_net").trigger_token,
     )
 
     registry: dict[str, Callable[[], Coroutine]] = {
@@ -211,6 +232,14 @@ def build_task_registry(
         "sl_tp_worker": lambda: run_sl_tp_worker(redis_client._redis),
         # ── Watchlist pre-warmer — pause/trigger-aware via WatchlistContextScheduler
         "watchlist_scheduler": lambda: watchlist_scheduler_instance.run(),
+        # ── Async batch news forecaster ───────────────────────────────────────
+        "forecast_batch": lambda: forecast_batch_loop(
+            redis=redis_client._redis,
+            session_factory=session_factory,
+            shutdown=shutdown,
+        ),
+        # ── Demand-driven AI processing safety net — pause/trigger-aware ──────
+        "ai_processing_safety_net": lambda: ai_processing_safety_net_instance.run(),
     }
 
     if set(registry.keys()) != set(TASK_NAMES):

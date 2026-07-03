@@ -93,6 +93,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field
 from sqlalchemy import select, update
@@ -108,6 +109,7 @@ from app.ai.intelligence.llm_client import (
 )
 from app.ai.rag.pipeline import build_retrieval_source_refs, format_context, retrieve
 from app.core.metrics import (
+    gemini_dlq_requeue_total,
     llm_audit_log_writes_total,
     llm_explanation_dedup_total,
     llm_explanation_dlq_total,
@@ -160,7 +162,9 @@ _LOCK_HEARTBEAT_INTERVAL_SECS = 15
 
 # SSE event store TTLs
 _SSE_EXPLANATION_TTL_SECS = 86_400    # 24 h — matches suggestion lifetime
-_SSE_CONTEXT_TTL_SECS = 3_600         # 1 h — matches watchlist refresh cadence
+_SSE_CONTEXT_TTL_SECS = 86_400        # 24 h — matches WATCHLIST_CONTEXT_SERVE_MAX_AGE_HOURS
+                                       #         so the richer SSE payload (with source citations)
+                                       #         stays available for the same window Stage 2 serves
 _SSE_EVENT_MAXLEN = 20                 # per-key stream depth
 
 # Stream max lengths (approximate trim — O(1) amortised)
@@ -725,7 +729,9 @@ async def _write_sse_explanation_event(redis: Any, suggestion_id: str, payload: 
 async def _write_sse_context_event(redis: Any, instrument_key: str, payload: dict) -> None:
     """
     Write a full context payload to the per-instrument SSE event store.
-    TTL = 3 600 s (1 h) — matches watchlist card refresh cadence.
+    TTL = 86 400 s (24 h) — matches WATCHLIST_CONTEXT_SERVE_MAX_AGE_HOURS so the
+    richer SSE payload (including RAG source citations) remains available for the
+    same duration that Stage 2 in ai_stream.py will serve cached context.
     """
     key = RedisStreams.sse_context_key(instrument_key)
     try:
@@ -1172,7 +1178,7 @@ async def _generate_instrument_context(
                 system=_CONTEXT_SYSTEM_PROMPT,
                 temperature=0.2,
                 max_tokens=1400,
-                priority=Priority.MEDIUM,
+                priority=Priority.HIGH,
             ),
             timeout=_LLM_CALL_TIMEOUT_SECS,
         )
@@ -1820,6 +1826,215 @@ async def _process_context_message(
         # Not ACKing — stays in PEL; housekeeping re-delivers after _PEL_IDLE_THRESHOLD_MS
 
 
+# ── DLQ quota recovery ────────────────────────────────────────────────────────
+
+# Redis key prefix for per-suggestion requeue dedup guard (SET NX, 48-hour TTL).
+# Prevents the same DLQ entry from being re-added to the jobs stream more than
+# once per quota cycle even if the recovery function runs multiple times.
+_DLQ_REQUEUE_DEDUP_TTL_SECS = 172_800  # 48 h — spans current + next quota day
+
+
+async def _requeue_quota_dlq_entries(redis: Any, *, trigger: str) -> int:
+    """
+    Scan the explanation DLQ for ``gemini_quota_exhausted`` entries from the
+    previous quota day and re-publish them to the explanation jobs stream.
+
+    Called in two scenarios:
+      - ``trigger="boot"``        — worker startup; only requeues entries whose
+                                    ``moved_at`` timestamp falls before today's
+                                    Pacific Time midnight (safe because the Gemini
+                                    RPD quota boundary is midnight PT).
+      - ``trigger="quota_reset"`` — fired by the pub/sub signal from
+                                    GeminiRequestManager after midnight PT reset;
+                                    same cutoff applies (reset fires after midnight
+                                    so all previous-day entries qualify).
+
+    De-duplication: a per-suggestion Redis key (SET NX, 48 h TTL) prevents the
+    same suggestion from being requeued twice within a single quota cycle, even
+    if this function is called multiple times (e.g. boot AND pub/sub signal fire
+    in the same session after a restart near midnight).
+
+    Returns the number of entries successfully requeued.
+    """
+    pt = ZoneInfo("America/Los_Angeles")
+    today_midnight_pt = datetime.now(pt).replace(
+        hour=0, minute=0, second=0, microsecond=0, tzinfo=pt
+    )
+    requeued = 0
+    last_id = "0-0"
+
+    while True:
+        try:
+            entries = await redis.xrange(
+                RedisStreams.EXPLANATION_DLQ,
+                min=last_id,
+                count=50,
+            )
+        except Exception as exc:
+            logger.error(
+                "explanation_worker: DLQ quota recovery — XRANGE failed: %s "
+                "(partial recovery may have occurred, requeued=%d so far)",
+                exc, requeued,
+            )
+            break
+
+        if not entries:
+            break
+
+        for msg_id, fields in entries:
+            last_id = msg_id  # advance cursor regardless of match
+
+            if fields.get("reason") != "gemini_quota_exhausted":
+                continue
+
+            # Only requeue entries from before today's PT midnight — entries
+            # from the current quota day may still be within an active outage.
+            moved_at_str = fields.get("moved_at", "")
+            try:
+                moved_at = datetime.fromisoformat(moved_at_str)
+                if moved_at.astimezone(pt) >= today_midnight_pt:
+                    continue
+            except (ValueError, TypeError, AttributeError):
+                logger.warning(
+                    "explanation_worker: DLQ recovery — skipping entry %s "
+                    "with unparseable moved_at=%r",
+                    msg_id, moved_at_str,
+                )
+                continue
+
+            # Recover the original job fields.
+            try:
+                original_fields = json.loads(fields.get("fields", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                logger.warning(
+                    "explanation_worker: DLQ recovery — skipping entry %s "
+                    "with malformed fields payload",
+                    msg_id,
+                )
+                continue
+
+            suggestion_id = original_fields.get("suggestion_id", "")
+            if not suggestion_id:
+                continue
+
+            # Dedup guard: skip if already requeued in this quota cycle.
+            dedup_key = f"cortex:gemini:dlq:requeued:{suggestion_id}"
+            try:
+                acquired = await redis.set(
+                    dedup_key, "1", nx=True, ex=_DLQ_REQUEUE_DEDUP_TTL_SECS
+                )
+                if acquired is None:
+                    # Key already existed — this suggestion was already requeued.
+                    logger.debug(
+                        "explanation_worker: DLQ recovery — suggestion %s already "
+                        "requeued this cycle (dedup key exists), skipping.",
+                        suggestion_id,
+                    )
+                    continue
+            except Exception as exc:
+                logger.warning(
+                    "explanation_worker: DLQ recovery — dedup key check failed "
+                    "for suggestion %s: %s — proceeding without dedup guard.",
+                    suggestion_id, exc,
+                )
+
+            # Re-publish to the jobs stream.
+            try:
+                await redis.xadd(
+                    RedisStreams.EXPLANATION_JOBS,
+                    original_fields,
+                    maxlen=_STREAM_MAXLEN_EXPLANATION,
+                    approximate=True,
+                )
+                requeued += 1
+                gemini_dlq_requeue_total.labels(trigger=trigger).inc()
+                logger.info(
+                    "explanation_worker: DLQ quota recovery — requeued suggestion "
+                    "%s (originally DLQ'd %s, trigger=%s)",
+                    suggestion_id, moved_at_str, trigger,
+                )
+            except Exception as exc:
+                logger.error(
+                    "explanation_worker: DLQ recovery — XADD failed for suggestion "
+                    "%s: %s",
+                    suggestion_id, exc,
+                )
+                # Undo the dedup key so a retry can attempt this entry again.
+                try:
+                    await redis.delete(dedup_key)
+                except Exception:
+                    pass
+
+        if len(entries) < 50:
+            break
+
+    if requeued > 0:
+        logger.info(
+            "explanation_worker: DLQ quota recovery complete — %d suggestion(s) "
+            "requeued to jobs stream (trigger=%s)",
+            requeued, trigger,
+        )
+
+    return requeued
+
+
+async def _quota_reset_listener(redis: Any) -> None:
+    """
+    Subscribe to the Gemini quota reset pub/sub channel and auto-requeue
+    DLQ entries whenever the nightly circuit reset fires.
+
+    This is the realtime complement to the boot-time DLQ scan: it handles the
+    case where the process stays running through midnight PT (no restart) but
+    the quota resets and previously-DLQ'd explanations can now be retried.
+
+    Runs as a background task inside ``explanation_worker()``; cancelled cleanly
+    on shutdown.  Crashes are logged and the task self-heals with a 30s delay.
+    """
+    while True:
+        ps = None
+        try:
+            ps = redis.pubsub()
+            await ps.subscribe(RedisChannels.GEMINI_QUOTA_RESET)
+            logger.debug(
+                "explanation_worker: subscribed to %s for DLQ auto-recovery",
+                RedisChannels.GEMINI_QUOTA_RESET,
+            )
+            async for message in ps.listen():
+                if message["type"] != "message":
+                    continue
+                try:
+                    payload = json.loads(message["data"])
+                    keys_reset = payload.get("keys_reset", 0)
+                    reset_at = payload.get("reset_at", "unknown")
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    payload = {}
+                    keys_reset = 0
+                    reset_at = "unknown"
+
+                logger.info(
+                    "explanation_worker: received Gemini quota reset signal "
+                    "(keys_reset=%d reset_at=%s) — scanning DLQ for recovery",
+                    keys_reset, reset_at,
+                )
+                await _requeue_quota_dlq_entries(redis, trigger="quota_reset")
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "explanation_worker: quota reset listener error: %s — "
+                "restarting in 30 s",
+                exc,
+            )
+            await asyncio.sleep(30.0)
+        finally:
+            if ps is not None:
+                with contextlib.suppress(Exception):
+                    await ps.unsubscribe(RedisChannels.GEMINI_QUOTA_RESET)
+                with contextlib.suppress(Exception):
+                    await ps.aclose()
+
+
 # ── Worker entry points ───────────────────────────────────────────────────────
 
 async def explanation_worker(worker_id: int = 0) -> None:
@@ -1848,6 +2063,12 @@ async def explanation_worker(worker_id: int = 0) -> None:
 
     _redis = _get_redis()
 
+    # Boot-time DLQ recovery (worker_id=0 only — prevents duplicate requeues when
+    # both workers start simultaneously; worker 1 starts its listener for realtime
+    # recovery instead).
+    if worker_id == 0:
+        await _requeue_quota_dlq_entries(_redis, trigger="boot")
+
     # PEL drain before entering the main loop
     await _drain_pel(_redis, stream, group, consumer_name)
 
@@ -1859,6 +2080,15 @@ async def explanation_worker(worker_id: int = 0) -> None:
         _pel_housekeeping(_redis, stream, group, consumer_name),
         name=f"explanation_pel_housekeeping_{worker_id}",
     )
+
+    # Realtime DLQ recovery: listen for midnight PT quota resets from the manager.
+    # Only worker 0 subscribes — one listener per process is sufficient.
+    quota_listener_task: asyncio.Task | None = None
+    if worker_id == 0:
+        quota_listener_task = asyncio.create_task(
+            _quota_reset_listener(_redis),
+            name="gemini_quota_reset_dlq_listener",
+        )
 
     try:
         while True:
@@ -1898,6 +2128,10 @@ async def explanation_worker(worker_id: int = 0) -> None:
         housekeeping_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await housekeeping_task
+        if quota_listener_task is not None:
+            quota_listener_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await quota_listener_task
 
 
 async def _context_pel_housekeeping(

@@ -328,9 +328,15 @@ async def _fetch_explanation_for_instrument(
         superseded before the worker ran) are skipped so Stage 2/3 can serve
         fresh context instead of an eternal skeleton.
 
-    Stage 2 — Non-expired AIInstrumentContext row
+    Stage 2 — AIInstrumentContext within the configurable serve window
         A market-context summary generated for this instrument previously.
-        Served from DB cache as long as it has not passed its 2-hour TTL.
+        Served from DB cache when generated_at is within
+        WATCHLIST_CONTEXT_SERVE_MAX_AGE_HOURS (default 24 h).  This window
+        is intentionally longer than the DB expires_at TTL (2 h), which is
+        used solely to gate the scheduler's intraday re-enqueue decisions
+        (watchlist_context_scheduler.py).  Decoupling the two allows intraday
+        refreshes to continue normally while bridging the ~19 h overnight gap
+        after the last market-hours scheduler run at 14:30 IST.
 
     Stage 3 — No valid data → trigger background generation
         Acquires a distributed lock (SET NX EX 120) to prevent duplicate
@@ -402,13 +408,19 @@ async def _fetch_explanation_for_instrument(
             instrument_key, exc,
         )
 
-    # ── Stage 2: non-expired instrument context ────────────────────────────────
+    # ── Stage 2: instrument context within the serve window ───────────────────
+    # Uses generated_at (not expires_at) so the 2-hour DB TTL that gates the
+    # scheduler's intraday re-enqueue logic does not also evict overnight cache.
     try:
+        from app.core.config import get_settings as _cfg
+        _serve_cutoff = datetime.now(timezone.utc) - timedelta(
+            hours=_cfg().WATCHLIST_CONTEXT_SERVE_MAX_AGE_HOURS
+        )
         ctx_stmt = (
             select(AIInstrumentContext)
             .where(
                 AIInstrumentContext.instrument_key == instrument_key,
-                AIInstrumentContext.expires_at > datetime.now(timezone.utc),
+                AIInstrumentContext.generated_at > _serve_cutoff,
             )
         )
         ctx_result = await db.execute(ctx_stmt)

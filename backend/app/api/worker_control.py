@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+from datetime import datetime, timezone
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
@@ -114,12 +115,28 @@ def _get_state(request: Request, name: str) -> TaskState:
 # ── Liveness (no auth — Docker healthcheck) ───────────────────────────────────
 
 @router.get("/health", include_in_schema=False)
-async def health() -> dict[str, str]:
+async def health(request: Request) -> dict[str, Any]:
     """
     Liveness endpoint.  Always 200 while the process is alive.
     Docker healthcheck: ``curl -f http://localhost:8001/health``
+
+    Response fields:
+        status         — always "ok" while the process is responsive
+        uptime_seconds — seconds since the control plane became live
+        task_count     — number of supervised tasks registered
     """
-    return {"status": "ok"}
+    started_at: datetime | None = getattr(request.app.state, "started_at", None)
+    uptime = (
+        (datetime.now(timezone.utc) - started_at).total_seconds()
+        if started_at is not None
+        else 0.0
+    )
+    states: dict = getattr(request.app.state, "task_states", {})
+    return {
+        "status": "ok",
+        "uptime_seconds": uptime,
+        "task_count": len(states),
+    }
 
 
 # ── Prometheus metrics (no auth — Prometheus scrape agent) ────────────────────
