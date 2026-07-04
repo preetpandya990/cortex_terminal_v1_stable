@@ -42,6 +42,7 @@ import logging
 import time
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from typing import Callable
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
@@ -69,7 +70,11 @@ _SKIP_UNCHANGED_THRESHOLD_HOURS: float = 26.0
 # Public loop entry point (called by worker.py)
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def regime_detection_loop(session_factory: async_sessionmaker) -> None:
+async def regime_detection_loop(
+    session_factory: async_sessionmaker,
+    *,
+    on_cycle: Callable[[], None] | None = None,
+) -> None:
     """
     Perpetual post-market regime detection loop.
 
@@ -131,6 +136,9 @@ async def regime_detection_loop(session_factory: async_sessionmaker) -> None:
                     "trading_day=%s, already_ran=%s",
                     today, is_trading_day, last_run_date == today,
                 )
+
+            if on_cycle is not None:
+                on_cycle()
 
             try:
                 await asyncio.wait_for(

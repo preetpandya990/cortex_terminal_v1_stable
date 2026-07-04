@@ -25,9 +25,9 @@ const CATEGORY_INFO: Record<AIProcessingCategory, string> = {
   sentiment:
     'Batches article sentiment scoring into one Gemini call per batch. Queue is in-process memory — a worker restart before dispatch silently drops pending items.',
   forecast:
-    'Batches per-symbol news-forecast generation into one Gemini call per batch of symbols. Queue is a durable Redis list — survives worker restarts.',
+    'Batches per-symbol news-forecast generation into one Gemini call per batch of symbols. Queue is a durable Kafka topic (Redpanda) — survives worker restarts.',
   classification:
-    'Classifies ambiguous ("general") events one at a time via Gemini, upgrading the immediate rule-based classification already persisted for that event. Queue is a durable Redis list.',
+    'Classifies ambiguous ("general") events one at a time via Gemini, upgrading the immediate rule-based classification already persisted for that event. Queue is a durable Kafka topic (Redpanda).',
 }
 
 interface Props {
@@ -73,7 +73,8 @@ function InfoPortal({ anchor }: { anchor: { top: number; left: number; width: nu
           <span className="font-semibold text-amber-700">Sentiment queue is non-durable</span> —
           it lives in worker process memory. A worker restart before dispatch
           silently drops any pending sentiment items. Forecast and
-          classification queues are durable Redis lists.
+          classification queues are durable Kafka topics (Redpanda) — they
+          survive worker restarts.
         </p>
       </div>
     </div>,

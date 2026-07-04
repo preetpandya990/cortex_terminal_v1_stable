@@ -25,6 +25,9 @@ pydantic-settings==2.6.1        # Settings management
 # ── Redis ──────────────────────────────────────────────────────────────────────
 redis[hiredis]==5.2.0           # Async Redis client with C parser
 
+# ── Kafka / Event Streaming ────────────────────────────────────────────────────
+aiokafka==0.14.0                # Async Kafka client — durable job queues on Redpanda
+
 # ── HTTP Client ────────────────────────────────────────────────────────────────
 httpx==0.27.2                   # Async HTTP client
 aiohttp==3.9.3                  # Alternative async HTTP (for RSS)

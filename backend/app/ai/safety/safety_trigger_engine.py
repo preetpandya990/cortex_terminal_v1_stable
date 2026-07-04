@@ -7,6 +7,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 from decimal import Decimal
+from typing import Callable
 
 from redis.asyncio import Redis
 from sqlalchemy import select
@@ -117,6 +118,8 @@ class SafetyTriggerEngine:
 async def safety_monitoring_loop(
     session_factory: async_sessionmaker,
     redis: Redis,
+    *,
+    on_cycle: Callable[[], None] | None = None,
 ) -> None:
     """
     Safety monitoring background loop.
@@ -160,7 +163,10 @@ async def safety_monitoring_loop(
             
             except Exception as e:
                 logger.error(f"Safety monitoring error: {e}", exc_info=True)
-            
+
+            if on_cycle is not None:
+                on_cycle()
+
             # Sleep between iterations
             logger.debug(f"Sleeping for {settings.SAFETY_CHECK_INTERVAL_SECONDS}s")
             await asyncio.sleep(settings.SAFETY_CHECK_INTERVAL_SECONDS)

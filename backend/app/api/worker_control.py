@@ -6,7 +6,7 @@ FastAPI router mounted on the worker sidecar (:8001).
 Routes:
     GET  /health              Liveness — no auth (Docker healthcheck + Prometheus)
     GET  /metrics             Prometheus scrape — no auth; syncs Gauges from TaskState
-    GET  /tasks               All 15 task states — requires X-Internal-Token
+    GET  /tasks               All 18 task states — requires X-Internal-Token
     GET  /tasks/{name}        Single task detail — requires X-Internal-Token
     POST /tasks/{name}/pause  Cooperative pause at next safepoint
     POST /tasks/{name}/resume Lift pause; task continues at next checkpoint
@@ -21,9 +21,17 @@ Auth:
       - /metrics: Prometheus scrape agent does not send a token.
 
 Per-task Prometheus metrics (synced at each /metrics scrape):
-    worker_task_last_cycle_seconds{task}  — Unix timestamp of last cycle start
-    worker_task_crash_count{task}         — Consecutive crash count
-    worker_task_status{task}              — 0=starting 1=running 2=paused 3=crashed 4=stopped
+    worker_task_last_cycle_seconds{task}       — Unix timestamp of last real work
+                                                  cycle (TaskState.last_cycle_at);
+                                                  falls back to started_at until
+                                                  the first cycle completes
+    worker_task_started_at_seconds{task}       — Unix timestamp of last supervisor
+                                                  (re)start (TaskState.last_run_at)
+    worker_task_expected_interval_seconds{task} — static, published once at
+                                                  startup (see worker_app.py)
+    worker_task_crash_count{task}              — Consecutive crash count
+    worker_task_status{task}                   — 0=starting 1=running 2=paused
+                                                  3=crashed 4=stopped
 """
 from __future__ import annotations
 
@@ -155,6 +163,7 @@ async def metrics(request: Request) -> Response:
     from app.core.metrics import (
         worker_task_crash_count_gauge,
         worker_task_last_cycle_seconds,
+        worker_task_started_at_seconds,
         worker_task_status_gauge,
     )
 
@@ -164,9 +173,22 @@ async def metrics(request: Request) -> Response:
             _STATUS_INT.get(state.status, 0)
         )
         worker_task_crash_count_gauge.labels(task=name).set(state.crash_count)
+
         if state.last_run_at is not None:
-            worker_task_last_cycle_seconds.labels(task=name).set(
+            worker_task_started_at_seconds.labels(task=name).set(
                 state.last_run_at.timestamp()
+            )
+
+        # last_cycle_at is the real source of truth for cycle activity. Before
+        # a task's first cycle completes (last_cycle_at is None, e.g. right
+        # after startup/crash-restart), fall back to last_run_at instead of
+        # publishing nothing — a task that hasn't had a chance to run yet is
+        # not "stale," and this avoids a confusing blank/no-data cell in
+        # Grafana for the first cycle-interval after every restart.
+        cycle_ts = state.last_cycle_at or state.last_run_at
+        if cycle_ts is not None:
+            worker_task_last_cycle_seconds.labels(task=name).set(
+                cycle_ts.timestamp()
             )
 
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)

@@ -22,9 +22,9 @@ from app.ai.intelligence.event_classifier import (
     _ALLCAPS_RE,
     _CORP_NAME_RE,
     _NON_TICKER_WORDS,
-    _PENDING_QUEUE_KEY,
     _ClassificationSchema,
 )
+from app.core.kafka import KafkaTopics
 
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
@@ -54,14 +54,15 @@ def classifier_with_mock(mock_llm_client):
 
 @pytest.mark.asyncio
 async def test_classify_with_llm_success(classifier_with_mock):
-    """LLM path: successful structured classification with symbols."""
+    """LLM path: an ambiguous (non-heuristic) article with inline auto-dispatch
+    enabled goes to Gemini and persists the structured result."""
     classifier_with_mock.ollama_client.generate_structured.return_value = (
         _ClassificationSchema(
             event_type="earnings",
             impact_score=75.0,
             confidence=0.85,
             affected_symbols=["TCS", "INFY"],
-            reasoning="Tata Consultancy quarterly earnings beat estimates.",
+            reasoning="Tata Consultancy quarterly results beat estimates.",
             decay_hours=12,
             decay_slow_hours=72,
         )
@@ -71,6 +72,8 @@ async def test_classify_with_llm_success(classifier_with_mock):
     db_mock.add = MagicMock()
     db_mock.commit = AsyncMock()
     db_mock.refresh = AsyncMock()
+
+    mock_settings = MagicMock(EVENT_CLASSIFIER_AUTO_DISPATCH=True)
 
     # Patch content extraction so no DB calls are needed
     with patch.object(
@@ -82,12 +85,18 @@ async def test_classify_with_llm_success(classifier_with_mock):
             "app.ai.intelligence.event_classifier.normalize_and_validate_symbols",
             return_value=["TCS", "INFY"],
         ):
-            result = await classifier_with_mock.classify(
-                db=db_mock,
-                nlp_result_id=1,
-                content="TCS and Infosys announce record Q4 earnings",
-                entities={"companies": ["TCS", "Infosys"], "people": [], "locations": []},
-            )
+            with patch("app.core.config.get_settings", return_value=mock_settings):
+                with patch("app.core.redis.get_cache_service") as mock_cache_getter:
+                    mock_cache_getter.return_value.get = AsyncMock(return_value=None)
+                    mock_cache_getter.return_value.set = AsyncMock(return_value=None)
+                    result = await classifier_with_mock.classify(
+                        db=db_mock,
+                        nlp_result_id=1,
+                        # Deliberately matches no heuristic keyword — must fall
+                        # through the pre-filter to the Gemini call.
+                        content="Two large IT companies made an announcement today",
+                        entities={"companies": ["TCS", "Infosys"], "people": [], "locations": []},
+                    )
 
     classifier_with_mock.ollama_client.generate_structured.assert_called_once()
     assert result.event_type == "earnings"
@@ -141,15 +150,17 @@ async def test_classify_llm_low_confidence_preserves_symbols(classifier_with_moc
 
 @pytest.mark.asyncio
 async def test_classify_llm_failure_falls_back_to_rule_based(classifier_with_mock):
-    """LLM failure propagates to rule-based classification."""
+    """LLM failure on an ambiguous article falls back to rule-based classification."""
     classifier_with_mock.ollama_client.generate_structured.side_effect = Exception(
-        "Ollama connection timeout"
+        "Gemini connection timeout"
     )
 
     db_mock = AsyncMock()
     db_mock.add = MagicMock()
     db_mock.commit = AsyncMock()
     db_mock.refresh = AsyncMock()
+
+    mock_settings = MagicMock(EVENT_CLASSIFIER_AUTO_DISPATCH=True)
 
     with patch.object(
         classifier_with_mock,
@@ -160,14 +171,19 @@ async def test_classify_llm_failure_falls_back_to_rule_based(classifier_with_moc
             "app.ai.intelligence.event_classifier.normalize_and_validate_symbols",
             return_value=[],
         ):
-            result = await classifier_with_mock.classify(
-                db=db_mock,
-                nlp_result_id=3,
-                content="Federal Reserve announces interest rate hike at FOMC",
-                entities={"companies": [], "people": [], "locations": []},
-            )
+            with patch("app.core.config.get_settings", return_value=mock_settings):
+                with patch("app.core.redis.get_cache_service") as mock_cache_getter:
+                    mock_cache_getter.return_value.get = AsyncMock(return_value=None)
+                    mock_cache_getter.return_value.set = AsyncMock(return_value=None)
+                    result = await classifier_with_mock.classify(
+                        db=db_mock,
+                        nlp_result_id=3,
+                        # No heuristic keyword match — reaches Gemini, which fails.
+                        content="Two large IT companies made an announcement today",
+                        entities={"companies": [], "people": [], "locations": []},
+                    )
 
-    assert result.event_type == "fed_announcement"
+    assert result.event_type == "general"
     assert result.classification_confidence == Decimal("0.6")
 
 
@@ -396,10 +412,10 @@ async def test_general_event_enqueues_when_auto_dispatch_disabled(classifier_wit
     Gemini must never be called inline.
     """
     mock_settings = MagicMock(EVENT_CLASSIFIER_AUTO_DISPATCH=False)
-    mock_redis = AsyncMock()
+    mock_publish = AsyncMock()
 
     with patch("app.core.config.get_settings", return_value=mock_settings):
-        with patch("app.core.redis.get_redis", return_value=mock_redis):
+        with patch("app.core.kafka.publish", mock_publish):
             with patch("app.core.redis.get_cache_service") as mock_cache_getter:
                 mock_cache_getter.return_value.get = AsyncMock(return_value=None)
                 result = await classifier_with_mock._classify_with_ollama(
@@ -409,11 +425,11 @@ async def test_general_event_enqueues_when_auto_dispatch_disabled(classifier_wit
                 )
 
     classifier_with_mock.ollama_client.generate_structured.assert_not_called()
-    mock_redis.lpush.assert_awaited_once()
-    key, raw_payload = mock_redis.lpush.call_args[0]
-    assert key == _PENDING_QUEUE_KEY
-    payload = json.loads(raw_payload)
+    mock_publish.assert_awaited_once()
+    topic, payload = mock_publish.call_args[0]
+    assert topic == KafkaTopics.CLASSIFIER_PENDING
     assert payload["nlp_result_id"] == 42
+    assert mock_publish.call_args.kwargs["key"] == "42"
     assert result["event_type"] == "general"
     assert result["confidence"] == 0.6  # rule-based confidence
 
@@ -446,18 +462,60 @@ async def test_general_event_calls_gemini_when_auto_dispatch_enabled(classifier_
     assert result["confidence"] == 0.8
 
 
+def _classifier_payload(nlp_result_id: int, content: str = "content") -> dict:
+    return {
+        "content_hash": "abc123",
+        "content": content,
+        "entities": {"companies": []},
+        "nlp_result_id": nlp_result_id,
+        "enqueued_at": "2026-07-01T00:00:00+00:00",
+    }
+
+
+class _FakeKafkaMsg:
+    def __init__(self, offset: int, value: dict) -> None:
+        self.offset = offset
+        self.value = value
+        self.headers = []
+
+
+def _fake_flush_consumer(payloads: list[dict]) -> MagicMock:
+    """Scripted manual-assignment consumer for flush_pending_classifications."""
+    msgs = [_FakeKafkaMsg(i, p) for i, p in enumerate(payloads)]
+    state = {"pos": 0}
+
+    consumer = MagicMock()
+    consumer.assign = MagicMock()
+    consumer.start = AsyncMock()
+    consumer.stop = AsyncMock()
+    consumer.commit = AsyncMock()
+
+    async def _end_offsets(tps):
+        return {tps[0]: len(msgs)}
+
+    async def _position(_tp):
+        return state["pos"]
+
+    async def _getmany(_tp, timeout_ms=0, max_records=1):
+        if state["pos"] >= len(msgs):
+            return {_tp: []}
+        msg = msgs[state["pos"]]
+        state["pos"] += 1
+        return {_tp: [msg]}
+
+    consumer.end_offsets = _end_offsets
+    consumer.position = _position
+    consumer.getmany = _getmany
+    return consumer
+
+
 @pytest.mark.asyncio
 async def test_flush_pending_classifications_upgrades_existing_row(classifier_with_mock):
-    """flush_pending_classifications() looks up the row by nlp_result_id and upgrades it."""
-    payload = json.dumps({
-        "content_hash": "abc123",
-        "content": "Vedanta Hindustan Zinc news",
-        "entities": {"companies": []},
-        "nlp_result_id": 99,
-        "enqueued_at": "2026-07-01T00:00:00+00:00",
-    })
-    mock_redis = AsyncMock()
-    mock_redis.lpop.side_effect = [payload.encode(), None]
+    """flush_pending_classifications() looks up the row by nlp_result_id and
+    upgrades it, committing the Kafka offset only after the persist."""
+    consumer = _fake_flush_consumer(
+        [_classifier_payload(99, "Vedanta Hindustan Zinc news")]
+    )
 
     existing_row = MagicMock()
     db_mock = AsyncMock()
@@ -483,31 +541,29 @@ async def test_flush_pending_classifications_upgrades_existing_row(classifier_wi
                 "app.ai.intelligence.event_classifier.normalize_and_validate_symbols",
                 AsyncMock(return_value=["VEDL"]),
             ):
-                result = await classifier_with_mock.flush_pending_classifications(
-                    _db_factory(db_mock), mock_redis
-                )
+                with patch("app.core.kafka.new_consumer", return_value=consumer):
+                    result = await classifier_with_mock.flush_pending_classifications(
+                        _db_factory(db_mock)
+                    )
 
     assert result == {"dispatched": 1, "calls_made": 1}
     assert existing_row.event_type == "regulatory"
     assert existing_row.affected_symbols == ["VEDL"]
     db_mock.commit.assert_awaited()
+    # Offset committed exactly once, and only after the successful persist.
+    consumer.commit.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_flush_pending_classifications_stops_on_gemini_failure(classifier_with_mock):
     """
     A Gemini call failure (confidence=0.0 fallback from _gemini_classify) stops
-    the drain and raises — the failed item's row is left untouched.
+    the drain and raises — the failed item's offset is NOT committed, so it
+    (and the remainder) is redelivered on the next dispatch.
     """
-    payload = json.dumps({
-        "content_hash": "abc123",
-        "content": "content",
-        "entities": {},
-        "nlp_result_id": 5,
-        "enqueued_at": "2026-07-01T00:00:00+00:00",
-    })
-    mock_redis = AsyncMock()
-    mock_redis.lpop.side_effect = [payload.encode(), payload.encode()]  # 2 items queued
+    consumer = _fake_flush_consumer(
+        [_classifier_payload(5), _classifier_payload(6)]  # 2 items queued
+    )
 
     db_mock = AsyncMock()
     failure_result = {
@@ -521,16 +577,21 @@ async def test_flush_pending_classifications_stops_on_gemini_failure(classifier_
     }
 
     with patch.object(classifier_with_mock, "_gemini_classify", AsyncMock(return_value=failure_result)):
-        with pytest.raises(RuntimeError, match="nlp_result_id=5"):
-            await classifier_with_mock.flush_pending_classifications(_db_factory(db_mock), mock_redis)
+        with patch("app.core.kafka.new_consumer", return_value=consumer):
+            with pytest.raises(RuntimeError, match="nlp_result_id=5"):
+                await classifier_with_mock.flush_pending_classifications(
+                    _db_factory(db_mock)
+                )
 
-    # Only the first item was popped and attempted — the second stays queued.
-    assert mock_redis.lpop.await_count == 1
+    # Nothing was committed — both items stay pending for the next dispatch.
+    consumer.commit.assert_not_awaited()
     db_mock.commit.assert_not_called()
+    # The consumer is always stopped, even on the failure path.
+    consumer.stop.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_pending_classification_count_calls_llen(classifier_with_mock):
-    mock_redis = AsyncMock()
-    mock_redis.llen.return_value = 12
-    assert await classifier_with_mock.pending_classification_count(mock_redis) == 12
+async def test_pending_classification_count_uses_consumer_lag(classifier_with_mock):
+    with patch("app.core.kafka.pending_count", new=AsyncMock(return_value=12)) as mock_lag:
+        assert await classifier_with_mock.pending_classification_count() == 12
+    mock_lag.assert_awaited_once()

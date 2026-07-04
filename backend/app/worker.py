@@ -29,7 +29,7 @@ import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Callable
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -85,6 +85,13 @@ async def worker_lifespan() -> AsyncGenerator[tuple[async_sessionmaker, AsyncSes
     # Initialize Redis
     await init_redis()
     redis_client = get_cache_service()
+
+    # Initialize Kafka (Redpanda) — durable job topics + process-wide producer.
+    # The forecast batch consumer and classifier flush consumers access the
+    # app.core.kafka accessors directly (same pattern as get_redis()).
+    from app.core.kafka import init_kafka
+    await init_kafka()
+    logger.info("Kafka topics and producer initialized")
 
     # Initialize Gemini Request Manager — must run after init_redis() (circuit
     # pre-load reads Redis) and before LLM client / NLPEngine (both call acquire()).
@@ -208,6 +215,16 @@ async def worker_lifespan() -> AsyncGenerator[tuple[async_sessionmaker, AsyncSes
             logger.debug("LLM client close failed (non-fatal): %s", exc)
 
         await upstox_client.stop()
+
+        # Close Kafka after all task loops have been cancelled by worker_app's
+        # TaskGroup teardown and before Redis (consumers write guard keys and
+        # result caches through Redis until they stop).
+        try:
+            from app.core.kafka import close_kafka
+            await close_kafka()
+        except Exception as exc:
+            logger.debug("Kafka close failed (non-fatal): %s", exc)
+
         await close_redis()
         await engine.dispose()
         logger.info("Worker resources cleaned up")
@@ -217,6 +234,8 @@ async def heartbeat_loop(
     pause: PauseToken,
     trigger: TriggerToken,
     shutdown: asyncio.Event,
+    *,
+    on_cycle: Callable[[], None] | None = None,
 ) -> None:
     """
     Heartbeat loop — writes a UTC timestamp to Redis every 30s.
@@ -238,6 +257,9 @@ async def heartbeat_loop(
             except Exception as exc:
                 logger.error("Heartbeat error: %s", exc, exc_info=True)
 
+            if on_cycle is not None:
+                on_cycle()
+
             await trigger.wait_or_timeout(30.0)
 
     except asyncio.CancelledError:
@@ -252,6 +274,8 @@ async def cache_invalidation_loop(
     pause: PauseToken,
     trigger: TriggerToken,
     shutdown: asyncio.Event,
+    *,
+    on_cycle: Callable[[], None] | None = None,
 ) -> None:
     """
     Cache invalidation loop — event-driven via Redis pub/sub.
@@ -314,6 +338,9 @@ async def cache_invalidation_loop(
                     },
                 )
 
+                if on_cycle is not None:
+                    on_cycle()
+
             except Exception as exc:
                 logger.error(
                     "[Cache Invalidation] Error processing message: %s", exc,
@@ -339,6 +366,8 @@ async def expiry_loop(
     pause: PauseToken,
     trigger: TriggerToken,
     shutdown: asyncio.Event,
+    *,
+    on_cycle: Callable[[], None] | None = None,
 ) -> None:
     """
     Suggestion expiry loop — marks expired TradeSuggestions every 60s.
@@ -453,6 +482,9 @@ async def expiry_loop(
                     loop_iteration, cycle_duration,
                 )
 
+                if on_cycle is not None:
+                    on_cycle()
+
                 await trigger.wait_or_timeout(60.0)
 
             except Exception as exc:
@@ -470,7 +502,11 @@ async def expiry_loop(
         logger.info("Suggestion expiry loop stopped")
 
 
-async def feature_refresh_loop(shutdown: asyncio.Event) -> None:
+async def feature_refresh_loop(
+    shutdown: asyncio.Event,
+    *,
+    on_cycle: Callable[[], None] | None = None,
+) -> None:
     """
     Daily ML feature store refresh — fires at 16:00 IST (30 min after NSE close).
 
@@ -548,6 +584,9 @@ async def feature_refresh_loop(shutdown: asyncio.Event) -> None:
             logger.error(
                 "Feature refresh: daily run failed — %s", exc, exc_info=True,
             )
+        finally:
+            if on_cycle is not None:
+                on_cycle()
 
     logger.info("Feature refresh loop stopped")
 
@@ -560,6 +599,8 @@ async def correlation_loop(
     pause: PauseToken,
     trigger: TriggerToken,
     shutdown: asyncio.Event,
+    *,
+    on_cycle: Callable[[], None] | None = None,
 ) -> None:
     """
     Correlation engine loop - monitors scanner anomalies and news events.
@@ -786,7 +827,10 @@ async def correlation_loop(
                     f"[Correlation #{loop_iteration}] "
                     f"Cycle completed in {cycle_duration:.2f}s"
                 )
-                
+
+                if on_cycle is not None:
+                    on_cycle()
+
                 # Sleep 30s (market open) or 5min (market closed) before next cycle.
                 # trigger.fire() (from the control plane) wakes the loop immediately.
                 sleep_secs = 30.0 if market.is_open_now else 300.0

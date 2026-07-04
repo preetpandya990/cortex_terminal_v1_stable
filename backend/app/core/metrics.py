@@ -469,8 +469,9 @@ news_forecast_batch_calls_total = Counter(
 news_forecast_queue_depth = Gauge(
     'news_forecast_queue_depth',
     'Number of symbols currently pending in the forecast batch queue '
-    '(cortex:forecast:batch:queue).  Sustained high values indicate a '
-    'stalled batch worker or sustained quota exhaustion.',
+    '(cortex.forecast.batch Kafka topic, measured as consumer-group lag). '
+    'Sustained high values indicate a stalled batch worker or sustained '
+    'quota exhaustion; retry republishes briefly inflate it.',
 )
 
 
@@ -544,10 +545,40 @@ instrument_sync_last_success_timestamp = Gauge(
 # ── Worker Sidecar Task Metrics ────────────────────────────────────────────────
 # Per-task gauges updated by worker_control.py at scrape time (pull model).
 # Label `task` matches TASK_NAMES in workers/registry.py.
+#
+# Two independent timestamps — do not conflate:
+#   last_cycle_seconds  — sourced from TaskState.last_cycle_at, set by the
+#                         task's own loop body via record_cycle() once per
+#                         real work cycle. THE genuine liveness/staleness
+#                         signal. Falls back to started_at until the first
+#                         cycle completes (see worker_control.py /metrics).
+#   started_at_seconds  — sourced from TaskState.last_run_at, set once by
+#                         supervised() per process start / crash-restart.
+#                         Answers "when did this task last restart," not
+#                         "is it still doing work" — useful for
+#                         crash-restart-recency, not for staleness alerting.
+#
+# expected_interval_seconds is static per task (TASK_EXPECTED_INTERVAL_SECONDS
+# in workers/registry.py), published once at worker startup (worker_app.py),
+# not per scrape. Absent for event-driven tasks with no fixed cadence
+# (cache_invalidation, pnl_worker, sl_tp_worker) — PromQL `on(task)` joins
+# against it naturally exclude those tasks from ratio-based staleness alerts.
 
 worker_task_last_cycle_seconds = Gauge(
     'worker_task_last_cycle_seconds',
-    'Unix timestamp of the last completed cycle per worker task (from supervised() state)',
+    'Unix timestamp of the last completed real work cycle per worker task (from TaskState.last_cycle_at)',
+    ['task'],
+)
+
+worker_task_started_at_seconds = Gauge(
+    'worker_task_started_at_seconds',
+    'Unix timestamp of the current supervised() iteration start (crash-restart recency; NOT cycle activity)',
+    ['task'],
+)
+
+worker_task_expected_interval_seconds = Gauge(
+    'worker_task_expected_interval_seconds',
+    'Expected seconds between real work cycles for this task; absent for event-driven tasks with no fixed cadence',
     ['task'],
 )
 
@@ -637,7 +668,8 @@ llm_explanation_dedup_total = Counter(
 
 llm_stream_queue_depth = Gauge(
     'llm_stream_queue_depth',
-    'Approximate number of pending (unacknowledged) messages in each job stream',
+    'Pending (uncommitted) messages per LLM job topic, measured as Kafka '
+    'consumer-group lag; retry republishes briefly inflate it',
     ['stream'],  # explanation | context
 )
 

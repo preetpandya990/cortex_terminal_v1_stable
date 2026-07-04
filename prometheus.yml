@@ -19,6 +19,12 @@ scrape_configs:
 
   - job_name: 'cortex-worker'
     static_configs:
-      - targets: ['worker:8001']
+      - targets: ['host.docker.internal:8001']
     metrics_path: '/metrics'
+    scrape_interval: 10s
+
+  - job_name: 'redpanda'
+    static_configs:
+      - targets: ['redpanda:9644']
+    metrics_path: '/public_metrics'
     scrape_interval: 10s

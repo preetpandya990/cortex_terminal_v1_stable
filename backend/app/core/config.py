@@ -47,6 +47,17 @@ class Settings(BaseSettings):
     REDIS_URL: RedisDsn = Field(..., description="Redis URL (redis://host:port/db)")
     REDIS_MAX_CONNECTIONS: int = Field(50, ge=10, le=500)
 
+    # ── Kafka / Redpanda ───────────────────────────────────────────────────────
+    # Durable job queues (explanation, context, forecast batch, classifier)
+    # live on Redpanda; Redis keeps cache/pub-sub/locks/dedup/SSE stores.
+    # Bare-metal processes reach the broker on the external listener
+    # (localhost:19092); containerized services override to redpanda:9092 via
+    # docker-compose.  Topic/group topology lives in app/core/kafka.py.
+    KAFKA_BOOTSTRAP_SERVERS: str = Field(
+        "localhost:19092",
+        description="Kafka bootstrap servers (host:port[,host:port...])",
+    )
+
     # ── Security — JWT ─────────────────────────────────────────────────────────
     SECRET_KEY: str = Field(..., min_length=32, description="HMAC secret (openssl rand -hex 32)")
     ALGORITHM: str = "HS256"
@@ -90,8 +101,8 @@ class Settings(BaseSettings):
     # The worker sidecar runs as a separate Docker Compose service on port 8001
     # (internal only — never exposed to the host).  The main API calls it via
     # httpx + circuit breaker for control-plane operations (pause/resume/trigger).
-    # All data flow continues through Redis pub/sub — these settings only affect
-    # the HTTP control plane.
+    # Data flow stays on Redis pub/sub (broadcast) and Kafka topics (durable
+    # job queues) — these settings only affect the HTTP control plane.
     WORKER_BASE_URL: str = Field(
         "http://worker:8001",
         description="Internal base URL of the worker sidecar service",
@@ -375,11 +386,11 @@ class Settings(BaseSettings):
 
     # ── Forecast Batch Accumulator ─────────────────────────────────────────────
     # The signal assembler no longer calls Gemini synchronously for news forecasts.
-    # Instead it enqueues the (symbol, context) to a Redis list and returns the
-    # NLP fallback immediately — keeping the hot path latency constant.  The
-    # forecast_batch_worker drains the queue in batches of N symbols, fires one
-    # Gemini call per batch, and writes results to the same 5-minute cache keys
-    # that gather_news_forecast already reads.  The NEXT signal for the same
+    # Instead it publishes the (symbol, context) to the cortex.forecast.batch
+    # Kafka topic and returns the NLP fallback immediately — keeping the hot
+    # path latency constant.  The forecast_batch_worker drains the topic in
+    # batches of N symbols, fires one Gemini call per batch, and writes results
+    # to the same 5-minute cache keys that gather_news_forecast already reads.  The NEXT signal for the same
     # symbol (within the cache TTL) receives the Gemini result with zero latency.
     #
     # NEWS_FORECAST_BATCH_SIZE: symbols per batched Gemini call.  Structured-output

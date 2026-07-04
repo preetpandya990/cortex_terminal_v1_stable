@@ -23,7 +23,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Callable
 
 from redis.asyncio import Redis
 from sqlalchemy import and_, select
@@ -44,7 +44,11 @@ _LTP_KEY_PREFIX: str = "cai:ltp:"
 _MAX_BATCH_SIZE: int = 200             # cap per tick to bound latency
 
 
-async def run_sl_tp_worker(redis: Redis) -> None:
+async def run_sl_tp_worker(
+    redis: Redis,
+    *,
+    on_cycle: Callable[[], None] | None = None,
+) -> None:
     """
     Entry point — start the SL/TP monitoring loop.
 
@@ -52,7 +56,7 @@ async def run_sl_tp_worker(redis: Redis) -> None:
     """
     logger.info("SL/TP worker starting")
     try:
-        await _worker_loop(redis)
+        await _worker_loop(redis, on_cycle=on_cycle)
     except asyncio.CancelledError:
         logger.info("SL/TP worker cancelled cleanly")
     except Exception as exc:
@@ -60,13 +64,21 @@ async def run_sl_tp_worker(redis: Redis) -> None:
         raise
 
 
-async def _worker_loop(redis: Redis) -> None:
+async def _worker_loop(
+    redis: Redis,
+    *,
+    on_cycle: Callable[[], None] | None = None,
+) -> None:
     while True:
         start = asyncio.get_event_loop().time()
         try:
             await _process_tick(redis)
         except Exception as exc:
             logger.warning("SL/TP worker tick error: %s", exc)
+
+        if on_cycle is not None:
+            on_cycle()
+
         elapsed = asyncio.get_event_loop().time() - start
         await asyncio.sleep(max(0.0, _TICK_INTERVAL_S - elapsed))
 

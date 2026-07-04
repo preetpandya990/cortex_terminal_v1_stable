@@ -98,9 +98,14 @@ groups:
           summary: "Forecast batch queue backed up — batch worker may be stalled"
           description: >
             news_forecast_queue_depth={{ $value | printf "%.0f" }} symbols queued
-            and not draining.
+            and not draining.  The gauge is consumer-group lag on the
+            cortex.forecast.batch Kafka topic (group cortex-forecast-batch);
+            retry republishes to the topic tail briefly inflate it during
+            retry storms — retried items are genuinely pending.
             If news_forecast_batch_calls_total{outcome="budget_throttled"} is
             rising, the budget guard is blocking the worker (expected and correct
             near quota exhaustion — no action needed until quota resets).
             If news_forecast_batch_calls_total{outcome="error"} is rising, the
-            batch worker may have crashed — check worker process logs and restart.
+            batch worker may have crashed — check worker process logs, then
+            `rpk group describe cortex-forecast-batch` on cortex-redpanda to
+            confirm the committed offset is advancing after restart.

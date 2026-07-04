@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import Callable
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -52,6 +53,8 @@ async def rag_cleanup_loop(
     session_factory: async_sessionmaker,
     redis: CacheService,
     shutdown: asyncio.Event,
+    *,
+    on_cycle: Callable[[], None] | None = None,
 ) -> None:
     """
     Daily RAG corpus TTL eviction loop.
@@ -136,6 +139,9 @@ async def rag_cleanup_loop(
                 logger.exception(
                     "rag_cleanup: cleanup cycle failed — will retry next tick: %s", exc
                 )
+
+        if on_cycle is not None:
+            on_cycle()
 
         # ── Sleep until the next tick (interruptible by shutdown) ─────────────
         try:

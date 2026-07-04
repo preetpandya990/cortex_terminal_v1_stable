@@ -1062,22 +1062,21 @@ class EventCorrelationEngine:
         # Trigger async LLM explanation generation — gated by consensus_score.
         # Only enqueue when the signal is strong enough to warrant a Gemini call;
         # weak signals surface a placeholder in the AI panel with a user-driven
-        # refresh button (bypass endpoint, Phase 2-B).  XADD failure is non-fatal:
-        # it must never block or roll back the committed suggestion.
+        # refresh button (bypass endpoint, Phase 2-B).  Publish failure is
+        # non-fatal: it must never block or roll back the committed suggestion.
         try:
             from app.core.config import get_settings as _get_settings
-            from app.core.redis import RedisStreams
+            from app.core.kafka import KafkaTopics, publish
             _threshold = _get_settings().EXPLANATION_CONSENSUS_THRESHOLD
             if float(suggestion.consensus_score) >= _threshold:
-                await self.redis.xadd(
-                    RedisStreams.EXPLANATION_JOBS,
+                await publish(
+                    KafkaTopics.EXPLANATION_JOBS,
                     {
                         "suggestion_id":  str(suggestion.suggestion_id),
                         "id":             str(suggestion.id),
                         "instrument_key": suggestion.instrument_key,
                     },
-                    maxlen=5000,
-                    approximate=True,
+                    key=str(suggestion.suggestion_id),
                 )
                 logger.debug(
                     "explanation job enqueued: suggestion=%s consensus_score=%.1f",

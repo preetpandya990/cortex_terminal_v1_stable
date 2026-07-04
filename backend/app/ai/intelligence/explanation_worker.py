@@ -4,18 +4,18 @@ LLM Explanation Worker
 Async background tasks that generate plain-English explanations for two use cases:
 
   1. Trade suggestion explanations
-       Triggered via ``cortex:stream:explanation:jobs`` Redis Stream consumer group.
+       Triggered via the ``cortex.explanation.jobs`` Kafka topic (Redpanda).
        Generates a signal-specific explanation for a committed TradeSuggestion and
        writes it back to the trade_suggestions table.
 
   2. Instrument market context
-       Triggered via ``cortex:stream:context:jobs`` Redis Stream consumer group.
+       Triggered via the ``cortex.context.jobs`` Kafka topic.
        Generates an instrument-level market context summary for Watchlist items
        with no active trade suggestion.  Written to ai_instrument_context (upsert).
 
 Pipeline — suggestion explanation
 ----------------------------------
-  1. Receive job from cortex:stream:explanation:jobs (XREADGROUP)
+  1. Receive job from cortex.explanation.jobs (manual-commit consumer)
   2. DB idempotency check — skip if explanation already exists
   3. In-flight dedup key — skip if another worker is already processing this suggestion
   4. Load TradeSuggestion from DB (Phase 1)
@@ -26,11 +26,11 @@ Pipeline — suggestion explanation
   9. Write full payload (with sources) to per-suggestion SSE event store
  10. Append one row to ai_llm_audit_log
  11. Publish routing signal to cortex:llm:explanation:ready:{suggestion_id}
- 12. XACK the stream message
+ 12. Commit the Kafka offset
 
 Pipeline — instrument market context
 --------------------------------------
-  1. Receive job from cortex:stream:context:jobs (XREADGROUP)
+  1. Receive job from cortex.context.jobs (manual-commit consumer)
   2. RAG retrieve — recent news for the symbol (Phase 1)
   3. LLM structured generation → ExplanationOutput (Phase 2)
   4. Apply same guardrails
@@ -38,23 +38,28 @@ Pipeline — instrument market context
   6. Write full payload to per-instrument SSE event store
   7. Append one row to ai_llm_audit_log
   8. Publish routing signal to cortex:llm:context:ready:{instrument_key}
-  9. XACK the stream message
+  9. Commit the Kafka offset
 
 Delivery architecture
 ---------------------
-  The pub/sub job channels (LLM_EXPLANATION_PENDING, LLM_CONTEXT_PENDING) are
-  replaced by Redis Streams consumer groups.  This provides:
+  Durable queueing lives on Kafka topics (Redpanda) with manual-commit consumer
+  groups.  This provides:
 
-  - At-least-once delivery: unACKed messages survive worker restarts (PEL drain).
-  - No message loss during LLM processing: the stream buffers jobs while a worker
+  - At-least-once delivery: an offset is committed only after the message reaches
+    a terminal outcome (success, DLQ, abandon, or a republished retry).  Crash
+    before commit → redelivery from the committed offset on restart.
+  - No message loss during LLM processing: the topic buffers jobs while a worker
     is busy; the old pub/sub design dropped any PUBLISH fired during the 10–120s
     LLM call window.
-  - Rate-limit back-pressure without blocking: on GeminiRateLimitError the message
-    is NOT ACKed.  It stays in the PEL; the housekeeping coroutine re-delivers it
-    via XCLAIM after _PEL_IDLE_THRESHOLD_MS.  No asyncio.sleep blocks the consumer
-    loop.
-  - Dead-letter queue: after MAX_ATTEMPTS deliveries the message is moved to
-    cortex:stream:explanation:dlq, a failed-state event is written to the SSE event
+  - Retries without blocking the partition: Kafka has no delivery counter, so a
+    retryable failure republishes the same payload to the topic tail with
+    ``attempts+1`` and a ``not_before`` deadline in the headers, then commits the
+    original.  On delivery, a deadline ≤60s away is slept off (aiokafka heartbeats
+    in the background — far below the 300s max_poll_interval_ms); a longer one is
+    republished to the tail unchanged so the consumer is never evicted from the
+    group for sleeping.
+  - Dead-letter queue: after MAX_ATTEMPTS the message is published to
+    cortex.explanation.dlq, a failed-state event is written to the SSE event
     store, and the browser renders "Analysis unavailable" instead of an eternal
     skeleton.
 
@@ -66,8 +71,9 @@ Design invariants
 -----------------
   - Failed generations never block indefinitely.  MAX_ATTEMPTS applies per message;
     after exhaustion the DLQ path fires.
-  - Two explanation workers run in parallel.  The context worker is a single task
-    (context jobs are low-frequency).
+  - Two explanation workers run in parallel (cortex.explanation.jobs has two
+    partitions keyed by suggestion_id — no head-of-line blocking).  The context
+    worker is a single task (context jobs are low-frequency).
   - Every LLM inference — success or failure — writes one ai_llm_audit_log row.
     This is a non-negotiable governance requirement (SR 11-7).
   - The in-flight dedup key (SET NX EX 150) prevents concurrent workers from
@@ -108,6 +114,16 @@ from app.ai.intelligence.llm_client import (
     get_intelligence_client,
 )
 from app.ai.rag.pipeline import build_retrieval_source_refs, format_context, retrieve
+from app.core.kafka import (
+    KafkaGroups,
+    KafkaTopics,
+    get_attempts,
+    get_not_before,
+    new_consumer,
+    pending_count,
+    publish,
+    retry_headers,
+)
 from app.core.metrics import (
     gemini_dlq_requeue_total,
     llm_audit_log_writes_total,
@@ -118,6 +134,7 @@ from app.core.metrics import (
     llm_explanations_total,
     llm_guardrail_events_total,
     llm_ready_publish_failures_total,
+    llm_stream_queue_depth,
 )
 from app.core.redis import RedisChannels, RedisStreams
 from app.models.trade_suggestions import TradeSuggestion
@@ -136,18 +153,21 @@ _RECONNECT_DELAY_SECS = 5
 # Hard ceiling on the total LLM call duration (queue wait + HTTP).
 _LLM_CALL_TIMEOUT_SECS = 120.0
 
-# Stream consumer configuration
-_CONSUMER_GROUP = RedisStreams.CONSUMER_GROUP
-_STREAM_BLOCK_MS = 5_000        # block 5s waiting for new messages on each XREADGROUP
-_PEL_IDLE_THRESHOLD_MS = 60_000 # XCLAIM PEL entries idle > 60s
-_PEL_HOUSEKEEPING_INTERVAL_SECS = 30
+# Retry pacing: retryable failures republish with not_before = now + this delay.
+_RETRY_DELAY_SECS = 60
+# not_before hybrid rule (see module docstring): a deadline this close is slept
+# off in the consumer; anything further is republished to the tail unchanged so
+# the consumer never risks max_poll_interval_ms (300s) group eviction.
+_NOT_BEFORE_SLEEP_CAP_SECS = 60
+# Cadence of the llm_stream_queue_depth gauge tick (consumer-lag based).
+_QUEUE_DEPTH_TICK_SECS = 30
 
 # In-flight dedup: longer than _LLM_CALL_TIMEOUT_SECS to cover Phase 3 DB write.
 _INFLIGHT_KEY_TTL_SECS = 150
 
 # Context-worker transient backoff: after a 5xx / network exhaustion, skip
-# re-processing the same instrument for this many seconds.  Must be longer than
-# _PEL_IDLE_THRESHOLD_MS so the cooldown expires before housekeeping re-delivers.
+# re-processing the same instrument for this many seconds.  The retry republish
+# carries not_before = now + this value so redelivery lands after the cooldown.
 _TRANSIENT_COOLDOWN_TTL_SECS = 180   # 3 min — covers typical Gemini overload spikes
 
 # Post-success dedup window: duplicate stream entries (e.g. scheduler double-enqueue)
@@ -166,10 +186,6 @@ _SSE_CONTEXT_TTL_SECS = 86_400        # 24 h — matches WATCHLIST_CONTEXT_SERVE
                                        #         so the richer SSE payload (with source citations)
                                        #         stays available for the same window Stage 2 serves
 _SSE_EVENT_MAXLEN = 20                 # per-key stream depth
-
-# Stream max lengths (approximate trim — O(1) amortised)
-_STREAM_MAXLEN_EXPLANATION = 5_000
-_STREAM_MAXLEN_CONTEXT = 1_000
 
 # Lua script for atomic lock renewal (Section 3.4 of fix design doc).
 # Checks ownership before extending so a re-acquired lock by another process
@@ -1347,7 +1363,7 @@ async def _generate_instrument_context(
         raise RuntimeError(error_message)
 
 
-# ── DLQ and PEL helpers ───────────────────────────────────────────────────────
+# ── DLQ and retry helpers ─────────────────────────────────────────────────────
 
 async def _publish_failed_state(
     redis: Any,
@@ -1389,355 +1405,258 @@ async def _publish_failed_state(
         )
 
 
-async def _move_to_dlq(
+async def _send_to_dlq(
     redis: Any,
-    stream: str,
-    group: str,
-    msg_id: str,
-    consumer_name: str,
     reason: str,
-    fields: dict,
+    payload: dict,
+    attempts: int,
 ) -> None:
     """
-    Move a message to the explanation DLQ, publish a failed-state SSE event,
-    and XACK to remove it from the PEL.
-    """
-    try:
-        dlq_entry = {
-            "original_stream": stream,
-            "original_msg_id": msg_id,
-            "consumer":        consumer_name,
-            "reason":          reason,
-            "fields":          json.dumps(fields, default=str),
-            "moved_at":        datetime.now(timezone.utc).isoformat(),
-        }
-        await redis.xadd(
-            RedisStreams.EXPLANATION_DLQ,
-            dlq_entry,
-            maxlen=1000,
-            approximate=True,
-        )
-        await redis.xack(stream, group, msg_id)
-        llm_explanation_dlq_total.labels(job_type="explanation").inc()
-        logger.error(
-            "explanation_worker: message %s moved to DLQ (reason=%s consumer=%s)",
-            msg_id, reason, consumer_name,
-        )
-    except Exception as exc:
-        logger.error(
-            "explanation_worker: DLQ write failed for message %s: %s", msg_id, exc
-        )
-        return
+    Publish a terminally-failed explanation job to the DLQ topic and write the
+    failed-state SSE event so the browser renders "Analysis unavailable".
 
-    # Publish failed state if we have enough routing information
-    suggestion_id  = fields.get("suggestion_id", "")
-    instrument_key = fields.get("instrument_key", "")
+    Raises on DLQ publish failure — the caller must NOT commit in that case so
+    the original message is redelivered (parity with the old no-XACK path).
+    """
+    suggestion_id = str(payload.get("suggestion_id", "") or "")
+    dlq_entry = {
+        "original_topic": KafkaTopics.EXPLANATION_JOBS,
+        "reason":         reason,
+        "fields":         payload,
+        "attempts":       attempts,
+        "moved_at":       datetime.now(timezone.utc).isoformat(),
+    }
+    await publish(
+        KafkaTopics.EXPLANATION_DLQ,
+        dlq_entry,
+        key=suggestion_id or None,
+    )
+    llm_explanation_dlq_total.labels(job_type="explanation").inc()
+    logger.error(
+        "explanation_worker: suggestion %s moved to DLQ (reason=%s attempts=%d)",
+        suggestion_id, reason, attempts,
+    )
+
+    instrument_key = str(payload.get("instrument_key", "") or "")
     if suggestion_id:
         await _publish_failed_state(redis, suggestion_id, instrument_key)
 
 
-async def _drain_pel(
-    redis: Any,
-    stream: str,
-    group: str,
-    consumer_name: str,
+async def _republish_retry(
+    topic: str,
+    payload: dict,
+    key: str,
+    attempts: int,
+    delay_secs: float,
+    *,
+    not_before: float | None = None,
 ) -> None:
-    """
-    Re-deliver all PEL entries for this consumer (handles pre-crash unACKed messages).
-
-    Called once at startup before entering the main XREADGROUP `>` loop.
-    Messages with delivery_count > MAX_ATTEMPTS are moved to DLQ.
-    Messages within the retry budget are XCLAIM'd back to this consumer and processed.
-    """
-    try:
-        pending_entries = await redis.xpending_range(
-            name=stream,
-            groupname=group,
-            min="-",
-            max="+",
-            count=200,
-            consumername=consumer_name,
-        )
-    except Exception as exc:
-        logger.warning(
-            "explanation_worker: PEL drain query failed for %s (continuing): %s",
-            consumer_name, exc,
-        )
-        return
-
-    if not pending_entries:
-        return
-
-    logger.info(
-        "explanation_worker: draining %d PEL entries for consumer %s",
-        len(pending_entries), consumer_name,
+    """Republish a job to the topic tail with retry headers, for a later attempt."""
+    await publish(
+        topic,
+        payload,
+        key=key,
+        headers=retry_headers(attempts, delay_secs, not_before=not_before),
     )
 
-    for entry in pending_entries:
-        msg_id         = entry["message_id"]
-        delivery_count = entry["times_delivered"]
 
-        if delivery_count > MAX_ATTEMPTS:
-            # Need to XCLAIM first to get the fields, then move to DLQ
-            try:
-                claimed = await redis.xclaim(
-                    name=stream,
-                    groupname=group,
-                    consumername=consumer_name,
-                    min_idle_time=0,
-                    message_ids=[msg_id],
-                )
-                for _, fields in claimed:
-                    await _move_to_dlq(
-                        redis, stream, group, msg_id, consumer_name,
-                        "max_attempts_exceeded_on_startup_drain", fields or {},
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "explanation_worker: PEL drain — DLQ move failed for %s: %s",
-                    msg_id, exc,
-                )
-            continue
-
-        # Re-claim and re-process
-        try:
-            claimed = await redis.xclaim(
-                name=stream,
-                groupname=group,
-                consumername=consumer_name,
-                min_idle_time=0,
-                message_ids=[msg_id],
-            )
-            for claim_id, fields in claimed:
-                if not fields:
-                    continue
-                await _process_explanation_message(
-                    redis, consumer_name, claim_id, fields,
-                    group, stream, delivery_count=delivery_count,
-                )
-        except Exception as exc:
-            logger.warning(
-                "explanation_worker: PEL drain — process failed for %s: %s",
-                msg_id, exc,
-            )
-
-
-async def _pel_housekeeping(
-    redis: Any,
-    stream: str,
-    group: str,
-    consumer_name: str,
-) -> None:
+async def _honor_not_before(msg: Any, topic: str, key: str) -> bool:
     """
-    Periodically scan the PEL for entries idle > _PEL_IDLE_THRESHOLD_MS and
-    re-claim them for this consumer.  This handles rate-limited messages that
-    were not ACKed (they sit in PEL until re-claimed).
+    Enforce the ``not_before`` retry deadline on a delivered message.
 
-    Entries that exceed MAX_ATTEMPTS are moved to DLQ.
+    Returns True when the message should be processed now.  A deadline within
+    _NOT_BEFORE_SLEEP_CAP_SECS is slept off (aiokafka heartbeats run in a
+    background task, so a bounded sleep cannot trigger group eviction); a
+    further deadline republishes the message to the tail UNCHANGED (same
+    attempts, same deadline) and returns False — the caller commits and moves
+    on.  Raises if the republish fails so the caller skips the commit and the
+    message is redelivered.
+    """
+    remaining = get_not_before(msg) - time.time()
+    if remaining <= 0:
+        return True
+    if remaining <= _NOT_BEFORE_SLEEP_CAP_SECS:
+        await asyncio.sleep(remaining)
+        return True
+    await _republish_retry(
+        topic, msg.value, key, get_attempts(msg), 0.0, not_before=get_not_before(msg)
+    )
+    logger.debug(
+        "explanation_worker: not_before %.0fs away — republished %s to tail",
+        remaining, key,
+    )
+    return False
+
+
+async def _queue_depth_ticker(topic: str, group_id: str, stream_label: str) -> None:
+    """
+    Feed llm_stream_queue_depth{stream=...} from consumer lag every 30s.
+
+    Lag briefly over-counts during retry storms (tail republish inflates end
+    offsets) — retried messages are genuinely pending, so this is acceptable.
     """
     while True:
         try:
-            await asyncio.sleep(_PEL_HOUSEKEEPING_INTERVAL_SECS)
-
-            pending_entries = await redis.xpending_range(
-                name=stream,
-                groupname=group,
-                min="-",
-                max="+",
-                count=50,
-                consumername=consumer_name,
-                idle=_PEL_IDLE_THRESHOLD_MS,
-            )
-
-            if not pending_entries:
-                continue
-
-            for entry in pending_entries:
-                msg_id         = entry["message_id"]
-                delivery_count = entry["times_delivered"]
-
-                if delivery_count > MAX_ATTEMPTS:
-                    try:
-                        claimed = await redis.xclaim(
-                            name=stream,
-                            groupname=group,
-                            consumername=consumer_name,
-                            min_idle_time=_PEL_IDLE_THRESHOLD_MS,
-                            message_ids=[msg_id],
-                        )
-                        for _, fields in claimed:
-                            await _move_to_dlq(
-                                redis, stream, group, msg_id, consumer_name,
-                                "max_attempts_exceeded_in_housekeeping", fields or {},
-                            )
-                    except Exception as exc:
-                        logger.warning(
-                            "explanation_worker: housekeeping DLQ move failed for %s: %s",
-                            msg_id, exc,
-                        )
-                    continue
-
-                try:
-                    claimed = await redis.xclaim(
-                        name=stream,
-                        groupname=group,
-                        consumername=consumer_name,
-                        min_idle_time=_PEL_IDLE_THRESHOLD_MS,
-                        message_ids=[msg_id],
-                    )
-                    for claim_id, fields in claimed:
-                        if not fields:
-                            continue
-                        logger.info(
-                            "explanation_worker: housekeeping re-claiming message %s "
-                            "(delivery_count=%d) for consumer %s",
-                            claim_id, delivery_count, consumer_name,
-                        )
-                        await _process_explanation_message(
-                            redis, consumer_name, claim_id, fields,
-                            group, stream, delivery_count=delivery_count,
-                        )
-                except Exception as exc:
-                    logger.warning(
-                        "explanation_worker: housekeeping re-claim failed for %s: %s",
-                        msg_id, exc,
-                    )
-
+            depth = await pending_count(topic, group_id)
+            llm_stream_queue_depth.labels(stream=stream_label).set(depth)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("explanation_worker: PEL housekeeping error: %s", exc)
+            logger.debug(
+                "explanation_worker: queue depth tick failed for %s: %s",
+                stream_label, exc,
+            )
+        await asyncio.sleep(_QUEUE_DEPTH_TICK_SECS)
 
 
 # ── Message processors ────────────────────────────────────────────────────────
 
 async def _process_explanation_message(
     redis: Any,
-    consumer_name: str,
-    msg_id: str,
-    fields: dict,
-    group: str,
-    stream: str,
-    delivery_count: int = 1,
+    consumer: Any,
+    msg: Any,
+    worker_id: int,
 ) -> None:
-    """Process a single explanation job from the stream."""
-    try:
-        suggestion_id  = fields.get("suggestion_id", "")
-        suggestion_db_id = int(fields.get("id", 0))
-        instrument_key = fields.get("instrument_key", "")
-        if not suggestion_id:
-            raise ValueError("missing suggestion_id")
-    except (ValueError, TypeError) as exc:
+    """
+    Process one explanation job from the Kafka topic to a terminal outcome,
+    then commit its offset.
+
+    Retry policy (attempts header, starts at 0):
+      - malformed / missing suggestion_id → commit + skip (poison message)
+      - attempts ≥ MAX_ATTEMPTS           → DLQ + failed-state UI + commit
+      - GeminiQuotaExhausted              → DLQ + failed-state UI + commit
+      - GeminiRateLimitError / other      → republish attempts+1 with a
+                                            _RETRY_DELAY_SECS deadline + commit
+      - success                           → commit
+
+    Any publish failure inside a handler propagates WITHOUT committing, so the
+    message is redelivered after reconnect — no job can be silently dropped.
+    """
+    payload = msg.value
+    if not isinstance(payload, dict) or not payload.get("suggestion_id"):
         logger.warning(
-            "explanation_worker[%s]: malformed message %s: %s", consumer_name, msg_id, exc
+            "explanation_worker[%d]: malformed message at offset %s — skipping",
+            worker_id, msg.offset,
         )
-        await redis.xack(stream, group, msg_id)
+        await consumer.commit()
         return
 
-    if delivery_count > MAX_ATTEMPTS:
-        await _move_to_dlq(
-            redis, stream, group, msg_id, consumer_name,
-            "max_attempts_exceeded", fields,
-        )
+    suggestion_id = str(payload["suggestion_id"])
+    try:
+        suggestion_db_id = int(payload.get("id", 0))
+    except (TypeError, ValueError):
+        suggestion_db_id = 0
+
+    attempts = get_attempts(msg)
+    if attempts >= MAX_ATTEMPTS:
+        await _send_to_dlq(redis, "max_attempts_exceeded", payload, attempts)
+        await consumer.commit()
+        return
+
+    if not await _honor_not_before(msg, KafkaTopics.EXPLANATION_JOBS, suggestion_id):
+        await consumer.commit()
         return
 
     logger.info(
-        "explanation_worker[%s]: processing suggestion %s (delivery=%d/%d)",
-        consumer_name, suggestion_id, delivery_count, MAX_ATTEMPTS,
+        "explanation_worker[%d]: processing suggestion %s (attempt=%d/%d)",
+        worker_id, suggestion_id, attempts + 1, MAX_ATTEMPTS,
     )
 
     try:
         await _generate_explanation(suggestion_id, suggestion_db_id)
-        await redis.xack(stream, group, msg_id)
+        await consumer.commit()
 
     except asyncio.CancelledError:
         raise
 
-    except GeminiRateLimitError:
-        # Not ACKing — message stays in PEL for housekeeping to re-deliver
-        logger.warning(
-            "explanation_worker[%s]: rate-limited for suggestion %s "
-            "— not ACKing, housekeeping will re-deliver after %ds idle",
-            consumer_name, suggestion_id, _PEL_IDLE_THRESHOLD_MS // 1000,
-        )
-
     except GeminiQuotaExhausted:
-        # Daily quota exhausted — move straight to DLQ
-        await _move_to_dlq(
-            redis, stream, group, msg_id, consumer_name,
-            "gemini_quota_exhausted", fields,
+        # Daily quota exhausted — straight to DLQ; the quota-reset recovery
+        # requeues it after midnight PT.
+        await _send_to_dlq(redis, "gemini_quota_exhausted", payload, attempts)
+        await consumer.commit()
+
+    except GeminiRateLimitError:
+        await _republish_retry(
+            KafkaTopics.EXPLANATION_JOBS, payload, suggestion_id,
+            attempts + 1, _RETRY_DELAY_SECS,
+        )
+        await consumer.commit()
+        logger.warning(
+            "explanation_worker[%d]: rate-limited for suggestion %s — "
+            "republished for retry in %ds (attempt %d/%d)",
+            worker_id, suggestion_id, _RETRY_DELAY_SECS, attempts + 1, MAX_ATTEMPTS,
         )
 
     except Exception as exc:
-        logger.error(
-            "explanation_worker[%s]: attempt failed for suggestion %s "
-            "(delivery=%d/%d): %s",
-            consumer_name, suggestion_id, delivery_count, MAX_ATTEMPTS, exc,
+        await _republish_retry(
+            KafkaTopics.EXPLANATION_JOBS, payload, suggestion_id,
+            attempts + 1, _RETRY_DELAY_SECS,
         )
-        # Not ACKing — stays in PEL; housekeeping will re-deliver for retry
+        await consumer.commit()
+        logger.error(
+            "explanation_worker[%d]: attempt %d/%d failed for suggestion %s: %s "
+            "— republished for retry in %ds",
+            worker_id, attempts + 1, MAX_ATTEMPTS, suggestion_id, exc,
+            _RETRY_DELAY_SECS,
+        )
 
 
 async def _process_context_message(
     redis: Any,
-    consumer_name: str,
-    msg_id: str,
-    fields: dict,
-    group: str,
-    stream: str,
-    delivery_count: int = 1,
+    consumer: Any,
+    msg: Any,
 ) -> None:
-    """Process a single instrument context generation job from the stream.
+    """Process one instrument context job to a terminal outcome, then commit.
 
-    ``delivery_count`` is the number of times this message has been delivered
-    (sourced from the PEL at re-claim time or from xpending_range at startup).
-    New messages delivered via XREADGROUP '>' always start at 1.
-
-    Retry policy:
-      - GeminiRateLimitError: NOT ACKed — stays in PEL, housekeeping retries after 60 s idle.
-      - GeminiQuotaExhausted: ACK + abandon — daily quota is exhausted; retrying is pointless.
-      - Other errors: NOT ACKed up to _MAX_CONTEXT_ATTEMPTS, then ACK + abandon.
-      - delivery_count > _MAX_CONTEXT_ATTEMPTS: ACK + abandon immediately.
-    Context jobs have no DLQ: they are best-effort and the user gets a fresh generation
-    the next time the watchlist item is opened (Stage 3 re-triggers via ai_stream.py).
+    Retry policy (attempts header, starts at 0; no DLQ — context is best-effort
+    and the user gets a fresh generation on the next watchlist open):
+      - malformed / missing instrument_key → commit + skip
+      - attempts ≥ _MAX_CONTEXT_ATTEMPTS   → abandon + commit
+      - recent-success key exists          → duplicate; commit + skip
+      - cooldown key exists                → republish SAME attempts with
+                                             not_before = now + remaining TTL, commit
+      - LLMTransientExhausted              → set cooldown + republish attempts+1
+                                             with a cooldown-length deadline, commit
+      - GeminiRateLimitError / other       → republish attempts+1, 60s deadline, commit
+      - GeminiQuotaExhausted               → abandon + commit
+      - success                            → commit + set recent key
     """
-    # ── Parse fields ──────────────────────────────────────────────────────────
-    try:
-        instrument_key = fields.get("instrument_key", "")
-        sym = fields.get("symbol") or None
-        if sym == "":
-            sym = None
-        lock_key   = fields.get("lock_key") or None
-        lock_token = fields.get("lock_token") or None
-        prediction_data_raw = fields.get("prediction_data", "")
-
-        ml_snapshot: dict | None = None
-        if prediction_data_raw:
-            try:
-                ml_snapshot = json.loads(prediction_data_raw)
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        force  = fields.get("force",  "0") == "1"
-        source = fields.get("source", "on_demand")
-
-        if not instrument_key:
-            raise ValueError("missing instrument_key")
-    except (ValueError, TypeError) as exc:
+    payload = msg.value
+    if not isinstance(payload, dict) or not payload.get("instrument_key"):
         logger.warning(
-            "context_worker[%s]: malformed message %s: %s", consumer_name, msg_id, exc
+            "context_worker: malformed message at offset %s — skipping", msg.offset
         )
-        await redis.xack(stream, group, msg_id)
+        await consumer.commit()
         return
 
-    # ── Delivery cap — ACK and abandon to prevent unbounded retries ───────────
-    if delivery_count > _MAX_CONTEXT_ATTEMPTS:
+    instrument_key = str(payload["instrument_key"])
+    sym = payload.get("symbol") or None
+    if sym == "":
+        sym = None
+    lock_key   = payload.get("lock_key") or None
+    lock_token = payload.get("lock_token") or None
+    prediction_data_raw = payload.get("prediction_data", "")
+
+    ml_snapshot: dict | None = None
+    if prediction_data_raw:
+        try:
+            ml_snapshot = json.loads(prediction_data_raw)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    force  = payload.get("force",  "0") == "1"
+    source = payload.get("source", "on_demand")
+
+    attempts = get_attempts(msg)
+
+    # ── Attempts cap — abandon to prevent unbounded retries ──────────────────
+    if attempts >= _MAX_CONTEXT_ATTEMPTS:
         logger.error(
-            "context_worker[%s]: abandoning context job %s for instrument=%s "
-            "after %d/%d deliveries — ACKing to clear PEL "
-            "(user will get fresh context on next watchlist open)",
-            consumer_name, msg_id, instrument_key, delivery_count, _MAX_CONTEXT_ATTEMPTS,
+            "context_worker: abandoning context job for instrument=%s after "
+            "%d/%d attempts (user will get fresh context on next watchlist open)",
+            instrument_key, attempts, _MAX_CONTEXT_ATTEMPTS,
         )
-        await redis.xack(stream, group, msg_id)
+        await consumer.commit()
         return
 
     # ── Per-instrument guard keys ──────────────────────────────────────────────
@@ -1748,41 +1667,49 @@ async def _process_context_message(
 
     # Post-success dedup: if this instrument was successfully processed within
     # _RECENT_SUCCESS_TTL_SECS, the current message is a duplicate (e.g. scheduler
-    # double-enqueue).  ACK and skip so the PEL stays clean.
+    # double-enqueue).  Commit and skip.
     if await redis.exists(recent_key):
         logger.info(
-            "context_worker[%s]: skipping duplicate job for %s "
-            "(successfully processed within last %ds) — ACKing",
-            consumer_name, instrument_key, _RECENT_SUCCESS_TTL_SECS,
+            "context_worker: skipping duplicate job for %s "
+            "(successfully processed within last %ds) — committing",
+            instrument_key, _RECENT_SUCCESS_TTL_SECS,
         )
-        await redis.xack(stream, group, msg_id)
+        await consumer.commit()
         return
 
-    # Transient cooldown: if a 5xx / network exhaustion was recorded for this
-    # instrument, leave the message in PEL and wait for the backoff to expire
-    # before retrying.  This prevents a burst of duplicate messages from hammering
-    # an overloaded Gemini endpoint back-to-back.
+    # Transient cooldown: a 5xx / network exhaustion was recorded for this
+    # instrument.  Republish with the SAME attempts and a deadline equal to the
+    # remaining cooldown so redelivery lands after the endpoint has recovered —
+    # this prevents a burst of duplicate messages from hammering an overloaded
+    # Gemini endpoint back-to-back.
     if await redis.exists(cooldown_key):
-        ttl = await redis.ttl(cooldown_key)
-        logger.debug(
-            "context_worker[%s]: %s in transient cooldown (%ds remaining) — "
-            "not ACKing, housekeeping will re-deliver after cooldown lifts",
-            consumer_name, instrument_key, max(ttl, 0),
+        ttl = max(await redis.ttl(cooldown_key), 1)
+        await _republish_retry(
+            KafkaTopics.CONTEXT_JOBS, payload, instrument_key, attempts, ttl
         )
+        await consumer.commit()
+        logger.debug(
+            "context_worker: %s in transient cooldown (%ds remaining) — "
+            "republished with matching not_before deadline",
+            instrument_key, ttl,
+        )
+        return
+
+    if not await _honor_not_before(msg, KafkaTopics.CONTEXT_JOBS, instrument_key):
+        await consumer.commit()
         return
 
     logger.info(
-        "context_worker[%s]: processing context for %s "
-        "(delivery=%d/%d, force=%s, source=%s)",
-        consumer_name, instrument_key, delivery_count, _MAX_CONTEXT_ATTEMPTS,
-        force, source,
+        "context_worker: processing context for %s "
+        "(attempt=%d/%d, force=%s, source=%s)",
+        instrument_key, attempts + 1, _MAX_CONTEXT_ATTEMPTS, force, source,
     )
 
     try:
         await _generate_instrument_context(
             instrument_key, sym, ml_snapshot, lock_key, lock_token, force=force
         )
-        await redis.xack(stream, group, msg_id)
+        await consumer.commit()
         # Record success so duplicate queued jobs are skipped within the dedup window.
         await redis.set(recent_key, "1", ex=_RECENT_SUCCESS_TTL_SECS)
 
@@ -1790,54 +1717,74 @@ async def _process_context_message(
         raise
 
     except LLMTransientExhausted:
-        # 5xx / network / timeout — Gemini is temporarily overloaded.  Set a cooldown
-        # so subsequent duplicate messages for this instrument are skipped until the
-        # endpoint recovers, then leave this message in PEL for housekeeping to
-        # re-deliver once both the cooldown and PEL idle threshold have elapsed.
+        # 5xx / network / timeout — Gemini is temporarily overloaded.  Set a
+        # cooldown so duplicate messages for this instrument are deferred until
+        # the endpoint recovers, and republish this job with a matching deadline.
         await redis.set(cooldown_key, "1", ex=_TRANSIENT_COOLDOWN_TTL_SECS)
+        await _republish_retry(
+            KafkaTopics.CONTEXT_JOBS, payload, instrument_key,
+            attempts + 1, _TRANSIENT_COOLDOWN_TTL_SECS,
+        )
+        await consumer.commit()
         logger.warning(
-            "context_worker[%s]: transient LLM failure for %s (delivery=%d/%d) — "
-            "cooldown set for %ds, not ACKing",
-            consumer_name, instrument_key, delivery_count, _MAX_CONTEXT_ATTEMPTS,
+            "context_worker: transient LLM failure for %s (attempt=%d/%d) — "
+            "cooldown set, republished for retry in %ds",
+            instrument_key, attempts + 1, _MAX_CONTEXT_ATTEMPTS,
             _TRANSIENT_COOLDOWN_TTL_SECS,
         )
 
     except GeminiRateLimitError:
+        await _republish_retry(
+            KafkaTopics.CONTEXT_JOBS, payload, instrument_key,
+            attempts + 1, _RETRY_DELAY_SECS,
+        )
+        await consumer.commit()
         logger.warning(
-            "context_worker[%s]: rate-limited for %s (delivery=%d/%d) — "
-            "not ACKing, housekeeping will re-deliver after %ds idle",
-            consumer_name, instrument_key, delivery_count, _MAX_CONTEXT_ATTEMPTS,
-            _PEL_IDLE_THRESHOLD_MS // 1000,
+            "context_worker: rate-limited for %s (attempt=%d/%d) — "
+            "republished for retry in %ds",
+            instrument_key, attempts + 1, _MAX_CONTEXT_ATTEMPTS, _RETRY_DELAY_SECS,
         )
 
     except GeminiQuotaExhausted:
-        await redis.xack(stream, group, msg_id)
+        await consumer.commit()
         logger.error(
-            "context_worker[%s]: quota exhausted for %s — ACKing and abandoning "
+            "context_worker: quota exhausted for %s — committing and abandoning "
             "until quota resets at midnight PT",
-            consumer_name, instrument_key,
+            instrument_key,
         )
 
     except Exception as exc:
-        logger.error(
-            "context_worker[%s]: attempt %d/%d failed for %s: %s",
-            consumer_name, delivery_count, _MAX_CONTEXT_ATTEMPTS, instrument_key, exc,
+        await _republish_retry(
+            KafkaTopics.CONTEXT_JOBS, payload, instrument_key,
+            attempts + 1, _RETRY_DELAY_SECS,
         )
-        # Not ACKing — stays in PEL; housekeeping re-delivers after _PEL_IDLE_THRESHOLD_MS
+        await consumer.commit()
+        logger.error(
+            "context_worker: attempt %d/%d failed for %s: %s — "
+            "republished for retry in %ds",
+            attempts + 1, _MAX_CONTEXT_ATTEMPTS, instrument_key, exc,
+            _RETRY_DELAY_SECS,
+        )
 
 
 # ── DLQ quota recovery ────────────────────────────────────────────────────────
 
 # Redis key prefix for per-suggestion requeue dedup guard (SET NX, 48-hour TTL).
-# Prevents the same DLQ entry from being re-added to the jobs stream more than
+# Prevents the same DLQ entry from being re-added to the jobs topic more than
 # once per quota cycle even if the recovery function runs multiple times.
 _DLQ_REQUEUE_DEDUP_TTL_SECS = 172_800  # 48 h — spans current + next quota day
+
+# Single-runner guard: the boot scan and the quota-reset listener can fire in
+# the same session (restart near midnight PT).  Both triggers are worker-0
+# gated, and this lock serializes them within the process so at most one DLQ
+# drain runs at a time.
+_dlq_requeue_lock = asyncio.Lock()
 
 
 async def _requeue_quota_dlq_entries(redis: Any, *, trigger: str) -> int:
     """
-    Scan the explanation DLQ for ``gemini_quota_exhausted`` entries from the
-    previous quota day and re-publish them to the explanation jobs stream.
+    Drain the explanation DLQ topic and re-publish ``gemini_quota_exhausted``
+    entries from the previous quota day to the explanation jobs topic.
 
     Called in two scenarios:
       - ``trigger="boot"``        — worker startup; only requeues entries whose
@@ -1849,6 +1796,19 @@ async def _requeue_quota_dlq_entries(redis: Any, *, trigger: str) -> int:
                                     same cutoff applies (reset fires after midnight
                                     so all previous-day entries qualify).
 
+    Mechanics: an on-demand manual-assignment consumer in the
+    ``cortex-dlq-requeue`` group drains from its committed offset to a
+    SNAPSHOT of the end offset (entries republished during the drain are
+    beyond the snapshot and processed on the next trigger).  Per entry:
+
+      - non-quota reason        → commit (terminal; topic retention keeps forensics)
+      - not yet eligible        → republish back to the DLQ tail + commit
+      - eligible                → Redis SET NX dedup → republish original fields
+                                  to the jobs topic with fresh attempts=0 → commit
+
+    A publish failure deletes the dedup key, does NOT commit, and aborts the
+    drain — the entry is redelivered on the next trigger.
+
     De-duplication: a per-suggestion Redis key (SET NX, 48 h TTL) prevents the
     same suggestion from being requeued twice within a single quota cycle, even
     if this function is called multiple times (e.g. boot AND pub/sub signal fire
@@ -1856,122 +1816,162 @@ async def _requeue_quota_dlq_entries(redis: Any, *, trigger: str) -> int:
 
     Returns the number of entries successfully requeued.
     """
+    from aiokafka.structs import TopicPartition
+
     pt = ZoneInfo("America/Los_Angeles")
     today_midnight_pt = datetime.now(pt).replace(
         hour=0, minute=0, second=0, microsecond=0, tzinfo=pt
     )
     requeued = 0
-    last_id = "0-0"
 
-    while True:
+    async with _dlq_requeue_lock:
+        # Manual assignment (the DLQ topic has exactly one partition) — avoids
+        # group-join latency and rebalance churn for an on-demand drain.
+        tp = TopicPartition(KafkaTopics.EXPLANATION_DLQ, 0)
+        consumer = new_consumer(group_id=KafkaGroups.DLQ_REQUEUE)
+        consumer.assign([tp])
         try:
-            entries = await redis.xrange(
-                RedisStreams.EXPLANATION_DLQ,
-                min=last_id,
-                count=50,
-            )
+            await consumer.start()
         except Exception as exc:
             logger.error(
-                "explanation_worker: DLQ quota recovery — XRANGE failed: %s "
+                "explanation_worker: DLQ quota recovery — consumer start failed: %s",
+                exc,
+            )
+            with contextlib.suppress(Exception):
+                await consumer.stop()
+            return 0
+
+        try:
+            end_snapshot = (await consumer.end_offsets([tp]))[tp]
+
+            while (await consumer.position(tp)) < end_snapshot:
+                batches = await consumer.getmany(tp, timeout_ms=2_000, max_records=50)
+                records = batches.get(tp, [])
+                if not records:
+                    break
+
+                for msg in records:
+                    if msg.offset >= end_snapshot:
+                        break
+
+                    entry = msg.value
+                    commit_offsets = {tp: msg.offset + 1}
+
+                    if not isinstance(entry, dict):
+                        await consumer.commit(commit_offsets)
+                        continue
+
+                    if entry.get("reason") != "gemini_quota_exhausted":
+                        # Terminal failure (e.g. max_attempts_exceeded) — commit
+                        # past it; topic retention (14d) keeps it for forensics.
+                        await consumer.commit(commit_offsets)
+                        continue
+
+                    # Only requeue entries from before today's PT midnight —
+                    # entries from the current quota day may still be within an
+                    # active outage.  Recycle them to the DLQ tail so they stay
+                    # queued for the next trigger.
+                    moved_at_str = str(entry.get("moved_at", ""))
+                    try:
+                        moved_at = datetime.fromisoformat(moved_at_str)
+                        eligible = moved_at.astimezone(pt) < today_midnight_pt
+                    except (ValueError, TypeError, AttributeError):
+                        logger.warning(
+                            "explanation_worker: DLQ recovery — skipping entry at "
+                            "offset %s with unparseable moved_at=%r",
+                            msg.offset, moved_at_str,
+                        )
+                        await consumer.commit(commit_offsets)
+                        continue
+
+                    original_fields = entry.get("fields") or {}
+                    if isinstance(original_fields, str):
+                        # Tolerate cutover-era entries whose fields survived as a
+                        # JSON string (the old Redis DLQ stored them serialized).
+                        try:
+                            original_fields = json.loads(original_fields)
+                        except (json.JSONDecodeError, TypeError):
+                            original_fields = {}
+                    suggestion_id = str(original_fields.get("suggestion_id", "") or "")
+
+                    if not eligible:
+                        if suggestion_id:
+                            await publish(
+                                KafkaTopics.EXPLANATION_DLQ, entry, key=suggestion_id
+                            )
+                        await consumer.commit(commit_offsets)
+                        continue
+
+                    if not suggestion_id:
+                        await consumer.commit(commit_offsets)
+                        continue
+
+                    # Dedup guard: skip if already requeued in this quota cycle.
+                    dedup_key = f"cortex:gemini:dlq:requeued:{suggestion_id}"
+                    try:
+                        acquired = await redis.set(
+                            dedup_key, "1", nx=True, ex=_DLQ_REQUEUE_DEDUP_TTL_SECS
+                        )
+                        if acquired is None:
+                            logger.debug(
+                                "explanation_worker: DLQ recovery — suggestion %s "
+                                "already requeued this cycle (dedup key exists), "
+                                "skipping.",
+                                suggestion_id,
+                            )
+                            await consumer.commit(commit_offsets)
+                            continue
+                    except Exception as exc:
+                        logger.warning(
+                            "explanation_worker: DLQ recovery — dedup key check "
+                            "failed for suggestion %s: %s — proceeding without "
+                            "dedup guard.",
+                            suggestion_id, exc,
+                        )
+
+                    # Re-publish to the jobs topic with a fresh retry budget.
+                    try:
+                        await publish(
+                            KafkaTopics.EXPLANATION_JOBS,
+                            original_fields,
+                            key=suggestion_id,
+                            headers=retry_headers(0),
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "explanation_worker: DLQ recovery — publish failed for "
+                            "suggestion %s: %s — aborting drain (offset NOT "
+                            "committed; resumes on next trigger)",
+                            suggestion_id, exc,
+                        )
+                        # Undo the dedup key so the next trigger can retry this entry.
+                        with contextlib.suppress(Exception):
+                            await redis.delete(dedup_key)
+                        return requeued
+
+                    requeued += 1
+                    gemini_dlq_requeue_total.labels(trigger=trigger).inc()
+                    await consumer.commit(commit_offsets)
+                    logger.info(
+                        "explanation_worker: DLQ quota recovery — requeued "
+                        "suggestion %s (originally DLQ'd %s, trigger=%s)",
+                        suggestion_id, moved_at_str, trigger,
+                    )
+
+        except Exception as exc:
+            logger.error(
+                "explanation_worker: DLQ quota recovery failed: %s "
                 "(partial recovery may have occurred, requeued=%d so far)",
                 exc, requeued,
             )
-            break
-
-        if not entries:
-            break
-
-        for msg_id, fields in entries:
-            last_id = msg_id  # advance cursor regardless of match
-
-            if fields.get("reason") != "gemini_quota_exhausted":
-                continue
-
-            # Only requeue entries from before today's PT midnight — entries
-            # from the current quota day may still be within an active outage.
-            moved_at_str = fields.get("moved_at", "")
-            try:
-                moved_at = datetime.fromisoformat(moved_at_str)
-                if moved_at.astimezone(pt) >= today_midnight_pt:
-                    continue
-            except (ValueError, TypeError, AttributeError):
-                logger.warning(
-                    "explanation_worker: DLQ recovery — skipping entry %s "
-                    "with unparseable moved_at=%r",
-                    msg_id, moved_at_str,
-                )
-                continue
-
-            # Recover the original job fields.
-            try:
-                original_fields = json.loads(fields.get("fields", "{}"))
-            except (json.JSONDecodeError, TypeError):
-                logger.warning(
-                    "explanation_worker: DLQ recovery — skipping entry %s "
-                    "with malformed fields payload",
-                    msg_id,
-                )
-                continue
-
-            suggestion_id = original_fields.get("suggestion_id", "")
-            if not suggestion_id:
-                continue
-
-            # Dedup guard: skip if already requeued in this quota cycle.
-            dedup_key = f"cortex:gemini:dlq:requeued:{suggestion_id}"
-            try:
-                acquired = await redis.set(
-                    dedup_key, "1", nx=True, ex=_DLQ_REQUEUE_DEDUP_TTL_SECS
-                )
-                if acquired is None:
-                    # Key already existed — this suggestion was already requeued.
-                    logger.debug(
-                        "explanation_worker: DLQ recovery — suggestion %s already "
-                        "requeued this cycle (dedup key exists), skipping.",
-                        suggestion_id,
-                    )
-                    continue
-            except Exception as exc:
-                logger.warning(
-                    "explanation_worker: DLQ recovery — dedup key check failed "
-                    "for suggestion %s: %s — proceeding without dedup guard.",
-                    suggestion_id, exc,
-                )
-
-            # Re-publish to the jobs stream.
-            try:
-                await redis.xadd(
-                    RedisStreams.EXPLANATION_JOBS,
-                    original_fields,
-                    maxlen=_STREAM_MAXLEN_EXPLANATION,
-                    approximate=True,
-                )
-                requeued += 1
-                gemini_dlq_requeue_total.labels(trigger=trigger).inc()
-                logger.info(
-                    "explanation_worker: DLQ quota recovery — requeued suggestion "
-                    "%s (originally DLQ'd %s, trigger=%s)",
-                    suggestion_id, moved_at_str, trigger,
-                )
-            except Exception as exc:
-                logger.error(
-                    "explanation_worker: DLQ recovery — XADD failed for suggestion "
-                    "%s: %s",
-                    suggestion_id, exc,
-                )
-                # Undo the dedup key so a retry can attempt this entry again.
-                try:
-                    await redis.delete(dedup_key)
-                except Exception:
-                    pass
-
-        if len(entries) < 50:
-            break
+        finally:
+            with contextlib.suppress(Exception):
+                await consumer.stop()
 
     if requeued > 0:
         logger.info(
             "explanation_worker: DLQ quota recovery complete — %d suggestion(s) "
-            "requeued to jobs stream (trigger=%s)",
+            "requeued to jobs topic (trigger=%s)",
             requeued, trigger,
         )
 
@@ -2039,277 +2039,151 @@ async def _quota_reset_listener(redis: Any) -> None:
 
 async def explanation_worker(worker_id: int = 0) -> None:
     """
-    Persistent Redis Streams consumer for LLM explanation jobs.
+    Persistent Kafka consumer for LLM explanation jobs.
 
-    Reads from ``cortex:stream:explanation:jobs`` using XREADGROUP for
-    at-least-once delivery.  Two instances run in parallel (worker_id 0 and 1)
-    spawned by ``main.py`` lifespan.
+    Consumes ``cortex.explanation.jobs`` (2 partitions, keyed by suggestion_id)
+    in the ``cortex-explanation-workers`` group with manual commits.  Two
+    instances run in parallel (worker_id 0 and 1) spawned by ``main.py``
+    lifespan — the group assigns one partition to each.
 
-    Startup sequence:
-      1. PEL drain — re-process any unACKed messages from before the last restart.
-      2. Main loop — XREADGROUP `>` with 5s BLOCK; processes one message at a time.
-      3. PEL housekeeping — separate background coroutine reclaims idle PEL entries.
+    Crash recovery is free: offsets are committed only after a terminal
+    outcome, so anything in flight at a crash is redelivered from the last
+    committed offset on restart (the old PEL-drain, without the machinery).
 
-    Retry policy:
-      - GeminiRateLimitError: NOT ACKed, stays in PEL, housekeeping re-delivers after 60s.
-      - GeminiQuotaExhausted: moved straight to DLQ with failed-state UI notification.
-      - Other errors: NOT ACKed, PEL retry, DLQ after MAX_ATTEMPTS deliveries.
+    Worker 0 additionally owns the single-runner side tasks: boot-time DLQ
+    quota recovery, the midnight-PT quota-reset listener, and the queue-depth
+    gauge ticker.
     """
     from app.core.redis import get_redis as _get_redis
-
-    consumer_name = f"explanation-worker-{worker_id}"
-    stream = RedisStreams.EXPLANATION_JOBS
-    group  = _CONSUMER_GROUP
 
     _redis = _get_redis()
 
     # Boot-time DLQ recovery (worker_id=0 only — prevents duplicate requeues when
-    # both workers start simultaneously; worker 1 starts its listener for realtime
-    # recovery instead).
+    # both workers start simultaneously; worker 1 relies on worker 0's listener
+    # for realtime recovery).
     if worker_id == 0:
         await _requeue_quota_dlq_entries(_redis, trigger="boot")
 
-    # PEL drain before entering the main loop
-    await _drain_pel(_redis, stream, group, consumer_name)
-
-    logger.info(
-        "explanation_worker[%d]: consumer=%s ready", worker_id, consumer_name
-    )
-
-    housekeeping_task = asyncio.create_task(
-        _pel_housekeeping(_redis, stream, group, consumer_name),
-        name=f"explanation_pel_housekeeping_{worker_id}",
-    )
-
-    # Realtime DLQ recovery: listen for midnight PT quota resets from the manager.
-    # Only worker 0 subscribes — one listener per process is sufficient.
-    quota_listener_task: asyncio.Task | None = None
+    background_tasks: list[asyncio.Task] = []
     if worker_id == 0:
-        quota_listener_task = asyncio.create_task(
+        # Realtime DLQ recovery: listen for midnight PT quota resets from the
+        # manager.  Only worker 0 subscribes — one listener per process.
+        background_tasks.append(asyncio.create_task(
             _quota_reset_listener(_redis),
             name="gemini_quota_reset_dlq_listener",
-        )
+        ))
+        # Consumer-lag depth gauge — one ticker per topic per process.
+        background_tasks.append(asyncio.create_task(
+            _queue_depth_ticker(
+                KafkaTopics.EXPLANATION_JOBS,
+                KafkaGroups.EXPLANATION_WORKERS,
+                "explanation",
+            ),
+            name="explanation_queue_depth_ticker",
+        ))
+
+    logger.info("explanation_worker[%d]: ready", worker_id)
 
     try:
         while True:
+            # max_poll_records=1: one message at a time keeps Gemini-latency
+            # work (≤120s LLM timeout) plus a bounded not_before sleep (≤60s)
+            # far below max_poll_interval_ms (300s).
+            consumer = new_consumer(
+                KafkaTopics.EXPLANATION_JOBS,
+                group_id=KafkaGroups.EXPLANATION_WORKERS,
+                max_poll_records=1,
+            )
             try:
-                messages = await _redis.xreadgroup(
-                    groupname=group,
-                    consumername=consumer_name,
-                    streams={stream: ">"},
-                    count=1,
-                    block=_STREAM_BLOCK_MS,
-                )
+                await consumer.start()
+                async for msg in consumer:
+                    await _process_explanation_message(
+                        _redis, consumer, msg, worker_id
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.error(
-                    "explanation_worker[%d]: Redis read error: %s — reconnecting in %ds",
+                    "explanation_worker[%d]: consumer error: %s — reconnecting in %ds",
                     worker_id, exc, _RECONNECT_DELAY_SECS,
                     exc_info=True,
                 )
                 await asyncio.sleep(_RECONNECT_DELAY_SECS)
                 _redis = _get_redis()
-                continue
-
-            if not messages:
-                continue
-
-            for _stream_name, entries in messages:
-                for msg_id, fields in entries:
-                    await _process_explanation_message(
-                        _redis, consumer_name, msg_id, fields, group, stream,
-                    )
+            finally:
+                with contextlib.suppress(Exception):
+                    await consumer.stop()
 
     except asyncio.CancelledError:
         logger.info("explanation_worker[%d]: cancelled — shutting down", worker_id)
         raise
     finally:
-        housekeeping_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await housekeeping_task
-        if quota_listener_task is not None:
-            quota_listener_task.cancel()
+        for task in background_tasks:
+            task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await quota_listener_task
-
-
-async def _context_pel_housekeeping(
-    redis: Any,
-    stream: str,
-    group: str,
-    consumer_name: str,
-) -> None:
-    """
-    Periodically re-claim context PEL entries idle > _PEL_IDLE_THRESHOLD_MS.
-
-    Mirrors _pel_housekeeping for explanation jobs but without a DLQ path:
-    context jobs are best-effort and idempotent.  After _MAX_CONTEXT_ATTEMPTS
-    the re-claimed message is ACKed and abandoned by _process_context_message.
-
-    The current delivery count from xpending_range is passed through to
-    _process_context_message so the processor can enforce the retry cap and
-    include accurate attempt numbers in structured log output.
-    """
-    while True:
-        try:
-            await asyncio.sleep(_PEL_HOUSEKEEPING_INTERVAL_SECS)
-
-            pending_entries = await redis.xpending_range(
-                name=stream,
-                groupname=group,
-                min="-",
-                max="+",
-                count=50,
-                consumername=consumer_name,
-                idle=_PEL_IDLE_THRESHOLD_MS,
-            )
-
-            if not pending_entries:
-                continue
-
-            for entry in pending_entries:
-                msg_id         = entry["message_id"]
-                delivery_count = entry["times_delivered"]
-                try:
-                    claimed = await redis.xclaim(
-                        name=stream,
-                        groupname=group,
-                        consumername=consumer_name,
-                        min_idle_time=_PEL_IDLE_THRESHOLD_MS,
-                        message_ids=[msg_id],
-                    )
-                    for claim_id, fields in claimed:
-                        if not fields:
-                            continue
-                        logger.info(
-                            "context_worker: housekeeping re-claiming message %s "
-                            "(delivery_count=%d/%d) for consumer %s",
-                            claim_id, delivery_count, _MAX_CONTEXT_ATTEMPTS, consumer_name,
-                        )
-                        await _process_context_message(
-                            redis, consumer_name, claim_id, fields, group, stream,
-                            delivery_count=delivery_count,
-                        )
-                except Exception as exc:
-                    logger.warning(
-                        "context_worker: housekeeping re-claim failed for %s: %s",
-                        msg_id, exc,
-                    )
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning("context_worker: PEL housekeeping error: %s", exc)
+                await task
 
 
 async def context_worker() -> None:
     """
-    Persistent Redis Streams consumer for instrument context generation jobs.
+    Persistent Kafka consumer for instrument context generation jobs.
 
-    Reads from ``cortex:stream:context:jobs`` using XREADGROUP.  A single instance
-    is sufficient because context jobs are low-frequency and already protected by
-    the distributed lock in ai_stream.py Stage 3.
+    Consumes ``cortex.context.jobs`` in the ``cortex-context-workers`` group
+    with manual commits.  A single instance is sufficient because context jobs
+    are low-frequency and already protected by the distributed lock in
+    ai_stream.py Stage 3.
 
-    Startup sequence:
-      1. PEL drain — re-process any unACKed messages from before the last restart,
-         passing the PEL delivery_count through so the processor can enforce the
-         retry cap and skip redundant LLM calls via the DB idempotency check.
-      2. Main loop — XREADGROUP '>' with 5 s BLOCK; processes one message at a time.
-      3. PEL housekeeping — background coroutine reclaims idle PEL entries every 30 s.
+    Crash recovery: offsets are committed only after a terminal outcome, so
+    in-flight jobs are redelivered from the committed offset on restart.  The
+    DB idempotency check and the recent-success key make redelivery cheap.
 
-    Retry policy:
-      - GeminiRateLimitError: NOT ACKed — housekeeping re-delivers after 60 s idle.
-      - GeminiQuotaExhausted: ACK + abandon — no point retrying an exhausted quota.
-      - Other failures: NOT ACKed, up to _MAX_CONTEXT_ATTEMPTS (5), then ACK + abandon.
-      - No DLQ: context is best-effort; the user gets fresh context on the next
-        watchlist page open (Stage 3 in ai_stream.py re-triggers generation).
+    Retry policy lives in _process_context_message (attempts header, republish
+    with not_before deadlines, abandon after _MAX_CONTEXT_ATTEMPTS, no DLQ).
     """
     from app.core.redis import get_redis as _get_redis
 
-    consumer_name = "context-worker-0"
-    stream = RedisStreams.CONTEXT_JOBS
-    group  = _CONSUMER_GROUP
-
     _redis = _get_redis()
 
-    # ── PEL drain on startup ──────────────────────────────────────────────────
-    # Re-process any messages that were delivered but not ACKed before the last
-    # restart (e.g. process killed between Phase 3 completion and XACK).
-    # delivery_count from xpending_range is passed through so the processor can
-    # enforce the retry cap and avoid redundant LLM calls via the idempotency check.
-    try:
-        pending_entries = await _redis.xpending_range(
-            name=stream, groupname=group, min="-", max="+", count=50,
-            consumername=consumer_name,
-        )
-        if pending_entries:
-            logger.info(
-                "context_worker: draining %d PEL entries on startup", len(pending_entries)
-            )
-            for entry in pending_entries:
-                msg_id         = entry["message_id"]
-                delivery_count = entry["times_delivered"]
-                try:
-                    claimed = await _redis.xclaim(
-                        name=stream, groupname=group, consumername=consumer_name,
-                        min_idle_time=0, message_ids=[msg_id],
-                    )
-                    for claim_id, fields in claimed:
-                        if fields:
-                            await _process_context_message(
-                                _redis, consumer_name, claim_id, fields, group, stream,
-                                delivery_count=delivery_count,
-                            )
-                except Exception as exc:
-                    logger.warning(
-                        "context_worker: PEL drain failed for message %s: %s", msg_id, exc
-                    )
-    except Exception as exc:
-        logger.warning("context_worker: PEL drain query failed (continuing): %s", exc)
-
-    logger.info("context_worker: consumer=%s ready", consumer_name)
-
-    housekeeping_task = asyncio.create_task(
-        _context_pel_housekeeping(_redis, stream, group, consumer_name),
-        name="context_pel_housekeeping",
+    depth_ticker_task = asyncio.create_task(
+        _queue_depth_ticker(
+            KafkaTopics.CONTEXT_JOBS,
+            KafkaGroups.CONTEXT_WORKERS,
+            "context",
+        ),
+        name="context_queue_depth_ticker",
     )
+
+    logger.info("context_worker: ready")
 
     try:
         while True:
+            consumer = new_consumer(
+                KafkaTopics.CONTEXT_JOBS,
+                group_id=KafkaGroups.CONTEXT_WORKERS,
+                max_poll_records=1,
+            )
             try:
-                messages = await _redis.xreadgroup(
-                    groupname=group,
-                    consumername=consumer_name,
-                    streams={stream: ">"},
-                    count=1,
-                    block=_STREAM_BLOCK_MS,
-                )
+                await consumer.start()
+                async for msg in consumer:
+                    await _process_context_message(_redis, consumer, msg)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.error(
-                    "context_worker: Redis read error: %s — reconnecting in %ds",
+                    "context_worker: consumer error: %s — reconnecting in %ds",
                     exc, _RECONNECT_DELAY_SECS,
                     exc_info=True,
                 )
                 await asyncio.sleep(_RECONNECT_DELAY_SECS)
                 _redis = _get_redis()
-                continue
-
-            if not messages:
-                continue
-
-            for _stream_name, entries in messages:
-                for msg_id, fields in entries:
-                    await _process_context_message(
-                        _redis, consumer_name, msg_id, fields, group, stream
-                    )
+            finally:
+                with contextlib.suppress(Exception):
+                    await consumer.stop()
 
     except asyncio.CancelledError:
         logger.info("context_worker: cancelled — shutting down")
         raise
     finally:
-        housekeeping_task.cancel()
+        depth_ticker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
-            await housekeeping_task
+            await depth_ticker_task

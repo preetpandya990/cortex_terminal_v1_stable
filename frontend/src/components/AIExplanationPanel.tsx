@@ -32,12 +32,22 @@
  * Disclaimer:
  *  The regulatory disclaimer appended by the explanation worker is separated
  *  from the narrative text and rendered in its own styled box.
+ *
+ * Reveal animation:
+ *  The narrative is revealed with a simulated typewriter effect (useTypewriter)
+ *  since it arrives as a single complete string rather than true token
+ *  streaming. Section headings appear instantly; only body prose animates.
+ *  Sources and the disclaimer are held back until typing finishes so nothing
+ *  appears ahead of the text it supports. Skips animation for users who
+ *  prefer reduced motion, and for content already revealed earlier this
+ *  session.
  */
 
-import { memo, useState, useCallback } from 'react';
+import { memo, useState, useCallback, useMemo } from 'react';
 import { Brain, Clock, ExternalLink, AlertTriangle, Sparkles } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { cn } from '@/lib/utils';
+import { useTypewriter } from '@/hooks/useTypewriter';
 import type { ExplanationData, ExplanationSource } from '@/types/analysis';
 
 // ── Disclaimer separator ───────────────────────────────────────────────────────
@@ -328,13 +338,48 @@ function StalenessBanner({ signalDirection, signalGeneratedAt }: StalenessBanner
   );
 }
 
+/**
+ * Blinking caret rendered at the point where text is actively being typed.
+ * Purely decorative (`aria-hidden`) — the underlying text node already
+ * carries the real content for assistive tech.
+ */
+function TypingCursor() {
+  return (
+    <span
+      aria-hidden
+      className="ml-0.5 inline-block h-[1em] w-[2px] -mb-[0.15em] animate-pulse bg-violet-400 align-middle"
+    />
+  );
+}
+
 interface ContentProps {
   data: ExplanationData & { full_explanation: string };
 }
 
 function ExplanationContent({ data }: ContentProps) {
-  const { body, disclaimer } = splitExplanation(data.full_explanation);
-  const sections = parseSections(body);
+  // Parsing runs only when the underlying text actually changes — not on
+  // every animation frame, which would otherwise re-run these regexes up
+  // to 60x/sec while the typewriter is revealing text.
+  const { body, disclaimer } = useMemo(
+    () => splitExplanation(data.full_explanation),
+    [data.full_explanation],
+  );
+  const sections = useMemo(() => parseSections(body), [body]);
+
+  // Normalize to a uniform block list so sectioned and legacy (single-block)
+  // narratives share one rendering + typewriter-offset path.
+  const blocks = useMemo(
+    () => sections ?? [{ heading: '', body }],
+    [sections, body],
+  );
+  const blockOffsets = useMemo(
+    () => blocks.map((_, i) => blocks.slice(0, i).reduce((sum, b) => sum + b.body.length, 0)),
+    [blocks],
+  );
+  // Headings render instantly when reached; only body prose is typed out,
+  // so the concatenated target excludes heading text.
+  const typewriterTarget = useMemo(() => blocks.map((b) => b.body).join(''), [blocks]);
+  const { revealedLength, isComplete: isTypingComplete } = useTypewriter(typewriterTarget);
 
   // Streaming: text is still flowing in (available flips true on the final event).
   const isStreaming = !data.available;
@@ -378,34 +423,45 @@ function ExplanationContent({ data }: ContentProps) {
         )}
 
         {/* Narrative body — rendered as labeled sections when the worker emits
-            the "### " sectioned format, else as a single block (legacy rows). */}
-        {sections ? (
-          <div className="space-y-3">
-            {sections.map((section, i) => (
+            the "### " sectioned format, else as a single block (legacy rows).
+            Body prose is revealed via the typewriter watermark; headings
+            appear as soon as their block is reached. */}
+        <div className="space-y-3">
+          {blocks.map((block, i) => {
+            const startOffset = blockOffsets[i];
+            const hasStarted = revealedLength > startOffset;
+            const visibleBody = block.body.slice(
+              0,
+              Math.max(0, Math.min(revealedLength - startOffset, block.body.length)),
+            );
+            const isActiveBlock = !isTypingComplete && hasStarted && visibleBody.length < block.body.length;
+
+            if (!hasStarted && startOffset > 0) return null;
+
+            return (
               <div key={i} className="space-y-1">
-                {section.heading && (
+                {block.heading && (
                   <h4 className="text-[11px] font-semibold uppercase tracking-wide text-violet-700/80">
-                    {section.heading}
+                    {block.heading}
                   </h4>
                 )}
                 <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-line">
-                  {section.body}
+                  {visibleBody}
+                  {isActiveBlock && <TypingCursor />}
                 </p>
               </div>
-            ))}
-          </div>
-        ) : (
-          <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-line">
-            {body}
-          </p>
-        )}
+            );
+          })}
+        </div>
 
-        {/* Source citations */}
-        <SourcesList sources={data.sources} />
+        {/* Source citations — held back until the narrative finishes typing
+            so citations don't appear ahead of the text they support. */}
+        {isTypingComplete && <SourcesList sources={data.sources} />}
 
-        {/* Regulatory disclaimer — always rendered in its own styled box */}
-        {disclaimer && (
-          <div className="flex gap-2 rounded-md border border-amber-100 bg-amber-50/70 px-3 py-2.5">
+        {/* Regulatory disclaimer — always rendered in its own styled box,
+            once the narrative has finished typing. */}
+        {isTypingComplete && disclaimer && (
+          <div className="flex gap-2 rounded-md border border-amber-100 bg-amber-50/70 px-3 py-2.5 animate-in fade-in duration-300">
             <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
             <p className="text-[11px] leading-relaxed text-amber-700">
               {disclaimer.replace(/^⚠\s*/, '')}

@@ -157,3 +157,60 @@ class TestRestart:
         resp = client.post("/tasks/heartbeat/restart", headers=auth_headers)
         assert resp.status_code == 200
         assert resp.json()["status"] == "restart_initiated"
+
+
+# ── /metrics — worker_task_last_cycle_seconds sourcing ────────────────────────
+# Verifies the fix: the gauge must reflect TaskState.last_cycle_at (real work
+# recency), not last_run_at (supervisor restart recency) — see supervisor.py
+# and worker_control.py's /metrics handler docstrings for the full rationale.
+
+def _parse_gauge_value(metrics_text: str, metric_name: str, task: str) -> float | None:
+    """Extract a single labeled gauge value from Prometheus exposition text."""
+    for line in metrics_text.splitlines():
+        if line.startswith(metric_name + "{") and f'task="{task}"' in line:
+            return float(line.rsplit(" ", 1)[1])
+    return None
+
+
+class TestMetrics:
+    def test_last_cycle_seconds_uses_last_cycle_at_when_present(self, client, auth_headers):
+        app = client.app
+        state = app.state.task_states["heartbeat"]
+        state.last_run_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        state.last_cycle_at = datetime(2025, 6, 1, tzinfo=timezone.utc)
+
+        resp = client.get("/metrics")
+        assert resp.status_code == 200
+        value = _parse_gauge_value(resp.text, "worker_task_last_cycle_seconds", "heartbeat")
+        assert value == state.last_cycle_at.timestamp()
+
+    def test_last_cycle_seconds_falls_back_to_last_run_at_before_first_cycle(
+        self, client, auth_headers,
+    ):
+        app = client.app
+        state = app.state.task_states["heartbeat"]
+        state.last_run_at = datetime(2025, 6, 1, tzinfo=timezone.utc)
+        state.last_cycle_at = None
+
+        resp = client.get("/metrics")
+        value = _parse_gauge_value(resp.text, "worker_task_last_cycle_seconds", "heartbeat")
+        assert value == state.last_run_at.timestamp()
+
+    def test_started_at_seconds_sourced_from_last_run_at(self, client, auth_headers):
+        app = client.app
+        state = app.state.task_states["heartbeat"]
+        state.last_run_at = datetime(2025, 6, 1, tzinfo=timezone.utc)
+
+        resp = client.get("/metrics")
+        value = _parse_gauge_value(resp.text, "worker_task_started_at_seconds", "heartbeat")
+        assert value == state.last_run_at.timestamp()
+
+    def test_metrics_exposes_all_five_worker_task_gauge_families(self, client, auth_headers):
+        resp = client.get("/metrics")
+        for metric in (
+            "worker_task_status",
+            "worker_task_crash_count",
+            "worker_task_last_cycle_seconds",
+            "worker_task_started_at_seconds",
+        ):
+            assert metric in resp.text, f"{metric} missing from /metrics output"

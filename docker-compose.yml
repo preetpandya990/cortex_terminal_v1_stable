@@ -83,6 +83,75 @@ services:
     networks:
       - cortex-network
 
+  # ── Redpanda (Kafka API — durable job queues) ─────────────────────────────
+  # Single-node Redpanda carries all durable queueing (explanation, context,
+  # forecast batch, classifier); Redis keeps cache/pub-sub/locks/SSE stores.
+  #
+  # Production flags per Redpanda's production-readiness checklist — NOT
+  # --mode=dev-container (that sets developer_mode=true):
+  #   --reserve-memory=0M   mandatory in containers (Seastar's host-memory
+  #                         heuristic is wrong inside cgroups)
+  #   --memory=1G           ~80% of the 1.25G container limit
+  #   --overprovisioned     accepted single-node-on-shared-host compromise
+  #                         (drop + `rpk redpanda tune all` if this box ever
+  #                         gets dedicated cores)
+  #
+  # Dual listener is REQUIRED: the API runs bare-metal (localhost:19092)
+  # while containerized services reach the broker at redpanda:9092.
+  # enable_consumer_group_metrics exposes redpanda_kafka_consumer_group_lag_*
+  # on /public_metrics for Prometheus.  NOTE: `--set redpanda.<cluster_prop>`
+  # seeds .bootstrap.yaml and applies only on FIRST bootstrap of a fresh data
+  # volume; for an already-bootstrapped cluster run:
+  #   docker exec cortex-redpanda rpk cluster config set \
+  #     enable_consumer_group_metrics '["group","partition","consumer_lag"]'
+  redpanda:
+    image: redpandadata/redpanda:v26.1.12
+    container_name: cortex-redpanda
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --set
+      - redpanda.enable_consumer_group_metrics=["group","partition","consumer_lag"]
+    deploy:
+      resources:
+        limits:
+          memory: 1280M
+    ports:
+      - "19092:19092"
+      - "9644:9644"
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health --exit-when-healthy || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - cortex-network
+
+  # ── Redpanda Console (Queue Operations UI) ────────────────────────────────
+  redpanda-console:
+    image: redpandadata/console:v3.8.0
+    container_name: cortex-redpanda-console
+    restart: unless-stopped
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8080:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    networks:
+      - cortex-network
+
   # ── Prometheus (Metrics) ──────────────────────────────────────────────────
   prometheus:
     image: prom/prometheus:v2.53.0
@@ -164,6 +233,7 @@ services:
     environment:
       DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-cortex}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-cortex_db}"
       REDIS_URL: "redis://redis:6379/0"
+      KAFKA_BOOTSTRAP_SERVERS: "redpanda:9092"
     expose:
       - "8001"
     volumes:
@@ -173,6 +243,8 @@ services:
       db:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      redpanda:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
@@ -202,6 +274,7 @@ services:
     environment:
       DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-cortex}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-cortex_db}"
       REDIS_URL: "redis://redis:6379/0"
+      KAFKA_BOOTSTRAP_SERVERS: "redpanda:9092"
       WORKER_BASE_URL: "http://worker:8001"
     ports:
       - "8000:8000"
@@ -212,6 +285,8 @@ services:
       db:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      redpanda:
         condition: service_healthy
       worker:
         condition: service_healthy
@@ -254,6 +329,7 @@ volumes:
   postgres_data_tsdb:
     external: true
   redis_data:
+  redpanda_data:
   ml_models:
   prometheus_data:
   grafana_data:

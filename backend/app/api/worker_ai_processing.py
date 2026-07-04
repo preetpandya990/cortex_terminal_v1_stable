@@ -54,13 +54,12 @@ async def get_ai_processing_status(_: InternalAuth, request: Request) -> dict[st
     from app.core.metrics import ai_processing_pending_gauge
 
     settings = get_settings()
-    redis = _redis(request)
 
     sentiment_pending = await NLPEngine.pending_sentiment_count()
-    forecast_pending = await pending_forecast_count(redis)
+    forecast_pending = await pending_forecast_count()
     classification_pending = await EventClassifier(
         use_llm=False
-    ).pending_classification_count(redis)
+    ).pending_classification_count()
 
     ai_processing_pending_gauge.labels(category="sentiment").set(sentiment_pending)
     ai_processing_pending_gauge.labels(category="forecast").set(forecast_pending)
@@ -103,7 +102,7 @@ async def dispatch_sentiment(_: InternalAuth) -> dict[str, int]:
 
 @router.post("/ai-processing/forecast/dispatch")
 async def dispatch_forecast(_: InternalAuth, request: Request) -> Any:
-    """Drain the Redis forecast batch queue now, regardless of FORECAST_AUTO_DISPATCH."""
+    """Drain the forecast batch topic now, regardless of FORECAST_AUTO_DISPATCH."""
     from app.ai.fusion.forecast_batch_worker import flush_pending_forecasts
     from app.core.metrics import ai_processing_dispatch_total
 
@@ -135,7 +134,7 @@ async def dispatch_classification(_: InternalAuth, request: Request) -> Any:
     classifier = EventClassifier(use_llm=True)
     try:
         result = await classifier.flush_pending_classifications(
-            _session_factory(request), _redis(request)
+            _session_factory(request)
         )
     except RuntimeError as exc:
         ai_processing_dispatch_total.labels(

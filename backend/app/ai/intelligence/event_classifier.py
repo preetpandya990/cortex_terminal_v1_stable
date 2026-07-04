@@ -33,6 +33,7 @@ Combined decay: 0.7 · 0.5^(t/fast_hl) + 0.3 · 0.5^(t/slow_hl)
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -40,6 +41,8 @@ import re
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Literal
+
+from aiokafka.structs import TopicPartition
 
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
@@ -82,10 +85,14 @@ _VALID_EVENT_TYPES = frozenset(_DECAY_HALF_LIVES.keys())
 _EVENT_CLASS_CACHE_TTL_SECS: int = 1800
 
 # Deferred-classification queue — used when EVENT_CLASSIFIER_AUTO_DISPATCH is
-# False: 'general' articles enqueue here instead of calling Gemini inline, and
-# flush_pending_classifications() drains it on explicit admin dispatch or the
-# daily safety net.
-_PENDING_QUEUE_KEY = "cortex:event:classifier:pending"
+# False: 'general' articles publish to the cortex.classifier.pending Kafka
+# topic instead of calling Gemini inline, and flush_pending_classifications()
+# drains it on explicit admin dispatch or the daily safety net.  One flush
+# runs at a time per process (module lock); offsets are committed only after
+# a successful persist, so a Gemini failure mid-drain redelivers the item on
+# the next dispatch instead of losing it (the old LPOP-then-fail bug) —
+# UNIQUE(nlp_result_id) makes redelivery a harmless in-place upgrade.
+_flush_lock = asyncio.Lock()
 
 
 def _half_lives_for(event_type: str) -> tuple[int, int]:
@@ -496,111 +503,151 @@ class EventClassifier:
 
     # ── Demand-driven dispatch (admin/safety-net entry points) ────────────────
 
-    async def pending_classification_count(self, redis: Any) -> int:
-        """Current deferred-classification queue depth (Worker Control Panel)."""
-        return await redis.llen(_PENDING_QUEUE_KEY)
+    async def pending_classification_count(self) -> int:
+        """Deferred-classification queue depth from consumer lag (Worker Control Panel)."""
+        from app.core.kafka import KafkaGroups, KafkaTopics, pending_count
+        return await pending_count(
+            KafkaTopics.CLASSIFIER_PENDING, KafkaGroups.CLASSIFIER_FLUSH
+        )
 
     async def flush_pending_classifications(
         self,
         db_factory: async_sessionmaker,
-        redis: Any,
     ) -> dict[str, int]:
         """
-        Drain the deferred-classification queue right now, regardless of
-        EVENT_CLASSIFIER_AUTO_DISPATCH. Called by an explicit admin dispatch
-        or the daily safety net.
+        Drain the deferred-classification topic to a snapshot of its end
+        offset right now, regardless of EVENT_CLASSIFIER_AUTO_DISPATCH.
+        Called by an explicit admin dispatch or the daily safety net.
 
-        Pops one item at a time (LPOP without count — bounds blast radius per
-        item so a Gemini failure mid-drain loses at most the one in-flight
-        item, not a whole popped batch). For each item: re-runs the full
+        Uses an on-demand manual-assignment consumer (no standing loop) in
+        the ``cortex-classifier-flush`` group, serialized by a module lock.
+        Processes one item at a time and commits its offset only AFTER a
+        successful persist — a Gemini failure mid-drain leaves the failed
+        item (and the remainder) uncommitted for redelivery on the next
+        dispatch; UNIQUE(nlp_result_id) (migration 0049) makes redelivery a
+        harmless in-place upgrade.  For each item: re-runs the full
         three-source symbol merge (content-level extraction + the Gemini
         call's own symbols — mirroring classify()'s merge logic minus the
         pre-confidence-fallback LLM-symbol capture, since there is no
         separate GPT-4o pass in the deferred path), calls _gemini_classify(),
-        looks up the existing row by nlp_result_id (guaranteed unique post
-        migration 0049), and upgrades it via _persist_classification(existing=row).
+        looks up the existing row by nlp_result_id, and upgrades it via
+        _persist_classification(existing=row).
 
         Returns:
             {"dispatched": N, "calls_made": N} — 1:1, no batching for
             classification (unlike sentiment/forecast).
 
         Raises:
-            RuntimeError: the moment a popped item's Gemini call fails (the
-            shared _gemini_classify() fallback contract signals this via
+            RuntimeError: the moment an item's Gemini call fails (the shared
+            _gemini_classify() fallback contract signals this via
             confidence == 0.0), so a quota outage during the drain fails
-            loudly instead of silently discarding the rest of the queue. The
-            failed item's existing row is left untouched (not overwritten
-            with the fallback) and is not returned to the queue. The caller
-            (worker sidecar router) maps this to HTTP 502.
+            loudly instead of silently discarding the rest of the queue.
+            The failed item's existing row is left untouched (not overwritten
+            with the fallback) and stays queued for the next dispatch.  The
+            caller (worker sidecar router) maps this to HTTP 502.  Known
+            debt (pre-existing, unchanged): a legitimate zero-confidence
+            result is indistinguishable from a failure at this check.
         """
+        from app.core.kafka import KafkaGroups, KafkaTopics, new_consumer
+
         dispatched = 0
         calls_made = 0
 
-        while True:
-            raw = await redis.lpop(_PENDING_QUEUE_KEY)
-            if raw is None:
-                break
-
+        async with _flush_lock:
+            tp = TopicPartition(KafkaTopics.CLASSIFIER_PENDING, 0)
+            consumer = new_consumer(group_id=KafkaGroups.CLASSIFIER_FLUSH)
+            consumer.assign([tp])
+            await consumer.start()
             try:
-                payload = json.loads(raw)
-                content = payload["content"]
-                entities = payload["entities"]
-                nlp_result_id = payload["nlp_result_id"]
-            except Exception as exc:
-                logger.warning(
-                    "event_classifier: dropping malformed pending-classification "
-                    "payload — %s", exc,
-                )
-                continue
+                end_snapshot = (await consumer.end_offsets([tp]))[tp]
 
-            dispatched += 1
-
-            async with db_factory() as db:
-                llm_result = await self._gemini_classify(content, entities)
-                calls_made += 1
-
-                if llm_result["confidence"] == 0.0:
-                    raise RuntimeError(
-                        f"classification dispatch stopped early: Gemini call "
-                        f"failed for nlp_result_id={nlp_result_id}; "
-                        f"{dispatched} items drained, {calls_made} Gemini "
-                        f"calls made so far"
+                while (await consumer.position(tp)) < end_snapshot:
+                    batches = await consumer.getmany(
+                        tp, timeout_ms=2_000, max_records=1
                     )
+                    records = batches.get(tp, [])
+                    if not records:
+                        break
 
-                content_symbols = await self._extract_symbols_from_content(db, content)
-                raw_symbols: list[str] = list(llm_result.get("affected_symbols") or [])
-                for sym in content_symbols:
-                    if sym not in raw_symbols:
-                        raw_symbols.append(sym)
-                validated_symbols = await normalize_and_validate_symbols(db, raw_symbols)
+                    msg = records[0]
+                    if msg.offset >= end_snapshot:
+                        break
+                    commit_offsets = {tp: msg.offset + 1}
 
-                fast_hl, slow_hl = _half_lives_for(llm_result["event_type"])
-                fast_hl = llm_result.get("decay_hours", fast_hl)
-
-                row = (
-                    await db.execute(
-                        select(AIEventClassification).where(
-                            AIEventClassification.nlp_result_id == nlp_result_id
+                    payload = msg.value
+                    try:
+                        content = payload["content"]
+                        entities = payload["entities"]
+                        nlp_result_id = payload["nlp_result_id"]
+                    except (TypeError, KeyError) as exc:
+                        logger.warning(
+                            "event_classifier: dropping malformed "
+                            "pending-classification payload — %s", exc,
                         )
-                    )
-                ).scalar_one_or_none()
+                        await consumer.commit(commit_offsets)
+                        continue
 
-                if row is None:
-                    logger.warning(
-                        "event_classifier: no existing row for nlp_result_id=%d "
-                        "during flush — inserting a new row instead of upgrading",
-                        nlp_result_id,
-                    )
+                    dispatched += 1
 
-                await self._persist_classification(
-                    db,
-                    nlp_result_id,
-                    llm_result,
-                    validated_symbols,
-                    fast_hl,
-                    slow_hl,
-                    existing=row,
-                )
+                    async with db_factory() as db:
+                        llm_result = await self._gemini_classify(content, entities)
+                        calls_made += 1
+
+                        if llm_result["confidence"] == 0.0:
+                            # NO commit — this item and the remainder stay
+                            # pending and are redelivered on the next dispatch.
+                            raise RuntimeError(
+                                f"classification dispatch stopped early: Gemini call "
+                                f"failed for nlp_result_id={nlp_result_id}; "
+                                f"{dispatched} items drained, {calls_made} Gemini "
+                                f"calls made so far"
+                            )
+
+                        content_symbols = await self._extract_symbols_from_content(db, content)
+                        raw_symbols: list[str] = list(llm_result.get("affected_symbols") or [])
+                        for sym in content_symbols:
+                            if sym not in raw_symbols:
+                                raw_symbols.append(sym)
+                        validated_symbols = await normalize_and_validate_symbols(db, raw_symbols)
+
+                        fast_hl, slow_hl = _half_lives_for(llm_result["event_type"])
+                        fast_hl = llm_result.get("decay_hours", fast_hl)
+
+                        row = (
+                            await db.execute(
+                                select(AIEventClassification).where(
+                                    AIEventClassification.nlp_result_id == nlp_result_id
+                                )
+                            )
+                        ).scalar_one_or_none()
+
+                        if row is None:
+                            logger.warning(
+                                "event_classifier: no existing row for nlp_result_id=%d "
+                                "during flush — inserting a new row instead of upgrading",
+                                nlp_result_id,
+                            )
+
+                        await self._persist_classification(
+                            db,
+                            nlp_result_id,
+                            llm_result,
+                            validated_symbols,
+                            fast_hl,
+                            slow_hl,
+                            existing=row,
+                        )
+
+                    # Persist succeeded — now (and only now) commit the offset.
+                    await consumer.commit(commit_offsets)
+            finally:
+                try:
+                    await consumer.stop()
+                except Exception as exc:
+                    logger.debug(
+                        "event_classifier: flush consumer stop failed (non-fatal): %s",
+                        exc,
+                    )
 
         return {"dispatched": dispatched, "calls_made": calls_made}
 
@@ -763,12 +810,13 @@ class EventClassifier:
         nlp_result_id: int,
     ) -> None:
         """
-        LPUSH a deferred-classification payload instead of calling Gemini
-        inline. Never raises — a Redis failure here just means this article
-        never gets upgraded past the rule-based classification classify()
-        already persisted; it must not block the caller.
+        Publish a deferred-classification payload to the Kafka topic instead
+        of calling Gemini inline. Never raises — a publish failure here just
+        means this article never gets upgraded past the rule-based
+        classification classify() already persisted; it must not block the
+        caller.
         """
-        from app.core.redis import get_redis
+        from app.core.kafka import KafkaTopics, publish
 
         content_hash = hashlib.sha256(content[:1500].encode()).hexdigest()
         payload = {
@@ -779,7 +827,9 @@ class EventClassifier:
             "enqueued_at": datetime.now(timezone.utc).isoformat(),
         }
         try:
-            await get_redis().lpush(_PENDING_QUEUE_KEY, json.dumps(payload))
+            await publish(
+                KafkaTopics.CLASSIFIER_PENDING, payload, key=str(nlp_result_id)
+            )
         except Exception as exc:
             logger.warning(
                 "event_classifier: failed to enqueue deferred classification "

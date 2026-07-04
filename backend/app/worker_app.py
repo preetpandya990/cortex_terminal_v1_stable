@@ -82,6 +82,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.task_states   = task_states
         app.state.shutdown_event = shutdown_event
 
+        # Publish each task's expected work-cycle interval once at startup —
+        # these are static for the lifetime of the process, so there's no
+        # need to re-set them on every /metrics scrape. Tasks with no fixed
+        # cadence (value is None in the table) are left unpublished: PromQL
+        # `on(task)` joins against this gauge then naturally exclude them
+        # from ratio-based staleness alerting rather than requiring
+        # special-case exclusion logic downstream.
+        from app.core.metrics import worker_task_expected_interval_seconds
+        from app.workers.registry import TASK_EXPECTED_INTERVAL_SECONDS
+
+        for _task_name, _interval in TASK_EXPECTED_INTERVAL_SECONDS.items():
+            if _interval is not None:
+                worker_task_expected_interval_seconds.labels(task=_task_name).set(_interval)
+
         # Stored for worker_ai_processing.py's demand-driven dispatch routes,
         # which need direct access to the forecast/classification queues'
         # Redis client and DB session factory (the sentiment queue is

@@ -25,7 +25,7 @@
       "icon": "external link",
       "tags": [],
       "targetBlank": false,
-      "title": "← Trading Signals",
+      "title": "\u2190 Trading Signals",
       "type": "link",
       "url": "/d/cortex-trading-signals"
     },
@@ -33,7 +33,7 @@
       "icon": "external link",
       "tags": [],
       "targetBlank": false,
-      "title": "Security →",
+      "title": "Security \u2192",
       "type": "link",
       "url": "/d/cortex-security-realtime"
     }
@@ -48,7 +48,7 @@
         "y": 0
       },
       "id": 100,
-      "title": "Database — TimescaleDB",
+      "title": "Database \u2014 TimescaleDB",
       "type": "row"
     },
     {
@@ -326,7 +326,7 @@
     {
       "id": 5,
       "type": "timeseries",
-      "title": "DB Query Latency — P50 / P95 / P99 by Operation",
+      "title": "DB Query Latency \u2014 P50 / P95 / P99 by Operation",
       "description": "Database query latency percentiles broken down by operation type.",
       "datasource": {
         "type": "prometheus",
@@ -419,7 +419,7 @@
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le, operation) (rate(db_query_duration_seconds_bucket[$__rate_interval])))",
-          "legendFormat": "P50 — {{operation}}",
+          "legendFormat": "P50 \u2014 {{operation}}",
           "range": true,
           "refId": "A"
         },
@@ -430,7 +430,7 @@
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le, operation) (rate(db_query_duration_seconds_bucket[$__rate_interval])))",
-          "legendFormat": "P95 — {{operation}}",
+          "legendFormat": "P95 \u2014 {{operation}}",
           "range": true,
           "refId": "B"
         },
@@ -441,7 +441,7 @@
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le, operation) (rate(db_query_duration_seconds_bucket[$__rate_interval])))",
-          "legendFormat": "P99 — {{operation}}",
+          "legendFormat": "P99 \u2014 {{operation}}",
           "range": true,
           "refId": "C"
         }
@@ -929,7 +929,7 @@
     {
       "id": 12,
       "type": "timeseries",
-      "title": "Redis Latency — P95 by Operation",
+      "title": "Redis Latency \u2014 P95 by Operation",
       "description": "95th percentile Redis operation latency by operation type.",
       "datasource": {
         "type": "prometheus",
@@ -1044,7 +1044,7 @@
       "id": 13,
       "type": "gauge",
       "title": "Worker Heartbeat Age",
-      "description": "Age of the last worker heartbeat. Red > 60s — worker is likely stalled.",
+      "description": "Age of the last worker heartbeat. Red > 60s \u2014 worker is likely stalled.",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -1209,7 +1209,7 @@
     {
       "id": 15,
       "type": "timeseries",
-      "title": "Worker Loop Duration — P95",
+      "title": "Worker Loop Duration \u2014 P95",
       "description": "95th percentile execution duration for each worker loop.",
       "datasource": {
         "type": "prometheus",
@@ -1314,7 +1314,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 35
+        "y": 46
       },
       "id": 103,
       "title": "API Cache",
@@ -1333,7 +1333,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 36
+        "y": 47
       },
       "fieldConfig": {
         "defaults": {
@@ -1406,7 +1406,7 @@
         "h": 8,
         "w": 10,
         "x": 6,
-        "y": 36
+        "y": 47
       },
       "fieldConfig": {
         "defaults": {
@@ -1481,7 +1481,7 @@
           },
           "editorMode": "code",
           "expr": "sum by(endpoint) (rate(api_cache_hits_total[$__rate_interval]))",
-          "legendFormat": "HIT — {{endpoint}}",
+          "legendFormat": "HIT \u2014 {{endpoint}}",
           "range": true,
           "refId": "A"
         },
@@ -1492,7 +1492,7 @@
           },
           "editorMode": "code",
           "expr": "sum by(endpoint) (rate(api_cache_misses_total[$__rate_interval]))",
-          "legendFormat": "MISS — {{endpoint}}",
+          "legendFormat": "MISS \u2014 {{endpoint}}",
           "range": true,
           "refId": "B"
         }
@@ -1511,7 +1511,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 36
+        "y": 47
       },
       "fieldConfig": {
         "defaults": {
@@ -1589,6 +1589,696 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 35
+      },
+      "id": 200,
+      "title": "Worker \u2014 Per-Task Detail",
+      "type": "row"
+    },
+    {
+      "id": 201,
+      "type": "table",
+      "title": "Worker Task Status",
+      "description": "Per-task lifecycle status (0=starting 1=running 2=paused 3=crashed 4=stopped), consecutive crash count, and a per-task-scaled freshness ratio ((time since last cycle) / expected interval) for each of the worker sidecar's supervised background tasks. Ratio >=1 means the task is overdue for its next cycle relative to its own cadence; tasks with no fixed cadence show 'Event-driven' instead of a ratio.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 11,
+        "w": 24,
+        "x": 0,
+        "y": 36
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Status"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "Starting",
+                        "color": "blue",
+                        "index": 0
+                      },
+                      "1": {
+                        "text": "Running",
+                        "color": "green",
+                        "index": 1
+                      },
+                      "2": {
+                        "text": "Paused",
+                        "color": "yellow",
+                        "index": 2
+                      },
+                      "3": {
+                        "text": "Crashed",
+                        "color": "red",
+                        "index": 3
+                      },
+                      "4": {
+                        "text": "Stopped",
+                        "color": "orange",
+                        "index": 4
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Crash Count"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 1
+                    },
+                    {
+                      "color": "red",
+                      "value": 3
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Time"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "instance"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "job"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "__name__"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "task"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Task"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Freshness Ratio"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 1.5
+                    },
+                    {
+                      "color": "red",
+                      "value": 3
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Cadence (s)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "text": "Event-driven",
+                        "color": "text.secondary"
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Restarted (s ago)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "Task",
+            "desc": false
+          }
+        ]
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "worker_task_status",
+          "legendFormat": "__auto",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "worker_task_crash_count",
+          "legendFormat": "__auto",
+          "format": "table",
+          "instant": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "(time() - worker_task_last_cycle_seconds) / on(task) worker_task_expected_interval_seconds",
+          "legendFormat": "__auto",
+          "format": "table",
+          "instant": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "worker_task_expected_interval_seconds",
+          "legendFormat": "__auto",
+          "format": "table",
+          "instant": true,
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "time() - worker_task_started_at_seconds",
+          "legendFormat": "__auto",
+          "format": "table",
+          "instant": true,
+          "refId": "E"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "renameByName": {
+              "Value #A": "Status",
+              "Value #B": "Crash Count",
+              "Value #C": "Freshness Ratio",
+              "Value #D": "Cadence (s)",
+              "Value #E": "Restarted (s ago)"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 300,
+      "type": "row",
+      "title": "Redpanda \u2014 Queue Broker",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 55
+      },
+      "panels": []
+    },
+    {
+      "id": 301,
+      "type": "stat",
+      "title": "Broker Up",
+      "description": "Redpanda broker scrape health (job=redpanda, /public_metrics on :9644).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 56
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "DOWN",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "UP",
+                  "color": "green"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "up{job=\"redpanda\"}",
+          "legendFormat": "broker",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 302,
+      "type": "stat",
+      "title": "Broker Disk Free",
+      "description": "Free bytes on the Redpanda data volume.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 60
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 2147483648
+              },
+              {
+                "color": "green",
+                "value": 10737418240
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(redpanda_storage_disk_free_bytes)",
+          "legendFormat": "free",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 303,
+      "type": "timeseries",
+      "title": "Consumer Group Lag",
+      "description": "Max consumer-group lag per group (requires the enable_consumer_group_metrics cluster property). Retry republishes to a topic tail briefly inflate lag during retry storms \u2014 retried messages are genuinely pending.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 9,
+        "x": 6,
+        "y": 56
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            },
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "messages",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "pointSize": 5
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "max by (redpanda_group) (redpanda_kafka_consumer_group_lag_max)",
+          "legendFormat": "{{redpanda_group}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 304,
+      "type": "timeseries",
+      "title": "Topic Produce Rate",
+      "description": "Messages appended per second per topic (rate of the partition max offset).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 9,
+        "x": 15,
+        "y": 56
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            },
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "msgs/s",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "pointSize": 5
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (redpanda_topic) (rate(redpanda_kafka_max_offset{redpanda_namespace=\"kafka\"}[5m]))",
+          "legendFormat": "{{redpanda_topic}}",
+          "refId": "A"
+        }
+      ]
     }
   ],
   "refresh": "15s",
@@ -1639,7 +2329,7 @@
     ]
   },
   "timezone": "browser",
-  "title": "Cortex AI — Infrastructure",
+  "title": "Cortex AI \u2014 Infrastructure",
   "uid": "cortex-infrastructure",
   "version": 1
 }

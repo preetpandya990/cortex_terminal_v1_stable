@@ -1,0 +1,55 @@
+groups:
+  - name: worker_tasks
+    interval: 60s
+    rules:
+
+      # ── Warning: a periodic worker task's cycle cadence has stalled ─────────
+      # Generalized rule — one expression covers every task with a defined
+      # cadence (worker_task_expected_interval_seconds present, published
+      # once at worker startup from TASK_EXPECTED_INTERVAL_SECONDS in
+      # workers/registry.py); tasks with no fixed cadence (cache_invalidation,
+      # pnl_worker, sl_tp_worker) have no expected_interval series and are
+      # excluded automatically by the on(task) join — no special-casing needed.
+      # Expected cause: task loop crashed silently without incrementing
+      # crash_count (should not happen — cross-check worker_task_status), or
+      # an upstream dependency (DB/Redis/Kafka/Upstox) is blocking the loop
+      # body indefinitely inside a call that isn't itself instrumented.
+      # Action: check worker process logs for the task name; GET
+      # /tasks/{name} on the worker control API for live state; consider
+      # POST /tasks/{name}/restart if confirmed wedged.
+      # Auto-resolves once the task completes its next real cycle.
+      - alert: WorkerTaskCycleStale
+        expr: (time() - worker_task_last_cycle_seconds) / on(task) worker_task_expected_interval_seconds >= 3
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Worker task {{ $labels.task }} has not completed a cycle in {{ $value | printf \"%.1f\" }}x its expected interval"
+          description: >
+            Task {{ $labels.task }} is overdue for its next cycle by a factor
+            of {{ $value }}. Check worker process logs and GET
+            /tasks/{{ $labels.task }} on the control API; consider
+            POST /tasks/{{ $labels.task }}/restart if confirmed wedged.
+            Auto-resolves on the task's next completed cycle. Tasks with no
+            fixed cadence (cache_invalidation, pnl_worker, sl_tp_worker) are
+            automatically excluded via the on(task) join.
+
+      # ── Warning: worker task crash-looping ───────────────────────────────────
+      # Fires when a task has crashed repeatedly within supervised()'s
+      # back-off window. At 5 consecutive crashes the exception propagates
+      # out of the TaskGroup and restarts the entire worker process (Docker's
+      # restart: unless-stopped / the bare-metal process supervisor brings it
+      # back) — this alert gives an early warning before that full restart.
+      - alert: WorkerTaskCrashLooping
+        expr: worker_task_crash_count >= 3
+        for: 1m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Worker task {{ $labels.task }} has crashed {{ $value }} times consecutively"
+          description: >
+            supervised() back-off is active for {{ $labels.task }}. At 5
+            consecutive crashes the exception propagates and restarts the
+            whole worker process. Check logs now to avoid a full restart.

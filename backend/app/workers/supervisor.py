@@ -162,7 +162,16 @@ class TaskState:
     Attributes:
         name:          Canonical task identifier (matches registry key).
         status:        Current lifecycle status (set by the supervisor).
-        last_run_at:   UTC timestamp of the most recent cycle start.
+        last_run_at:   UTC timestamp supervised() last (re)entered its outer
+                        loop for this task — i.e. restart recency, NOT work
+                        recency. Only changes on process start or a crash
+                        restart; frozen for the entire lifetime of a healthy,
+                        long-running task loop.
+        last_cycle_at: UTC timestamp the task itself last completed a real
+                        work cycle, set via record_cycle() from inside the
+                        loop body. This is the genuine liveness signal —
+                        distinct from last_run_at — and is None until the
+                        task's first cycle completes.
         crash_count:   Consecutive crash count; reset to 0 on clean exit.
         pause_token:   Cooperative pause gate for this task.
         trigger_token: Early-wakeup trigger for this task.
@@ -172,10 +181,23 @@ class TaskState:
     name: str
     status: TaskStatus = "starting"
     last_run_at: datetime | None = None
+    last_cycle_at: datetime | None = None
     crash_count: int = 0
     pause_token: PauseToken = field(default_factory=PauseToken)
     trigger_token: TriggerToken = field(default_factory=TriggerToken)
     task_handle: asyncio.Task | None = None
+
+    def record_cycle(self) -> None:
+        """
+        Mark that this task completed a real work cycle just now.
+
+        Synchronous, no await — safe to call from inside a plain loop body
+        right after a cycle's work has finished, before the loop's
+        sleep/wait call. Distinct from last_run_at, which only reflects
+        supervisor (re)start time and never changes for a healthy
+        long-running task.
+        """
+        self.last_cycle_at = datetime.now(timezone.utc)
 
 
 def create_task_states(names: list[str]) -> dict[str, TaskState]:
@@ -208,6 +230,17 @@ async def supervised(
         Each iteration calls ``coro_factory()`` to obtain a *fresh* coroutine
         so all closure-captured dependencies are re-evaluated on restart
         (avoids stale DB sessions, closed Redis connections, etc.).
+
+    Two-timestamp split (do not conflate these):
+        ``state.last_run_at`` is set below, once per outer-loop iteration —
+        i.e. once per process start or crash-restart. Every task's
+        coro_factory() is itself a long-running loop that never returns
+        under normal operation, so last_run_at freezes at start time for the
+        entire healthy lifetime of the task. It answers "when did this task
+        last restart," not "is this task still doing work." Real per-cycle
+        liveness is ``state.last_cycle_at``, updated independently by the
+        task body itself via ``state.record_cycle()`` — supervised() never
+        touches it.
 
     Back-off schedule (consecutive crashes):
         1st:  2s   2nd:  4s   3rd:  8s   4th: 16s   5th+: max 60s

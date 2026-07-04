@@ -85,15 +85,61 @@ TASK_NAMES: tuple[str, ...] = (
     # ── Watchlist pre-warmer (pause/trigger-aware) ────────────────────────────
     "watchlist_scheduler",
     # ── Async batch news forecaster ───────────────────────────────────────────
-    # Drains cortex:forecast:batch:queue; fires one Gemini call per batch of
-    # symbols (≤NEWS_FORECAST_BATCH_SIZE) rather than one call per signal-assembly
-    # hot path.  Results are written to the same 5-min forecast cache keys.
+    # Drains the cortex.forecast.batch Kafka topic; fires one Gemini call per
+    # batch of symbols (≤NEWS_FORECAST_BATCH_SIZE) rather than one call per
+    # signal-assembly hot path.  Results go to the same 5-min forecast cache keys.
     "forecast_batch",
     # ── Demand-driven AI processing safety net (pause/trigger-aware) ─────────
     # Daily 09:00 IST fallback sweep — dispatches sentiment/forecast/
     # classification queues independently when any crosses its threshold.
     "ai_processing_safety_net",
 )
+
+
+# Expected seconds between real work cycles, per task — used to compute a
+# per-task staleness ratio ((time() - last_cycle_seconds) / expected_interval)
+# instead of a single fixed threshold across tasks whose native cadence spans
+# 0.5s to daily. Values are the task's own poll-tick interval (liveness: is
+# the loop still ticking) x3 — i.e. Prometheus's documented "at least 2 full
+# runs" alerting guidance plus one run of headroom — NOT the rarer
+# business-work cadence for tasks that poll often but only act occasionally
+# (rag_cleanup, data_ingestion, forecast_batch, regime_detection,
+# drift_detection): a missed poll tick means the loop is actually wedged,
+# while a quiet business cycle within its own poll window is a separate,
+# non-worker-health concern.
+#
+# `None` marks a genuinely event-driven task with no fixed cadence — ratio
+# alerting is not meaningful for these, and PromQL `on(task)` joins against
+# worker_task_expected_interval_seconds naturally exclude them (no series
+# published) rather than requiring special-case exclusion logic.
+TASK_EXPECTED_INTERVAL_SECONDS: dict[str, int | None] = {
+    "heartbeat": 90,                    # 30s x 3
+    "cache_invalidation": None,         # event-driven (pub/sub)
+    "suggestion_expiry": 180,           # 60s x 3
+    "correlation_engine": 900,          # max(30s market-hours, 300s off-hours) x 3
+    "rss_ingestion": 2880,              # 960s max jittered poll x 3
+    "event_processing": 90,             # 30s x 3
+    "regime_detection": 900,            # 300s poll tick x 3 (actual detection is daily-gated)
+    "drift_detection": 900,             # 300s poll tick x 3
+    "safety_monitoring": 90,            # 30s x 3
+    "data_ingestion": 10800,            # 3600s poll tick x 3
+    "fundamentals_refresh": 64800,      # 21600s (6h priority sub-loop, most frequent) x 3
+    "feature_refresh": 259200,          # 86400s (daily) x 3
+    "rag_cleanup": 10800,               # 3600s poll tick x 3 (actual cleanup is daily-gated)
+    "pnl_worker": None,                 # event-driven, market-hours gated
+    "sl_tp_worker": None,               # event-driven (sub-second tick; ratio system not meaningful)
+    "watchlist_scheduler": 64800,       # 21600s typical gap (4x/day) x 3
+    "forecast_batch": 180,              # 60s batch window x 3
+    "ai_processing_safety_net": 259200, # 86400s (daily) x 3
+}
+
+if set(TASK_EXPECTED_INTERVAL_SECONDS.keys()) != set(TASK_NAMES):
+    _missing = set(TASK_NAMES) - set(TASK_EXPECTED_INTERVAL_SECONDS.keys())
+    _extra = set(TASK_EXPECTED_INTERVAL_SECONDS.keys()) - set(TASK_NAMES)
+    raise RuntimeError(
+        f"TASK_EXPECTED_INTERVAL_SECONDS/TASK_NAMES mismatch — "
+        f"missing={_missing} extra={_extra}"
+    )
 
 
 def build_task_registry(
@@ -156,6 +202,7 @@ def build_task_registry(
         shutdown=shutdown,
         pause=_state("fundamentals_refresh").pause_token,
         trigger=_state("fundamentals_refresh").trigger_token,
+        on_cycle=_state("fundamentals_refresh").record_cycle,
     )
 
     from app.workers.watchlist_context_scheduler import WatchlistContextScheduler
@@ -166,6 +213,7 @@ def build_task_registry(
         shutdown=shutdown,
         pause=_state("watchlist_scheduler").pause_token,
         trigger=_state("watchlist_scheduler").trigger_token,
+        on_cycle=_state("watchlist_scheduler").record_cycle,
     )
 
     from app.workers.ai_processing_safety_net import AIProcessingSafetyNet
@@ -175,6 +223,7 @@ def build_task_registry(
         shutdown=shutdown,
         pause=_state("ai_processing_safety_net").pause_token,
         trigger=_state("ai_processing_safety_net").trigger_token,
+        on_cycle=_state("ai_processing_safety_net").record_cycle,
     )
 
     registry: dict[str, Callable[[], Coroutine]] = {
@@ -183,12 +232,14 @@ def build_task_registry(
             pause=_state("heartbeat").pause_token,
             trigger=_state("heartbeat").trigger_token,
             shutdown=shutdown,
+            on_cycle=_state("heartbeat").record_cycle,
         ),
         "cache_invalidation": lambda: cache_invalidation_loop(
             redis_client=redis_client,
             pause=_state("cache_invalidation").pause_token,
             trigger=_state("cache_invalidation").trigger_token,
             shutdown=shutdown,
+            on_cycle=_state("cache_invalidation").record_cycle,
         ),
         "suggestion_expiry": lambda: expiry_loop(
             session_factory=session_factory,
@@ -196,6 +247,7 @@ def build_task_registry(
             pause=_state("suggestion_expiry").pause_token,
             trigger=_state("suggestion_expiry").trigger_token,
             shutdown=shutdown,
+            on_cycle=_state("suggestion_expiry").record_cycle,
         ),
         "correlation_engine": lambda: correlation_loop(
             session_factory=session_factory,
@@ -205,31 +257,54 @@ def build_task_registry(
             pause=_state("correlation_engine").pause_token,
             trigger=_state("correlation_engine").trigger_token,
             shutdown=shutdown,
+            on_cycle=_state("correlation_engine").record_cycle,
         ),
         # ── Fundamentals — pause/trigger-aware via FundamentalsRefreshScheduler
         "fundamentals_refresh": lambda: fundamentals_scheduler.run(),
         # ── Imported loops — respond to CancelledError from the supervisor ────
-        "rss_ingestion": lambda: rss_ingestion_loop(session_factory),
+        "rss_ingestion": lambda: rss_ingestion_loop(
+            session_factory, on_cycle=_state("rss_ingestion").record_cycle,
+        ),
         "event_processing": lambda: event_processing_loop(
             session_factory,
             ml_components=ml_components,
             redis=redis_client._redis,
+            on_cycle=_state("event_processing").record_cycle,
         ),
-        "regime_detection": lambda: regime_detection_loop(session_factory),
-        "drift_detection": lambda: drift_detection_loop(session_factory),
-        "safety_monitoring": lambda: safety_monitoring_loop(session_factory, redis_client._redis),
-        "data_ingestion": lambda: data_ingestion_loop(session_factory, upstox_client),
-        "feature_refresh": lambda: feature_refresh_loop(shutdown=shutdown),
+        "regime_detection": lambda: regime_detection_loop(
+            session_factory, on_cycle=_state("regime_detection").record_cycle,
+        ),
+        "drift_detection": lambda: drift_detection_loop(
+            session_factory, on_cycle=_state("drift_detection").record_cycle,
+        ),
+        "safety_monitoring": lambda: safety_monitoring_loop(
+            session_factory,
+            redis_client._redis,
+            on_cycle=_state("safety_monitoring").record_cycle,
+        ),
+        "data_ingestion": lambda: data_ingestion_loop(
+            session_factory,
+            upstox_client,
+            on_cycle=_state("data_ingestion").record_cycle,
+        ),
+        "feature_refresh": lambda: feature_refresh_loop(
+            shutdown=shutdown, on_cycle=_state("feature_refresh").record_cycle,
+        ),
         "rag_cleanup": lambda: rag_cleanup_loop(
             session_factory=session_factory,
             redis=redis_client,
             shutdown=shutdown,
+            on_cycle=_state("rag_cleanup").record_cycle,
         ),
         # ── Migrated from main.py ─────────────────────────────────────────────
         # pnl_worker uses WorkerSessionLocal internally — correct pool.
         # sl_tp_worker was updated to use WorkerSessionLocal (was AsyncSessionLocal).
-        "pnl_worker": lambda: run_pnl_worker(redis_client._redis),
-        "sl_tp_worker": lambda: run_sl_tp_worker(redis_client._redis),
+        "pnl_worker": lambda: run_pnl_worker(
+            redis_client._redis, on_cycle=_state("pnl_worker").record_cycle,
+        ),
+        "sl_tp_worker": lambda: run_sl_tp_worker(
+            redis_client._redis, on_cycle=_state("sl_tp_worker").record_cycle,
+        ),
         # ── Watchlist pre-warmer — pause/trigger-aware via WatchlistContextScheduler
         "watchlist_scheduler": lambda: watchlist_scheduler_instance.run(),
         # ── Async batch news forecaster ───────────────────────────────────────
@@ -237,6 +312,7 @@ def build_task_registry(
             redis=redis_client._redis,
             session_factory=session_factory,
             shutdown=shutdown,
+            on_cycle=_state("forecast_batch").record_cycle,
         ),
         # ── Demand-driven AI processing safety net — pause/trigger-aware ──────
         "ai_processing_safety_net": lambda: ai_processing_safety_net_instance.run(),

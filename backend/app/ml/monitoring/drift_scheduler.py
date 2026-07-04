@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, time, timedelta
-from typing import Optional
+from typing import Callable, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -402,7 +402,11 @@ if __name__ == "__main__":
 
 
 
-async def drift_detection_loop(session_factory: async_sessionmaker) -> None:
+async def drift_detection_loop(
+    session_factory: async_sessionmaker,
+    *,
+    on_cycle: Callable[[], None] | None = None,
+) -> None:
     """
     Drift detection background loop.
     
@@ -473,7 +477,10 @@ async def drift_detection_loop(session_factory: async_sessionmaker) -> None:
             
             except Exception as e:
                 logger.error(f"Drift detection error: {e}", exc_info=True)
-            
+
+            if on_cycle is not None:
+                on_cycle()
+
             # Sleep between iterations
             logger.debug(f"Sleeping for {settings.DRIFT_CHECK_INTERVAL_SECONDS}s")
             await asyncio.sleep(settings.DRIFT_CHECK_INTERVAL_SECONDS)

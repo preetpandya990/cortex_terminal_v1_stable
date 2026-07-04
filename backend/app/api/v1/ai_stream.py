@@ -105,6 +105,7 @@ from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 from app.ai.fusion.models import AIInstrumentContext
 from app.api.v1.ml_predictions import serialize_prediction_card
 from app.core.database import AsyncSessionLocal
+from app.core.kafka import KafkaTopics, publish as kafka_publish
 from app.core.metrics import llm_sse_explanation_pushes_total
 from app.core.redis import RedisChannels, RedisStreams, get_redis
 from app.core.security import CortexInvalidTokenError, decode_token
@@ -155,9 +156,6 @@ _CONTEXT_LOCK_INITIAL_TTL_SECS = 45
 # On refresher timeout, sleep this short interval before retrying instead of the
 # full refresh interval (Gap 9 — avoids a 55s dead zone after a 25s timeout).
 _TIMEOUT_RECOVERY_SECS = 10
-
-# Context job stream max length (approximate trim — amortised O(1)).
-_STREAM_MAXLEN_CONTEXT = 1000
 
 
 # ── Shared stream state ─────────────────────────────────────────────────────────
@@ -443,9 +441,10 @@ async def _fetch_explanation_for_instrument(
         )
 
     # ── Stage 3: trigger background context generation ────────────────────────
-    # Uses a Redis Stream (XADD) instead of fire-and-forget PUBLISH so the job
-    # survives a worker restart (Gap 1 + Gap 8 partial fix for context path).
-    # The lock token is stored so the context_worker's heartbeat can do an atomic
+    # Publishes to the durable Kafka context topic (not fire-and-forget PUBLISH)
+    # so the job survives a worker restart (Gap 1 + Gap 8 partial fix for the
+    # context path).  Lock acquisition stays on Redis; the token is carried in
+    # the payload so the context_worker's heartbeat can do an atomic
     # ownership-check before extending the TTL (Gap 6 fix).
     try:
         lock_key   = f"cortex:instrument_context:generating:{instrument_key}"
@@ -454,8 +453,8 @@ async def _fetch_explanation_for_instrument(
             lock_key, lock_token, nx=True, ex=_CONTEXT_LOCK_INITIAL_TTL_SECS
         )
         if acquired:
-            await redis.xadd(
-                RedisStreams.CONTEXT_JOBS,
+            await kafka_publish(
+                KafkaTopics.CONTEXT_JOBS,
                 {
                     "instrument_key":  instrument_key,
                     "symbol":          symbol or "",
@@ -466,8 +465,7 @@ async def _fetch_explanation_for_instrument(
                     "lock_key":   lock_key,
                     "lock_token": lock_token,
                 },
-                maxlen=_STREAM_MAXLEN_CONTEXT,
-                approximate=True,
+                key=instrument_key,
             )
             logger.info(
                 "SSE triggered instrument context generation: instrument=%s",
@@ -1171,15 +1169,14 @@ async def request_explanation(
         )
 
     try:
-        await redis.xadd(
-            RedisStreams.EXPLANATION_JOBS,
+        await kafka_publish(
+            KafkaTopics.EXPLANATION_JOBS,
             {
                 "suggestion_id":  suggestion_id,
                 "id":             str(suggestion.id),
                 "instrument_key": suggestion.instrument_key,
             },
-            maxlen=5000,
-            approximate=True,
+            key=suggestion_id,
         )
         logger.info(
             "on-demand bypass enqueued: suggestion=%s instrument=%s",
@@ -1188,7 +1185,7 @@ async def request_explanation(
     except Exception as exc:
         await redis.delete(debounce_key)
         logger.error(
-            "on-demand bypass: XADD failed suggestion=%s: %s",
+            "on-demand bypass: publish failed suggestion=%s: %s",
             suggestion_id, exc,
         )
         return JSONResponse(

@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy import text
@@ -645,6 +645,8 @@ class DataIngestionWorker:
 async def data_ingestion_loop(
     session_factory: async_sessionmaker,
     upstox_client: UpstoxClient,
+    *,
+    on_cycle: Callable[[], None] | None = None,
 ) -> None:
     """
     Main entry point called by worker.py.
@@ -703,6 +705,9 @@ async def data_ingestion_loop(
                 await worker.run_phase(tasks, "Maintenance")
             else:
                 logger.debug("Phase 2 — data current, no gaps")
+
+            if on_cycle is not None:
+                on_cycle()
         except asyncio.CancelledError:
             raise
         except Exception:

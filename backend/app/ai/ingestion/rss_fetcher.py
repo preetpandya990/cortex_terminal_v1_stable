@@ -8,7 +8,7 @@ import hashlib
 import logging
 import random
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 import feedparser
 import httpx
@@ -146,7 +146,11 @@ class RSSFetcher:
         await self.client.aclose()
 
 
-async def rss_ingestion_loop(session_factory: async_sessionmaker) -> None:
+async def rss_ingestion_loop(
+    session_factory: async_sessionmaker,
+    *,
+    on_cycle: Callable[[], None] | None = None,
+) -> None:
     """
     RSS ingestion background loop.
     
@@ -179,7 +183,10 @@ async def rss_ingestion_loop(session_factory: async_sessionmaker) -> None:
             
             except Exception as e:
                 logger.error(f"RSS ingestion error: {e}", exc_info=True)
-            
+
+            if on_cycle is not None:
+                on_cycle()
+
             # Jittered sleep between RSS_MIN_POLL_SECONDS and RSS_MAX_POLL_SECONDS
             jitter = random.randint(0, settings.RSS_POLL_JITTER_SECONDS)
             sleep_time = random.randint(

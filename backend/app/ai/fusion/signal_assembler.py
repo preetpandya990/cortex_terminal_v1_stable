@@ -41,9 +41,9 @@ from app.ai.fusion.news_forecaster import (
 )
 from app.ai.fusion.serializers import serialise_signal
 from app.core.config import get_settings
+from app.core.kafka import KafkaTopics, publish as kafka_publish
 from app.core.metrics import (
     llm_news_forecasts_total,
-    news_forecast_queue_depth,
     signal_generation_total,
     signal_staleness_abstentions_total,
 )
@@ -424,11 +424,12 @@ class SignalAssembler:
         regime: str | None,
         cache_key: str,
     ) -> None:
-        """Push a forecast request onto the batch worker queue (fire-and-forget).
+        """Publish a forecast request to the batch worker topic (fire-and-forget).
 
         Idempotent: a dedup key (TTL=10 min) prevents the same (symbol, news-set)
-        from flooding the queue within one accumulation window.  Queue depth is
-        bounded to prevent unbounded memory growth under sustained load.
+        from flooding the queue within one accumulation window.  ``enqueued_at``
+        lets the consumer skip payloads older than an hour — the staleness gate
+        that replaced the old producer-side queue trim.
         """
         if self._ml_cache is None:
             return
@@ -452,25 +453,17 @@ class SignalAssembler:
             k: float(v) for k, v in indicators.items() if isinstance(v, (int, float))
         }
 
-        payload = json.dumps({
-            "symbol":     symbol,
-            "events":     slim_events,
-            "indicators": slim_indicators,
-            "regime":     regime,
-            "cache_key":  cache_key,
-        }, default=str)
+        payload = {
+            "symbol":      symbol,
+            "events":      slim_events,
+            "indicators":  slim_indicators,
+            "regime":      regime,
+            "cache_key":   cache_key,
+            "enqueued_at": datetime.now(timezone.utc).isoformat(),
+        }
 
         try:
-            await self._ml_cache.lpush("cortex:forecast:batch:queue", payload)
-
-            # Bound queue depth — remove the oldest (rightmost) item when the
-            # queue exceeds NEWS_FORECAST_BATCH_SIZE × 5 (a full 5-batch backlog).
-            settings = get_settings()
-            max_depth = settings.NEWS_FORECAST_BATCH_SIZE * 5
-            depth = await self._ml_cache.llen("cortex:forecast:batch:queue")
-            news_forecast_queue_depth.set(depth)
-            if depth > max_depth:
-                await self._ml_cache.rpop("cortex:forecast:batch:queue")
+            await kafka_publish(KafkaTopics.FORECAST_BATCH, payload, key=symbol)
         except Exception as exc:
             logger.debug("news_forecaster: enqueue failed for %s — %s", symbol, exc)
 

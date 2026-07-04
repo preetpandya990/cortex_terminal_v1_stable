@@ -415,12 +415,14 @@ class FundamentalsRefreshScheduler:
         *,
         pause: PauseToken | None = None,
         trigger: TriggerToken | None = None,
+        on_cycle: Callable[[], None] | None = None,
     ) -> None:
         self._sf       = session_factory
         self._redis    = redis
         self._shutdown = shutdown
         self._pause    = pause
         self._trigger  = trigger
+        self._on_cycle = on_cycle
 
     async def run(self) -> None:
         """Launch all sub-loops; cancel them if this coroutine is cancelled."""
@@ -466,6 +468,12 @@ class FundamentalsRefreshScheduler:
             loop_name, len(instruments), ok, skip, err,
         )
         await _record_loop_run(loop_name, self._redis)
+
+        # Single shared heartbeat for the coarse "fundamentals_refresh" task
+        # (all 6 sub-loops fund it) — see TASK_EXPECTED_INTERVAL_SECONDS in
+        # workers/registry.py for the coarse-granularity design rationale.
+        if self._on_cycle is not None:
+            self._on_cycle()
 
     async def _already_ran_today(self, loop_name: str) -> bool:
         last = await _last_loop_run(loop_name, self._redis)

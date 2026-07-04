@@ -35,7 +35,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -81,6 +81,7 @@ class AIProcessingSafetyNet:
         "_shutdown",
         "_pause",
         "_trigger",
+        "_on_cycle",
     )
 
     def __init__(
@@ -90,12 +91,14 @@ class AIProcessingSafetyNet:
         shutdown: asyncio.Event,
         pause: PauseToken,
         trigger: TriggerToken,
+        on_cycle: Callable[[], None] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._redis = redis
         self._shutdown = shutdown
         self._pause = pause
         self._trigger = trigger
+        self._on_cycle = on_cycle
 
     async def run(self) -> None:
         """
@@ -140,6 +143,9 @@ class AIProcessingSafetyNet:
                 break
 
             await self._run_batch(triggered=triggered)
+
+            if self._on_cycle is not None:
+                self._on_cycle()
 
         logger.info("ai_processing_safety_net: exiting cleanly (shutdown signalled)")
 
@@ -218,7 +224,7 @@ class AIProcessingSafetyNet:
             pending_forecast_count,
         )
 
-        pending = await pending_forecast_count(self._redis)
+        pending = await pending_forecast_count()
         if pending < settings.AI_SAFETY_NET_FORECAST_THRESHOLD:
             return False
 
@@ -238,7 +244,7 @@ class AIProcessingSafetyNet:
         from app.ai.intelligence.event_classifier import EventClassifier
 
         classifier = EventClassifier(use_llm=True)
-        pending = await classifier.pending_classification_count(self._redis)
+        pending = await classifier.pending_classification_count()
         if pending < settings.AI_SAFETY_NET_EVENTS_THRESHOLD:
             return False
 
@@ -248,7 +254,7 @@ class AIProcessingSafetyNet:
             pending, settings.AI_SAFETY_NET_EVENTS_THRESHOLD,
         )
         result = await classifier.flush_pending_classifications(
-            self._session_factory, self._redis
+            self._session_factory
         )
         ai_processing_dispatch_total.labels(
             category="classification", trigger_source="scheduled", outcome="success"

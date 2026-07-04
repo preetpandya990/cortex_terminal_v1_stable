@@ -131,6 +131,7 @@ class TestTaskState:
         assert state.name == "test_task"
         assert state.status == "starting"
         assert state.last_run_at is None
+        assert state.last_cycle_at is None
         assert state.crash_count == 0
         assert state.task_handle is None
         assert isinstance(state.pause_token, PauseToken)
@@ -149,6 +150,31 @@ class TestTaskState:
         states = create_task_states(["a", "b"])
         states["a"].pause_token.pause()
         assert not states["b"].pause_token.is_paused
+
+
+# ── TaskState.record_cycle() ────────────────────────────────────────────────────
+
+class TestRecordCycle:
+    def test_record_cycle_sets_last_cycle_at(self):
+        state = TaskState(name="cycle_task")
+        assert state.last_cycle_at is None
+        state.record_cycle()
+        assert state.last_cycle_at is not None
+        assert isinstance(state.last_cycle_at, datetime)
+
+    def test_record_cycle_independent_of_last_run_at(self):
+        """record_cycle() must never touch last_run_at — distinct signals."""
+        state = TaskState(name="cycle_task")
+        state.record_cycle()
+        assert state.last_run_at is None
+
+    def test_record_cycle_monotonic_across_calls(self):
+        state = TaskState(name="cycle_task")
+        state.record_cycle()
+        first = state.last_cycle_at
+        state.record_cycle()
+        second = state.last_cycle_at
+        assert second >= first
 
 
 # ── supervised() ───────────────────────────────────────────────────────────────
@@ -170,6 +196,11 @@ class TestSupervised:
         assert len(calls) == 1
         assert state.crash_count == 0
         assert state.status == "stopped"
+        # Regression guard: supervised() must still stamp last_run_at at
+        # loop-top (restart recency) — record_cycle()/last_cycle_at are a
+        # fully separate concern it never touches.
+        assert state.last_run_at is not None
+        assert state.last_cycle_at is None
 
     @pytest.mark.asyncio
     async def test_retries_with_back_off_on_crash(self):

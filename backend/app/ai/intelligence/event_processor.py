@@ -12,7 +12,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Optional
+from typing import Callable, Optional
 
 from sqlalchemy import and_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -197,6 +197,8 @@ async def event_processing_loop(
     feature_loader=None,
     ml_components: dict | None = None,
     redis=None,
+    *,
+    on_cycle: Callable[[], None] | None = None,
 ) -> None:
     """
     Event processing background loop.
@@ -288,6 +290,9 @@ async def event_processing_loop(
                 logger.error("Event processing error: %s", e, exc_info=True)
                 # Ensure the feature_loader is cleared even on error
                 processor.signal_assembler.feature_loader = None
+
+            if on_cycle is not None:
+                on_cycle()
 
             await asyncio.sleep(processing_interval)
 

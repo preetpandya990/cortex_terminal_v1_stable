@@ -48,7 +48,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -60,7 +60,7 @@ from app.core.metrics import (
     watchlist_scheduler_last_run_timestamp,
     watchlist_scheduler_runs_total,
 )
-from app.core.redis import RedisStreams
+from app.core.kafka import KafkaTopics, publish as kafka_publish
 from app.workers.supervisor import PauseToken, TriggerToken
 
 logger = logging.getLogger(__name__)
@@ -72,9 +72,6 @@ _IST_TZ = timezone(timedelta(hours=5, minutes=30))
 
 # Polling cadence when recalculating the next scheduled run time.
 _SCHEDULE_POLL_SECS: float = 30.0
-
-# XADD stream cap — keeps cortex:stream:context:jobs bounded.
-_CONTEXT_STREAM_MAXLEN: int = 1_000
 
 
 # ── Pure helpers ───────────────────────────────────────────────────────────────
@@ -169,6 +166,7 @@ class WatchlistContextScheduler:
         "_shutdown",
         "_pause",
         "_trigger",
+        "_on_cycle",
     )
 
     def __init__(
@@ -178,12 +176,14 @@ class WatchlistContextScheduler:
         shutdown: asyncio.Event,
         pause: PauseToken,
         trigger: TriggerToken,
+        on_cycle: Callable[[], None] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._redis            = redis
         self._shutdown         = shutdown
         self._pause            = pause
         self._trigger          = trigger
+        self._on_cycle         = on_cycle
 
     async def run(self) -> None:
         """
@@ -240,6 +240,9 @@ class WatchlistContextScheduler:
                 continue
 
             await self._run_batch(triggered=triggered)
+
+            if self._on_cycle is not None:
+                self._on_cycle()
 
         logger.info("watchlist_scheduler: exiting cleanly (shutdown signalled)")
 
@@ -314,7 +317,7 @@ class WatchlistContextScheduler:
                     len(stale_keys), cap, cap,
                 )
 
-            # ── 3. Enqueue stale instruments on the context stream ────────────
+            # ── 3. Enqueue stale instruments on the context topic ─────────────
             enqueued = 0
             for instrument_key in to_enqueue:
                 symbol = (
@@ -323,8 +326,8 @@ class WatchlistContextScheduler:
                     else instrument_key
                 )
                 try:
-                    await self._redis.xadd(
-                        RedisStreams.CONTEXT_JOBS,
+                    await kafka_publish(
+                        KafkaTopics.CONTEXT_JOBS,
                         {
                             "instrument_key":  instrument_key,
                             "symbol":          symbol,
@@ -334,13 +337,12 @@ class WatchlistContextScheduler:
                             "force":           "1",
                             "source":          "watchlist_scheduler",
                         },
-                        maxlen=_CONTEXT_STREAM_MAXLEN,
-                        approximate=True,
+                        key=instrument_key,
                     )
                     enqueued += 1
                 except Exception as exc:
                     logger.warning(
-                        "watchlist_scheduler: XADD failed for instrument=%s: %s",
+                        "watchlist_scheduler: publish failed for instrument=%s: %s",
                         instrument_key,
                         exc,
                     )

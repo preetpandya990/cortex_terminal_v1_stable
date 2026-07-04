@@ -65,12 +65,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     await init_redis()
 
-    # Create Redis Stream consumer groups for the explanation pipeline.
-    # Idempotent: BUSYGROUP is silently ignored on restart so the groups are
-    # created once and survive process restarts without any state reset.
-    from app.core.redis import init_explanation_streams
-    await init_explanation_streams()
-    logger.info("Explanation stream consumer groups initialized")
+    # Initialize Kafka (Redpanda) — ensures the durable job topics exist and
+    # starts the process-wide idempotent producer.  Idempotent across restarts
+    # (TopicAlreadyExistsError is swallowed, mirroring the old BUSYGROUP path).
+    from app.core.kafka import init_kafka
+    await init_kafka()
+    logger.info("Kafka topics and producer initialized")
 
     # Initialize Gemini Request Manager — central coordinator for all 6 Gemini callers.
     # Pre-loads quota circuit state from Redis so a post-exhaustion restart fast-fails
@@ -213,9 +213,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Worker sidecar client initialized (base_url=%s)", settings.WORKER_BASE_URL)
 
     # Start LLM Explanation Workers — two parallel consumers on the explanation
-    # jobs stream + one context worker, all using XREADGROUP for at-least-once
-    # delivery.  Two explanation workers run in parallel so a slow Gemini call
-    # for one suggestion does not block all subsequent jobs.
+    # jobs topic (2 partitions) + one context worker, all using manual-commit
+    # Kafka consumer groups for at-least-once delivery.  Two explanation workers
+    # run in parallel so a slow Gemini call for one suggestion does not block
+    # all subsequent jobs.
     from app.ai.intelligence.explanation_worker import context_worker, explanation_worker
     explanation_worker_tasks = [
         asyncio.create_task(
@@ -337,6 +338,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     await market_feed_service.stop()
     await upstox_client.stop()
+
+    # Close Kafka AFTER all consumer tasks above are cancelled (a live consumer
+    # must never outlive the shared clients) and BEFORE Redis — consumer
+    # processing paths write SSE/pub-sub state through Redis until they stop.
+    from app.core.kafka import close_kafka
+    await close_kafka()
+
     await close_redis()
     await engine.dispose()
     await worker_engine.dispose()

@@ -71,7 +71,7 @@ from dataclasses import dataclass
 from datetime import datetime, time, timezone
 from decimal import Decimal
 from time import monotonic
-from typing import Any
+from typing import Any, Callable
 from uuid import UUID
 
 from redis.asyncio import Redis
@@ -128,7 +128,11 @@ class _PendingOrderSlot:
 # Worker entry-point (supervisor)
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def run_pnl_worker(redis: Redis) -> None:
+async def run_pnl_worker(
+    redis: Redis,
+    *,
+    on_cycle: Callable[[], None] | None = None,
+) -> None:
     """
     Supervisor coroutine — started with asyncio.create_task at app lifespan.
 
@@ -137,7 +141,7 @@ async def run_pnl_worker(redis: Redis) -> None:
     logger.info("PnL worker starting")
     while True:
         try:
-            await _worker_loop(redis)
+            await _worker_loop(redis, on_cycle=on_cycle)
         except asyncio.CancelledError:
             logger.info("PnL worker cancelled — shutting down")
             return
@@ -150,7 +154,11 @@ async def run_pnl_worker(redis: Redis) -> None:
 # Inner loop — two cooperative tasks under a shared lifecycle
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def _worker_loop(redis: Redis) -> None:
+async def _worker_loop(
+    redis: Redis,
+    *,
+    on_cycle: Callable[[], None] | None = None,
+) -> None:
     """
     Spin up the listener, recompute, post-close monitor, and matching engine.
     Restarts all four if any one exits unexpectedly.
@@ -165,7 +173,7 @@ async def _worker_loop(redis: Redis) -> None:
         _tick_listener(redis, pubsub, queue), name="pnl-tick-listener"
     )
     recompute = asyncio.create_task(
-        _recompute_loop(redis, queue), name="pnl-recompute-loop"
+        _recompute_loop(redis, queue, on_cycle=on_cycle), name="pnl-recompute-loop"
     )
     monitor = asyncio.create_task(
         _post_close_monitor_loop(redis), name="pnl-post-close-monitor"
@@ -244,7 +252,12 @@ async def _tick_listener(
                 queue.put_nowait(pid)
 
 
-async def _recompute_loop(redis: Redis, queue: asyncio.Queue[UUID]) -> None:
+async def _recompute_loop(
+    redis: Redis,
+    queue: asyncio.Queue[UUID],
+    *,
+    on_cycle: Callable[[], None] | None = None,
+) -> None:
     """
     Coalescing recompute loop — event-driven, zero artificial delay.
 
@@ -272,6 +285,9 @@ async def _recompute_loop(redis: Redis, queue: asyncio.Queue[UUID]) -> None:
                 logger.warning(
                     "PnL recompute failed for portfolio %s: %s", portfolio_id, exc
                 )
+
+            if on_cycle is not None:
+                on_cycle()
 
 
 async def _recompute_portfolio_pnl(redis: Redis, portfolio_id: UUID) -> None:
