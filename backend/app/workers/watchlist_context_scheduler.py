@@ -257,6 +257,21 @@ class WatchlistContextScheduler:
         """
         t0       = time.monotonic()
         settings = get_settings()
+
+        # On-demand mode (WS7, user-confirmed decision): pre-warming is a
+        # background Gemini spend path — under EXPLANATION_ON_DEMAND, context
+        # generates at first view via ai_stream Stage 3 instead. The flag
+        # gates BOTH the engine's explanation auto-publish and this scheduler
+        # so one env var owns all background LLM spend; flipping it back
+        # restores pre-warming (rollback lever).
+        if settings.EXPLANATION_ON_DEMAND:
+            logger.info(
+                "watchlist_scheduler: batch skipped — EXPLANATION_ON_DEMAND is "
+                "active (context generates on first view)"
+            )
+            watchlist_scheduler_runs_total.labels(status="skipped_on_demand").inc()
+            return
+
         margin   = timedelta(minutes=settings.WATCHLIST_SCHEDULER_FRESHNESS_MARGIN_MINUTES)
         cap      = settings.WATCHLIST_SCHEDULER_BATCH_CAP
         now_utc  = datetime.now(timezone.utc)

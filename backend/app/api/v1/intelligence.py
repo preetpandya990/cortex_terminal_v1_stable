@@ -5,7 +5,7 @@ Endpoints for NLP, event classification, and fake news detection.
 """
 import logging
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.intelligence.event_classifier import EventClassifier
@@ -119,7 +119,13 @@ class ClassifyEventRequest(BaseModel):
 class DetectFakeNewsRequest(BaseModel):
     classification_id: int
     content: str
-    source: str
+    source: str = Field(
+        description=(
+            "Feed display name (ai_raw_events.source_name, e.g. "
+            "'Economic Times Markets') — the canonical source-identity key. "
+            "URLs will not match the credibility registry."
+        )
+    )
 
 
 @router.post("/classify")

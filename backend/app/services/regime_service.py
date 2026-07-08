@@ -328,8 +328,11 @@ class RegimeService:
     # ── OHLCV loading ──────────────────────────────────────────────────────────
 
     @staticmethod
-    async def _load_ohlcv(db: AsyncSession, instrument_key: str, limit: int = 60) -> list[dict]:
-        """Return up to `limit` daily candles, oldest-first, for a single instrument."""
+    async def load_ohlcv(db: AsyncSession, instrument_key: str, limit: int = 60) -> list[dict]:
+        """Return up to `limit` daily candles, oldest-first, for a single instrument.
+
+        Public API — also consumed by the demand explanation path (WS7) to
+        build the price-action prompt summary."""
         result = await db.execute(
             text("""
                 SELECT timestamp, open::float, high::float,
@@ -473,7 +476,7 @@ class RegimeService:
         trading_symbol: str,
         company_name: str,
     ) -> dict:
-        candles = await self._load_ohlcv(db, instrument_key)
+        candles = await self.load_ohlcv(db, instrument_key)
         result = self._compute_regime_from_candles(candles)
         return {
             "instrument_key": instrument_key,
@@ -536,7 +539,7 @@ class RegimeService:
             info = instrument_map.get(sym)
             if not info:
                 return None
-            candles = await self._load_ohlcv(db, info["instrument_key"])
+            candles = await self.load_ohlcv(db, info["instrument_key"])
             r = self._compute_regime_from_candles(candles)
             return r if r["regime"] != "insufficient_data" else None
 

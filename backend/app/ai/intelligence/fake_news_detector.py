@@ -9,6 +9,7 @@ Detects fake news using:
 """
 import hashlib
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -21,6 +22,7 @@ from app.ai.fusion.models import (
     AISourceCredibility,
     AIRawEvent,
 )
+from app.ai.intelligence.credibility_scorer import CredibilityScorer
 from app.ai.intelligence.llm_client import get_ollama_client
 
 logger = logging.getLogger(__name__)
@@ -30,6 +32,19 @@ logger = logging.getLogger(__name__)
 # Article credibility is static within a trading session; 1-hour TTL eliminates
 # redundant LLM calls when the same article appears across multiple RSS feeds.
 _FAKENEWS_CACHE_TTL_SECS: int = 3600
+
+# Sentiment cue words as explicit word forms with \b anchors — raw substring
+# matching produced systematic false positives ("up" inside "group"/"support",
+# "down" inside "showdown", "miss" inside "commissioner"). Explicit forms
+# instead of stem+\w* so e.g. "mission" can never match "miss".
+_POSITIVE_CUES_RE = re.compile(
+    r"\b(?:surges?|surged|soars?|soared|gains?|gained|up|positive|beats?|exceed(?:s|ed)?)\b",
+    re.IGNORECASE,
+)
+_NEGATIVE_CUES_RE = re.compile(
+    r"\b(?:plunges?|plunged|crash(?:es|ed)?|falls?|fell|fallen|down|negative|miss(?:es|ed)?|below)\b",
+    re.IGNORECASE,
+)
 
 
 class FakeNewsDetector:
@@ -77,8 +92,10 @@ class FakeNewsDetector:
             db: Database session
             classification_id: Event classification ID
             content: Event content text
-            source: Source URL or identifier
-            
+            source: Feed display name (canonical source-identity key, e.g.
+                    "Economic Times Markets") — used for both the credibility
+                    lookup and the outcome feedback. URLs will not match.
+
         Returns:
             AIFakeNewsFlag record
         """
@@ -100,7 +117,7 @@ class FakeNewsDetector:
         
         # Layer 2: Cross-reference verification
         layer_scores["cross_reference"] = await self._check_cross_reference(
-            db, content, classification.event_type
+            db, classification
         )
         
         # Layer 3: Sentiment consistency
@@ -152,6 +169,21 @@ class FakeNewsDetector:
         await db.commit()
         await db.refresh(flag)
 
+        # Feed the outcome back into source credibility so future
+        # _check_source_credibility lookups read earned scores. Decisive
+        # outcomes only — "suspected" is ambiguous and counts neither way.
+        # Unknown sources are skipped inside update_credibility (sources are
+        # registered at ingest, keyed by feed display name).
+        if flag_status != "suspected":
+            try:
+                await CredibilityScorer().update_credibility(
+                    db, source, confirmed=(flag_status == "cleared")
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Credibility feedback for %r failed (non-fatal): %s", source, exc
+                )
+
         logger.info(
             f"Fake news detection for classification {classification_id}: "
             f"{flag_status} (score: {final_score:.2f})"
@@ -165,56 +197,68 @@ class FakeNewsDetector:
     ) -> float:
         """
         Check source credibility from database.
-        
+
         Args:
             db: Database session
-            source: Source identifier
-            
+            source: Feed display name (the canonical source-identity key,
+                    matching ai_source_credibility.source_name — e.g.
+                    "Economic Times Markets"). URLs will not match.
+
         Returns:
             Credibility score (0-1, higher = more credible)
+
+        The stored score is 0-100 (see credibility_scorer.py); it is rescaled
+        here because this layer feeds a 0-1 weighted sum — an unscaled value
+        would dominate final_score ~50x.
         """
-        # Try to find source in credibility database
         stmt = select(AISourceCredibility).where(AISourceCredibility.source_name == source)
         result = await db.execute(stmt)
         credibility = result.scalar_one_or_none()
 
         if credibility:
-            return float(credibility.credibility_score)
-        
+            return min(max(float(credibility.credibility_score) / 100.0, 0.0), 1.0)
+
         # Default score for unknown sources
         return 0.5
 
     async def _check_cross_reference(
         self,
         db: AsyncSession,
-        content: str,
-        event_type: str,
+        classification: AIEventClassification,
     ) -> float:
         """
         Check if event is corroborated by other sources.
-        
-        Args:
-            db: Database session
-            content: Event content
-            event_type: Event type
-            
+
+        Corroboration requires the same event_type within 24h AND an
+        affected_symbols overlap — event_type alone let a fabricated earnings
+        story about company X score 0.9 purely because 3+ *other* companies
+        published genuine earnings news in the same window (guaranteed during
+        earnings season, this layer's 30% weight is the highest of the four).
+        The classification under test is excluded from its own corroboration.
+
+        Symbol-less classifications (market-wide events: fed announcements,
+        geopolitical) fall back to event_type-only matching — for those, other
+        reports of the same event type genuinely are corroboration.
+
         Returns:
             Cross-reference score (0-1, higher = more corroborated)
         """
-        # Look for similar events in last 24 hours
         cutoff_time = datetime.utcnow() - timedelta(hours=24)
-        
-        stmt = (
-            select(AIEventClassification)
-            .where(
-                and_(
-                    AIEventClassification.event_type == event_type,
-                    AIEventClassification.created_at >= cutoff_time,
+
+        conditions = [
+            AIEventClassification.event_type == classification.event_type,
+            AIEventClassification.created_at >= cutoff_time,
+            AIEventClassification.id != classification.id,
+        ]
+        if classification.affected_symbols:
+            # Postgres array overlap (&&): at least one symbol in common.
+            conditions.append(
+                AIEventClassification.affected_symbols.op("&&")(
+                    classification.affected_symbols
                 )
             )
-            .limit(10)
-        )
-        
+
+        stmt = select(AIEventClassification).where(and_(*conditions)).limit(10)
         result = await db.execute(stmt)
         similar_events = result.scalars().all()
 
@@ -243,14 +287,11 @@ class FakeNewsDetector:
         Returns:
             Consistency score (0-1, higher = more consistent)
         """
-        content_lower = content.lower()
-        
-        # Detect sentiment from content
-        positive_words = ["surge", "soar", "gain", "up", "positive", "beat", "exceed"]
-        negative_words = ["plunge", "crash", "fall", "down", "negative", "miss", "below"]
-        
-        positive_count = sum(1 for word in positive_words if word in content_lower)
-        negative_count = sum(1 for word in negative_words if word in content_lower)
+        # Word-boundary-anchored cue matching (see _POSITIVE_CUES_RE /
+        # _NEGATIVE_CUES_RE) — raw substring checks flipped this layer on
+        # unrelated tokens ("XYZ Group" counted as "up").
+        positive_count = len(_POSITIVE_CUES_RE.findall(content))
+        negative_count = len(_NEGATIVE_CUES_RE.findall(content))
         
         # Determine detected sentiment
         if positive_count > negative_count:

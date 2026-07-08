@@ -51,6 +51,11 @@ class AIRawEvent(Base):
     source_url: Mapped[str] = mapped_column(String(500), nullable=False)
     source_name: Mapped[str] = mapped_column(String(200), nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    # SHA-256 over normalize_for_hash(raw_content) — catches syndicated wire
+    # copy that differs only in case/whitespace/punctuation/byline. Non-unique
+    # (near-dup detection is best-effort; exact dedup is content_hash's job).
+    # Nullable: rows predating migration 0051's backfill may be NULL.
+    normalized_hash: Mapped[str | None] = mapped_column(String(64), index=True)
     raw_content: Mapped[str] = mapped_column(Text, nullable=False)
     language: Mapped[str | None] = mapped_column(String(10))
     extra_data: Mapped[dict | None] = mapped_column("metadata", JSONB)
@@ -95,6 +100,12 @@ class AIEventClassification(Base):
     impact_score: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)
     affected_symbols: Mapped[list[str] | None] = mapped_column(ARRAY(String(20)), index=True)
     classification_confidence: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)
+    # Directional read: bullish | bearish | neutral. The classifier always
+    # computed this; migration 0052 finally persists it — impact_score is an
+    # UNSIGNED severity (0-100) and must never be used to infer direction.
+    # NULL on rows classified before 0052 (no backfill; consumers treat NULL
+    # as neutral/unavailable).
+    sentiment: Mapped[str | None] = mapped_column(String(10))
     reasoning: Mapped[str | None] = mapped_column(Text)
     decay_half_life_hours: Mapped[int] = mapped_column(Integer, server_default="24")
     decay_slow_half_life_hours: Mapped[int] = mapped_column(Integer, server_default="72")

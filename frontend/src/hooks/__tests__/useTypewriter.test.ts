@@ -15,7 +15,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
-import { useTypewriter } from '@/hooks/useTypewriter';
+import { useTypewriter, TYPED_CACHE_MAX_ENTRIES } from '@/hooks/useTypewriter';
 
 // ── Fake requestAnimationFrame ──────────────────────────────────────────────
 
@@ -160,6 +160,58 @@ describe('useTypewriter', () => {
     act(() => raf.tick(0));
     act(() => raf.tick(300));
     expect(result.current.revealedLength).toBe(30);
+  });
+
+  describe('typed-cache eviction', () => {
+    /** Fully reveals `text` in a throwaway hook instance, caching it. */
+    function revealFully(text: string) {
+      const { unmount } = renderHook(() => useTypewriter(text, { charsPerSecond: 1_000_000 }));
+      act(() => raf.tick(0)); // establish the starting timestamp
+      act(() => raf.tick(1000)); // more than enough to complete any fixture
+      unmount();
+    }
+
+    /** True when a fresh mount of `text` renders instantly (cache hit). */
+    function isCached(text: string): boolean {
+      const { result, unmount } = renderHook(() => useTypewriter(text, { charsPerSecond: 1_000_000 }));
+      const cached = result.current.revealedLength === text.length;
+      unmount();
+      return cached;
+    }
+
+    it('evicts the least-recently-revealed entry once the cap is exceeded', () => {
+      const victim = 'evict-victim-' + 'v'.repeat(10);
+      revealFully(victim);
+      expect(isCached(victim)).toBe(true);
+
+      // Note: isCached(victim) above re-marked it, so exactly
+      // TYPED_CACHE_MAX_ENTRIES further inserts are needed to push it out.
+      for (let i = 0; i < TYPED_CACHE_MAX_ENTRIES; i++) {
+        revealFully(`evict-filler-${i}-` + 'w'.repeat(10));
+      }
+
+      expect(isCached(victim)).toBe(false);
+    });
+
+    it('re-revealing cached content refreshes its recency (LRU, not FIFO)', () => {
+      const keeper = 'lru-keeper-' + 'k'.repeat(10);
+      revealFully(keeper);
+
+      // Fill to exactly the cap (keeper + cap-1 fillers), oldest-first = keeper.
+      for (let i = 0; i < TYPED_CACHE_MAX_ENTRIES - 1; i++) {
+        revealFully(`lru-filler-a-${i}-` + 'x'.repeat(10));
+      }
+
+      // Touch the keeper: instant render re-marks it as most recent.
+      expect(isCached(keeper)).toBe(true);
+
+      // One more insert exceeds the cap — with LRU it evicts the oldest
+      // filler, not the freshly-touched keeper.
+      revealFully('lru-filler-b-' + 'y'.repeat(10));
+
+      expect(isCached(keeper)).toBe(true);
+      expect(isCached('lru-filler-a-0-' + 'x'.repeat(10))).toBe(false);
+    });
   });
 
   it('continues in place when the text grows as a superset of the current content (incremental streaming)', () => {

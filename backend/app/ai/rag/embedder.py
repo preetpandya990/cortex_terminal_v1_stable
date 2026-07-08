@@ -70,8 +70,10 @@ async def embed_texts(
     Raises:
         LLMFallbackExhausted: If Gemini is not configured (GEMINI_API_KEY unset)
             or the embedding call fails.
-        RuntimeError: If the provider returns vectors of the wrong dimension
-            (signals a model or configuration mismatch vs. GEMINI_EMBED_DIM).
+        RuntimeError: If the provider returns the wrong NUMBER of vectors
+            (would positionally mispair vectors with texts downstream) or
+            vectors of the wrong dimension (signals a model or configuration
+            mismatch vs. GEMINI_EMBED_DIM).
     """
     if not texts:
         return []
@@ -85,6 +87,16 @@ async def embed_texts(
     for batch_start in range(0, len(texts), effective_batch):
         batch = texts[batch_start : batch_start + effective_batch]
         batch_vectors = await client.embed(batch, input_type=input_type, priority=Priority.BACKGROUND)
+
+        # Defense in depth alongside the same guard inside client.embed():
+        # a count mismatch here means every (text, vector) pair after the gap
+        # would be misaligned — permanent corruption once persisted, since the
+        # anti-join never re-selects rows that already have an embedding.
+        if len(batch_vectors) != len(batch):
+            raise RuntimeError(
+                f"Embedding count mismatch: batch of {len(batch)} texts "
+                f"returned {len(batch_vectors)} vectors."
+            )
 
         if batch_vectors and len(batch_vectors[0]) != dim:
             raise RuntimeError(

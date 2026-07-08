@@ -49,10 +49,30 @@ interface AnalysisCardsSectionProps {
 
 // ── SSE connection hook ────────────────────────────────────────────────────────
 
-const SSE_MAX_RETRIES   = 3;
-const SSE_RETRY_DELAY_MS = 5_000;
+// Exponential reconnect backoff: 5s → 10s → 20s → 40s → 60s cap, forever.
+// The old design gave up permanently after 3 attempts (~15s) — one flaky
+// minute killed real-time delivery for the rest of the session (WS8 fix).
+const SSE_RETRY_BASE_MS = 5_000;
+const SSE_RETRY_MAX_MS  = 60_000;
 
-function useAnalysisStream(
+// A healthy stream emits an analysis_update at least every 60s (the
+// prediction refresher's cadence, and every emit carries all four slices).
+// No event for 3× that window ⇒ the stream is silently stalled and the
+// per-component polling fallback must resume.
+const SSE_EVENT_SILENCE_HORIZON_MS = 180_000;
+
+// Re-evaluate liveness on a timer: when the stream goes quiet there are no
+// events to trigger a render, so staleness would otherwise go unnoticed.
+const SSE_FRESHNESS_TICK_MS = 30_000;
+
+type StreamComponent = 'prediction' | 'pattern' | 'sentiment' | 'explanation';
+const STREAM_COMPONENTS: readonly StreamComponent[] = [
+  'prediction', 'pattern', 'sentiment', 'explanation',
+];
+
+// Exported for direct hook-level testing (connection lifecycle, backoff and
+// per-component liveness are regression-prone — see the WS8 test suite).
+export function useAnalysisStream(
   instrumentKey: string | null,
   symbol: string | null | undefined,
   accessToken: string | null,
@@ -64,27 +84,51 @@ function useAnalysisStream(
   const [explanationData, setExplanationData] = useState<ExplanationData       | null>(null);
   const [isConnected,     setIsConnected]     = useState(false);
   const [isInitialLoad,   setIsInitialLoad]   = useState(true);
+  // Per-component degradation (WS8): the backend emits analysis_error when a
+  // component's refresher fails while re-broadcasting its last good data —
+  // the shared boolean used to hide exactly this. Value = when it degraded,
+  // so a genuinely fresher slice (updated_at after that moment) clears it.
+  const [degradedAt, setDegradedAt] = useState<Partial<Record<StreamComponent, number>>>({});
+  const [lastEventAt, setLastEventAt] = useState(0);
+  // Timer-driven re-render so liveness decays even when the stream is quiet.
+  const [, setFreshnessTick] = useState(0);
 
   const esRef         = useRef<EventSource | null>(null);
   const retryCountRef = useRef(0);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Token ref (WS8, mirrors useWebSocket): kept current on every render so a
+  // reconnect always presents a FRESH token, while the connection lifecycle
+  // never depends on the token value — the silent ~29-min refresh used to
+  // recreate `connect`, wiping all four cards and tearing down the stream.
+  const tokenRef = useRef(accessToken);
+  tokenRef.current = accessToken;
+
   const connect = useCallback(() => {
-    if (!enabled || !instrumentKey || !accessToken) return;
+    if (!enabled || !instrumentKey || !tokenRef.current) return;
 
     esRef.current?.close();
 
     const url = new URL('/api/v1/ai/stream', window.location.origin);
     url.searchParams.set('instrument_key', instrumentKey);
-    url.searchParams.set('token', accessToken);
+    url.searchParams.set('token', tokenRef.current);
     if (symbol) url.searchParams.set('symbol', symbol);
 
     const es = new EventSource(url.toString());
     esRef.current = es;
 
+    es.onopen = () => {
+      // Connected is flipped on OPEN, not first data (WS8): a connected-but-
+      // quiet stream previously left polling running in parallel (double-fetch).
+      setIsConnected(true);
+      setLastEventAt(Date.now());
+      retryCountRef.current = 0;
+    };
+
     es.addEventListener('analysis_update', (e: MessageEvent) => {
       try {
         const payload: AnalysisStreamEvent = JSON.parse(e.data);
+        const receivedAt = Date.now();
         if (payload.prediction) setPredictionData(payload.prediction);
         if (payload.pattern)    setPatternData(payload.pattern);
         if (payload.sentiment)  setSentimentData(payload.sentiment);
@@ -94,6 +138,27 @@ function useAnalysisStream(
         // the field is present in the payload, including on null.
         if ('explanation' in payload) setExplanationData(payload.explanation);
 
+        // Clear degradation for components whose slice genuinely refreshed
+        // (updated_at newer than the degradation moment). Slices without an
+        // updated_at (pre-WS8 backend) clear on receipt.
+        setDegradedAt((prev) => {
+          const entries = Object.entries(prev) as [StreamComponent, number][];
+          if (entries.length === 0) return prev;
+          const next = { ...prev };
+          let changed = false;
+          for (const [component, markedAt] of entries) {
+            const slice = payload[component] as { updated_at?: string } | null;
+            if (!slice) continue;
+            const sliceAt = slice.updated_at ? Date.parse(slice.updated_at) : receivedAt;
+            if (sliceAt >= markedAt) {
+              delete next[component];
+              changed = true;
+            }
+          }
+          return changed ? next : prev;
+        });
+
+        setLastEventAt(receivedAt);
         setIsInitialLoad(false);
         setIsConnected(true);
         retryCountRef.current = 0;
@@ -102,20 +167,44 @@ function useAnalysisStream(
       }
     });
 
-    es.addEventListener('error', (_e: MessageEvent) => {
-      // Non-fatal server-side error event — keep connection open
+    es.addEventListener('analysis_error', (e: MessageEvent) => {
+      // Per-component degradation (WS8 — the old generic listener no-op'd):
+      // the backend keeps re-broadcasting the last good data; marking the
+      // component degraded re-arms ITS polling fallback and shows the
+      // "live data delayed" strip, without touching the healthy cards.
+      try {
+        const { component } = JSON.parse(e.data) as { component?: string };
+        if (component && (STREAM_COMPONENTS as readonly string[]).includes(component)) {
+          setDegradedAt((prev) => ({ ...prev, [component]: Date.now() }));
+        }
+      } catch {
+        // Malformed error event — ignore
+      }
     });
 
     es.onerror = () => {
       setIsConnected(false);
       es.close();
-      if (retryCountRef.current < SSE_MAX_RETRIES) {
-        retryCountRef.current += 1;
-        retryTimerRef.current = setTimeout(connect, SSE_RETRY_DELAY_MS);
-      }
+      // Never give up: exponential backoff, reset on the next successful open.
+      const delay = Math.min(
+        SSE_RETRY_BASE_MS * 2 ** retryCountRef.current,
+        SSE_RETRY_MAX_MS,
+      );
+      retryCountRef.current += 1;
+      retryTimerRef.current = setTimeout(connect, delay);
     };
-  }, [enabled, instrumentKey, symbol, accessToken]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- accessToken is
+  // deliberately read via tokenRef so token rotation never recreates connect.
+  }, [enabled, instrumentKey, symbol]);
 
+  useEffect(() => {
+    if (!enabled) return;
+    const id = setInterval(() => setFreshnessTick((t) => t + 1), SSE_FRESHNESS_TICK_MS);
+    return () => clearInterval(id);
+  }, [enabled]);
+
+  // Connection lifecycle — keyed on the INSTRUMENT, never the token (WS8):
+  // this reset-and-reconnect must run only when the user views something new.
   useEffect(() => {
     if (!enabled) return;
     setIsInitialLoad(true);
@@ -123,6 +212,8 @@ function useAnalysisStream(
     setPatternData(null);
     setSentimentData(null);
     setExplanationData(null);
+    setDegradedAt({});
+    setLastEventAt(0);
     retryCountRef.current = 0;
     connect();
 
@@ -132,7 +223,25 @@ function useAnalysisStream(
     };
   }, [connect, enabled, instrumentKey]);
 
-  return { predictionData, patternData, sentimentData, explanationData, isConnected, isInitialLoad };
+  // Per-component liveness: the stream is delivering for THIS component.
+  // False → its React Query refetchInterval re-arms (see query definitions).
+  const isComponentLive = useCallback(
+    (component: StreamComponent): boolean =>
+      isConnected &&
+      degradedAt[component] === undefined &&
+      Date.now() - lastEventAt < SSE_EVENT_SILENCE_HORIZON_MS,
+    [isConnected, degradedAt, lastEventAt],
+  );
+
+  const degradedComponents = useMemo(
+    () => STREAM_COMPONENTS.filter((c) => degradedAt[c] !== undefined),
+    [degradedAt],
+  );
+
+  return {
+    predictionData, patternData, sentimentData, explanationData,
+    isConnected, isInitialLoad, isComponentLive, degradedComponents,
+  };
 }
 
 // ── Main component ─────────────────────────────────────────────────────────────
@@ -152,8 +261,9 @@ export function AnalysisCardsSection({
     patternData:     ssePattern,
     sentimentData:   sseSentiment,
     explanationData: sseExplanation,
-    isConnected:     sseConnected,
     isInitialLoad:   sseLoading,
+    isComponentLive,
+    degradedComponents,
   } = useAnalysisStream(instrumentKey, symbol, accessToken, canQuery);
 
   // ── Invalidate suggestions when explanation becomes ready ─────────────────
@@ -162,12 +272,19 @@ export function AnalysisCardsSection({
   // Invalidating here causes React Query to refetch, which updates
   // currentDetailSuggestion → the next suggestionExplanation memo cycle returns
   // available: true → the panel transitions from skeleton to content.
+  //
+  // Keyed on the explanation's identity (generated_at) rather than the
+  // `available` boolean so it fires ONCE per newly delivered explanation —
+  // not on every reconnect that re-delivers the same one (WS8 churn fix).
   const queryClient = useQueryClient();
+  const readyExplanationKey = sseExplanation?.available
+    ? sseExplanation.generated_at ?? 'ready'
+    : null;
   useEffect(() => {
-    if (sseExplanation?.available) {
+    if (readyExplanationKey !== null) {
       queryClient.invalidateQueries({ queryKey: ['trade-suggestions'] });
     }
-  }, [sseExplanation?.available, queryClient]);
+  }, [readyExplanationKey, queryClient]);
 
   // ── Explanation seed from REST response ────────────────────────────────────
   // The parent DetailPane already has the suggestion object from the REST list
@@ -231,7 +348,7 @@ export function AnalysisCardsSection({
     },
     enabled: canQuery,
     staleTime:       60_000,
-    refetchInterval: sseConnected ? false : 60_000,
+    refetchInterval: isComponentLive('prediction') ? false : 60_000,
   });
 
   const patternQuery = useQuery({
@@ -244,7 +361,7 @@ export function AnalysisCardsSection({
     },
     enabled: canQuery,
     staleTime:       300_000,
-    refetchInterval: sseConnected ? false : 300_000,
+    refetchInterval: isComponentLive('pattern') ? false : 300_000,
   });
 
   const sentimentQuery = useQuery({
@@ -261,7 +378,7 @@ export function AnalysisCardsSection({
     },
     enabled: canQuery,
     staleTime:       120_000,
-    refetchInterval: sseConnected ? false : 120_000,
+    refetchInterval: isComponentLive('sentiment') ? false : 120_000,
   });
 
   // Explanation REST fallback — the fourth query.
@@ -290,7 +407,7 @@ export function AnalysisCardsSection({
     },
     enabled: canQuery,
     staleTime:                  2 * 60 * 60 * 1000,   // 2 hours — matches backend cache TTL
-    refetchInterval:            sseConnected ? false : 5 * 60 * 1000,
+    refetchInterval:            isComponentLive('explanation') ? false : 5 * 60 * 1000,
     refetchIntervalInBackground: false,
   });
 
@@ -364,6 +481,24 @@ export function AnalysisCardsSection({
 
   return (
     <div className={cn('space-y-4', className)}>
+      {/* ── Live-data degradation strip (WS8) — inline, no toasts. Shown when
+          the backend reported a component's refresher failing; its last good
+          data stays on screen and polling has re-armed for it. ── */}
+      {degradedComponents.length > 0 && (
+        <div
+          className="flex items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs text-amber-700"
+          role="status"
+          aria-live="polite"
+        >
+          <span
+            className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-amber-500"
+            aria-hidden
+          />
+          Live data delayed for {degradedComponents.join(', ')} — showing last
+          received data.
+        </div>
+      )}
+
       {/* ── Three-card grid: ML Pattern | AI Sentiment | Prediction Summary ── */}
       <div className="grid gap-4 md:grid-cols-3">
         <MLPatternCard
@@ -398,7 +533,8 @@ export function AnalysisCardsSection({
         data={explanationData}
         isLoading={isExplanationLoading}
         onRequestExplanation={
-          explanationData?.weak_signal && explanationData.suggestion_id
+          (explanationData?.weak_signal || explanationData?.failed) &&
+          explanationData.suggestion_id
             ? handleRequestExplanation
             : undefined
         }

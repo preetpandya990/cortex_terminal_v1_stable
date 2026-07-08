@@ -80,7 +80,7 @@ async def test_flush_commits_only_after_success(redis, fresh_queue_consumer, rea
     ) as fake_gemini:
         result = await fbw.flush_pending_forecasts(redis, MagicMock())
 
-    assert result == {"dispatched": 1, "calls_made": 1}
+    assert result == {"dispatched": 1, "calls_made": 1, "stale_dropped": 0}
     fake_gemini.assert_awaited_once()
     (batch, _redis_arg, _sf), _ = fake_gemini.await_args
     assert batch[0]["symbol"] == real_symbol
@@ -128,5 +128,41 @@ async def test_stale_payloads_are_skipped_and_committed(
         result = await fbw.flush_pending_forecasts(redis, MagicMock())
 
     fake_gemini.assert_not_awaited()
-    assert result == {"dispatched": 0, "calls_made": 0}
+    assert result == {"dispatched": 0, "calls_made": 0, "stale_dropped": 1}
+    assert await pending_count(_TOPIC, _GROUP) == 0
+
+
+@pytest.mark.asyncio
+async def test_flush_drains_past_stale_run(redis, fresh_queue_consumer, real_symbol):
+    """
+    WS6 under-drain fix against the real broker: a contiguous run of stale
+    payloads at the head of the topic must not stop the drain — ONE dispatch
+    works through the stale run AND fires the fresh group behind it, with the
+    dropped count reported honestly.
+
+    Pre-fix behavior: the first all-stale getmany() produced zero filtered
+    items, the loop broke, and the call returned a clean-looking
+    {"dispatched": 0} while valid requests sat undispatched.
+    """
+    # 10 stale payloads at the head (distinct symbols so intra-batch dedup
+    # can't collapse them), then 5 fresh ones behind.
+    for i in range(10):
+        await publish(
+            _TOPIC, _payload(f"{real_symbol}-STALE{i}", age_secs=2 * 3600), key=real_symbol
+        )
+    for i in range(5):
+        await publish(_TOPIC, _payload(f"{real_symbol}-F{i}"), key=real_symbol)
+
+    with patch.object(
+        fbw, "_flush_batch",
+        new=AsyncMock(return_value={"outcome": "success", "valid_count": 5, "total": 5}),
+    ) as fake_gemini:
+        result = await fbw.flush_pending_forecasts(redis, MagicMock())
+
+    assert result["dispatched"] == 5
+    assert result["stale_dropped"] == 10
+    fake_gemini.assert_awaited_once()
+    (batch, _redis_arg, _sf), _ = fake_gemini.await_args
+    assert {p["symbol"] for p in batch} == {f"{real_symbol}-F{i}" for i in range(5)}
+    # Everything — stale run included — is committed past; queue fully drained.
     assert await pending_count(_TOPIC, _GROUP) == 0

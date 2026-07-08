@@ -93,7 +93,7 @@ async def test_success_commits_offset(redis, worker_consumer, real_suggestion):
         await _process_explanation_message(redis, worker_consumer, msg, 0)
 
     fake_gemini.assert_awaited_once_with(
-        real_suggestion["suggestion_id"], int(real_suggestion["id"])
+        real_suggestion["suggestion_id"], int(real_suggestion["id"]), trigger="auto"
     )
     assert await pending_count(_TOPIC, _GROUP) == 0
 

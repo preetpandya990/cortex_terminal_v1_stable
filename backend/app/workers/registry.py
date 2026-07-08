@@ -2,7 +2,7 @@
 Cortex AI — Worker Task Registry
 =================================
 
-Single source of truth for all 18 background tasks that run inside the worker
+Single source of truth for all 19 background tasks that run inside the worker
 sidecar.  Each entry is a zero-argument factory (a closure) so that:
 
   - The supervisor can call factory() to obtain a *fresh* coroutine on restart
@@ -23,7 +23,7 @@ Task inventory
     ai_processing_safety_net  Daily fallback dispatch for the 3 demand-driven
                               Tier-2 Gemini queues (sentiment/forecast/classification).
 
-  Imported (10) — respond to CancelledError only:
+  Imported (11) — respond to CancelledError only:
     rss_ingestion       RSS news feed ingestion.
     event_processing    ML event classification pipeline.
     regime_detection    Post-market regime labelling.
@@ -32,6 +32,7 @@ Task inventory
     data_ingestion      OHLCV historical / live gap-fill.
     feature_refresh     Daily ML feature store refresh at 16:00 IST.
     rag_cleanup         Daily TTL eviction of stale RAG embeddings (>7 days).
+    sentiment_drift     Daily 7d-vs-30d sentiment distribution drift check.
     pnl_worker          Paper trading P&L recompute (migrated from main.py).
     sl_tp_worker        Strategy SL/TP FSM monitor (migrated from main.py).
 
@@ -79,6 +80,7 @@ TASK_NAMES: tuple[str, ...] = (
     "fundamentals_refresh",
     "feature_refresh",
     "rag_cleanup",
+    "sentiment_drift",
     # ── Migrated from main.py ────────────────────────────────────────────────
     "pnl_worker",
     "sl_tp_worker",
@@ -126,6 +128,7 @@ TASK_EXPECTED_INTERVAL_SECONDS: dict[str, int | None] = {
     "fundamentals_refresh": 64800,      # 21600s (6h priority sub-loop, most frequent) x 3
     "feature_refresh": 259200,          # 86400s (daily) x 3
     "rag_cleanup": 10800,               # 3600s poll tick x 3 (actual cleanup is daily-gated)
+    "sentiment_drift": 10800,           # 3600s poll tick x 3 (actual check is daily-gated)
     "pnl_worker": None,                 # event-driven, market-hours gated
     "sl_tp_worker": None,               # event-driven (sub-second tick; ratio system not meaningful)
     "watchlist_scheduler": 64800,       # 21600s typical gap (4x/day) x 3
@@ -172,6 +175,7 @@ def build_task_registry(
     # Lazy imports keep module-level import time fast and avoid circular deps.
     from app.ai.ingestion.rss_fetcher import rss_ingestion_loop
     from app.workers.rag_cleanup import rag_cleanup_loop
+    from app.workers.sentiment_drift_monitor import sentiment_drift_loop
     from app.ai.intelligence.event_processor import event_processing_loop
     from app.ai.safety.safety_trigger_engine import safety_monitoring_loop
     from app.ai.strategy.regime_detector import regime_detection_loop
@@ -295,6 +299,12 @@ def build_task_registry(
             redis=redis_client,
             shutdown=shutdown,
             on_cycle=_state("rag_cleanup").record_cycle,
+        ),
+        "sentiment_drift": lambda: sentiment_drift_loop(
+            session_factory=session_factory,
+            redis=redis_client,
+            shutdown=shutdown,
+            on_cycle=_state("sentiment_drift").record_cycle,
         ),
         # ── Migrated from main.py ─────────────────────────────────────────────
         # pnl_worker uses WorkerSessionLocal internally — correct pool.

@@ -170,8 +170,21 @@ def mock_signal_assembler():
     """Mock SignalAssembler for controlled test scenarios."""
     assembler = AsyncMock(spec=SignalAssembler)
     
-    # Default: Return bullish signals with high confidence
-    # AI signal: score > 0 = BUY, confidence 0-1 scale
+    # Default: Return bullish signals with high confidence.
+    # The engine's AI agent call is gather_news_forecast — a live forecast
+    # (forecast_source=gemini_batch + explicit direction) votes in the
+    # unanimity check; fallback shapes abstain and renormalize.
+    assembler.gather_news_forecast = AsyncMock(return_value={
+        "score": 85.0,
+        "confidence": 0.90,  # 0-1 scale (will be * 100 in engine)
+        "event_count": 1,
+        "events": [{"id": 1, "type": "earnings", "impact": 85.0}],
+        "available": True,
+        "forecast_source": "gemini_batch",
+        "direction": "BUY",
+    })
+
+    # Legacy shape kept for any direct callers; not used by the engine.
     assembler.gather_event_signals = AsyncMock(return_value={
         "score": 85.0,  # Positive = BUY
         "confidence": 0.90,  # 0-1 scale (will be * 100 in engine)
@@ -256,6 +269,7 @@ async def create_news_event(
     event_type: str = "earnings",
     impact_score: float = 85.0,
     affected_symbols: list[str] = None,
+    sentiment: str = "bullish",
 ) -> AIEventClassification:
     """
     Create a news event with all required parent records.
@@ -316,6 +330,7 @@ async def create_news_event(
         impact_score=Decimal(str(impact_score)),
         classification_confidence=Decimal("0.90"),
         affected_symbols=affected_symbols,
+        sentiment=sentiment,  # drives Pathway-2 synthetic direction (WS5)
         reasoning="Test news event for integration testing",
     )
     db.add(event_classification)
@@ -392,9 +407,11 @@ async def test_pathway1_scanner_anomaly_success(
         message = await pubsub.get_message(timeout=1.0)
     
     if message and message["type"] == "message":
-        # Engine publishes str(suggestion_id)
-        published_id = message["data"]
-        assert published_id == str(suggestion.suggestion_id)
+        # Engine publishes the full suggestion payload as JSON — assert the
+        # identifying field rather than the whole (schema-evolving) envelope.
+        payload = json.loads(message["data"])
+        assert payload["suggestion_id"] == str(suggestion.suggestion_id)
+        assert payload["status"] == "active"
     
     await pubsub.unsubscribe()
     await pubsub.aclose()
@@ -413,14 +430,16 @@ async def test_pathway1_direction_mismatch_rejected(
     """
     # Arrange: Scanner says buy (lowercase)
     scanner_signal = create_scanner_signal(direction="buy", score=8.5)
-    
-    # Mock: AI and ML say SELL
-    mock_signal_assembler.gather_event_signals.return_value = {
-        "score": -85.0,  # Negative = SELL
+
+    # Mock: AI (live forecast — votes) and ML say SELL
+    mock_signal_assembler.gather_news_forecast.return_value = {
+        "score": -85.0,
         "confidence": 0.90,
-        "sentiment": "negative",
         "event_count": 1,
         "events": [{"id": 1, "type": "earnings", "impact": -85.0}],
+        "available": True,
+        "forecast_source": "gemini_batch",
+        "direction": "SELL",
     }
     
     mock_signal_assembler.gather_ml_signals.return_value = {
@@ -581,13 +600,13 @@ async def test_timeout_handling(
     Engine should timeout after 5 seconds and record failure.
     """
     # Arrange: Configure existing mock to sleep
-    async def slow_ai_response(db, symbol):
+    async def slow_ai_response(*args, **kwargs):
         await asyncio.sleep(10)  # Longer than 5s timeout
         return {}
-    
-    # Reset the mock and configure side_effect
-    mock_signal_assembler.gather_event_signals.reset_mock()
-    mock_signal_assembler.gather_event_signals.side_effect = slow_ai_response
+
+    # Reset the mock and configure side_effect on the engine's actual AI call
+    mock_signal_assembler.gather_news_forecast.reset_mock()
+    mock_signal_assembler.gather_news_forecast.side_effect = slow_ai_response
     
     scanner_signal = create_scanner_signal()
     
@@ -608,42 +627,6 @@ async def test_timeout_handling(
     assert "TIMEOUT" in correlation.rejection_reason
 
 
-@pytest.mark.skip(reason="Circuit breaker feature defined but not yet integrated into engine error handling")
-@pytest.mark.asyncio
-async def test_circuit_breaker_activation(
-    db_session: AsyncSession,
-    correlation_engine: EventCorrelationEngine,
-    mock_signal_assembler: AsyncMock,
-):
-    """
-    Test circuit breaker opens after repeated failures.
-    
-    After 5 consecutive failures, circuit breaker should open.
-    """
-    # Arrange: Mock failing AI service
-    mock_signal_assembler.gather_event_signals.side_effect = Exception("AI service down")
-    
-    scanner_signal = create_scanner_signal()
-    
-    # Act: Trigger 5 failures
-    for i in range(5):
-        suggestion = await correlation_engine.on_scanner_anomaly(
-            db=db_session,
-            scanner_signal=scanner_signal,
-        )
-        assert suggestion is None
-    
-    # Assert: Circuit breaker opened
-    assert correlation_engine.circuit_breakers["ai"].state == "open"
-    
-    # Assert: 6th attempt fails fast (circuit open)
-    suggestion = await correlation_engine.on_scanner_anomaly(
-        db=db_session,
-        scanner_signal=scanner_signal,
-    )
-    assert suggestion is None
-
-
 # ============================================================================
 # CONCURRENCY TESTS
 # ============================================================================
@@ -660,14 +643,25 @@ async def test_concurrent_requests_isolated(
     Each request gets its own DB session to avoid flush conflicts.
     """
     settings = get_settings()
-    
+
     # Create engine for session creation
     engine = create_async_engine(
         str(settings.DATABASE_URL),
         poolclass=NullPool,
         echo=False,
     )
-    
+
+    # This test COMMITS real rows (its subject is concurrent-session
+    # isolation, so per-test transaction rollback can't be used). Idempotency
+    # preamble: remove any artifacts a previous run left behind — otherwise
+    # the engine's dedup guard suppresses the identical re-run signals and
+    # the test flips to failing on its second execution.
+    async with engine.begin() as conn:
+        from sqlalchemy import text as sa_text
+        await conn.execute(
+            sa_text("DELETE FROM trade_suggestions WHERE instrument_key LIKE 'NSE_EQ|INE00_A01018'")
+        )
+
     # Arrange: Create 5 different scanner signals
     signals = [
         create_scanner_signal(
@@ -721,7 +715,15 @@ async def test_concurrent_requests_isolated(
         db_suggestions = result.scalars().all()
         assert len(db_suggestions) >= 5  # At least 5 from this test
         await session.close()
-    
+
+    # Post-test cleanup: don't leave synthetic suggestions in the shared DB
+    # (they would surface as fake cards in the UI until the next test run).
+    async with engine.begin() as conn:
+        from sqlalchemy import text as sa_text
+        await conn.execute(
+            sa_text("DELETE FROM trade_suggestions WHERE instrument_key LIKE 'NSE_EQ|INE00_A01018'")
+        )
+
     await engine.dispose()
 
 

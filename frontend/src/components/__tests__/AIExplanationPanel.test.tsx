@@ -145,3 +145,114 @@ describe('AIExplanationPanel — typewriter integration', () => {
     expect(screen.getByText('Analysis unavailable for this signal.')).toBeInTheDocument();
   });
 });
+
+// ── WS8 additions ─────────────────────────────────────────────────────────────
+
+describe('AIExplanationPanel — source URL sanitization (WS8)', () => {
+  it('renders a javascript: source_url as plain text, never an href', () => {
+    const data = makeData({
+      sources: [
+        {
+          source_name: 'Malicious Feed',
+          as_of: '2026-07-03T09:00:00Z',
+          source_url: 'javascript:alert(1)',
+        },
+      ],
+    });
+    render(<AIExplanationPanel data={data} isLoading={false} />);
+    act(() => raf.tick(0));
+    act(() => raf.tick(60_000)); // finish typing so SourcesList mounts
+
+    expect(screen.getByText('Malicious Feed')).toBeInTheDocument();
+    expect(
+      screen.queryByLabelText('Open source: Malicious Feed'),
+    ).not.toBeInTheDocument(); // no anchor rendered
+  });
+
+  it('renders an https source_url as a link', () => {
+    render(<AIExplanationPanel data={makeData()} isLoading={false} />);
+    act(() => raf.tick(0));
+    act(() => raf.tick(60_000));
+
+    const link = screen.getByLabelText('Open source: Reuters');
+    expect(link).toHaveAttribute('href', 'https://example.com');
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+  });
+});
+
+describe('AIExplanationPanel — banners (WS8)', () => {
+  it('shows the direction-mismatch banner when the backend flags it', () => {
+    render(
+      <AIExplanationPanel
+        data={makeData({ direction_mismatch: true })}
+        isLoading={false}
+      />,
+    );
+    expect(
+      screen.getByText(/Signal has changed since this explanation/),
+    ).toBeInTheDocument();
+  });
+
+  it('no mismatch banner when the flag is absent or false', () => {
+    render(
+      <AIExplanationPanel
+        data={makeData({ direction_mismatch: false })}
+        isLoading={false}
+      />,
+    );
+    expect(
+      screen.queryByText(/Signal has changed since this explanation/),
+    ).not.toBeInTheDocument();
+  });
+
+  it('staleness banner is age-based: fresh signal → no banner', () => {
+    render(
+      <AIExplanationPanel
+        data={makeData({
+          signal_direction: 'BUY',
+          signal_generated_at: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+        })}
+        isLoading={false}
+      />,
+    );
+    expect(screen.queryByText(/Based on/)).not.toBeInTheDocument();
+  });
+
+  it('staleness banner appears for a signal older than one hour', () => {
+    render(
+      <AIExplanationPanel
+        data={makeData({
+          signal_direction: 'BUY',
+          signal_generated_at: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(),
+        })}
+        isLoading={false}
+      />,
+    );
+    expect(screen.getByText(/Based on/)).toBeInTheDocument();
+  });
+});
+
+describe('AIExplanationPanel — failed state retry (WS8)', () => {
+  it('renders a retry button when a handler is provided', () => {
+    let called = 0;
+    render(
+      <AIExplanationPanel
+        data={{ ...makeData(), failed: true, suggestion_id: 'sid-1' }}
+        isLoading={false}
+        onRequestExplanation={async () => { called += 1; }}
+      />,
+    );
+    const button = screen.getByLabelText('Retry AI explanation generation');
+    act(() => { button.click(); });
+    expect(called).toBe(1);
+  });
+
+  it('no retry button without a handler', () => {
+    render(
+      <AIExplanationPanel data={{ ...makeData(), failed: true }} isLoading={false} />,
+    );
+    expect(
+      screen.queryByLabelText('Retry AI explanation generation'),
+    ).not.toBeInTheDocument();
+  });
+});

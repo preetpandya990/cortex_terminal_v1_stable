@@ -227,6 +227,20 @@ export interface ExplanationSource {
 export interface ExplanationData {
   available:        boolean;
   /**
+   * Explicit lifecycle state (WS7 contract): optional — payloads from before
+   * the contract landed derive the same states from available/failed/weak_signal.
+   */
+  status?:          'ready' | 'generating' | 'failed' | 'weak_signal';
+  /**
+   * True when the live prediction card's direction contradicts the direction
+   * this explanation was written for (backend-computed at every SSE emit —
+   * the ONE authoritative comparison point). Renders the "signal has changed"
+   * banner alongside (not replacing) the age-based staleness banner.
+   */
+  direction_mismatch?: boolean;
+  /** ISO-8601 UTC timestamp when this payload slice was last refreshed. */
+  updated_at?:      string;
+  /**
    * True when the explanation pipeline failed permanently after MAX_ATTEMPTS
    * (Gemini quota exhausted, repeated timeouts, or DLQ promotion).  The panel
    * renders a static "Analysis unavailable" state instead of an eternal skeleton.
@@ -271,8 +285,9 @@ export interface ExplanationData {
   weak_signal?: boolean;
 
   /**
-   * UUID of the backing TradeSuggestion.  Populated only when ``weak_signal === true``
-   * so the panel can construct the bypass endpoint URL without an extra lookup.
+   * UUID of the backing TradeSuggestion.  Populated on all suggestion-
+   * explanation payloads since WS7 (previously weak_signal only) — used for
+   * the bypass/retry endpoint and the backend anti-downgrade guard.
    */
   suggestion_id?: string;
 

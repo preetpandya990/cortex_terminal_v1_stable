@@ -556,6 +556,53 @@ class Settings(BaseSettings):
     # ── Intelligence Layer — RAG ───────────────────────────────────────────────
     RAG_TOP_K: int = Field(5, ge=1, le=20)
     RAG_WINDOW_HOURS: int = Field(24, ge=1, le=168)
+    # Ingest quality floor — tag, not reject: bodies shorter than this are still
+    # stored and embedded (preserves recall for short-but-real disclosures, e.g.
+    # one-line filing notices) but carry metadata.low_confidence_source=true so
+    # retrieval ranking can demote them.
+    RAG_MIN_CONTENT_CHARS: int = Field(200, ge=0, le=2000)
+    # Time bound for the sentiment service's in-process L1 cache. Matches the
+    # 900s L2 Redis TTL — without it, LRU-only eviction let a stale aggregate
+    # persist in a long-lived worker process far past the intended 15 minutes.
+    SENTIMENT_L1_TTL_SECS: int = Field(900, ge=60, le=3600)
+
+    # ── Forecast demand gating (WS6) ───────────────────────────────────────────
+    # When True, background news-forecast enqueues fire only for symbols in
+    # the in-demand set (watchlist ∪ active suggestions) — unwatched symbols
+    # get the fallback shape and their AI weight renormalizes to scanner/ML
+    # (F.A). MUST stay False until the WS5 consensus changes are deployed and
+    # verified: gated symbols rely on that renormalization.
+    FORECAST_DEMAND_GATING: bool = False
+    # Freshness window for the lazily rebuilt Redis demand-symbol set.
+    DEMAND_SYMBOLS_TTL_SECS: int = Field(60, ge=10, le=600)
+    # Producer-side dedup TTL for forecast batch enqueues. Aligned with the
+    # consumer's _STALE_AFTER_SECS (3600): under demand-driven dispatch the
+    # queue may sit undrained for hours, and the old hardcoded 600s let the
+    # same unchanged (symbol, news-set) republish every ~10 minutes for the
+    # rest of the trading day — pure duplicate Gemini spend once flushed.
+    FORECAST_ENQUEUE_DEDUP_TTL_SECS: int = Field(3600, ge=60, le=86_400)
+
+    # ── On-demand explanation generation (WS7) ─────────────────────────────────
+    # When True, explanations generate at FIRST VIEW (SSE/REST lookup publishes
+    # a demand job; ~5-20s generating state, then cached) instead of being
+    # auto-published by the correlation engine at suggestion creation. Gates
+    # exactly two producers: the engine auto-publish and the watchlist context
+    # pre-warming scheduler. Never gates the user bypass endpoint or the
+    # worker's retry/DLQ requeue paths. Legacy auto-publish is the rollback
+    # lever — flip this back to False to restore it.
+    EXPLANATION_ON_DEMAND: bool = False
+    # Demand-context prompt budget: full article bodies included in the prompt.
+    EXPLANATION_MAX_ARTICLES: int = Field(3, ge=1, le=10)
+    EXPLANATION_ARTICLE_MAX_CHARS: int = Field(4000, ge=500, le=20_000)
+
+    # ── LLM-assessment retraining feedback (WS10/C.B2) ─────────────────────────
+    # When True, compute_sample_weight multiplies in the assessment factor
+    # from trade_suggestions.llm_ml_assessment (contradicts+wrong-direction
+    # x1.3, overconfident+hard-negative x1.2; final clip unchanged at
+    # 0.1-5.0). MUST stay False until the offline retrain comparison
+    # (scripts/compare_feedback_assessment.py + a full run_eval.py pass)
+    # shows non-regression. Flag-off is bit-identical to pre-WS10 weights.
+    FEEDBACK_LLM_ASSESSMENT_ENABLED: bool = False
     # 96 texts/call: 3× throughput vs. default 32, stays within gemini-embedding-001
     # input limits. Reduces embed API calls proportionally for the same corpus size.
     RAG_EMBED_BATCH_SIZE: int = Field(96, ge=1, le=128)

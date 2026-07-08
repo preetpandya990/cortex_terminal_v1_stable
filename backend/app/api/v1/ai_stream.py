@@ -7,15 +7,22 @@ LLM explanation updates to connected frontend clients.
 Endpoint:
   GET /api/v1/ai/stream?instrument_key=...&token=<jwt>
 
-Why query-param auth:
-  Browser's EventSource API does not support custom request headers.
-  The JWT is passed as a query parameter and validated server-side before
-  any data is streamed. The Next.js proxy (frontend/src/app/api/v1/ai/stream)
-  converts the Authorization header from the frontend into the query param.
+Why query-param auth (documented deviation from the WS token model):
+  Browser's EventSource API does not support custom request headers, so the
+  frontend places the JWT directly in the query string
+  (AnalysisCardsSection sets `token=` on the EventSource URL — there is no
+  header-converting proxy). The token is validated ONCE at connect; the
+  stream can outlive token expiry, and unlike the WebSocket path there is no
+  in-band reauth (EventSource cannot send frames). Accepted for this
+  read-only analysis stream; the frontend keeps a live token ref so any
+  RECONNECT always presents a fresh token. Operational note: query tokens
+  can appear in access logs — keep such logs access-controlled.
 
 Event types:
   - "analysis_update" : combined prediction + pattern + sentiment + explanation payload
-  - "error"           : transient error info (client should keep connection)
+  - "analysis_error"  : per-component degradation {component, message, stale};
+                        last good data is retained — client shows a delayed
+                        chip and re-arms its own polling for that component
   - heartbeat         : ":ping" comment emitted by sse-starlette every _HEARTBEAT_SECS
 
 analysis_update payload shape:
@@ -105,6 +112,10 @@ from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 from app.ai.fusion.models import AIInstrumentContext
 from app.api.v1.ml_predictions import serialize_prediction_card
 from app.core.database import AsyncSessionLocal
+from app.ai.intelligence.explanation_service import (
+    ensure_explanation,
+    publish_explanation_job,
+)
 from app.core.kafka import KafkaTopics, publish as kafka_publish
 from app.core.metrics import llm_sse_explanation_pushes_total
 from app.core.redis import RedisChannels, RedisStreams, get_redis
@@ -160,6 +171,36 @@ _TIMEOUT_RECOVERY_SECS = 10
 
 # ── Shared stream state ─────────────────────────────────────────────────────────
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _direction_mismatch(
+    prediction: dict[str, Any] | None,
+    explanation: dict[str, Any] | None,
+) -> bool:
+    """True when the live prediction direction contradicts the direction the
+    delivered suggestion explanation was written for (Proposal B).
+
+    The ONE authoritative comparison point — computed at emit time so every
+    consumer (panel, admin cards) reads the same verdict instead of each
+    reimplementing "what counts as a mismatch". Only meaningful for delivered
+    suggestion explanations with both directions present; HOLD predictions
+    are not a contradiction (no directional claim).
+    """
+    if not prediction or not explanation:
+        return False
+    if not explanation.get("available"):
+        return False
+    if explanation.get("context_type") != "suggestion_explanation":
+        return False
+    pred_dir = str(prediction.get("direction") or "").upper()
+    expl_dir = str(explanation.get("signal_direction") or "").upper()
+    if pred_dir not in ("BUY", "SELL") or expl_dir not in ("BUY", "SELL"):
+        return False
+    return pred_dir != expl_dir
+
+
 @dataclass
 class _StreamState:
     """Latest payload for each analysis component, shared across producer tasks.
@@ -174,43 +215,85 @@ class _StreamState:
     explanation: dict[str, Any] | None = None
 
     def render(self, instrument_key: str) -> dict[str, Any]:
+        explanation = self.explanation
+        if explanation is not None:
+            # Recomputed at every emit: either producer refreshing flips it
+            # without the other having to know (the old design let a delivered
+            # BUY narrative sit silently beside a refreshed SELL prediction).
+            explanation = {
+                **explanation,
+                "direction_mismatch": _direction_mismatch(self.prediction, explanation),
+            }
         return {
             "prediction":     self.prediction,
             "pattern":        self.pattern,
             "sentiment":      self.sentiment,
-            "explanation":    self.explanation,
+            "explanation":    explanation,
             "instrument_key": instrument_key,
-            "emitted_at":     datetime.now(timezone.utc).isoformat(),
+            "emitted_at":     _now_iso(),
         }
 
 
-def _should_apply_polled_explanation(
+def _should_apply_explanation(
     current: dict[str, Any] | None,
-    polled: dict[str, Any] | None,
+    incoming: dict[str, Any] | None,
 ) -> bool:
-    """Decide whether a poll-path explanation should replace the current one.
+    """Decide whether an incoming explanation should replace the current one.
 
-    A periodic poll must never downgrade a richer real-time state.  Three cases
-    where a poll is suppressed:
+    Shared by the POLL path and BOTH PUSH branches (WS8) — the push path used
+    to write unconditionally, so a delayed retry for a superseded suggestion
+    could silently overwrite a fresher, correct explanation.
+
+    Suppression rules:
       1. Payload is identical — no-op.
-      2. Poll is a pending skeleton (available=False, failed=False) and we already
-         hold a delivered explanation (available=True) or streaming state.
-      3. Poll is a pending skeleton and we already hold a confirmed failed state
-         (failed=True) — the DLQ already decided; a skeleton would hide the error.
+      2. Incoming is a pending skeleton (available=False, failed=False) and we
+         already hold a delivered explanation, streaming state, or a confirmed
+         failed state (the DLQ already decided; a skeleton would hide it).
+      3. Incoming is a weak_signal placeholder and we already hold a delivered
+         or streaming explanation (bypass-path completion beat the next poll).
+      4. Anti-downgrade across suggestions: an incoming payload belonging to an
+         OLDER suggestion (signal_generated_at ordering — ISO-8601 strings
+         compare correctly) never overwrites a delivered explanation for a
+         newer one, regardless of which finished generating last.
+      5. A failed push for a DIFFERENT suggestion never clobbers a delivered
+         explanation — suggestion A's DLQ verdict is not suggestion B's.
     """
-    if current == polled:
+    if current == incoming:
         return False
-    if polled is not None and not polled.get("available") and not polled.get("failed"):
-        if current is not None and (
-            current.get("available") or current.get("streaming") or current.get("failed")
+    if incoming is None:
+        return False
+    if current is None:
+        return True
+
+    current_delivered = bool(current.get("available") or current.get("streaming"))
+
+    if not incoming.get("available") and not incoming.get("failed"):
+        if current_delivered or current.get("failed"):
+            return False
+
+    if incoming.get("weak_signal") and current_delivered:
+        return False
+
+    if current_delivered:
+        # Type precedence (mirrors the Stage-1 lookup order): an instrument-
+        # context payload never replaces a delivered suggestion explanation.
+        if (
+            incoming.get("context_type") == "instrument_context"
+            and current.get("context_type") == "suggestion_explanation"
         ):
             return False
-    # A weak_signal poll must not overwrite a successfully delivered explanation
-    # pushed via the bypass path (user clicked "Request AI Explanation" and the
-    # worker completed before the next poll cycle).
-    if polled is not None and polled.get("weak_signal") and current is not None:
-        if current.get("available") or current.get("streaming"):
+
+        cur_signal_at = current.get("signal_generated_at")
+        inc_signal_at = incoming.get("signal_generated_at")
+        if cur_signal_at and inc_signal_at and inc_signal_at < cur_signal_at:
             return False
+
+        if incoming.get("failed"):
+            cur_id = current.get("suggestion_id")
+            inc_id = incoming.get("suggestion_id")
+            if cur_id and inc_id and cur_id != inc_id:
+                return False
+
     return True
 
 
@@ -231,8 +314,14 @@ def _build_explanation_payload(
     staleness banner ("Based on BUY signal · 6h ago") when the suggestion is
     not currently active.
     """
+    available = suggestion.llm_summary is not None
     return {
-        "available":          suggestion.llm_summary is not None,
+        "available":          available,
+        # WS7 contract: status ∈ ready|generating|failed|weak_signal.
+        # generated_at doubles as the explanation's creation timestamp for
+        # the WS8 anti-downgrade guard (suggestion_id + generated_at).
+        "status":             "ready" if available else "generating",
+        "suggestion_id":      str(suggestion.suggestion_id),
         "summary":            suggestion.llm_summary,
         "full_explanation":   suggestion.llm_explanation,
         "model":              suggestion.explanation_model,
@@ -262,8 +351,10 @@ def _build_context_payload(
     is available.  ``context_type = 'instrument_context'`` tells the frontend
     to render market context copy rather than signal-specific explanation copy.
     """
+    available = context.context_summary is not None
     return {
-        "available":          context.context_summary is not None,
+        "available":          available,
+        "status":             "ready" if available else "generating",
         "summary":            context.context_summary,
         "full_explanation":   context.context_full,
         "model":              context.model_used,
@@ -291,6 +382,7 @@ def _build_weak_signal_payload(suggestion: TradeSuggestion) -> dict[str, Any]:
         "available":           False,
         "failed":              False,
         "weak_signal":         True,
+        "status":              "weak_signal",
         "suggestion_id":       str(suggestion.suggestion_id),
         "consensus_score":     float(suggestion.consensus_score),
         "summary":             None,
@@ -369,16 +461,15 @@ async def _fetch_explanation_for_instrument(
             has_explanation = suggestion.llm_summary is not None
             is_active       = suggestion.status == "active"
             if has_explanation or is_active:
-                # Weak-signal gate: suggestion is active but the correlation engine
-                # intentionally skipped enqueueing an explanation job because
-                # consensus_score < EXPLANATION_CONSENSUS_THRESHOLD.  The worker
-                # will never generate one — return the weak-signal placeholder so
-                # the panel shows the "Request AI Explanation" button instead of
-                # an eternal generating skeleton.
-                if is_active and not has_explanation:
-                    from app.core.config import get_settings as _cfg
-                    if float(suggestion.consensus_score) < _cfg().EXPLANATION_CONSENSUS_THRESHOLD:
-                        return _build_weak_signal_payload(suggestion)
+                # Delegate the "what happens next?" decision to the
+                # explanation service — the single authority shared with the
+                # REST endpoint and the bypass endpoint (WS7). In legacy mode
+                # it classifies (ready/generating/weak_signal); in on-demand
+                # mode the FIRST viewer's lookup publishes the demand job.
+                state = await ensure_explanation(redis, suggestion)
+
+                if state["status"] == "weak_signal":
+                    return _build_weak_signal_payload(suggestion)
 
                 # Prefer the SSE event store payload: it includes RAG source citations
                 # that are not stored in the trade_suggestions table (Gap 5 fix).
@@ -390,10 +481,23 @@ async def _fetch_explanation_for_instrument(
                         entries = await redis.xrevrange(ess_key, max="+", min="-", count=1)
                         if entries:
                             _, fields = entries[0]
-                            return json.loads(fields["data"])
+                            stored = json.loads(fields["data"])
+                            # Older event-store entries predate the WS7
+                            # contract keys — backfill without overriding.
+                            stored.setdefault("status", "ready")
+                            stored.setdefault(
+                                "suggestion_id", str(suggestion.suggestion_id)
+                            )
+                            return stored
                     except Exception:
                         pass  # fall through to DB payload
-                return _build_explanation_payload(suggestion)
+                payload = _build_explanation_payload(suggestion)
+                # ensure_explanation is authoritative for the pending state
+                # (it knows whether the enqueue actually succeeded).
+                payload["status"] = state["status"]
+                if state["status"] == "failed":
+                    payload["failed"] = True
+                return payload
             # Non-active + no explanation → fall through to Stage 2/3
             logger.debug(
                 "SSE stage-1 skip: instrument=%s suggestion=%s status=%s "
@@ -506,10 +610,12 @@ async def _fetch_explanation_for_instrument(
 
     **Events**:
     - `analysis_update`: Full combined payload (prediction + pattern + sentiment + explanation)
-    - `error`: Non-fatal error notification
+    - `analysis_error`: Per-component degradation notice (last good data retained)
     - heartbeat: `:ping` comment every 15 seconds
 
-    **Reconnection**: Browser will auto-reconnect after 5 seconds on disconnect.
+    **Reconnection**: The frontend manages reconnects itself (exponential
+    backoff with a fresh token ref) — it does NOT rely on native EventSource
+    auto-reconnect. The `retry:` hint remains for generic SSE clients.
     """,
     responses={
         200: {"description": "SSE stream established", "content": {"text/event-stream": {}}},
@@ -587,9 +693,19 @@ async def analysis_stream(
             ))
 
         def _emit_error(component: str, message: str) -> None:
+            """Per-component degradation signal (WS8): named "analysis_error"
+            with an explicit stale flag — the last good data is retained and
+            re-broadcast, so the frontend shows a "live data delayed" chip on
+            THAT card and re-arms its own polling fallback, instead of the old
+            generic "error" event its listener no-op'd."""
             _enqueue(ServerSentEvent(
-                data=json.dumps({"type": "error", "component": component, "message": message}),
-                event="error",
+                data=json.dumps({
+                    "type":      "error",
+                    "component": component,
+                    "message":   message,
+                    "stale":     getattr(state, component, None) is not None,
+                }),
+                event="analysis_error",
             ))
 
         # ── Per-component refreshers ───────────────────────────────────────
@@ -623,17 +739,32 @@ async def analysis_stream(
                     timeframe="1d",
                     use_cache=True,
                 )
-                state.prediction = serialize_prediction_card(raw_pred, timeframe="1d")
+                # Stamp the refresh time (WS7 §3): the snapshot can be up to
+                # _PREDICTION_REFRESH_SECS old when a context job is built
+                # from it — the prompt renders "as of <t>" so the LLM (and
+                # audit) know the read's actual age. Additive payload key.
+                state.prediction = {
+                    **serialize_prediction_card(raw_pred, timeframe="1d"),
+                    "prediction_generated_at": _now_iso(),
+                    "updated_at": _now_iso(),
+                }
             except ValueError:
-                state.prediction = {"available": False, "unavailable_reason": "insufficient_data"}
+                state.prediction = {
+                    "available": False,
+                    "unavailable_reason": "insufficient_data",
+                    "updated_at": _now_iso(),
+                }
             _emit_update()
 
         async def _refresh_pattern() -> None:
             async with AsyncSessionLocal() as db:
                 pattern_service = PatternDetectionService(db=db, redis=redis)
-                state.pattern = await pattern_service.detect_strongest_signal(
+                pattern = await pattern_service.detect_strongest_signal(
                     instrument_key=instrument_key,
                 )
+            state.pattern = (
+                {**pattern, "updated_at": _now_iso()} if pattern is not None else None
+            )
             _emit_update()
 
         async def _refresh_sentiment() -> None:
@@ -644,7 +775,7 @@ async def analysis_stream(
                     symbol=symbol,
                     lookback_hours=lookback_hours,
                 )
-            state.sentiment = result.model_dump()
+            state.sentiment = {**result.model_dump(), "updated_at": _now_iso()}
             _emit_update()
 
         async def _refresh_explanation() -> None:
@@ -656,8 +787,8 @@ async def analysis_stream(
                     redis,
                     prediction_snapshot=state.prediction,
                 )
-            if _should_apply_polled_explanation(state.explanation, fetched):
-                state.explanation = fetched
+            if _should_apply_explanation(state.explanation, fetched):
+                state.explanation = {**fetched, "updated_at": _now_iso()}
                 llm_sse_explanation_pushes_total.labels(path="poll").inc()
                 _emit_update()
 
@@ -726,9 +857,11 @@ async def analysis_stream(
 
                 # Handle DLQ failed state — explanation_worker gave up after MAX_ATTEMPTS
                 if push.get("failed"):
-                    state.explanation = {
+                    failed_payload = {
                         "available":           False,
                         "failed":              True,
+                        "status":              "failed",
+                        "suggestion_id":       suggestion_id,
                         "summary":             None,
                         "full_explanation":    None,
                         "model":               None,
@@ -738,12 +871,14 @@ async def analysis_stream(
                         "signal_direction":    None,
                         "signal_generated_at": None,
                     }
-                    llm_sse_explanation_pushes_total.labels(path="push_failed").inc()
-                    logger.info(
-                        "SSE push: explanation failed state instrument=%s suggestion=%s",
-                        instrument_key, suggestion_id,
-                    )
-                    _emit_update()
+                    if _should_apply_explanation(state.explanation, failed_payload):
+                        state.explanation = {**failed_payload, "updated_at": _now_iso()}
+                        llm_sse_explanation_pushes_total.labels(path="push_failed").inc()
+                        logger.info(
+                            "SSE push: explanation failed state instrument=%s suggestion=%s",
+                            instrument_key, suggestion_id,
+                        )
+                        _emit_update()
                     return
 
                 # Read full payload from the per-suggestion SSE event store
@@ -777,7 +912,16 @@ async def analysis_stream(
                     )
                     return
 
-                state.explanation = payload
+                # Anti-downgrade guard (WS8): a delayed retry for a superseded
+                # suggestion must not overwrite a fresher explanation.
+                if not _should_apply_explanation(state.explanation, payload):
+                    logger.info(
+                        "SSE push: suppressed stale explanation push "
+                        "instrument=%s suggestion=%s",
+                        instrument_key, suggestion_id,
+                    )
+                    return
+                state.explanation = {**payload, "updated_at": _now_iso()}
                 llm_sse_explanation_pushes_total.labels(path="push").inc()
                 logger.info(
                     "SSE push: suggestion explanation ready instrument=%s suggestion=%s",
@@ -819,7 +963,16 @@ async def analysis_stream(
                     )
                     return
 
-                state.explanation = payload
+                # Same guard on the CONTEXT branch (WS8 — the original fix
+                # covered only the suggestion branch): a late context push
+                # must not clobber a richer suggestion explanation.
+                if not _should_apply_explanation(state.explanation, payload):
+                    logger.info(
+                        "SSE push: suppressed stale context push instrument=%s",
+                        instrument_key,
+                    )
+                    return
+                state.explanation = {**payload, "updated_at": _now_iso()}
                 llm_sse_explanation_pushes_total.labels(path="push_context").inc()
                 logger.info(
                     "SSE push: instrument context ready instrument=%s",
@@ -900,6 +1053,7 @@ async def analysis_stream(
             )),
             asyncio.create_task(_refresher(
                 "explanation", _EXPLANATION_REFRESH_SECS, _refresh_explanation,
+                error_component="explanation",
             )),
         ]
 
@@ -1169,14 +1323,9 @@ async def request_explanation(
         )
 
     try:
-        await kafka_publish(
-            KafkaTopics.EXPLANATION_JOBS,
-            {
-                "suggestion_id":  suggestion_id,
-                "id":             str(suggestion.id),
-                "instrument_key": suggestion.instrument_key,
-            },
-            key=suggestion_id,
+        await publish_explanation_job(
+            suggestion_id, suggestion.id, suggestion.instrument_key,
+            trigger="bypass",
         )
         logger.info(
             "on-demand bypass enqueued: suggestion=%s instrument=%s",

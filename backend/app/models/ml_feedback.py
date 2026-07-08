@@ -46,8 +46,12 @@ class MLFeedbackError(Base):
     __tablename__ = "ml_feedback_errors"
 
     __table_args__ = (
+        # Sanity floor only. The retry ceiling is a runtime policy owned by
+        # app.core.retry._MAX_ATTEMPTS — hardcoding it here (as the original
+        # BETWEEN 1 AND 5 did) turns a routine retry-policy retune into a DB
+        # CheckViolation inside the audit trail itself. See migration 0050.
         CheckConstraint(
-            "attempt_count BETWEEN 1 AND 5",
+            "attempt_count >= 1",
             name="ck_ml_feedback_errors_attempt_count",
         ),
     )

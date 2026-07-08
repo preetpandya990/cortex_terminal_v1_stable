@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.ai.fusion.forecast_batch_worker import (
+    DrainResult,
     ForecastQueueConsumer,
     flush_pending_forecasts,
     forecast_batch_loop,
@@ -59,13 +60,17 @@ class _FakeQueueConsumer:
     async def ensure_started(self):
         return self._consumer
 
-    async def drain(self, max_items: int, timeout_ms: int) -> list[dict]:
+    async def drain(self, max_items: int, timeout_ms: int) -> DrainResult:
         self.drain_count += 1
         if not self._batches:
-            return []
+            return DrainResult(items=[], raw_count=0, stale_dropped=0)
         batch = self._batches.pop(0)
         self._pos += len(batch)
-        return batch
+        # Mirror the real drain(): position advances by the RAW read; payloads
+        # marked stale (test convention: {"_stale": True}) are filtered out.
+        items = [p for p in batch if not p.get("_stale")]
+        stale = len(batch) - len(items)
+        return DrainResult(items=items, raw_count=len(batch), stale_dropped=stale)
 
     async def commit(self) -> None:
         self.commit_count += 1
@@ -119,7 +124,7 @@ async def test_flush_pending_forecasts_drains_fully(mock_settings, mock_session_
             ) as mock_flush:
                 result = await flush_pending_forecasts(redis, mock_session_factory)
 
-    assert result == {"dispatched": 2, "calls_made": 1}
+    assert result == {"dispatched": 2, "calls_made": 1, "stale_dropped": 0}
     mock_flush.assert_awaited_once()
     assert fake.commit_count == 1
     assert fake.rewind_count == 0
@@ -160,7 +165,37 @@ async def test_flush_pending_forecasts_empty_queue(mock_settings, mock_session_f
         with patch("app.ai.fusion.forecast_batch_worker._queue_consumer", fake):
             result = await flush_pending_forecasts(redis, mock_session_factory)
 
-    assert result == {"dispatched": 0, "calls_made": 0}
+    assert result == {"dispatched": 0, "calls_made": 0, "stale_dropped": 0}
+
+
+@pytest.mark.asyncio
+async def test_flush_drains_past_stale_run(mock_settings, mock_session_factory):
+    """
+    The WS6 under-drain fix: a contiguous run of stale payloads at the head
+    of the topic must not stop the drain — fresher valid requests behind it
+    are still dispatched, and the response reports what was dropped.
+    (The old `if not items → break` returned {"dispatched": 0} here.)
+    """
+    stale = [{**_payload(f"S{i}"), "_stale": True} for i in range(10)]
+    fresh = [_payload("TCS"), _payload("INFY"), _payload("RELIANCE"),
+             _payload("HDFC"), _payload("WIPRO")]
+    # Two all-stale reads, then the fresh group.
+    fake = _FakeQueueConsumer([stale[:5], stale[5:], fresh])
+    redis = AsyncMock()
+
+    with patch("app.ai.fusion.forecast_batch_worker.get_settings", return_value=mock_settings):
+        with patch("app.ai.fusion.forecast_batch_worker._queue_consumer", fake):
+            with patch(
+                "app.ai.fusion.forecast_batch_worker._flush_batch",
+                new=AsyncMock(return_value={"outcome": "success", "valid_count": 5, "total": 5}),
+            ) as mock_flush:
+                result = await flush_pending_forecasts(redis, mock_session_factory)
+
+    assert result == {"dispatched": 5, "calls_made": 1, "stale_dropped": 10}
+    mock_flush.assert_awaited_once()
+    # Commits: one per all-stale read (passing over them) + one for the group.
+    assert fake.commit_count == 3
+    assert fake.rewind_count == 0
 
 
 # ── forecast_batch_loop gating ─────────────────────────────────────────────────

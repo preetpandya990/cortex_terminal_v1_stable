@@ -4,12 +4,11 @@ Unit Tests for EventCorrelationEngine - Production Grade
 Comprehensive test coverage for bidirectional multi-agent consensus system.
 
 Coverage:
-- CircuitBreaker: States, thresholds, recovery
 - Consensus Logic: Weighted scoring, confidence levels
 - Directional Alignment: BUY/SELL agreement checks
 - Rejection Reasons: ML HOLD, direction mismatch, low confidence
 - Pathways: Scanner anomaly (P1), News event (P2)
-- Error Handling: Timeouts, exceptions, circuit breakers
+- Error Handling: Timeouts, exceptions
 - Performance: Latency tracking, Redis pub/sub
 
 Author: Cortex AI Team
@@ -25,7 +24,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
 from app.ai.correlation.engine import (
-    CircuitBreaker,
     EventCorrelationEngine,
     CONSENSUS_HIGH_THRESHOLD,
     CONSENSUS_MEDIUM_THRESHOLD,
@@ -111,7 +109,7 @@ def mock_signal_assembler():
         "confidence": 0.85,
         "event_count": 2,
         "available": True,
-        "source": "gemini",
+        "forecast_source": "gemini_batch",  # live forecast → votes in unanimity
         "direction": "BUY",
     })
 
@@ -172,95 +170,10 @@ def news_event():
         impact_score=Decimal("85.0"),
         classification_confidence=Decimal("0.92"),
         affected_symbols=["NSE_EQ|INE002A01018", "NSE_EQ|INE009A01021"],
+        sentiment="bullish",  # directional read — drives Pathway-2 fallback direction
         created_at=datetime.now(timezone.utc),
         decay_half_life_hours=24.0,
     )
-
-
-# ============================================================================
-# TEST CIRCUIT BREAKER
-# ============================================================================
-
-class TestCircuitBreaker:
-    """Test CircuitBreaker fault tolerance."""
-
-    def test_init_state_closed(self):
-        """Circuit breaker starts in closed state."""
-        breaker = CircuitBreaker()
-        assert breaker.state == "closed"
-        assert breaker.failure_count == 0
-        assert breaker.last_failure_time is None
-
-    def test_record_success_in_closed(self):
-        """Recording success in closed state maintains state."""
-        breaker = CircuitBreaker()
-        breaker.record_success()
-        assert breaker.state == "closed"
-        assert breaker.failure_count == 0
-
-    def test_record_failure_increments_count(self):
-        """Failures increment counter."""
-        breaker = CircuitBreaker(failure_threshold=3)
-        breaker.record_failure()
-        assert breaker.failure_count == 1
-        assert breaker.state == "closed"
-        assert breaker.last_failure_time is not None
-
-    def test_opens_after_threshold(self):
-        """Circuit opens after threshold failures."""
-        breaker = CircuitBreaker(failure_threshold=3)
-        breaker.record_failure()
-        breaker.record_failure()
-        assert breaker.state == "closed"
-        
-        breaker.record_failure()
-        assert breaker.state == "open"
-        assert breaker.failure_count == 3
-
-    def test_can_attempt_when_closed(self):
-        """Attempts allowed when closed."""
-        breaker = CircuitBreaker()
-        assert breaker.can_attempt() is True
-
-    def test_cannot_attempt_when_open(self):
-        """Attempts blocked when open."""
-        breaker = CircuitBreaker(failure_threshold=1)
-        breaker.record_failure()
-        assert breaker.state == "open"
-        assert breaker.can_attempt() is False
-
-    def test_transitions_to_half_open_after_timeout(self):
-        """Transitions to half-open after timeout."""
-        breaker = CircuitBreaker(failure_threshold=1, timeout_seconds=1)
-        breaker.record_failure()
-        assert breaker.state == "open"
-        
-        # Simulate timeout
-        breaker.last_failure_time = datetime.now(timezone.utc) - timedelta(seconds=2)
-        
-        assert breaker.can_attempt() is True
-        assert breaker.state == "half_open"
-
-    def test_half_open_closes_on_success(self):
-        """Half-open closes on success."""
-        breaker = CircuitBreaker(failure_threshold=1, timeout_seconds=1)
-        breaker.record_failure()
-        breaker.last_failure_time = datetime.now(timezone.utc) - timedelta(seconds=2)
-        breaker.can_attempt()  # Transition to half_open
-        
-        breaker.record_success()
-        assert breaker.state == "closed"
-        assert breaker.failure_count == 0
-
-    def test_half_open_reopens_on_failure(self):
-        """Half-open reopens on failure."""
-        breaker = CircuitBreaker(failure_threshold=1, timeout_seconds=1)
-        breaker.record_failure()
-        breaker.last_failure_time = datetime.now(timezone.utc) - timedelta(seconds=2)
-        breaker.can_attempt()  # Transition to half_open
-        
-        breaker.record_failure()
-        assert breaker.state == "open"
 
 
 # ============================================================================
@@ -283,8 +196,11 @@ class TestConsensusComputation:
         ml_conf = 88.0
 
         scanner_signal = {**scanner_signal_buy, "confidence": scanner_conf}
-        # available=True + event_count=2 → standard 3-weight formula (no redistribution).
-        ai_signal = {"score": 80.0, "confidence": ai_conf / 100, "available": True, "event_count": 2}
+        # Live forecast (gemini_batch + BUY) → votes; standard 3-weight formula.
+        ai_signal = {
+            "score": 80.0, "confidence": ai_conf / 100, "available": True,
+            "event_count": 2, "forecast_source": "gemini_batch", "direction": "BUY",
+        }
         ml_signal = {
             "score": 100.0,
             "confidence": ml_conf / 100,
@@ -341,8 +257,11 @@ class TestConsensusComputation:
         ml_conf = 68.0
 
         scanner_signal = {**scanner_signal_sell, "confidence": scanner_conf}
-        # Negative score → SELL; available=True + event_count=2 → standard 3-weight formula.
-        ai_signal = {"score": -60.0, "confidence": ai_conf / 100, "available": True, "event_count": 2}
+        # Live SELL forecast → votes; standard 3-weight formula.
+        ai_signal = {
+            "score": -60.0, "confidence": ai_conf / 100, "available": True,
+            "event_count": 2, "forecast_source": "gemini_batch", "direction": "SELL",
+        }
         ml_signal = {
             "score": -100.0,
             "confidence": ml_conf / 100,
@@ -433,8 +352,11 @@ class TestRejectionReasons:
         scanner_signal_buy,
     ):
         """Direction mismatch → rejection."""
-        # Scanner: BUY, AI: SELL, ML: BUY
-        ai_signal = {"score": -70.0, "confidence": 0.85}  # SELL
+        # Scanner: BUY, AI: SELL (live forecast — votes), ML: BUY
+        ai_signal = {
+            "score": -70.0, "confidence": 0.85,
+            "forecast_source": "gemini_batch", "direction": "SELL",
+        }
         ml_signal = {
             "score": 100.0,
             "confidence": 0.88,
@@ -471,8 +393,11 @@ class TestRejectionReasons:
         ml_conf = 52.0
 
         scanner_signal = {**scanner_signal_buy, "confidence": scanner_conf}
-        # available=True + event_count=2 → standard 3-weight formula (no redistribution).
-        ai_signal = {"score": 60.0, "confidence": ai_conf / 100, "available": True, "event_count": 2}
+        # Live BUY forecast → votes; standard 3-weight formula.
+        ai_signal = {
+            "score": 60.0, "confidence": ai_conf / 100, "available": True,
+            "event_count": 2, "forecast_source": "gemini_batch", "direction": "BUY",
+        }
         ml_signal = {
             "score": 100.0,
             "confidence": ml_conf / 100,
@@ -508,6 +433,223 @@ class TestRejectionReasons:
         assert "LOW_CONFIDENCE" in correlation.rejection_reason
         # Verify the rejection reason contains the actual computed score (2 d.p.)
         assert str(expected_score)[:4] in correlation.rejection_reason
+
+
+# ============================================================================
+# TEST WS5 SEMANTICS — F.A renormalization, F.B abstain vote, pathway-2
+# direction from persisted sentiment, F.C regime weight override
+# ============================================================================
+
+class TestWS5ConsensusSemantics:
+    """Pending/fallback AI abstains + renormalizes; regime conditions weights."""
+
+    def _ml_buy(self, conf: float = 0.90) -> dict:
+        return {
+            "score": 100.0,
+            "confidence": conf,
+            "prediction": {
+                "direction": "BUY",
+                "entry_price": 1500.0,
+                "stop_loss": 1450.0,
+                "targets": [1600.0],
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_pending_ai_abstains_and_renormalizes_no_news_pathway_alive(
+        self, correlation_engine, mock_db, scanner_signal_buy,
+    ):
+        """
+        THE load-bearing F.A/F.B case: a batch_pending fallback shape must not
+        vote (old code force-aligned it) and must not zero-drag the score —
+        scanner+ML agreement alone still creates a suggestion.
+        """
+        scanner_conf = 85.0
+        ml_conf = 0.88
+        scanner_signal = {**scanner_signal_buy, "confidence": scanner_conf}
+        # Exact batch_pending shape from signal_assembler._fallback().
+        ai_signal = {
+            "score": 0.0, "confidence": 0.0, "event_count": 0, "events": [],
+            "available": True,  # the old gate wrongly trusted this
+            "forecast_source": "fallback", "fallback_reason": "batch_pending",
+        }
+
+        suggestion = await correlation_engine._compute_consensus(
+            db=mock_db,
+            correlation_id=uuid4(),
+            trigger_type="SCANNER_ANOMALY",
+            trigger_timestamp=datetime.now(timezone.utc),
+            scanner_signal=scanner_signal,
+            ai_signal=ai_signal,
+            ml_signal=self._ml_buy(ml_conf),
+            latencies={"scanner_ms": 10, "ai_ms": 50, "ml_ms": 40, "total_ms": 100},
+        )
+
+        assert suggestion is not None, "no-news scanner+ML pathway must keep working"
+        assert suggestion.signal_direction == "BUY"
+        # Renormalized 50/50 over scanner and ML; AI contributes nothing.
+        _vol_conf = min(scanner_signal["volume_ratio"], 10.0) / 10.0 * 100.0
+        blended_scanner = min(scanner_conf * 0.70 + _vol_conf * 0.30, 100.0)
+        expected = 0.5 * blended_scanner + 0.5 * (ml_conf * 100)
+        assert float(suggestion.consensus_score) == pytest.approx(expected, rel=0.01)
+
+    @pytest.mark.asyncio
+    async def test_genuine_hold_forecast_abstains_not_vetoes(
+        self, correlation_engine, mock_db, scanner_signal_buy,
+    ):
+        """A live forecast that genuinely says HOLD abstains — no veto, no drag."""
+        ai_signal = {
+            "score": 0.0, "confidence": 0.55, "event_count": 3, "available": True,
+            "forecast_source": "gemini_batch", "direction": "HOLD",
+        }
+
+        suggestion = await correlation_engine._compute_consensus(
+            db=mock_db,
+            correlation_id=uuid4(),
+            trigger_type="SCANNER_ANOMALY",
+            trigger_timestamp=datetime.now(timezone.utc),
+            scanner_signal={**scanner_signal_buy, "confidence": 85.0},
+            ai_signal=ai_signal,
+            ml_signal=self._ml_buy(),
+            latencies={"scanner_ms": 10, "ai_ms": 50, "ml_ms": 40, "total_ms": 100},
+        )
+
+        assert suggestion is not None
+
+    @pytest.mark.asyncio
+    async def test_live_conflicting_forecast_still_vetoes(
+        self, correlation_engine, mock_db, scanner_signal_buy,
+    ):
+        """Abstention is only for non-genuine directions — a real SELL vetoes BUY."""
+        ai_signal = {
+            "score": -80.0, "confidence": 0.9, "event_count": 3, "available": True,
+            "forecast_source": "gemini_batch", "direction": "SELL",
+        }
+
+        suggestion = await correlation_engine._compute_consensus(
+            db=mock_db,
+            correlation_id=uuid4(),
+            trigger_type="SCANNER_ANOMALY",
+            trigger_timestamp=datetime.now(timezone.utc),
+            scanner_signal=scanner_signal_buy,
+            ai_signal=ai_signal,
+            ml_signal=self._ml_buy(),
+            latencies={"scanner_ms": 10, "ai_ms": 50, "ml_ms": 40, "total_ms": 100},
+        )
+
+        assert suggestion is None
+        correlation = mock_db.add.call_args[0][0]
+        assert "DIRECTION_MISMATCH" in correlation.rejection_reason
+
+    @pytest.mark.asyncio
+    async def test_high_volatility_regime_overrides_weights(
+        self, correlation_engine, mock_db, scanner_signal_buy,
+    ):
+        """F.C: high_volatility regime shifts weight from scanner to ML."""
+        scanner_conf = 85.0
+        ai_conf = 0.90
+        ml_conf = 0.88
+        scanner_signal = {**scanner_signal_buy, "confidence": scanner_conf}
+        ai_signal = {
+            "score": 80.0, "confidence": ai_conf, "event_count": 2, "available": True,
+            "forecast_source": "gemini_batch", "direction": "BUY",
+        }
+
+        with patch(
+            "app.ai.correlation.engine.RegimeService.get_instrument_regime",
+            new=AsyncMock(return_value={"regime": "high_volatility", "confidence": 0.8}),
+        ):
+            suggestion = await correlation_engine._compute_consensus(
+                db=mock_db,
+                correlation_id=uuid4(),
+                trigger_type="SCANNER_ANOMALY",
+                trigger_timestamp=datetime.now(timezone.utc),
+                scanner_signal=scanner_signal,
+                ai_signal=ai_signal,
+                ml_signal=self._ml_buy(ml_conf),
+                latencies={"scanner_ms": 10, "ai_ms": 50, "ml_ms": 40, "total_ms": 100},
+            )
+
+        assert suggestion is not None
+        assert suggestion.regime_type == "high_volatility"
+        _vol_conf = min(scanner_signal["volume_ratio"], 10.0) / 10.0 * 100.0
+        blended_scanner = min(scanner_conf * 0.70 + _vol_conf * 0.30, 100.0)
+        expected = 0.25 * blended_scanner + 0.30 * (ai_conf * 100) + 0.45 * (ml_conf * 100)
+        assert float(suggestion.consensus_score) == pytest.approx(expected, rel=0.01)
+
+    @pytest.mark.asyncio
+    async def test_regime_failure_degrades_to_defaults(
+        self, correlation_engine, mock_db, scanner_signal_buy,
+    ):
+        """Regime lookup failure must never block consensus."""
+        ai_signal = {
+            "score": 80.0, "confidence": 0.90, "event_count": 2, "available": True,
+            "forecast_source": "gemini_batch", "direction": "BUY",
+        }
+
+        with patch(
+            "app.ai.correlation.engine.RegimeService.get_instrument_regime",
+            new=AsyncMock(side_effect=RuntimeError("ohlcv unavailable")),
+        ):
+            suggestion = await correlation_engine._compute_consensus(
+                db=mock_db,
+                correlation_id=uuid4(),
+                trigger_type="SCANNER_ANOMALY",
+                trigger_timestamp=datetime.now(timezone.utc),
+                scanner_signal={**scanner_signal_buy, "confidence": 85.0},
+                ai_signal=ai_signal,
+                ml_signal=self._ml_buy(),
+                latencies={"scanner_ms": 10, "ai_ms": 50, "ml_ms": 40, "total_ms": 100},
+            )
+
+        assert suggestion is not None
+        assert suggestion.regime_type == "unknown"
+
+
+class TestPathway2FallbackDirection:
+    """Pathway-2 synthetic scanner direction comes from persisted sentiment."""
+
+    def _event(self, sentiment: str | None) -> AIEventClassification:
+        return AIEventClassification(
+            id=7,
+            event_type="regulatory",
+            impact_score=Decimal("85.0"),  # unsigned severity — must NOT drive direction
+            classification_confidence=Decimal("0.9"),
+            affected_symbols=["XYZ"],
+            sentiment=sentiment,
+            created_at=datetime.now(timezone.utc),
+        )
+
+    @pytest.mark.asyncio
+    async def test_bearish_event_yields_sell(self, correlation_engine):
+        """The old impact>0 derivation returned BUY for this exact case."""
+        correlation_engine.scanner_cache = None
+        signal = await correlation_engine._resolve_scanner_signal_for_symbol(
+            "XYZ", self._event("bearish")
+        )
+        assert signal["direction"] == "sell"
+        assert signal["available"] is False
+
+    @pytest.mark.asyncio
+    async def test_bullish_event_yields_buy(self, correlation_engine):
+        correlation_engine.scanner_cache = None
+        signal = await correlation_engine._resolve_scanner_signal_for_symbol(
+            "XYZ", self._event("bullish")
+        )
+        assert signal["direction"] == "buy"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sentiment", [None, "neutral"])
+    async def test_neutral_or_null_yields_no_direction(
+        self, correlation_engine, sentiment,
+    ):
+        """No directional basis → neutral (consensus hard-rejects, never fabricates)."""
+        correlation_engine.scanner_cache = None
+        signal = await correlation_engine._resolve_scanner_signal_for_symbol(
+            "XYZ", self._event(sentiment)
+        )
+        assert signal["direction"] == "neutral"
+        assert signal["available"] is False
 
 
 # ============================================================================

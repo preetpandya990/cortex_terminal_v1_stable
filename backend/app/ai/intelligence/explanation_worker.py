@@ -101,7 +101,7 @@ from typing import Any
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -125,6 +125,8 @@ from app.core.kafka import (
     retry_headers,
 )
 from app.core.metrics import (
+    explanation_demand_latency_seconds,
+    explanation_ungrounded_numbers_total,
     gemini_dlq_requeue_total,
     llm_audit_log_writes_total,
     llm_explanation_dedup_total,
@@ -155,6 +157,13 @@ _LLM_CALL_TIMEOUT_SECS = 120.0
 
 # Retry pacing: retryable failures republish with not_before = now + this delay.
 _RETRY_DELAY_SECS = 60
+
+# Demand jobs (WS7): a user is staring at a generating skeleton, so fail fast —
+# fewer attempts, short delay, and rate-limit backpressure is TERMINAL (DLQ →
+# failed push → PanelFailed with a retry button) instead of a queued retry the
+# user can't see.
+_DEMAND_MAX_ATTEMPTS = 2
+_DEMAND_RETRY_DELAY_SECS = 5
 # not_before hybrid rule (see module docstring): a deadline this close is slept
 # off in the consumer; anything further is republished to the tail unchanged so
 # the consumer never risks max_poll_interval_ms (300s) group eviction.
@@ -237,17 +246,100 @@ class ExplanationOutput(BaseModel):
     )
 
 
-# ── System prompt (per CORTEX_LLM_UPGRADE_PLAN.md §8.2) ──────────────────────
+class NewsForecastOutput(BaseModel):
+    """News-conditioned forecast fields produced alongside a DEMAND explanation.
 
-_EXPLANATION_SYSTEM_PROMPT = """\
-You are a financial signal analysis tool for the Cortex algorithmic trading platform.
-You are NOT a licensed financial advisor and must not provide investment recommendations.
+    Written back to TradeSuggestion.ai_signal and the shared forecast cache in
+    the same transaction as the explanation (WS7) — closing the async-forecast
+    race: what the narrative says and what the system knows can no longer
+    diverge, and the dead ``sentiment_label`` key finally has a producer.
+    """
+    direction: str = Field(
+        description="Directional lean from the news: BUY, SELL, or HOLD."
+    )
+    sentiment_label: str = Field(
+        description="Overall news sentiment: bullish, bearish, or neutral."
+    )
+    confidence: float = Field(
+        ge=0.0, le=1.0,
+        description="Confidence in the directional lean (0.0-1.0).",
+    )
+    rationale: str = Field(
+        description="One-sentence rationale for the lean, grounded in the articles.",
+    )
 
-Your task: explain a machine-generated trade signal in plain English — what the ML
-ensemble (XGBoost + GRU) and technical scanner observed, how that evidence combined into
-a consensus, and what it implies — grounded strictly in the structured signal data and the
-retrieved news articles provided in the prompt.
 
+class MLAssessmentOutput(BaseModel):
+    """Structured, machine-consumable read on the ML call itself (WS10/C.B2).
+
+    The demand prompt includes the actual OHLCV price action, so the LLM can
+    judge whether the ML's directional call squares with what price is doing.
+    Enumerated fields (never free text) feed ``compute_sample_weight`` as an
+    additional retraining multiplier — gated behind
+    FEEDBACK_LLM_ASSESSMENT_ENABLED and an offline non-regression comparison.
+    """
+    likely_missed_pattern: str = Field(
+        description=(
+            "The single most plausible price pattern the ML may have missed, "
+            "judged ONLY from the Recent Price Action data: one of none, "
+            "trend_reversal, breakout_failure, volume_divergence, news_shock, "
+            "range_bound_chop, other."
+        ),
+    )
+    confidence_should_have_been_lower: bool = Field(
+        description=(
+            "True when the provided price action clearly warranted less "
+            "conviction than the ML's stated confidence."
+        ),
+    )
+    price_action_agreement: str = Field(
+        description=(
+            "Whether recent price action supports the ML direction: "
+            "agrees, partial, or contradicts."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _coerce_enums(self) -> "MLAssessmentOutput":
+        """Coerce out-of-vocabulary values to safe defaults instead of
+        raising — a flaky enum must never fail the whole generation (the
+        narrative rides in the same structured response)."""
+        if self.likely_missed_pattern not in _VALID_MISSED_PATTERNS:
+            self.likely_missed_pattern = "other"
+        if self.price_action_agreement not in _VALID_AGREEMENT:
+            self.price_action_agreement = "partial"
+        return self
+
+
+# Version stamp persisted alongside every assessment (LLM-as-judge practice:
+# judge-model or prompt changes shift score distributions, so weights from
+# different versions are not comparable — the offline retrain comparison must
+# be re-run whenever this bumps or the model id changes).
+_ASSESSMENT_PROMPT_VERSION = 1
+
+_VALID_MISSED_PATTERNS = frozenset({
+    "none", "trend_reversal", "breakout_failure", "volume_divergence",
+    "news_shock", "range_bound_chop", "other",
+})
+_VALID_AGREEMENT = frozenset({"agrees", "partial", "contradicts"})
+
+
+class DemandExplanationOutput(ExplanationOutput):
+    """Extended schema for demand-triggered generations (WS7): one structured
+    Gemini call returns the narrative AND the news-forecast fields together,
+    plus the ML assessment (WS10) — near-zero marginal tokens since the model
+    is already reasoning over the OHLCV summary."""
+    news_forecast: NewsForecastOutput
+    ml_assessment: MLAssessmentOutput
+
+
+# ── System prompts (per CORTEX_LLM_UPGRADE_PLAN.md §8.2) ─────────────────────
+#
+# Composed from shared blocks + per-mode task/guidance suffixes: the two
+# prompts were ~95% duplicated text, and a rule fixed in one was easily
+# missed in the other. Anything true of BOTH modes lives in a shared block.
+
+_PROMPT_STRUCTURE_BLOCK = """\
 Write full_explanation as Markdown with EXACTLY these five section headers, in order, each
 on its own line:
 ### What the models saw
@@ -259,23 +351,10 @@ on its own line:
 Be concise — 1–2 short sentences per section, ≤110 words total for full_explanation.
 No preamble, no filler, no restating the prompt; an analyst is skimming this. When a
 section has nothing substantive (e.g. no news, no per-model split), state it in one short
-line rather than padding.
+line rather than padding.\
+"""
 
-Section guidance:
-- "What the models saw": describe the ensemble direction and calibrated confidence, then
-  the per-model (XGBoost and GRU) directions, buy/sell/hold probabilities, and how each
-  model's conviction compares to its regime-adaptive threshold. Note agreement or
-  disagreement between the two models. Use ONLY the numbers given.
-- "Technical picture": summarise the scanner readings provided (e.g. RSI, volume ratio,
-  price change). If none are present, say so briefly.
-- "News context": summarise the retrieved articles and CITE each factual claim inline as
-  According to [Source Name, YYYY-MM-DD]... If no articles were provided, state that no
-  recent news context was available — never invent sources.
-- "What this suggests": a neutral synthesis of direction, confidence band and time horizon.
-  Describe; do NOT advise.
-- "Key risks": what could invalidate the setup (model disagreement, low conviction, thin
-  news corroboration, regime, etc.).
-
+_PROMPT_RULES_BLOCK = """\
 Mandatory rules:
 1. GROUND every ML/technical claim in the numbers provided; never invent figures, prices,
    model internals, events, or sources.
@@ -286,13 +365,66 @@ Mandatory rules:
    - Advisory language: "you should buy/sell", "recommend buying", "buy now"
 4. DISCLAIMER: The system automatically appends the required regulatory disclaimer.
    Do NOT add your own disclaimer — it would duplicate the injected one.
-5. Output JSON only: {"summary": "...", "full_explanation": "...", "sources_used": [...]}
+5. Output JSON only, matching the response schema exactly.
    The summary is plain text (no headers); full_explanation contains the five sections.\
 """
 
-# ── Context system prompt ─────────────────────────────────────────────────────
+_SHARED_GUIDANCE_NEWS = """\
+- "News context": summarise the retrieved articles and CITE each factual claim inline as
+  According to [Source Name, YYYY-MM-DD]... If no articles were provided, state that no
+  recent news context was available — never invent sources.\
+"""
 
-_CONTEXT_SYSTEM_PROMPT = """\
+_EXPLANATION_SYSTEM_PROMPT = f"""\
+You are a financial signal analysis tool for the Cortex algorithmic trading platform.
+You are NOT a licensed financial advisor and must not provide investment recommendations.
+
+Your task: explain a machine-generated trade signal in plain English — what the ML
+ensemble (XGBoost + GRU) and technical scanner observed, how that evidence combined into
+a consensus, and what it implies — grounded strictly in the structured signal data and the
+retrieved news articles provided in the prompt.
+
+{_PROMPT_STRUCTURE_BLOCK}
+
+Section guidance:
+- "What the models saw": describe the ensemble direction and calibrated confidence, then
+  the per-model (XGBoost and GRU) directions, buy/sell/hold probabilities, and how each
+  model's conviction compares to its regime-adaptive threshold. Note agreement or
+  disagreement between the two models. Use ONLY the numbers given.
+- "Technical picture": summarise the scanner readings provided (e.g. RSI, volume ratio,
+  price change) and, when a Recent Price Action section is present, how price has actually
+  behaved. If neither is present, say so briefly.
+{_SHARED_GUIDANCE_NEWS}
+- "What this suggests": a neutral synthesis of direction, confidence band and time horizon.
+  Describe; do NOT advise.
+- "Key risks": what could invalidate the setup (model disagreement, low conviction, thin
+  news corroboration, regime, price action contradicting the signal, etc.).
+
+{_PROMPT_RULES_BLOCK}\
+"""
+
+_DEMAND_FORECAST_INSTRUCTION = """
+
+Additionally, populate news_forecast from the retrieved articles: direction (BUY/SELL/HOLD
+lean the news supports), sentiment_label (bullish/bearish/neutral), confidence (0.0-1.0),
+and a one-sentence rationale. Base it ONLY on the provided articles; with no articles,
+return direction HOLD, sentiment_label neutral, confidence 0.0.
+
+Also populate ml_assessment by comparing the ML signal against the Recent Price Action
+section (judge ONLY from the numbers provided — never outside knowledge):
+- likely_missed_pattern: the single most plausible pattern the ML may have missed, one of
+  none | trend_reversal | breakout_failure | volume_divergence | news_shock |
+  range_bound_chop | other. Use "none" when nothing stands out.
+- confidence_should_have_been_lower: true only when the price action clearly warranted
+  less conviction than the ML's stated confidence.
+- price_action_agreement: agrees | partial | contradicts — whether recent price action
+  supports the ML direction. With no Recent Price Action section, return
+  likely_missed_pattern none, confidence_should_have_been_lower false, agreement partial.\
+"""
+
+_DEMAND_EXPLANATION_SYSTEM_PROMPT = _EXPLANATION_SYSTEM_PROMPT + _DEMAND_FORECAST_INSTRUCTION
+
+_CONTEXT_SYSTEM_PROMPT = f"""\
 You are a market context analysis tool for the Cortex algorithmic trading platform.
 You are NOT a licensed financial advisor and must not provide investment recommendations.
 
@@ -301,18 +433,7 @@ signal — what the ML ensemble (XGBoost + GRU) is currently leaning toward and 
 recent news is relevant — grounded strictly in the structured model snapshot and the
 retrieved news articles provided in the prompt.
 
-Write full_explanation as Markdown with EXACTLY these five section headers, in order, each
-on its own line:
-### What the models saw
-### Technical picture
-### News context
-### What this suggests
-### Key risks
-
-Be concise — 1–2 short sentences per section, ≤110 words total for full_explanation.
-No preamble, no filler, no restating the prompt; an analyst is skimming this. When a
-section has nothing substantive (e.g. no news, no per-model split), state it in one short
-line rather than padding.
+{_PROMPT_STRUCTURE_BLOCK}
 
 Section guidance:
 - "What the models saw": describe the ensemble's current direction and calibrated
@@ -320,24 +441,11 @@ Section guidance:
   and conviction-vs-threshold. Note agreement or disagreement. Use ONLY the numbers given.
   If no model snapshot is provided, state that no live model read was available.
 - "Technical picture": summarise volatility / market-regime signals provided, if any.
-- "News context": summarise the retrieved articles and CITE each factual claim inline as
-  According to [Source Name, YYYY-MM-DD]... If no articles were provided, state that no
-  recent news context was available — never invent sources.
+{_SHARED_GUIDANCE_NEWS}
 - "What this suggests": a neutral synthesis of the current lean. Describe; do NOT advise.
 - "Key risks": model disagreement, low conviction, thin news corroboration, volatility, etc.
 
-Mandatory rules:
-1. GROUND every ML claim in the numbers provided; never invent figures, prices, model
-   internals, events, or sources.
-2. CITE news claims inline: According to [Source Name, YYYY-MM-DD]...
-3. PROHIBITED language (these will be filtered):
-   - Price predictions: "will reach ₹X", "target price", "price target"
-   - Guarantees: "guaranteed", "certain to", "will definitely"
-   - Advisory language: "you should buy/sell", "recommend buying", "buy now"
-4. DISCLAIMER: The system automatically appends the required regulatory disclaimer.
-   Do NOT add your own disclaimer — it would duplicate the injected one.
-5. Output JSON only: {"summary": "...", "full_explanation": "...", "sources_used": [...]}
-   The summary is plain text (no headers); full_explanation contains the five sections.\
+{_PROMPT_RULES_BLOCK}\
 """
 
 # ── Guardrail patterns ────────────────────────────────────────────────────────
@@ -385,9 +493,71 @@ def _strip_price_predictions(text: str) -> tuple[str, int]:
     return "\n".join(clean_lines), removed
 
 
+# Numeric tokens the grounding check verifies: percentages ("62%", "3.5%")
+# and RSI readings ("RSI 71", "RSI-14: 71.2"). Deliberately limited to these
+# two families (full numeric NLI would be over-engineering): they are the
+# figures the prompt always provides exactly, so any novel one is invented.
+_GROUNDING_TOKEN_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*%"
+    r"|RSI(?:-14)?[\s:]*(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def _number_variants(num: str) -> set[str]:
+    """String forms under which a numeric literal may appear in the prompt."""
+    variants = {num}
+    try:
+        value = float(num)
+        variants.add(f"{value:.0f}")
+        variants.add(f"{value:.1f}")
+        variants.add(f"{value:.2f}")
+        if value == int(value):
+            variants.add(str(int(value)))
+    except ValueError:
+        pass
+    return variants
+
+
+def _strip_ungrounded_numbers(text: str, prompt: str) -> tuple[str, int]:
+    """
+    Remove sentences citing a %/RSI figure that does not appear in the prompt
+    (§1: a hallucinated confidence % or RSI value passed all guardrails
+    silently). Same per-line mechanics as ``_strip_price_predictions`` so the
+    markdown section structure survives. Returns ``(filtered_text, n_removed)``.
+    """
+    removed = 0
+    clean_lines: list[str] = []
+    for line in text.split("\n"):
+        if not line.strip() or line.lstrip().startswith("#"):
+            clean_lines.append(line)
+            continue
+        kept: list[str] = []
+        for sentence in re.split(r"(?<=[.!?])\s+", line):
+            grounded = True
+            for match in _GROUNDING_TOKEN_RE.finditer(sentence):
+                num = match.group(1) or match.group(2)
+                if not any(v in prompt for v in _number_variants(num)):
+                    grounded = False
+                    break
+            if grounded:
+                kept.append(sentence)
+            else:
+                removed += 1
+                explanation_ungrounded_numbers_total.inc()
+                logger.warning(
+                    "explanation_worker: ungrounded-number guardrail removed "
+                    "sentence: %.100s...",
+                    sentence,
+                )
+        clean_lines.append(" ".join(kept))
+    return "\n".join(clean_lines), removed
+
+
 def _apply_guardrails(
     output: ExplanationOutput,
     has_context: bool,
+    prompt: str = "",
 ) -> tuple[ExplanationOutput, list[str]]:
     """
     Apply all output guardrails.  Returns the (possibly modified) output and
@@ -397,6 +567,12 @@ def _apply_guardrails(
 
     full_explanation, n_removed = _strip_price_predictions(output.full_explanation)
     events.extend(["price_prediction_filter"] * n_removed)
+
+    if prompt:
+        full_explanation, n_ungrounded = _strip_ungrounded_numbers(
+            full_explanation, prompt
+        )
+        events.extend(["ungrounded_number_filter"] * n_ungrounded)
 
     summary_sentences = re.split(r"(?<=[.!?])\s+", output.summary)
     clean_summary = " ".join(
@@ -414,12 +590,13 @@ def _apply_guardrails(
 
     full_explanation_with_disclaimer = full_explanation.rstrip() + _REGULATORY_DISCLAIMER
 
+    # model_copy (not reconstruction) so subclass fields — e.g. the demand
+    # path's news_forecast — survive the guardrail pass.
     return (
-        ExplanationOutput(
-            summary=clean_summary or output.summary,
-            full_explanation=full_explanation_with_disclaimer,
-            sources_used=output.sources_used,
-        ),
+        output.model_copy(update={
+            "summary": clean_summary or output.summary,
+            "full_explanation": full_explanation_with_disclaimer,
+        }),
         events,
     )
 
@@ -498,7 +675,70 @@ def _render_scanner(scanner: dict | None) -> list[str]:
     return lines
 
 
-def _build_explanation_prompt(suggestion: TradeSuggestion, context: str) -> str:
+def _summarize_price_action(candles: list[dict]) -> list[str]:
+    """
+    Compact, token-conscious price-action summary from daily OHLCV candles
+    (C.A): trend, swing high/low, realized volatility, last-5-bar behavior —
+    ~6 text lines, never a raw per-bar dump. Pure function; empty input or
+    too few bars yields an honest one-liner instead of fabricated statistics.
+    """
+    if len(candles) < 5:
+        return ["Insufficient OHLCV history for a price-action summary."]
+
+    closes = [float(c["close"]) for c in candles]
+    highs = [float(c["high"]) for c in candles]
+    lows = [float(c["low"]) for c in candles]
+
+    first, last = closes[0], closes[-1]
+    window_change_pct = (last - first) / first * 100 if first else 0.0
+    swing_high, swing_low = max(highs), min(lows)
+
+    daily_returns = [
+        (closes[i] - closes[i - 1]) / closes[i - 1]
+        for i in range(1, len(closes))
+        if closes[i - 1]
+    ]
+    if daily_returns:
+        mean_r = sum(daily_returns) / len(daily_returns)
+        variance = sum((r - mean_r) ** 2 for r in daily_returns) / len(daily_returns)
+        daily_vol_pct = variance ** 0.5 * 100
+    else:
+        daily_vol_pct = 0.0
+
+    last5 = closes[-5:]
+    last5_change_pct = (last5[-1] - last5[0]) / last5[0] * 100 if last5[0] else 0.0
+    up_days = sum(1 for i in range(1, len(last5)) if last5[i] > last5[i - 1])
+
+    return [
+        f"Window: {len(candles)} daily bars",
+        f"Close: {last:.2f} ({window_change_pct:+.1f}% over the window)",
+        f"Swing high/low: {swing_high:.2f} / {swing_low:.2f}",
+        f"Realized daily volatility: {daily_vol_pct:.1f}%",
+        f"Last 5 bars: {last5_change_pct:+.1f}% ({up_days}/4 up days)",
+    ]
+
+
+def _format_demand_context(chunks: list, max_articles: int, max_chars: int) -> str:
+    """
+    Full-article context block for demand generations: the top ``max_articles``
+    retrieved chunks with bodies truncated to ``max_chars`` each, rendered
+    through the standard [Source: ...] header format so inline citations stay
+    verifiable against the audit log.
+    """
+    import dataclasses
+
+    capped = [
+        dataclasses.replace(chunk, content=chunk.content[:max_chars])
+        for chunk in chunks[:max_articles]
+    ]
+    return format_context(capped)
+
+
+def _build_explanation_prompt(
+    suggestion: TradeSuggestion,
+    context: str,
+    price_action: list[str] | None = None,
+) -> str:
     ml = suggestion.ml_signal or {}
     ai = suggestion.ai_signal or {}
     scanner = suggestion.scanner_signal or {}
@@ -550,10 +790,22 @@ def _build_explanation_prompt(suggestion: TradeSuggestion, context: str) -> str:
             lines.extend(model_lines)
 
     scanner_lines = _render_scanner(scanner)
+    lines.append("")
+    lines.append("## Technical Scanner Readings")
     if scanner_lines:
-        lines.append("")
-        lines.append("## Technical Scanner Readings")
         lines.extend(scanner_lines)
+    else:
+        # §2: an omitted section let the LLM confuse "missing" with
+        # "genuinely neutral" — state unavailability explicitly instead.
+        lines.append(
+            "Technical scanner data unavailable — do not infer or invent "
+            "technical readings."
+        )
+
+    if price_action:
+        lines.append("")
+        lines.append("## Recent Price Action (daily bars)")
+        lines.extend(price_action)
 
     sentiment_label = ai.get("sentiment_label") or ai.get("sentiment")
     forecast_dir = ai.get("direction")
@@ -622,6 +874,10 @@ def _build_context_prompt(
     if ml_snapshot and ml_snapshot.get("available"):
         lines.append("")
         lines.append("## Current ML Ensemble Snapshot")
+        if ml_snapshot.get("prediction_generated_at"):
+            # §3: the snapshot can be up to 60s old at dispatch — surface its
+            # actual age so the narrative (and audit) reflect reality.
+            lines.append(f"(Snapshot as of {ml_snapshot['prediction_generated_at']})")
         lines.append(f"Ensemble Direction:     {ml_snapshot.get('direction', 'N/A')}")
         lines.append(f"Calibrated Confidence:  {_fmt_pct(ml_snapshot.get('confidence'))}")
         if ml_snapshot.get("conviction_scale") is not None:
@@ -770,6 +1026,8 @@ async def _write_sse_context_event(redis: Any, instrument_key: str, payload: dic
 async def _generate_explanation(
     suggestion_id: str,
     suggestion_db_id: int,
+    *,
+    trigger: str = "auto",
 ) -> None:
     """
     Execute the full explanation pipeline for one suggestion.
@@ -779,17 +1037,27 @@ async def _generate_explanation(
       Phase 2 — LLM call: outside any DB session; bounded by _LLM_CALL_TIMEOUT_SECS.
       Phase 3 — DB write + SSE event store write + PUBLISH routing signal.
 
+    ``trigger == "demand"`` (WS7) upgrades the generation: full article bodies
+    + an OHLCV price-action summary go into the prompt, ONE structured Gemini
+    call returns narrative + news-forecast fields, and Phase 3 additionally
+    writes the forecast back to TradeSuggestion.ai_signal and the shared
+    forecast cache — closing the async-forecast race for this suggestion.
+
     Raises on unrecoverable errors so the consumer can decide ACK vs PEL.
     Raises GeminiRateLimitError so the consumer leaves the message in PEL
     (no real LLM attempt was made so the delivery counter is not incremented).
     """
+    from app.core.config import get_settings
     from app.core.database import AsyncSessionLocal
     from app.core.redis import get_redis
+    from app.services.regime_service import RegimeService
 
     _redis = get_redis()
     client = get_intelligence_client()
+    settings = get_settings()
     invocation_id = uuid4()
     suggestion_uuid = UUID(suggestion_id)
+    is_demand = trigger == "demand"
 
     # ── Phase 1: DB read — closed before LLM call ────────────────────────────
     chunks: list = []
@@ -800,6 +1068,10 @@ async def _generate_explanation(
     suggestion_instrument_key: str = ""
     suggestion_signal_direction: str | None = None
     suggestion_signal_generated_at: str | None = None
+    # Demand write-back inputs captured while the session is open.
+    captured_ai_signal: dict[str, Any] = {}
+    captured_indicators: dict[str, Any] = {}
+    forecast_cache_symbol: str = ""
 
     async with AsyncSessionLocal() as db:
         stmt = select(TradeSuggestion).where(
@@ -850,9 +1122,45 @@ async def _generate_explanation(
             )
             chunks = []
 
-        context = format_context(chunks)
+        price_action: list[str] | None = None
+        if is_demand:
+            # Full article bodies (capped) instead of the standard context
+            # block, plus the OHLCV price-action summary (C.A). Failures
+            # degrade to the standard path — demand must not fail harder
+            # than legacy over an optional enrichment.
+            context = _format_demand_context(
+                chunks,
+                settings.EXPLANATION_MAX_ARTICLES,
+                settings.EXPLANATION_ARTICLE_MAX_CHARS,
+            )
+            try:
+                candles = await RegimeService.load_ohlcv(
+                    db, suggestion.instrument_key, limit=60
+                )
+                price_action = _summarize_price_action(candles)
+            except Exception as exc:
+                logger.warning(
+                    "explanation_worker: OHLCV load failed for %s "
+                    "(continuing without price action): %s",
+                    suggestion_id, exc,
+                )
+            # Write-back inputs: the forecast cache key must be derived
+            # through the SHARED builder over the same inputs the assembler
+            # hashes (events + rounded indicators).
+            captured_ai_signal = dict(suggestion.ai_signal or {})
+            captured_indicators = (suggestion.ml_signal or {}).get("indicators") or {}
+            # Pathway 1 keys the forecast cache by instrument_key; Pathway 2
+            # by trading symbol (mirrors what gather_news_forecast received).
+            forecast_cache_symbol = (
+                suggestion.instrument_key
+                if suggestion.trigger_pathway == "scanner_anomaly"
+                else (suggestion.trading_symbol or suggestion.symbol)
+            )
+        else:
+            context = format_context(chunks)
+
         source_refs = build_retrieval_source_refs(chunks)
-        prompt = _build_explanation_prompt(suggestion, context)
+        prompt = _build_explanation_prompt(suggestion, context, price_action)
         prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
     # ── DB session closed — pool connection returned before LLM call ──────────
 
@@ -886,10 +1194,18 @@ async def _generate_explanation(
             raw_output, usage_info = await asyncio.wait_for(
                 client.generate_structured_with_usage(
                     prompt=prompt,
-                    response_model=ExplanationOutput,
-                    system=_EXPLANATION_SYSTEM_PROMPT,
+                    # Demand jobs return narrative + news-forecast fields in
+                    # ONE structured call (WS7); priority HIGH per the
+                    # request-manager convention for user-facing explanations.
+                    response_model=(
+                        DemandExplanationOutput if is_demand else ExplanationOutput
+                    ),
+                    system=(
+                        _DEMAND_EXPLANATION_SYSTEM_PROMPT
+                        if is_demand else _EXPLANATION_SYSTEM_PROMPT
+                    ),
                     temperature=0.2,
-                    max_tokens=1400,
+                    max_tokens=1600 if is_demand else 1400,
                     priority=Priority.HIGH,
                 ),
                 timeout=_LLM_CALL_TIMEOUT_SECS,
@@ -945,7 +1261,9 @@ async def _generate_explanation(
     final_output: ExplanationOutput | None = None
 
     if raw_output is not None:
-        final_output, guardrail_events = _apply_guardrails(raw_output, has_context=bool(chunks))
+        final_output, guardrail_events = _apply_guardrails(
+            raw_output, has_context=bool(chunks), prompt=prompt
+        )
         for event in guardrail_events:
             llm_guardrail_events_total.labels(guardrail=event).inc()
 
@@ -964,27 +1282,65 @@ async def _generate_explanation(
             for chunk in chunks
         ]
 
+    demand_forecast: NewsForecastOutput | None = (
+        final_output.news_forecast
+        if is_demand and isinstance(final_output, DemandExplanationOutput)
+        else None
+    )
+
     async with AsyncSessionLocal() as db:
         if final_output is not None:
             now_utc = datetime.now(timezone.utc)
+            values: dict[str, Any] = dict(
+                llm_summary=final_output.summary,
+                llm_explanation=final_output.full_explanation,
+                explanation_model=f"{model_provider}/{model_id}",
+                explanation_generated_at=now_utc,
+                updated_at=now_utc,
+            )
+            if demand_forecast is not None:
+                # WS7 write-back, same transaction as the narrative: the
+                # suggestion's ai_signal now reflects what the explanation
+                # actually says (closes the §0 propagation gap and finally
+                # produces the sentiment_label the prompt reads).
+                values["ai_signal"] = {
+                    **captured_ai_signal,
+                    "direction":       demand_forecast.direction.upper(),
+                    "sentiment_label": demand_forecast.sentiment_label.lower(),
+                    "rationale":       demand_forecast.rationale,
+                    "confidence":      demand_forecast.confidence,
+                    "available":       True,
+                    "forecast_source": "demand",
+                    "refreshed_at":    now_utc.isoformat(),
+                }
+            if isinstance(final_output, DemandExplanationOutput):
+                # ML assessment (WS10/C.B2), with judge identity: model +
+                # prompt version travel with every verdict so the retraining
+                # gate can detect non-comparable judge generations.
+                assessment = final_output.ml_assessment
+                values["llm_ml_assessment"] = {
+                    "likely_missed_pattern": assessment.likely_missed_pattern,
+                    "confidence_should_have_been_lower": (
+                        assessment.confidence_should_have_been_lower
+                    ),
+                    "price_action_agreement": assessment.price_action_agreement,
+                    "model": f"{model_provider}/{model_id}",
+                    "prompt_version": _ASSESSMENT_PROMPT_VERSION,
+                    "assessed_at": now_utc.isoformat(),
+                }
             await db.execute(
                 update(TradeSuggestion)
                 .where(TradeSuggestion.suggestion_id == suggestion_uuid)
-                .values(
-                    llm_summary=final_output.summary,
-                    llm_explanation=final_output.full_explanation,
-                    explanation_model=f"{model_provider}/{model_id}",
-                    explanation_generated_at=now_utc,
-                    updated_at=now_utc,
-                )
+                .values(**values)
             )
             await db.commit()
 
             logger.info(
                 "explanation_worker: explanation written for suggestion %s "
-                "symbol=%s latency_ms=%d guardrails=%s",
+                "symbol=%s trigger=%s latency_ms=%d guardrails=%s",
                 suggestion_id,
                 suggestion_symbol,
+                trigger,
                 latency_ms,
                 guardrail_events or "none",
             )
@@ -1007,11 +1363,55 @@ async def _generate_explanation(
             error_message=error_message,
         )
 
+    # ── Forecast cache write (demand path) ────────────────────────────────────
+    # Through the SHARED key builder over the same inputs the assembler hashes
+    # — the next consensus cycle for this symbol reuses the demand forecast
+    # instead of re-enqueueing a batch job. Best-effort: a miss costs one
+    # batch forecast, never correctness.
+    if demand_forecast is not None and forecast_cache_symbol:
+        try:
+            from app.ai.fusion.forecast_cache import forecast_cache_key
+            from app.ai.fusion.news_forecaster import score_from_direction
+
+            cache_events = captured_ai_signal.get("events") or []
+            cache_value = {
+                "score":           score_from_direction(
+                    demand_forecast.direction.upper(), demand_forecast.confidence
+                ),
+                "confidence":      demand_forecast.confidence,
+                "available":       True,
+                "events":          cache_events,
+                "event_count":     captured_ai_signal.get("event_count")
+                                   or len(cache_events),
+                "direction":       demand_forecast.direction.upper(),
+                "sentiment_label": demand_forecast.sentiment_label.lower(),
+                "rationale":       demand_forecast.rationale,
+                "forecast_source": "demand",
+                "model":           f"{model_provider}/{model_id}",
+            }
+            await _redis.setex(
+                forecast_cache_key(
+                    forecast_cache_symbol, cache_events, captured_indicators
+                ),
+                settings.NEWS_FORECAST_CACHE_TTL,
+                json.dumps(cache_value, default=str),
+            )
+        except Exception as exc:
+            logger.warning(
+                "explanation_worker: demand forecast cache write failed for %s "
+                "(non-fatal): %s",
+                suggestion_id, exc,
+            )
+
     # ── Write to SSE event store BEFORE publishing routing signal ─────────────
     if final_output is not None:
+        if is_demand:
+            explanation_demand_latency_seconds.observe(latency_ms / 1000.0)
         sse_payload = {
             "available":           True,
             "failed":              False,
+            "status":              "ready",
+            "suggestion_id":       suggestion_id,
             "summary":             final_output.summary,
             "full_explanation":    final_output.full_explanation,
             "model":               f"{model_provider}/{model_id}",
@@ -1041,9 +1441,16 @@ async def _generate_explanation(
                 suggestion_id, exc,
             )
 
-    # ── Clean up inflight key ─────────────────────────────────────────────────
+    # ── Clean up inflight keys ────────────────────────────────────────────────
     with contextlib.suppress(Exception):
         await _redis.delete(inflight_key)
+    if is_demand:
+        # Free the explanation_service demand lock so a later viewer can
+        # re-trigger if this attempt ultimately fails (retries hold their own
+        # worker inflight key per attempt).
+        from app.ai.intelligence.explanation_service import DEMAND_INFLIGHT_KEY
+        with contextlib.suppress(Exception):
+            await _redis.delete(DEMAND_INFLIGHT_KEY.format(suggestion_id=suggestion_id))
 
     if error_message is not None:
         if _is_quota_exhausted:
@@ -1246,7 +1653,9 @@ async def _generate_instrument_context(
     final_output:     ExplanationOutput | None = None
 
     if raw_output is not None:
-        final_output, guardrail_events = _apply_guardrails(raw_output, has_context=bool(chunks))
+        final_output, guardrail_events = _apply_guardrails(
+            raw_output, has_context=bool(chunks), prompt=prompt
+        )
         for event in guardrail_events:
             llm_guardrail_events_total.labels(guardrail=event).inc()
 
@@ -1378,6 +1787,8 @@ async def _publish_failed_state(
     failed_payload: dict = {
         "available":           False,
         "failed":              True,
+        "status":              "failed",
+        "suggestion_id":       suggestion_id,
         "summary":             None,
         "full_explanation":    None,
         "model":               None,
@@ -1388,6 +1799,12 @@ async def _publish_failed_state(
         "signal_generated_at": None,
     }
     await _write_sse_explanation_event(redis, suggestion_id, failed_payload)
+
+    # Free the demand-trigger lock so the retry button (or a later view) can
+    # re-request generation without waiting for the TTL.
+    from app.ai.intelligence.explanation_service import DEMAND_INFLIGHT_KEY
+    with contextlib.suppress(Exception):
+        await redis.delete(DEMAND_INFLIGHT_KEY.format(suggestion_id=suggestion_id))
 
     try:
         ready_channel = RedisChannels.LLM_EXPLANATION_READY.format(
@@ -1547,8 +1964,16 @@ async def _process_explanation_message(
     except (TypeError, ValueError):
         suggestion_db_id = 0
 
+    # WS7: demand jobs (a user is watching) fail fast; legacy jobs keep the
+    # patient 3-attempt/60s policy. The trigger travels in the payload so
+    # retries and requeues preserve it.
+    trigger = str(payload.get("trigger") or "auto")
+    is_demand = trigger == "demand"
+    max_attempts = _DEMAND_MAX_ATTEMPTS if is_demand else MAX_ATTEMPTS
+    retry_delay = _DEMAND_RETRY_DELAY_SECS if is_demand else _RETRY_DELAY_SECS
+
     attempts = get_attempts(msg)
-    if attempts >= MAX_ATTEMPTS:
+    if attempts >= max_attempts:
         await _send_to_dlq(redis, "max_attempts_exceeded", payload, attempts)
         await consumer.commit()
         return
@@ -1558,12 +1983,12 @@ async def _process_explanation_message(
         return
 
     logger.info(
-        "explanation_worker[%d]: processing suggestion %s (attempt=%d/%d)",
-        worker_id, suggestion_id, attempts + 1, MAX_ATTEMPTS,
+        "explanation_worker[%d]: processing suggestion %s (trigger=%s attempt=%d/%d)",
+        worker_id, suggestion_id, trigger, attempts + 1, max_attempts,
     )
 
     try:
-        await _generate_explanation(suggestion_id, suggestion_db_id)
+        await _generate_explanation(suggestion_id, suggestion_db_id, trigger=trigger)
         await consumer.commit()
 
     except asyncio.CancelledError:
@@ -1576,28 +2001,35 @@ async def _process_explanation_message(
         await consumer.commit()
 
     except GeminiRateLimitError:
+        if is_demand:
+            # Backpressure is TERMINAL for demand jobs: the user gets the
+            # failed push (PanelFailed + retry button) within the permit
+            # timeout instead of a skeleton that outlives their patience.
+            await _send_to_dlq(redis, "gemini_rate_limited", payload, attempts)
+            await consumer.commit()
+            return
         await _republish_retry(
             KafkaTopics.EXPLANATION_JOBS, payload, suggestion_id,
-            attempts + 1, _RETRY_DELAY_SECS,
+            attempts + 1, retry_delay,
         )
         await consumer.commit()
         logger.warning(
             "explanation_worker[%d]: rate-limited for suggestion %s — "
             "republished for retry in %ds (attempt %d/%d)",
-            worker_id, suggestion_id, _RETRY_DELAY_SECS, attempts + 1, MAX_ATTEMPTS,
+            worker_id, suggestion_id, retry_delay, attempts + 1, max_attempts,
         )
 
     except Exception as exc:
         await _republish_retry(
             KafkaTopics.EXPLANATION_JOBS, payload, suggestion_id,
-            attempts + 1, _RETRY_DELAY_SECS,
+            attempts + 1, retry_delay,
         )
         await consumer.commit()
         logger.error(
             "explanation_worker[%d]: attempt %d/%d failed for suggestion %s: %s "
             "— republished for retry in %ds",
-            worker_id, attempts + 1, MAX_ATTEMPTS, suggestion_id, exc,
-            _RETRY_DELAY_SECS,
+            worker_id, attempts + 1, max_attempts, suggestion_id, exc,
+            retry_delay,
         )
 
 

@@ -27,8 +27,9 @@ from __future__ import annotations
 import json
 import logging
 import math
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 from cachetools import LRUCache
 from redis.asyncio import Redis
@@ -41,7 +42,9 @@ from app.ai.fusion.models import (
     AIProcessedEvent,
     AIRawEvent,
 )
+from app.ai.intelligence.credibility_scorer import load_credibility_scores
 from app.ai.intelligence.nlp_engine import NLPEngine
+from app.core.config import get_settings
 from app.schemas.sentiment_analysis import (
     SentimentAnalysisResponse,
     SentimentBreakdown,
@@ -55,17 +58,88 @@ _RECENCY_HALF_LIFE_HOURS = 12.0
 _MAX_EVENTS_PER_REQUEST = 50   # Cap to bound inference latency
 _L2_TTL = 900                  # 15-minute Redis TTL for sentiment
 
-# Higher credibility for official exchange feeds
-_SOURCE_WEIGHTS: dict[str, float] = {
-    "NSE Corporate Filings": 1.0,
-    "BSE Corporate Notices": 1.0,
-}
+# Source weight comes from the live ai_source_credibility score (0-100, keyed
+# by feed display name, earned from fake-news outcomes; exchange feeds seed at
+# 80) via a linear 0.4–1.0 map — replaced the old hardcoded 2-entry dict.
+# Unknown sources get the neutral default.
 _DEFAULT_SOURCE_WEIGHT = 0.7
+_MIN_SOURCE_WEIGHT = 0.4
+_MAX_SOURCE_WEIGHT = 1.0
+
+
+def credibility_to_weight(score_0_100: float | None) -> float:
+    """Map a 0-100 credibility score to a 0.4-1.0 aggregation weight."""
+    if score_0_100 is None:
+        return _DEFAULT_SOURCE_WEIGHT
+    clamped = min(max(score_0_100, 0.0), 100.0)
+    return _MIN_SOURCE_WEIGHT + (_MAX_SOURCE_WEIGHT - _MIN_SOURCE_WEIGHT) * (
+        clamped / 100.0
+    )
 
 # Minimum articles needed before we extend the lookback window for symbol queries.
 # Below this threshold the service automatically tries _EXTENDED_LOOKBACK_MULTIPLIER × lookback_hours.
 _MIN_CLASSIFIED_ARTICLES = 5
 _EXTENDED_LOOKBACK_MULTIPLIER = 3
+
+_VALID_SENTIMENT_LABELS = frozenset({"positive", "negative", "neutral"})
+
+
+class _ScoredEvent(NamedTuple):
+    """An event plus its stored full-body sentiment, if the NLP pipeline has one.
+
+    ``stored`` is None for events the pipeline hasn't scored yet (raw-text
+    fallback / not-yet-processed events) — only those go to the batched
+    headline LLM call. Events with a stored score reuse the full-article
+    result computed once by ``nlp_engine.process_event`` instead of paying a
+    second Gemini call for a weaker, headline-only signal.
+    """
+
+    event: AIRawEvent
+    stored: dict[str, Any] | None
+
+
+def _stored_sentiment(
+    score: Any,
+    label: Any,
+    confidence: Any,
+    model_used: Any,
+) -> dict[str, Any] | None:
+    """Shape AINLPResult columns into the analyze_sentiment_batch dict contract."""
+    if score is None or label not in _VALID_SENTIMENT_LABELS:
+        return None
+    return {
+        "label": label,
+        "score": float(score),
+        "confidence": float(confidence) if confidence is not None else 0.5,
+        "model": model_used or "stored",
+    }
+
+
+# AINLPResult columns attached to event queries for stored-score reuse.
+_NLP_SENTIMENT_COLUMNS = (
+    AINLPResult.sentiment_score,
+    AINLPResult.sentiment_label,
+    AINLPResult.confidence_score,
+    AINLPResult.model_used,
+)
+
+
+def _rows_to_scored_events(rows: list[Any]) -> list[_ScoredEvent]:
+    """
+    Convert (AIRawEvent, score, label, confidence, model) rows to _ScoredEvents,
+    keeping the first row per event id (defensive: the processed→NLP join is
+    1:1 by pipeline construction, but a historical duplicate must not double-
+    count an article in the aggregate).
+    """
+    seen: dict[int, None] = {}
+    scored: list[_ScoredEvent] = []
+    for row in rows:
+        event = row[0]
+        if event.id in seen:
+            continue
+        seen[event.id] = None
+        scored.append(_ScoredEvent(event, _stored_sentiment(row[1], row[2], row[3], row[4])))
+    return scored
 
 
 class SentimentAnalysisService:
@@ -76,8 +150,26 @@ class SentimentAnalysisService:
     Each service instance holds its own DB + Redis references.
     """
 
-    # Class-level L1 cache: shared across request instances
+    # Class-level L1 cache: shared across request instances. Entries are
+    # (payload, expires_at) pairs — LRU bounds SIZE, the timestamp bounds AGE
+    # (SENTIMENT_L1_TTL_SECS, matching the 900s L2 TTL). Without the time
+    # bound, a stale aggregate could persist in a long-lived worker process
+    # indefinitely under low eviction pressure.
     _l1_cache: LRUCache = LRUCache(maxsize=500)
+
+    def _l1_get(self, key: str) -> dict | None:
+        entry = self._l1_cache.get(key)
+        if entry is None:
+            return None
+        payload, expires_at = entry
+        if time.monotonic() >= expires_at:
+            self._l1_cache.pop(key, None)
+            return None
+        return payload
+
+    def _l1_set(self, key: str, payload: dict) -> None:
+        expires_at = time.monotonic() + get_settings().SENTIMENT_L1_TTL_SECS
+        self._l1_cache[key] = (payload, expires_at)
 
     def __init__(self, db: AsyncSession, redis: Redis | None = None) -> None:
         self.db = db
@@ -106,8 +198,8 @@ class SentimentAnalysisService:
         """
         cache_key = f"sentiment:{instrument_key}:{symbol or ''}:{lookback_hours}"
 
-        # L1 cache
-        cached = self._l1_cache.get(cache_key)
+        # L1 cache (time-bounded — see _l1_get/_l1_set)
+        cached = self._l1_get(cache_key)
         if cached:
             cached["cache_tier"] = "L1"
             return SentimentAnalysisResponse(**cached)
@@ -116,7 +208,7 @@ class SentimentAnalysisService:
         if self.redis:
             raw = await self._redis_get(cache_key)
             if raw:
-                self._l1_cache[cache_key] = raw
+                self._l1_set(cache_key, dict(raw))  # copy: tier mutation below must not leak into cache
                 raw["cache_tier"] = "L2"
                 return SentimentAnalysisResponse(**raw)
 
@@ -125,7 +217,7 @@ class SentimentAnalysisService:
 
         # Cache result (strip cache_tier before storing)
         payload = result.model_dump(exclude={"cache_tier"})
-        self._l1_cache[cache_key] = payload
+        self._l1_set(cache_key, payload)
         if self.redis:
             await self._redis_set(cache_key, payload)
 
@@ -144,7 +236,8 @@ class SentimentAnalysisService:
         computed_at = now.isoformat()
 
         # Fetch events — may internally extend the lookback window if thin on data.
-        events, effective_lookback = await self._fetch_events(now, symbol, lookback_hours)
+        scored_events, effective_lookback = await self._fetch_events(now, symbol, lookback_hours)
+        events = [se.event for se in scored_events]
 
         if not events:
             return SentimentAnalysisResponse(
@@ -162,9 +255,30 @@ class SentimentAnalysisService:
                 computed_at=computed_at,
             )
 
-        # Run LLM sentiment inference — one batched Gemini call for all titles.
+        # Sentiment per event: reuse the full-article score the NLP pipeline
+        # already computed and stored (AINLPResult) wherever it exists — the
+        # stronger signal at zero LLM cost. Only genuinely unscored events
+        # (raw-text fallback / not-yet-processed) go to the batched
+        # headline-level Gemini call.
         titles = [self._extract_title(e.extra_data, e.raw_content) for e in events]
-        sentiments = await self._nlp.analyze_sentiment_batch(titles)
+        sentiments: list[Any] = [se.stored for se in scored_events]
+        pending = [i for i, s in enumerate(sentiments) if s is None]
+        if pending:
+            batch_results = await self._nlp.analyze_sentiment_batch(
+                [titles[i] for i in pending]
+            )
+            for i, batch_result in zip(pending, batch_results):
+                sentiments[i] = batch_result
+        logger.info(
+            "Sentiment scores: %d stored (reused), %d LLM-analyzed",
+            len(events) - len(pending), len(pending),
+        )
+
+        # Live credibility scores for all sources in this batch (one cached
+        # batch lookup — see credibility_scorer.load_credibility_scores).
+        credibility_scores = await load_credibility_scores(
+            self.db, {e.source_name for e in events}
+        )
 
         # Aggregate
         pos_count = neg_count = neu_count = 0
@@ -192,8 +306,10 @@ class SentimentAnalysisService:
             hours_ago = (now - event.event_timestamp.replace(tzinfo=timezone.utc)).total_seconds() / 3600
             recency_w = math.exp(-hours_ago / _RECENCY_HALF_LIFE_HOURS)
 
-            # Source credibility weight
-            source_w = _SOURCE_WEIGHTS.get(event.source_name, _DEFAULT_SOURCE_WEIGHT)
+            # Source credibility weight (live 0-100 score → 0.4-1.0)
+            source_w = credibility_to_weight(
+                credibility_scores.get(event.source_name)
+            )
 
             # Confidence-adjusted weight
             w = recency_w * source_w * max(confidence, 0.3)
@@ -268,7 +384,7 @@ class SentimentAnalysisService:
         now: datetime,
         symbol: str | None,
         lookback_hours: int,
-    ) -> tuple[list[AIRawEvent], int]:
+    ) -> tuple[list[_ScoredEvent], int]:
         """
         Fetch recent news events for sentiment analysis.
 
@@ -324,15 +440,19 @@ class SentimentAnalysisService:
         self,
         since: datetime,
         symbol: str,
-    ) -> list[AIRawEvent]:
+    ) -> list[_ScoredEvent]:
         """
         Query events tagged with `symbol` in ai_event_classifications.affected_symbols.
         This is the high-precision path — symbols are assigned by the NLP pipeline's
         entity recognition, not by naive text matching.
+
+        Every event on this path has an AINLPResult by construction (inner
+        join), so its full-article sentiment is selected alongside and reused —
+        no second LLM call for already-scored articles.
         """
         try:
             stmt = (
-                select(AIRawEvent)
+                select(AIRawEvent, *_NLP_SENTIMENT_COLUMNS)
                 .join(AIProcessedEvent, AIProcessedEvent.raw_event_id == AIRawEvent.id)
                 .join(AINLPResult, AINLPResult.processed_event_id == AIProcessedEvent.id)
                 .join(AIEventClassification, AIEventClassification.nlp_result_id == AINLPResult.id)
@@ -345,7 +465,7 @@ class SentimentAnalysisService:
                 .distinct()
             )
             result = await self.db.execute(stmt)
-            return list(result.scalars().all())
+            return _rows_to_scored_events(result.all())
         except Exception as exc:
             logger.error("Classified event query failed: symbol=%s error=%s", symbol, exc, exc_info=True)
             return []
@@ -354,37 +474,44 @@ class SentimentAnalysisService:
         self,
         since: datetime,
         symbol: str,
-    ) -> list[AIRawEvent]:
+    ) -> list[_ScoredEvent]:
         """
         Fallback: case-insensitive text search on raw_content.
         Less precise than the classification join — used only when the NLP pipeline
         hasn't yet processed events for this instrument.
+
+        LEFT JOINs the NLP chain so events that DO have a stored score reuse
+        it; only genuinely unscored events go to the batched LLM call.
         """
         try:
             stmt = (
-                select(AIRawEvent)
+                select(AIRawEvent, *_NLP_SENTIMENT_COLUMNS)
+                .outerjoin(AIProcessedEvent, AIProcessedEvent.raw_event_id == AIRawEvent.id)
+                .outerjoin(AINLPResult, AINLPResult.processed_event_id == AIProcessedEvent.id)
                 .where(AIRawEvent.event_timestamp >= since)
                 .where(AIRawEvent.raw_content.ilike(f"%{symbol}%"))
                 .order_by(AIRawEvent.event_timestamp.desc())
                 .limit(_MAX_EVENTS_PER_REQUEST)
             )
             result = await self.db.execute(stmt)
-            return list(result.scalars().all())
+            return _rows_to_scored_events(result.all())
         except Exception as exc:
             logger.error("Raw text event query failed: symbol=%s error=%s", symbol, exc, exc_info=True)
             return []
 
-    async def _query_all_events(self, since: datetime) -> list[AIRawEvent]:
-        """General market events — no symbol filter."""
+    async def _query_all_events(self, since: datetime) -> list[_ScoredEvent]:
+        """General market events — no symbol filter. Stored scores reused via LEFT JOIN."""
         try:
             stmt = (
-                select(AIRawEvent)
+                select(AIRawEvent, *_NLP_SENTIMENT_COLUMNS)
+                .outerjoin(AIProcessedEvent, AIProcessedEvent.raw_event_id == AIRawEvent.id)
+                .outerjoin(AINLPResult, AINLPResult.processed_event_id == AIProcessedEvent.id)
                 .where(AIRawEvent.event_timestamp >= since)
                 .order_by(AIRawEvent.event_timestamp.desc())
                 .limit(_MAX_EVENTS_PER_REQUEST)
             )
             result = await self.db.execute(stmt)
-            return list(result.scalars().all())
+            return _rows_to_scored_events(result.all())
         except Exception as exc:
             logger.error("General event query failed: %s", exc, exc_info=True)
             return []

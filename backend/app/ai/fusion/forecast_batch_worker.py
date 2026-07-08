@@ -52,7 +52,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from time import monotonic
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 from uuid import uuid4
 
 from aiokafka.structs import TopicPartition
@@ -75,6 +75,7 @@ from app.ai.intelligence.request_manager import (
 from app.core.config import get_settings
 from app.core.kafka import KafkaGroups, KafkaTopics, new_consumer, pending_count
 from app.core.metrics import (
+    forecast_stale_dropped_total,
     llm_audit_log_writes_total,
     news_forecast_batch_calls_total,
     news_forecast_batch_size_histogram,
@@ -95,6 +96,14 @@ _IDLE_POLL_INTERVAL = 2.0
 # worthless and calling Gemini on it wastes quota.  Replaces the old
 # producer-side LLEN>cap→RPOP queue trim.
 _STALE_AFTER_SECS = 3_600
+
+
+class DrainResult(NamedTuple):
+    """One drain() read: filtered payloads + what the raw fetch contained."""
+
+    items: list[dict]
+    raw_count: int       # records physically read (position already advanced past them)
+    stale_dropped: int   # subset of raw_count dropped by the staleness gate
 
 
 class ForecastQueueConsumer:
@@ -124,21 +133,33 @@ class ForecastQueueConsumer:
             self._consumer = consumer
         return self._consumer
 
-    async def drain(self, max_items: int, timeout_ms: int) -> list[dict]:
+    async def drain(self, max_items: int, timeout_ms: int) -> "DrainResult":
         """
         Read up to ``max_items`` payloads.  Malformed and stale payloads are
         dropped here (the next commit passes over them).  Does NOT commit —
         the caller commits after the batch reaches its terminal outcome.
+
+        Returns a DrainResult carrying ``raw_count`` alongside the filtered
+        items: because filtering happens here AFTER getmany() has already
+        advanced the fetch position, "drained N records that were all stale"
+        and "broker returned nothing" are indistinguishable from the filtered
+        list alone — and flush_pending_forecasts must keep draining through a
+        contiguous stale run rather than stopping at it.
         """
         consumer = await self.ensure_started()
         batches = await consumer.getmany(timeout_ms=timeout_ms, max_records=max_items)
         items: list[dict] = []
+        raw_count = 0
+        stale_dropped = 0
         for records in batches.values():
             for msg in records:
+                raw_count += 1
                 payload = msg.value
                 if not isinstance(payload, dict) or not payload.get("symbol"):
                     continue
                 if _is_stale(payload):
+                    stale_dropped += 1
+                    forecast_stale_dropped_total.inc()
                     logger.debug(
                         "forecast_batch_worker: skipping stale payload for %s "
                         "(enqueued_at=%s)",
@@ -146,7 +167,7 @@ class ForecastQueueConsumer:
                     )
                     continue
                 items.append(payload)
-        return items
+        return DrainResult(items=items, raw_count=raw_count, stale_dropped=stale_dropped)
 
     async def commit(self) -> None:
         """Commit the current consume position (call only after a terminal outcome)."""
@@ -249,9 +270,9 @@ async def forecast_batch_loop(
                                 seen_symbols.add(symbol)
                                 batch.append(payload)
 
-                    _absorb(await _queue_consumer.drain(
+                    _absorb((await _queue_consumer.drain(
                         batch_size, timeout_ms=int(_IDLE_POLL_INTERVAL * 1000)
-                    ))
+                    )).items)
 
                     if batch:
                         # First item arrived — wait up to the batch window for
@@ -262,9 +283,9 @@ async def forecast_batch_loop(
                             and monotonic() < window_deadline
                             and not shutdown.is_set()
                         ):
-                            _absorb(await _queue_consumer.drain(
+                            _absorb((await _queue_consumer.drain(
                                 batch_size - len(batch), timeout_ms=1_000
-                            ))
+                            )).items)
 
                         await _flush_batch(batch, redis, session_factory)
 
@@ -326,7 +347,7 @@ async def flush_pending_forecasts(
     which lost the popped items).
 
     Returns:
-        {"dispatched": N, "calls_made": M} on full success.
+        {"dispatched": N, "calls_made": M, "stale_dropped": S} on full success.
 
     Raises:
         RuntimeError: if any batch's outcome is "budget_throttled" or "error".
@@ -335,6 +356,7 @@ async def flush_pending_forecasts(
     batch_size = get_settings().NEWS_FORECAST_BATCH_SIZE
     dispatched = 0
     calls_made = 0
+    stale_dropped = 0
 
     async with _queue_consumer.lock:
         consumer = await _queue_consumer.ensure_started()
@@ -342,21 +364,30 @@ async def flush_pending_forecasts(
         end_snapshot = (await consumer.end_offsets([tp]))[tp]
 
         while (await consumer.position(tp)) < end_snapshot:
-            items = await _queue_consumer.drain(batch_size, timeout_ms=2_000)
+            drained = await _queue_consumer.drain(batch_size, timeout_ms=2_000)
+            stale_dropped += drained.stale_dropped
 
             batch: list[dict] = []
             seen_symbols: set[str] = set()
-            for payload in items:
+            for payload in drained.items:
                 symbol = payload.get("symbol")
                 if symbol and symbol not in seen_symbols:
                     seen_symbols.add(symbol)
                     batch.append(payload)
 
             if not batch:
-                # Drained only stale/malformed payloads (or nothing) — commit
-                # past them and re-check the position against the snapshot.
+                # Commit past whatever this read physically consumed (stale/
+                # malformed records advanced the position inside drain()).
                 await _queue_consumer.commit()
-                if not items and (await consumer.position(tp)) < end_snapshot:
+                if drained.raw_count > 0:
+                    # Real records were read — they just all filtered out.
+                    # A contiguous run of stale payloads at the head of the
+                    # topic must NOT stop the drain: fresher, valid requests
+                    # can sit behind it before end_snapshot. (The old
+                    # `if not items → break` returned a clean-looking
+                    # {"dispatched": 0} here and silently under-drained.)
+                    continue
+                if (await consumer.position(tp)) < end_snapshot:
                     # Broker returned nothing despite lag — avoid a hot loop.
                     break
                 continue
@@ -378,7 +409,11 @@ async def flush_pending_forecasts(
 
             await _queue_consumer.commit()
 
-    return {"dispatched": dispatched, "calls_made": calls_made}
+    return {
+        "dispatched": dispatched,
+        "calls_made": calls_made,
+        "stale_dropped": stale_dropped,
+    }
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────

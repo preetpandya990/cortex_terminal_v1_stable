@@ -101,6 +101,13 @@ class TradeSuggestion(Base):
     explanation_generated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Structured LLM read on the ML call itself (WS10/C.B2), written by
+    # demand-triggered generations: {likely_missed_pattern,
+    # confidence_should_have_been_lower, price_action_agreement, model,
+    # prompt_version, assessed_at}. Feeds compute_sample_weight as an extra
+    # retraining multiplier behind FEEDBACK_LLM_ASSESSMENT_ENABLED. NULL for
+    # legacy generations and suggestions never viewed.
+    llm_ml_assessment: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     # Strategy linkage (Phase 2 — Rule Engine)
     strategy_id: Mapped[UUID | None] = mapped_column(

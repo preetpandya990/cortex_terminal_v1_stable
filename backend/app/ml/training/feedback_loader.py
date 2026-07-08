@@ -89,6 +89,14 @@ _CONFIDENCE_HIGH_THRESHOLD       = 0.70
 _WEIGHT_CLIP_MIN = 0.1
 _WEIGHT_CLIP_MAX = 5.0
 
+# ── LLM-assessment factors (WS10/C.B2) ─────────────────────────────────────────
+# Applied ONLY when FEEDBACK_LLM_ASSESSMENT_ENABLED (flag-off is bit-identical
+# to pre-WS10 weights). Both conditions can stack; the final clip still bounds
+# the product. The assessment dict carries its judge identity (model +
+# prompt_version) — re-run the offline comparison gate on judge changes.
+_ASSESSMENT_CONTRADICTS_FACTOR   = 1.3  # price action contradicted + direction wrong
+_ASSESSMENT_OVERCONFIDENT_FACTOR = 1.2  # flagged overconfident + hard negative
+
 
 # ── Public data structures ─────────────────────────────────────────────────────
 
@@ -145,8 +153,46 @@ def _confidence_factor(confidence_01: float, direction_correct: Optional[bool]) 
     return 1.0
 
 
-def compute_sample_weight(row: pd.Series) -> float:
-    """Apply the B1×B2 formula to a single outcome row. Returns clipped weight."""
+def _assessment_factor(
+    assessment: Optional[dict],
+    direction_correct: Optional[bool],
+    confidence_01: float,
+) -> float:
+    """
+    WS10/C.B2: extra multiplier from the LLM's structured read on the ML call.
+
+    Fires only on CONFIRMED misses — the assessment sharpens the gradient on
+    trades that already went wrong, it never punishes a winning trade:
+      - price_action_agreement == "contradicts" AND direction wrong → x1.3
+        (the LLM saw price fighting the call, and it did fail)
+      - confidence_should_have_been_lower AND hard-negative (confidence ≥
+        threshold with wrong direction — same definition as
+        _confidence_factor) → x1.2
+    Both can stack; NULL/malformed assessments pass through at 1.0.
+    """
+    if not isinstance(assessment, dict):
+        return 1.0
+    factor = 1.0
+    direction_wrong = direction_correct is False
+    if direction_wrong and assessment.get("price_action_agreement") == "contradicts":
+        factor *= _ASSESSMENT_CONTRADICTS_FACTOR
+    if (
+        direction_wrong
+        and assessment.get("confidence_should_have_been_lower") is True
+        and confidence_01 >= _CONFIDENCE_HIGH_THRESHOLD
+    ):
+        factor *= _ASSESSMENT_OVERCONFIDENT_FACTOR
+    return factor
+
+
+def compute_sample_weight(row: pd.Series, *, use_llm_assessment: bool = False) -> float:
+    """Apply the B1×B2 formula to a single outcome row. Returns clipped weight.
+
+    ``use_llm_assessment`` (WS10, default False) multiplies in the
+    LLM-assessment factor from the row's ``llm_ml_assessment`` column. The
+    default-off path never reads that column — flag-off weights are
+    bit-identical to pre-WS10 output.
+    """
     conf_01 = float(row["confidence_score"]) / 100.0 if row["confidence_score"] is not None else 0.5
     of = _outcome_factor(
         hit_tp3=bool(row["hit_tp3"]),
@@ -156,7 +202,12 @@ def compute_sample_weight(row: pd.Series) -> float:
         direction_correct=row["ml_direction_correct"],
     )
     cf = _confidence_factor(conf_01, row["ml_direction_correct"])
-    return float(np.clip(of * cf, _WEIGHT_CLIP_MIN, _WEIGHT_CLIP_MAX))
+    af = 1.0
+    if use_llm_assessment:
+        af = _assessment_factor(
+            row.get("llm_ml_assessment"), row["ml_direction_correct"], conf_01
+        )
+    return float(np.clip(of * cf * af, _WEIGHT_CLIP_MIN, _WEIGHT_CLIP_MAX))
 
 
 # ── DB query ───────────────────────────────────────────────────────────────────
@@ -198,6 +249,7 @@ SELECT
     pto.hit_tp3,
     pto.hit_sl,
     COALESCE(ts.consensus_score, pto.suggestion_consensus_score)          AS confidence_score,
+    ts.llm_ml_assessment                                                  AS llm_ml_assessment,
     pto.created_at                                                        AS closed_at
 FROM  paper_trade_outcomes  pto
 JOIN  paper_positions        pos ON pto.position_id   = pos.id
@@ -213,16 +265,25 @@ ORDER BY instrument_key, signal_date
 _FEEDBACK_QUERY_COLUMNS = [
     "instrument_key", "signal_date", "ml_direction_correct",
     "hit_tp1", "hit_tp2", "hit_tp3", "hit_sl",
-    "confidence_score", "closed_at",
+    "confidence_score", "llm_ml_assessment", "closed_at",
 ]
 
 
 async def build_feedback_weights_df(
     session: AsyncSession,
+    *,
+    use_llm_assessment: bool | None = None,
 ) -> pd.DataFrame:
     """
-    Query matured outcomes, apply the B1×B2 weight formula, aggregate by
-    (instrument_key, signal_date), and return a DataFrame with columns:
+    Query matured outcomes, apply the B1×B2(×assessment) weight formula,
+    aggregate by (instrument_key, signal_date), and return a DataFrame.
+
+    ``use_llm_assessment``: None (default) reads FEEDBACK_LLM_ASSESSMENT_ENABLED
+    from settings; an explicit bool overrides it — used by the offline
+    comparison gate (scripts/compare_feedback_assessment.py) to build both
+    variants from one identical outcome window.
+
+    DataFrame columns:
       instrument_key  str       — NSE instrument key (NSE_EQ|INE...)
       signal_date     date      — UTC calendar date of the originating bar
       sample_weight   float32   — mean B1×B2 weight for all outcomes on that bar
@@ -256,8 +317,22 @@ async def build_feedback_weights_df(
 
     df_raw = pd.DataFrame(rows, columns=_FEEDBACK_QUERY_COLUMNS)
 
-    # ── Per-outcome weight (B1 × B2, clipped) ─────────────────────────────────
-    df_raw["sample_weight"] = df_raw.apply(compute_sample_weight, axis=1).astype(np.float32)
+    if use_llm_assessment is None:
+        from app.core.config import get_settings
+        use_llm_assessment = get_settings().FEEDBACK_LLM_ASSESSMENT_ENABLED
+
+    # ── Per-outcome weight (B1 × B2 × assessment, clipped) ────────────────────
+    df_raw["sample_weight"] = df_raw.apply(
+        compute_sample_weight, axis=1, use_llm_assessment=use_llm_assessment
+    ).astype(np.float32)
+
+    if use_llm_assessment:
+        n_assessed = int(df_raw["llm_ml_assessment"].notna().sum())
+        logger.info(
+            "LLM-assessment factor ACTIVE: %d / %d outcomes carry an assessment "
+            "(%.1f%% coverage — only viewed suggestions are assessed)",
+            n_assessed, len(df_raw), 100.0 * n_assessed / max(len(df_raw), 1),
+        )
 
     # ── Aggregate by (instrument_key, signal_date) ────────────────────────────
     # mean: balanced view of that bar's signal quality across all trades
@@ -558,16 +633,21 @@ def build_panel_weights(
 
     n = len(sym_all)
     weights = np.ones(n, dtype=np.float32)
+    # Count bundle-key hits directly: a matched row can legitimately weigh
+    # exactly 1.0 (direction_only/unknown outcome × neutral confidence), so
+    # inferring coverage from `weights != 1.0` undercounts real matches.
+    matched = 0
 
     for i in range(n):
         sym = str(sym_all[i])
         d   = pd.Timestamp(ts_all[i]).tz_localize("UTC").date()
-        fb_w = float(weight_lookup.get((sym, d), 1.0))
+        fb_w = weight_lookup.get((sym, d))
+        if fb_w is not None:
+            matched += 1
+            weights[i] = float(fb_w)
         if class_weights is not None:
             pass  # caller combines class_weights separately
-        weights[i] = fb_w
 
-    matched = int(np.sum(weights != 1.0))
     logger.info(
         "XGBoost panel weights: %d / %d rows matched feedback bundle (%.1f%%)",
         matched, n, 100.0 * matched / max(n, 1),

@@ -19,7 +19,8 @@ performing ranking in Python is faster and simpler than two separate DB queries:
      texts where exact term matching (tickers, regulatory terms) is critical.
 
   3. Cosine similarity (numpy matmul) ranks candidates by semantic proximity.
-     Query embedding: nv-embedqa-e5-v5 in "query" mode (1024-dim).
+     Query embedding: gemini-embedding-001 (768-dim) — see rag/embedder.py and
+     GEMINI_EMBED_MODEL / GEMINI_EMBED_DIM in core/config.py.
 
   4. Reciprocal Rank Fusion (k=60, Cormack et al. 2009) merges the two ranked
      lists into a single score without requiring score calibration.
@@ -53,6 +54,7 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.fusion.models import AIDocumentEmbedding, AIRawEvent
+from app.ai.intelligence.credibility_scorer import load_credibility_scores
 from app.ai.rag.embedder import embed_query
 
 logger = logging.getLogger(__name__)
@@ -63,6 +65,20 @@ _RRF_K = 60
 # Maximum candidates loaded from DB per retrieval call.
 # Safety cap: prevents pathological queries from pulling the entire corpus.
 _MAX_CANDIDATES = 500
+
+# Source-credibility RRF term: ~half the weight of the BM25/cosine relevance
+# terms — authority breaks ties between comparably relevant docs but must
+# never outrank relevance. Applied only to docs already relevance-ranked.
+_CREDIBILITY_RRF_WEIGHT = 0.5
+
+# Unknown sources rank as if they carried the neutral 0-100 seed score.
+_CREDIBILITY_DEFAULT_SCORE = 50.0
+
+# Final-score multiplier for docs tagged low_confidence_source at ingest
+# (bodies under RAG_MIN_CONTENT_CHARS): they stay retrievable — a one-line
+# exchange filing can still be the best answer — but rank behind substantive
+# articles of comparable relevance.
+_LOW_CONFIDENCE_DEMOTION = 0.5
 
 # BM25 parameters tuned for short financial texts (avg 60–80 tokens).
 # k1=1.5: moderate term-frequency saturation for short docs.
@@ -106,6 +122,7 @@ class _Candidate:
     as_of_timestamp: datetime
     embedding: list[float]
     symbol: str | None
+    low_confidence: bool = False
 
 
 def _tokenize(text: str) -> list[str]:
@@ -170,17 +187,47 @@ def _cosine_rank(
     return ranked[:top_n].tolist()
 
 
+def _credibility_ranks(
+    candidates: list[_Candidate],
+    scores_by_source: dict[str, float],
+) -> dict[int, int]:
+    """
+    Dense credibility rank (1 = most credible) per candidate index.
+
+    All docs from the same source share the same rank — with a handful of
+    feeds, an ordinal ranking would arbitrarily order same-source docs and
+    inject noise into the RRF sum. Unknown sources rank at the neutral
+    default score.
+    """
+    score_by_idx = {
+        i: scores_by_source.get(c.source_name, _CREDIBILITY_DEFAULT_SCORE)
+        for i, c in enumerate(candidates)
+    }
+    rank_of_score = {
+        score: rank
+        for rank, score in enumerate(sorted(set(score_by_idx.values()), reverse=True), start=1)
+    }
+    return {i: rank_of_score[s] for i, s in score_by_idx.items()}
+
+
 def _rrf_merge(
     vector_ranks: list[int],
     bm25_ranks: list[int],
     candidates: list[_Candidate],
     top_k: int,
+    credibility_ranks: dict[int, int] | None = None,
 ) -> list[RetrievedChunk]:
     """
-    Reciprocal Rank Fusion of two ranked index lists into a final result list.
+    Reciprocal Rank Fusion of the ranked lists into a final result list.
 
-    Documents that appear in only one ranked list still receive their RRF
+    Documents that appear in only one relevance list still receive their RRF
     contribution (i.e. there is no penalty for single-list membership).
+
+    The credibility term (weight _CREDIBILITY_RRF_WEIGHT) is added only to
+    documents already ranked by BM25 or cosine — authority refines relevance
+    ordering; it must never pull an irrelevant document into the results.
+    Low-confidence-tagged docs have their final score demoted last, so the
+    penalty applies uniformly across all three terms.
     """
     scores: dict[int, float] = {}
 
@@ -189,6 +236,16 @@ def _rrf_merge(
 
     for rank, idx in enumerate(bm25_ranks, start=1):
         scores[idx] = scores.get(idx, 0.0) + 1.0 / (_RRF_K + rank)
+
+    if credibility_ranks:
+        for idx in scores:
+            rank = credibility_ranks.get(idx)
+            if rank is not None:
+                scores[idx] += _CREDIBILITY_RRF_WEIGHT / (_RRF_K + rank)
+
+    for idx in scores:
+        if candidates[idx].low_confidence:
+            scores[idx] *= _LOW_CONFIDENCE_DEMOTION
 
     top_indices = sorted(scores, key=lambda i: -scores[i])[:top_k]
 
@@ -215,9 +272,13 @@ async def _load_candidates(
     """
     Load embedding records + raw content for a given symbol and time window.
 
-    Strategy — guaranteed symbol inclusion:
-      1. Fetch ALL instrument-specific docs (symbol = :symbol) in the window.
-         These are always included regardless of count to prevent crowd-out.
+    Strategy — prioritized symbol inclusion:
+      1. Fetch instrument-specific docs (symbol = :symbol) in the window,
+         most-recent first, capped at ``limit``. The cap keeps a heavily
+         covered symbol during earnings/M&A news flow (or a 168h swing
+         window) from loading thousands of rows into Python and blowing the
+         ~10ms/130-candidate performance model — hitting it truncates the
+         OLDEST docs in the window and logs a warning.
       2. Fill remaining budget (limit - symbol_count) with general market docs
          (symbol IS NULL), most-recent first.
 
@@ -234,9 +295,10 @@ async def _load_candidates(
         AIRawEvent.raw_content,
         AIRawEvent.source_name,
         AIRawEvent.source_url,
+        AIRawEvent.extra_data,
     )
 
-    # Step 1: all symbol-specific docs in the time window.
+    # Step 1: symbol-specific docs in the time window, recency-capped.
     symbol_stmt = (
         select(*_COLUMNS)
         .join(AIRawEvent, AIRawEvent.id == AIDocumentEmbedding.source_id)
@@ -245,8 +307,16 @@ async def _load_candidates(
             AIDocumentEmbedding.as_of_timestamp >= cutoff,
         )
         .order_by(AIDocumentEmbedding.as_of_timestamp.desc())
+        .limit(limit)
     )
     symbol_rows = (await db.execute(symbol_stmt)).all()
+    if len(symbol_rows) >= limit:
+        logger.warning(
+            "rag.retrieve: symbol-specific candidates for %s hit the %d cap — "
+            "oldest docs in the window were truncated",
+            symbol,
+            limit,
+        )
 
     # Step 2: general market docs to fill remaining budget.
     general_limit = max(0, limit - len(symbol_rows))
@@ -275,6 +345,9 @@ async def _load_candidates(
             as_of_timestamp=row.as_of_timestamp,
             embedding=row.embedding,
             symbol=row.symbol,
+            low_confidence=bool(
+                (row.extra_data or {}).get("low_confidence_source")
+            ),
         )
         for row in rows
     ]
@@ -334,7 +407,23 @@ async def retrieve(
 
     bm25_ranks = _bm25_rank(candidates, query, top_n=rank_n)
     vector_ranks = _cosine_rank(candidates, query_vector, top_n=rank_n)
-    chunks = _rrf_merge(vector_ranks, bm25_ranks, candidates, top_k=top_k)
+
+    # Third RRF term: source authority (live credibility scores, batch-loaded
+    # through a 900s in-process cache). Never blocks retrieval — on lookup
+    # failure ranking degrades to pure relevance.
+    credibility_ranks: dict[int, int] | None = None
+    try:
+        source_scores = await load_credibility_scores(
+            db, {c.source_name for c in candidates}
+        )
+        credibility_ranks = _credibility_ranks(candidates, source_scores)
+    except Exception as exc:
+        logger.warning("rag.retrieve: credibility lookup failed (non-fatal): %s", exc)
+
+    chunks = _rrf_merge(
+        vector_ranks, bm25_ranks, candidates, top_k=top_k,
+        credibility_ranks=credibility_ranks,
+    )
 
     logger.info(
         "rag.retrieve symbol=%s candidates=%d bm25_ranked=%d vector_ranked=%d returned=%d",

@@ -54,15 +54,66 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
+
+# Score band treated as neutral — mirrors the prompt's own rule ("neutral →
+# score = 0.0 ± 0.1 tolerance"). Shared by the label↔score sign validators.
+_NEUTRAL_SCORE_TOLERANCE = 0.1
+
+
+def _expected_label_for_score(score: float) -> str:
+    if score > _NEUTRAL_SCORE_TOLERANCE:
+        return "positive"
+    if score < -_NEUTRAL_SCORE_TOLERANCE:
+        return "negative"
+    return "neutral"
+
+
+def _label_contradicts_score(label: str, score: float) -> bool:
+    """
+    True iff the label is inconsistent with the score's sign per the prompt's
+    own contract: positive → score > 0, negative → score < 0, neutral →
+    |score| ≤ tolerance. A "positive" label with a small positive score
+    (0 < score ≤ tolerance) is NOT a contradiction.
+    """
+    if label == "positive":
+        return score <= 0.0
+    if label == "negative":
+        return score >= 0.0
+    return abs(score) > _NEUTRAL_SCORE_TOLERANCE  # neutral
+
+
+def _coerce_sign_violation(model: "SentimentOutput | _SentimentBatchItem", path: str) -> None:
+    """
+    Repair a label↔score contradiction in place: the label is re-derived from
+    the score sign (the score carries the magnitude signal; a flipped label is
+    the cheaper hallucination), and confidence is capped at 0.5 because the
+    response was internally contradictory. Counted per path for Grafana.
+
+    Runs at Pydantic parse time — BEFORE any cache write — so a violating
+    response is never cached un-repaired (the per-article cache holds entries
+    for 24h).
+    """
+    from app.core.metrics import sentiment_sign_violations_total
+
+    coerced = _expected_label_for_score(model.score)
+    logger.warning(
+        "nlp: label/score sign violation (path=%s): label=%r score=%.3f → "
+        "coerced label=%r, confidence capped",
+        path, model.label, model.score, coerced,
+    )
+    model.label = coerced  # type: ignore[assignment]
+    model.confidence = min(model.confidence, 0.5)
+    sentiment_sign_violations_total.labels(path=path).inc()
 
 # Sentiment results cached by prompt SHA-256.  24 hours spans the full trading
 # day: article sentiment is immutable, so one LLM call per article per day is
@@ -107,14 +158,21 @@ class SentimentOutput(BaseModel):
         ),
     )
 
+    @model_validator(mode="after")
+    def _enforce_label_score_consistency(self) -> "SentimentOutput":
+        if _label_contradicts_score(self.label, self.score):
+            _coerce_sign_violation(self, path="single")
+        return self
+
 
 class _SentimentBatchItem(BaseModel):
     """One article's result within a batch LLM response.
 
-    No ``reasoning`` field (Option A): saves ~100 output tokens per item
-    (~800/batch at size 8).  Reasoning is never stored or displayed; its only
-    potential benefit is chain-of-thought accuracy improvement — which 2025
-    research found absent for financial classification tasks (arxiv:2506.04574).
+    ``reasoning`` is kept in batch mode (E.A): a few extra output tokens per
+    item buys post-hoc auditability AND the input for the misattribution
+    spot-check in ``_call_batch_llm`` — without it, a structurally valid but
+    misattributed response passes silently. (Supersedes the earlier Option A
+    token-saving decision.)
     """
 
     index: int = Field(
@@ -123,12 +181,53 @@ class _SentimentBatchItem(BaseModel):
     label: Literal["positive", "negative", "neutral"]
     score: float = Field(ge=-1.0, le=1.0)
     confidence: float = Field(ge=0.0, le=1.0)
+    reasoning: str = Field(
+        default="",
+        max_length=300,
+        description=(
+            "One short sentence citing the specific fact from THIS article "
+            "that drives the classification."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _enforce_label_score_consistency(self) -> "_SentimentBatchItem":
+        if _label_contradicts_score(self.label, self.score):
+            _coerce_sign_violation(self, path="batch")
+        return self
 
 
 class _SentimentBatchOutput(BaseModel):
     """Batch LLM response envelope."""
 
     results: list[_SentimentBatchItem]
+
+
+# Minimum length for a token to count as "content" in the misattribution
+# check — filters articles/prepositions without a stopword list.
+_MIN_CONTENT_TOKEN_LEN = 4
+
+
+def _reasoning_matches_content(content: str, reasoning: str) -> bool | None:
+    """
+    Heuristic misattribution spot-check for batched sentiment results.
+
+    Returns True when the reasoning shares ≥1 significant token with the
+    article it claims to describe, False when it shares none (the signature
+    of a cross-contaminated batch response), and None when the article has no
+    judgeable tokens (too short) — in which case no verdict is possible.
+
+    Deliberately a token-overlap heuristic, not a second LLM call: the goal is
+    catching gross index misattribution, not grading reasoning quality.
+    """
+    content_tokens = {
+        t for t in re.findall(r"[a-z0-9]+", content.lower())
+        if len(t) >= _MIN_CONTENT_TOKEN_LEN
+    }
+    if not content_tokens:
+        return None
+    reasoning_tokens = set(re.findall(r"[a-z0-9]+", reasoning.lower()))
+    return bool(content_tokens & reasoning_tokens)
 
 
 # ── Internal state dataclasses ─────────────────────────────────────────────────
@@ -779,6 +878,8 @@ class NLPEngine:
             "Analyze the financial sentiment of each numbered article below.",
             "Return one result per article in the SAME ORDER as input.",
             "Set the 'index' field to match the article number (0-based).",
+            "For each result, 'reasoning' must cite a specific fact from THAT",
+            "article (one short sentence) — never from a different article.",
         ]
         for i, (text, _) in enumerate(items):
             lines.append(f"\n[{i}]\n{text}")
@@ -823,18 +924,39 @@ class NLPEngine:
                 continue
             index_map[item.index] = item
 
+        from app.core.metrics import sentiment_batch_misattribution_total
+
         results: list[dict[str, Any]] = []
         for i in range(n):
             batch_item = index_map.get(i)
             if batch_item is None:
                 logger.warning("nlp: batch response missing index %d — neutral fallback", i)
                 results.append(_NEUTRAL_FALLBACK.copy())
-            else:
-                results.append({
-                    "label":      batch_item.label,
-                    "score":      round(float(batch_item.score), 4),
-                    "confidence": round(float(batch_item.confidence), 4),
-                    "model":      model_tag,
-                })
+                continue
+
+            confidence = float(batch_item.confidence)
+
+            # Misattribution spot-check (E.A): a structurally valid batch
+            # response can still pair article i with article j's sentiment.
+            # Zero content-token overlap between the article and its claimed
+            # reasoning is the cheap, reliable signature of that failure.
+            matches = _reasoning_matches_content(items[i][0], batch_item.reasoning)
+            if matches is False:
+                confidence = confidence / 2.0
+                sentiment_batch_misattribution_total.inc()
+                logger.warning(
+                    "nlp: batch reasoning shares no content token with article "
+                    "%d — possible misattribution, confidence halved "
+                    "(reasoning=%.80r)",
+                    i, batch_item.reasoning,
+                )
+
+            results.append({
+                "label":      batch_item.label,
+                "score":      round(float(batch_item.score), 4),
+                "confidence": round(confidence, 4),
+                "model":      model_tag,
+                "reasoning":  batch_item.reasoning,
+            })
 
         return results

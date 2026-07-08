@@ -89,9 +89,15 @@ def _build_embed_rows(
 
     Uses column names (not ORM attribute names) so the result is compatible
     with Core-level ``pg_insert(AIDocumentEmbedding.__table__)``.
+
+    ``strict=True``: a length mismatch between events and vectors means the
+    embedding provider dropped an item — silently zipping would write another
+    event's embedding to every row after the gap, and the anti-join in
+    ``_fetch_unembedded_events`` would never re-select those rows for repair.
+    Raising instead leaves the batch unembedded, so the next cycle retries it.
     """
     rows: list[dict] = []
-    for row, vector in zip(deduped, vectors):
+    for row, vector in zip(deduped, vectors, strict=True):
         affected_symbols = _flatten_affected_symbols(row.all_affected_symbols)
         symbol = _assign_symbol(affected_symbols)
         content_hash = hashlib.sha256(row.raw_content.encode("utf-8")).hexdigest()

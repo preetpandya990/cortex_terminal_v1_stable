@@ -721,6 +721,104 @@ event_classification_total = Counter(
 )
 
 
+# ── Sentiment Accuracy Metrics (WS4) ─────────────────────────────────────────
+# Guardrail observability for the pure-Gemini sentiment pipeline: sign-flip
+# coercions, batch misattribution, and rolling drift vs the 30-day baseline.
+
+sentiment_sign_violations_total = Counter(
+    'sentiment_sign_violations_total',
+    'LLM sentiment responses whose label contradicted the score sign '
+    '(label coerced from score, confidence capped at 0.5)',
+    ['path'],  # single | batch
+)
+
+sentiment_batch_misattribution_total = Counter(
+    'sentiment_batch_misattribution_total',
+    'Batched sentiment results whose reasoning shares no content token with '
+    'the article it claims to describe (confidence halved)',
+)
+
+sentiment_drift_label_fraction = Gauge(
+    'sentiment_drift_label_fraction',
+    'Fraction of ai_nlp_results rows carrying each sentiment label per window',
+    ['label', 'window'],  # label: positive|negative|neutral · window: 7d|30d
+)
+
+sentiment_drift_mean_score = Gauge(
+    'sentiment_drift_mean_score',
+    'Mean stored sentiment score (-1..1) per rolling window',
+    ['window'],  # 7d | 30d
+)
+
+sentiment_drift_distribution_distance = Gauge(
+    'sentiment_drift_distribution_distance',
+    'Total variation distance (0..1) between the 7d and 30d label distributions',
+)
+
+sentiment_drift_runs_total = Counter(
+    'sentiment_drift_runs_total',
+    'Sentiment drift monitor cycles by outcome',
+    ['status'],  # success | error | insufficient_data
+)
+
+
+# ── Forecast Demand Gating Metrics (WS6) ─────────────────────────────────────
+
+forecast_enqueue_gated_total = Counter(
+    'forecast_enqueue_gated_total',
+    'Forecast batch enqueues skipped because the symbol is not in the '
+    'in-demand set (watchlist or active suggestions)',
+)
+
+forecast_stale_dropped_total = Counter(
+    'forecast_stale_dropped_total',
+    'Forecast batch payloads dropped as stale (older than _STALE_AFTER_SECS) '
+    'during queue drains',
+)
+
+
+# ── Safety Engine Metrics (WS9) ──────────────────────────────────────────────
+# The kill-switch manager owns its own activation/check metrics; these cover
+# the trigger engine's live inputs and its anti-latch recovery behavior.
+
+safety_metric_value = Gauge(
+    'safety_metric_value',
+    'Live safety-engine input metrics (signal_rate: suggestions/hour · '
+    'volatility: high-vol regime prevalence vs 30d baseline · '
+    'loss_pct: realized session loss fraction)',
+    ['metric'],  # signal_rate | volatility | loss_pct
+)
+
+safety_triggers_total = Counter(
+    'safety_triggers_total',
+    'Safety triggers fired, by type (cooldown-suppressed re-fires excluded)',
+    ['trigger_type'],  # high_signal_rate | high_volatility | session_loss_limit
+)
+
+safety_kill_switch_auto_releases_total = Counter(
+    'safety_kill_switch_auto_releases_total',
+    'Engine-activated switches auto-released after sustained metric recovery '
+    '(manual activations are never auto-released)',
+    ['switch_type'],  # global | signal_pause
+)
+
+
+# ── On-Demand Explanation Metrics (WS7) ──────────────────────────────────────
+
+explanation_demand_latency_seconds = Histogram(
+    'explanation_demand_latency_seconds',
+    'End-to-end generation latency for demand-triggered explanations '
+    '(user is watching a generating skeleton; p95 target < 20s)',
+    buckets=(1, 2.5, 5, 7.5, 10, 15, 20, 30, 45, 60, 90, 120),
+)
+
+explanation_ungrounded_numbers_total = Counter(
+    'explanation_ungrounded_numbers_total',
+    'Sentences stripped from explanations because they cited a %/RSI figure '
+    'absent from the prompt (hallucinated number guardrail)',
+)
+
+
 def init_metrics(app_version: str, environment: str):
     """Initialize application info metrics."""
     app_info.info({

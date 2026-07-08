@@ -562,6 +562,16 @@ class CortexIntelligenceClient:
                     model=self._embed_model, contents=texts, config=config,
                 )
                 vectors = [list(e.values) for e in (resp.embeddings or [])]
+                # A short response would positionally mispair every vector
+                # after the gap with the wrong text downstream — fail the
+                # call (inside _do, so the retry wrapper gets a shot) rather
+                # than return a silently misaligned batch. Mirrors the
+                # equivalent guard in embed_batch_job.
+                if len(vectors) != len(texts):
+                    raise RuntimeError(
+                        f"Embedding count mismatch: sent {len(texts)} texts, "
+                        f"received {len(vectors)} embeddings."
+                    )
                 if self._embed_dim < _GEMINI_NATIVE_EMBED_DIM:
                     vectors = [_l2_normalize(v) for v in vectors]
                 return vectors

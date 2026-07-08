@@ -20,9 +20,16 @@ Two scheduling modes share the same in-process core (`run_one_challenger`):
                orchestrator subprocess or acquiring the lock.
 
 A `fcntl.flock` on the configured lock file makes concurrent runs impossible
-(POSIX-atomic, OS auto-releases on process exit).  If the lock is held by
-another process the second invocation logs a warning and exits non-zero —
+(atomic at the OS level, auto-released on process exit).  If the lock is held
+by another process the second invocation logs a warning and exits non-zero —
 the orchestrator is never invoked twice in parallel.
+
+The lock file is runtime state and is deliberately .gitignore'd, never
+committed: flock is scoped to the file's inode, so correctness depends on all
+participants opening the same on-disk file — git managing (and potentially
+recreating) it would both churn the working tree on every run and invite
+inode swaps.  The file's pid/started_at content is informational only; the
+held flock is the actual mutual-exclusion mechanism.
 
 Exit codes:
     0 — challenger run completed successfully (or dry-run printed plan)

@@ -7,8 +7,26 @@ import { useEffect, useRef, useState } from 'react';
  * same content (e.g. navigating prev/next between suggestions and back)
  * renders instantly instead of retyping.  Module-scoped by design — it must
  * outlive individual component mounts/unmounts as the user browses.
+ *
+ * Bounded: each entry is a full explanation string (often several KB), so an
+ * unbounded set would grow for the tab's lifetime. When the cap is exceeded
+ * the least-recently-revealed entry is evicted — re-revealing cached content
+ * refreshes its recency, so actively browsed explanations stay resident. The
+ * only cost of eviction is a cosmetic re-animation on a later revisit.
  */
+export const TYPED_CACHE_MAX_ENTRIES = 100;
 const typedCache = new Set<string>();
+
+function markFullyTyped(text: string): void {
+  // Delete-then-add refreshes insertion order, making the Set LRU-ordered:
+  // the first entry iterated is always the least recently revealed.
+  typedCache.delete(text);
+  typedCache.add(text);
+  if (typedCache.size > TYPED_CACHE_MAX_ENTRIES) {
+    const oldest = typedCache.values().next().value;
+    if (oldest !== undefined) typedCache.delete(oldest);
+  }
+}
 
 interface UseTypewriterOptions {
   /** Characters revealed per second of animation. */
@@ -100,7 +118,7 @@ export function useTypewriter(
 
     const startLength = revealedLengthRef.current;
     if (startLength >= text.length) {
-      if (text.length > 0) typedCache.add(text);
+      if (text.length > 0) markFullyTyped(text);
       return;
     }
 
@@ -124,7 +142,7 @@ export function useTypewriter(
       if (charAccumulator < text.length) {
         rafId = requestAnimationFrame(step);
       } else {
-        typedCache.add(text);
+        markFullyTyped(text);
       }
     };
 

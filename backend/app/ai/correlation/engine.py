@@ -39,6 +39,7 @@ from app.core.metrics import (
 )
 from app.core.redis import RedisChannels
 from app.models.trade_suggestions import EventCorrelation, TradeSuggestion
+from app.services.regime_service import RegimeService
 
 logger = logging.getLogger(__name__)
 
@@ -52,72 +53,26 @@ SCANNER_WEIGHT = 0.30
 AI_WEIGHT = 0.40
 ML_WEIGHT = 0.30
 
+# AI forecast sources that carry a genuinely computed direction (F.A).
+# Every other shape — fallback/batch_pending, circuit_breaker_open,
+# stale_data, no_news — is treated as unavailable: its weight renormalizes
+# to scanner/ML and it abstains from the direction vote.
+LIVE_FORECAST_SOURCES = frozenset({"gemini_batch", "demand"})
+
+# Regime-conditioned weight overrides (F.C), keyed by RegimeService label:
+# in high-volatility regimes technical anomaly readings are noisier, so the
+# scanner cedes weight to ML (whose features include volatility context).
+# Static map by design — no learned weighting. Absent labels use defaults.
+REGIME_WEIGHT_OVERRIDES: dict[str, tuple[float, float, float]] = {
+    # (scanner, ai, ml)
+    "high_volatility": (0.25, 0.30, 0.45),
+}
+
 # Deduplication thresholds — a new signal must exceed at least one of these
 # to supersede an existing active suggestion for the same instrument+direction.
 # Below all thresholds the new signal is suppressed (no new row created).
 DRASTIC_SCORE_DELTA = 5.0        # consensus_score change ≥ 5 points
 DRASTIC_PRICE_DELTA_PCT = 0.02   # entry_price change ≥ 2%
-
-
-class CircuitBreaker:
-    """
-    Production-grade circuit breaker for fault tolerance.
-    
-    States:
-    - CLOSED: Normal operation, requests pass through
-    - OPEN: Failure threshold exceeded, requests fail fast
-    - HALF_OPEN: Testing if service recovered
-    
-    Pattern: After timeout in OPEN state, transition to HALF_OPEN.
-    First success in HALF_OPEN → CLOSED. Failure → OPEN.
-    """
-
-    def __init__(self, failure_threshold: int = 5, timeout_seconds: int = 60):
-        """
-        Initialize circuit breaker.
-        
-        Args:
-            failure_threshold: Consecutive failures before opening
-            timeout_seconds: Time to wait before attempting recovery
-        """
-        self.failure_threshold = failure_threshold
-        self.timeout_seconds = timeout_seconds
-        self.failure_count = 0
-        self.last_failure_time: datetime | None = None
-        self.state: Literal["closed", "open", "half_open"] = "closed"
-
-    def record_success(self) -> None:
-        """Record successful operation."""
-        if self.state == "half_open":
-            self.state = "closed"
-            self.failure_count = 0
-            logger.info("Circuit breaker closed after successful recovery")
-
-    def record_failure(self) -> None:
-        """Record failed operation."""
-        self.failure_count += 1
-        self.last_failure_time = datetime.now(timezone.utc)
-        
-        if self.failure_count >= self.failure_threshold:
-            self.state = "open"
-            logger.warning(
-                f"Circuit breaker opened (failures: {self.failure_count})"
-            )
-
-    def can_attempt(self) -> bool:
-        """Check if operation can be attempted."""
-        if self.state == "closed":
-            return True
-            
-        if self.state == "open" and self.last_failure_time:
-            elapsed = (datetime.now(timezone.utc) - self.last_failure_time).total_seconds()
-            if elapsed >= self.timeout_seconds:
-                self.state = "half_open"
-                logger.info("Circuit breaker half-open, testing recovery")
-                return True
-            return False
-            
-        return self.state == "half_open"
 
 
 class EventCorrelationEngine:
@@ -126,12 +81,15 @@ class EventCorrelationEngine:
     
     Implements weighted consensus with directional alignment checks.
     All three agents (Scanner, AI, ML) must agree on direction.
-    
+
     Features:
-    - Circuit breakers per agent for fault tolerance
     - Sub-100ms consensus latency target
     - Comprehensive audit trail via EventCorrelation records
     - Redis pub/sub for real-time frontend updates
+
+    Fault tolerance for the one external dependency (Gemini news forecast)
+    lives in SignalAssembler's circuit breaker; scanner and ML signal loads
+    are local DB reads with their own error handling.
     """
 
     def __init__(
@@ -157,13 +115,6 @@ class EventCorrelationEngine:
         # Ceiling for the consensus signal-gather (ML → news forecast).
         from app.core.config import get_settings
         self._gather_timeout = get_settings().CONSENSUS_GATHER_TIMEOUT
-
-        # Circuit breakers per agent
-        self.circuit_breakers = {
-            "scanner": CircuitBreaker(failure_threshold=5, timeout_seconds=60),
-            "ai": CircuitBreaker(failure_threshold=5, timeout_seconds=60),
-            "ml": CircuitBreaker(failure_threshold=5, timeout_seconds=60),
-        }
 
     async def _publish_correlation_event(
         self,
@@ -553,16 +504,31 @@ class EventCorrelationEngine:
         """
         Look up a symbol in the latest cached scanner results.
 
-        Returns the real scanner dict when found; otherwise falls back to an
-        event-impact-derived synthetic signal (available=False flagged) so the
-        consensus engine can still evaluate Pathway 2 with a weak scanner agent.
+        Returns the real scanner dict when found; otherwise falls back to a
+        synthetic signal derived from the event's PERSISTED directional
+        sentiment (available=False flagged) so the consensus engine can still
+        evaluate Pathway 2 with a weak scanner agent.
+
+        Direction comes from ``event.sentiment`` (bullish/bearish, written by
+        the classifier since migration 0052) — NEVER from ``impact_score``,
+        which is an unsigned severity magnitude: the old ``impact > 0``
+        derivation returned "buy" for virtually every event, including
+        severely bearish ones (fraud probe, impact 85 → BUY-leaning signal).
+        Neutral or NULL sentiment yields no synthetic direction; consensus
+        then rejects via NEUTRAL_SIGNAL instead of manufacturing agreement.
         """
         # Synthetic fallback used when scanner cache is absent or symbol not found.
         # Confidence is intentionally capped at 50 so a synthetic-only Pathway 2
         # signal can only reach consensus if the ML score is very high.
-        impact = float(event.impact_score)
+        sentiment = (event.sentiment or "").lower()
+        if sentiment == "bullish":
+            fallback_direction = "buy"
+        elif sentiment == "bearish":
+            fallback_direction = "sell"
+        else:
+            fallback_direction = "neutral"  # no directional basis — never fabricate one
         fallback: dict[str, Any] = {
-            "direction":       "buy"  if impact > 0 else "sell",
+            "direction":       fallback_direction,
             "confidence":      50.0,   # capped — signal is inferred, not observed
             "instrument_key":  symbol,
             "trading_symbol":  symbol,
@@ -709,10 +675,18 @@ class EventCorrelationEngine:
         _raw_score = abs(scanner_signal.get("score", 0.0))
         scanner_conf = scanner_signal.get("confidence") or min(_raw_score / 20.0 * 100, 100.0)
 
-        ai_score = ai_signal.get("score", 0.0)
-        # Neutral AI (no events, score=0) should not vote SELL — it is uninformative.
-        # Align with the scanner direction so it does not block a scanner+ML consensus.
-        ai_dir = "BUY" if ai_score > 0 else ("SELL" if ai_score < 0 else scanner_dir)
+        # AI directional vote (F.A/F.B): only a genuinely computed forecast —
+        # live source AND an explicit BUY/SELL direction — votes in the
+        # unanimity check. Pending/fallback/neutral(HOLD) AI ABSTAINS. The old
+        # code force-aligned a zero score to the scanner direction, which
+        # manufactured agreement a real forecast (landing seconds later) could
+        # contradict — the scoring-side twin of the batch_pending race.
+        ai_direction_raw = str(ai_signal.get("direction") or "").upper()
+        ai_available = (
+            ai_signal.get("forecast_source") in LIVE_FORECAST_SOURCES
+            and ai_direction_raw in ("BUY", "SELL")
+        )
+        ai_dir = ai_direction_raw if ai_available else "ABSTAIN"
 
         ml_prediction = ml_signal.get("prediction", {})
         ml_dir = ml_prediction.get("direction", "HOLD")
@@ -738,9 +712,13 @@ class EventCorrelationEngine:
             )
             return None
 
-        # Check directional alignment
-        all_buy = (scanner_dir == "BUY" and ai_dir == "BUY" and ml_dir == "BUY")
-        all_sell = (scanner_dir == "SELL" and ai_dir == "SELL" and ml_dir == "SELL")
+        # Directional unanimity over the VOTING components only (F.B): scanner
+        # and ML always vote; AI votes only when available. An abstaining AI
+        # neither agrees nor vetoes — this is what keeps the no-news
+        # scanner+ML pathway alive after removing the force-align above.
+        votes = [scanner_dir, ml_dir] + ([ai_dir] if ai_available else [])
+        all_buy = all(v == "BUY" for v in votes)
+        all_sell = all(v == "SELL" for v in votes)
 
         if not (all_buy or all_sell):
             await self._record_correlation(
@@ -778,19 +756,51 @@ class EventCorrelationEngine:
         ai_conf = abs(ai_signal.get("confidence", 0.0)) * 100
         ml_conf = ml_signal.get("confidence", 0.0) * 100
 
-        # Dynamic weight redistribution: when AI has no events its 40% weight is
-        # dead weight and makes consensus unreachable.  Redistribute proportionally
-        # to scanner and ML so strong technical + model agreement can produce a
-        # valid suggestion — mirrors SignalAssembler.fuse_signals() renormalization.
-        ai_available = bool(ai_signal.get("available")) and ai_signal.get("event_count", 0) > 0
+        # ── Regime-conditioned weighting (F.C) ────────────────────────────────
+        # Real regime classification (RegimeService over 60 daily candles)
+        # replaces the old post-hoc placeholder label and conditions the agent
+        # weights. Fetched only after the unanimity gate — candidates rejected
+        # on direction never pay the OHLCV read. Any failure degrades to
+        # default weights + "unknown"; regime must never block consensus.
+        _regime_instrument = scanner_signal.get("instrument_key") or ml_signal.get("symbol", "")
+        regime_type = "unknown"
+        try:
+            regime_info = await RegimeService().get_instrument_regime(
+                db,
+                instrument_key=_regime_instrument,
+                # trading_symbol/company_name are echo-only in the regime
+                # response; the computation needs only the instrument_key.
+                trading_symbol=_act_trading_sym or _regime_instrument,
+                company_name=_act_trading_sym or _regime_instrument,
+            )
+            regime_type = regime_info.get("regime", "unknown")
+        except Exception as exc:
+            logger.warning(
+                "Regime lookup failed for %s — using default weights: %s",
+                _regime_instrument, exc,
+            )
+
+        base_scanner, base_ai, base_ml = REGIME_WEIGHT_OVERRIDES.get(
+            regime_type, (SCANNER_WEIGHT, AI_WEIGHT, ML_WEIGHT)
+        )
+        if regime_type in REGIME_WEIGHT_OVERRIDES:
+            logger.info(
+                "Regime weight override active for %s: regime=%s weights=(%.2f/%.2f/%.2f)",
+                _regime_instrument, regime_type, base_scanner, base_ai, base_ml,
+            )
+
+        # Dynamic weight redistribution (F.A): when the AI forecast is not a
+        # genuinely computed one (see ai_available above), its weight is dead
+        # weight that silently zero-drags the score — redistribute it
+        # proportionally to scanner and ML from the regime-conditioned base,
+        # mirroring SignalAssembler.fuse_signals() renormalization.
         if ai_available:
-            w_scanner, w_ai, w_ml = SCANNER_WEIGHT, AI_WEIGHT, ML_WEIGHT
+            w_scanner, w_ai, w_ml = base_scanner, base_ai, base_ml
         else:
-            # Distribute AI_WEIGHT proportionally between scanner and ML
-            total_remaining = SCANNER_WEIGHT + ML_WEIGHT  # 0.60
-            w_scanner = SCANNER_WEIGHT / total_remaining  # 0.50
+            total_remaining = base_scanner + base_ml
+            w_scanner = base_scanner / total_remaining
             w_ai      = 0.0
-            w_ml      = ML_WEIGHT / total_remaining       # 0.50
+            w_ml      = base_ml / total_remaining
 
         consensus_score = (
             w_scanner * scanner_conf +
@@ -835,9 +845,8 @@ class EventCorrelationEngine:
             reward = abs(targets[0] - entry_price)
             risk_reward_ratio = reward / risk if risk > 0 else None
 
-        # Derive regime_type from signal direction (heuristic; refined when ML
-        # model outputs explicit regime classification in a future iteration).
-        regime_type = "bull_trending" if all_buy else "bear_trending"
+        # regime_type was computed above by RegimeService (F.C) — the old
+        # direction-derived placeholder ("bull_trending" if all_buy) is gone.
 
         # Derive time_horizon from trigger pathway:
         # Scanner anomalies are intraday momentum events; news events typically
@@ -1059,16 +1068,27 @@ class EventCorrelationEngine:
             ml_output=ml_signal,
         )
 
-        # Trigger async LLM explanation generation — gated by consensus_score.
-        # Only enqueue when the signal is strong enough to warrant a Gemini call;
-        # weak signals surface a placeholder in the AI panel with a user-driven
-        # refresh button (bypass endpoint, Phase 2-B).  Publish failure is
-        # non-fatal: it must never block or roll back the committed suggestion.
+        # Trigger async LLM explanation generation (LEGACY auto-publish path).
+        # Skipped entirely under EXPLANATION_ON_DEMAND: explanations then
+        # generate at first view (ai_stream → explanation_service publishes a
+        # demand job), so demand — not consensus strength — is the gate.
+        # Flipping the flag back to False restores this path (rollback lever).
+        # In legacy mode the consensus gate applies: only enqueue when the
+        # signal is strong enough to warrant a Gemini call; weak signals
+        # surface a placeholder with a user-driven refresh button (bypass
+        # endpoint).  Publish failure is non-fatal: it must never block or
+        # roll back the committed suggestion.
         try:
             from app.core.config import get_settings as _get_settings
             from app.core.kafka import KafkaTopics, publish
-            _threshold = _get_settings().EXPLANATION_CONSENSUS_THRESHOLD
-            if float(suggestion.consensus_score) >= _threshold:
+            _settings = _get_settings()
+            _threshold = _settings.EXPLANATION_CONSENSUS_THRESHOLD
+            if _settings.EXPLANATION_ON_DEMAND:
+                logger.debug(
+                    "explanation auto-publish skipped (on-demand mode): suggestion=%s",
+                    suggestion.suggestion_id,
+                )
+            elif float(suggestion.consensus_score) >= _threshold:
                 await publish(
                     KafkaTopics.EXPLANATION_JOBS,
                     {

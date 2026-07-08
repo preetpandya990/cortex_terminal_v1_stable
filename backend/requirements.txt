@@ -59,12 +59,13 @@ keras-tuner==1.4.7              # Hyperparameter optimization (keras-tuner >= 1.
 # build (torch==X+cu130) which CANNOT use this driver and drags a redundant CUDA-13
 # nvidia-* stack into the venv. The CPU wheel MUST be installed explicitly:
 #   pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
-# FinBERT/transformer inference runs fine on CPU. (Orphan -cu13 lib cleanup is
-# tracked as a separate validated step — see ML_IMPLEMENTATION_TASKS.md A0.1b.)
+# Used by the TFT/GRU training stack (ml/training/*, ml/models/*, onnx_converter).
+# (Orphan -cu13 lib cleanup is tracked separately — see ML_IMPLEMENTATION_TASKS.md A0.1b.)
 torch==2.11.0                   # CPU build (+cpu) — see install note above
-transformers==4.46.3            # Hugging Face transformers (FinBERT) — 4.46.3 is the resolved version; 4.41+ requires tf-keras for Keras 3 compat
-tf-keras==2.21.0                # Keras 2 compatibility shim for transformers 4.41+ when Keras 3 is active (via tensorflow); pinned to the installed/verified version
-sentencepiece==0.1.99           # Tokenizer for transformers
+# FinBERT removed from production (2026-07): transformers, tf-keras and
+# sentencepiece were FinBERT-only (sole importer: poc/finbert_sentiment_poc.py).
+# Sentiment is pure-Gemini; eval/gold_set.jsonl keeps frozen finbert_score
+# fixture values as static calibration anchors — those need no runtime deps.
 onnxruntime-gpu==1.19.2         # ONNX GPU inference via CUDAExecutionProvider — do NOT also install onnxruntime (CPU); both write to the same onnxruntime/ namespace and the CPU uninstall removes shared __init__.py
 onnx==1.21.0                    # Verified with onnxruntime-gpu 1.19.2 (>=1.16 needed for TensorProto.INT4). The old hummingbird-ml<=1.16.1 cap no longer applies — hummingbird is unused in the codebase.
 evidently==0.4.33               # ML monitoring and drift detection

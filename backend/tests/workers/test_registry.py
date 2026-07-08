@@ -1,7 +1,7 @@
 """
 Tests for app.workers.registry
 ================================
-Validates that build_task_registry() produces exactly 18 callable factories
+Validates that build_task_registry() produces exactly 19 callable factories
 matching TASK_NAMES, and that the key migrated tasks are present.
 """
 from __future__ import annotations
@@ -34,6 +34,7 @@ _LOOP_PATCH_TARGETS = (
     "app.worker.correlation_loop",
     "app.worker.feature_refresh_loop",
     "app.workers.rag_cleanup.rag_cleanup_loop",
+    "app.workers.sentiment_drift_monitor.sentiment_drift_loop",
     "app.workers.watchlist_context_scheduler.WatchlistContextScheduler",
     "app.ai.fusion.forecast_batch_worker.forecast_batch_loop",
     "app.workers.ai_processing_safety_net.AIProcessingSafetyNet",
@@ -86,8 +87,8 @@ def task_states():
 # ── TASK_NAMES ─────────────────────────────────────────────────────────────────
 
 class TestTaskNames:
-    def test_has_18_tasks(self):
-        assert len(TASK_NAMES) == 18
+    def test_has_19_tasks(self):
+        assert len(TASK_NAMES) == 19
 
     def test_is_tuple(self):
         assert isinstance(TASK_NAMES, tuple)
@@ -151,7 +152,7 @@ class TestBuildTaskRegistry:
                 task_states=task_states,
             )
 
-    def test_builds_all_18_tasks(
+    def test_builds_all_19_tasks(
         self, mock_session_factory, mock_redis_client, mock_ml_components,
         mock_upstox_client, shutdown_event, task_states,
     ):
@@ -159,7 +160,7 @@ class TestBuildTaskRegistry:
             mock_session_factory, mock_redis_client, mock_ml_components,
             mock_upstox_client, shutdown_event, task_states,
         )
-        assert len(registry) == 18
+        assert len(registry) == 19
         assert set(registry.keys()) == set(TASK_NAMES)
 
     def test_factories_are_callable(
@@ -207,9 +208,9 @@ class TestBuildTaskRegistry:
 
 
 # ── on_cycle wiring proof ────────────────────────────────────────────────────────
-# Only 2 representative tests (not 18) — one per wiring pattern (see plan
+# Only 2 representative tests (not 19) — one per wiring pattern (see plan
 # pure-brewing-backus.md §9): proves the two mechanics work without
-# re-verifying all 18 call sites individually, matching the existing coverage
+# re-verifying all 19 call sites individually, matching the existing coverage
 # boundary (nothing tests loop bodies directly, only the wiring).
 
 class TestOnCycleWiring:

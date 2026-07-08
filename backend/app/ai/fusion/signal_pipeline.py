@@ -177,6 +177,14 @@ class SignalPipeline:
             logger.warning("Global kill switch active - skipping event")
             return {"status": "skipped", "reason": "kill_switch_active"}
 
+        # Check signal pause (WS9): the safety engine's volatility trigger
+        # activates an auto-expiring signal_pause switch. Before this check
+        # existed, "paused_signals" was a DB-row-only no-op — a real high-
+        # volatility trigger recorded itself and paused nothing.
+        if await kill_switch_manager.is_active(db, switch_type="signal_pause"):
+            logger.warning("Signal pause active (safety trigger) - skipping event")
+            return {"status": "skipped", "reason": "signals_paused"}
+
         # Intelligence layer
         intelligence_result = await self._retry_with_backoff(
             self.process_intelligence_layer,

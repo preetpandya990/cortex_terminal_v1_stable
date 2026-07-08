@@ -43,10 +43,13 @@ from app.ai.fusion.serializers import serialise_signal
 from app.core.config import get_settings
 from app.core.kafka import KafkaTopics, publish as kafka_publish
 from app.core.metrics import (
+    forecast_enqueue_gated_total,
     llm_news_forecasts_total,
     signal_generation_total,
     signal_staleness_abstentions_total,
 )
+from app.ai.fusion.forecast_cache import forecast_cache_key
+from app.services.demand_registry import is_in_demand
 from app.core.redis import PubSubClient, RedisChannels
 from app.ml.inference.ensemble_predictor import EnsemblePredictor
 from app.ml.inference.feature_loader import FeatureLoader
@@ -304,8 +307,6 @@ class SignalAssembler:
 
     # ── News forecaster (Gemini, AI/news consensus slot) ───────────────────────
 
-    _FORECAST_CACHE_PREFIX = "cortex:news_forecast"
-
     async def gather_news_forecast(
         self,
         db: AsyncSession,
@@ -368,6 +369,22 @@ class SignalAssembler:
             llm_news_forecasts_total.labels(outcome="cache_hit").inc()
             return cached
 
+        # Demand gating (WS6): background forecast enqueues are an uncapped
+        # RPD cost driver when fired for every scanned symbol. Behind the
+        # flag, only symbols with live user demand (watchlist ∪ active
+        # suggestions) enqueue; gated symbols return a fallback shape whose
+        # AI weight the consensus renormalizes away (F.A). Cache HITS above
+        # are always served regardless — they cost nothing. Fails open inside
+        # is_in_demand on infrastructure errors.
+        if (
+            get_settings().FORECAST_DEMAND_GATING
+            and self._ml_cache is not None
+            and not await is_in_demand(self._ml_cache, db, symbol)
+        ):
+            forecast_enqueue_gated_total.inc()
+            llm_news_forecasts_total.labels(outcome="demand_gated").inc()
+            return _fallback("demand_gated")
+
         # Cache miss — enqueue for background batch processing; return NLP fallback
         # immediately so the hot path (signal assembly, consensus) never blocks on
         # Gemini.  The forecast_batch_worker drains this queue asynchronously,
@@ -381,22 +398,9 @@ class SignalAssembler:
     def _forecast_cache_key(
         self, symbol: str, events: list[dict], indicators: dict[str, Any]
     ) -> str:
-        """Stable key over symbol + news identity + rounded indicators.
-
-        A new event or a materially changed indicator value busts the cache.
-        """
-        ev_ids = sorted(
-            str(e.get("id") or e.get("article_title") or e.get("type") or "")
-            for e in events
-        )
-        ind = {
-            k: round(float(v), 4)
-            for k, v in indicators.items()
-            if isinstance(v, (int, float))
-        }
-        basis = json.dumps({"s": symbol, "e": ev_ids, "i": ind}, sort_keys=True, default=str)
-        digest = hashlib.sha256(basis.encode()).hexdigest()[:16]
-        return f"{self._FORECAST_CACHE_PREFIX}:{symbol}:{digest}"
+        """Delegates to the SHARED builder (app.ai.fusion.forecast_cache) —
+        the WS7 demand path writes the same keys; never fork this logic."""
+        return forecast_cache_key(symbol, events, indicators)
 
     async def _forecast_cache_get(self, key: str) -> dict[str, Any] | None:
         if self._ml_cache is None:
@@ -426,17 +430,22 @@ class SignalAssembler:
     ) -> None:
         """Publish a forecast request to the batch worker topic (fire-and-forget).
 
-        Idempotent: a dedup key (TTL=10 min) prevents the same (symbol, news-set)
-        from flooding the queue within one accumulation window.  ``enqueued_at``
-        lets the consumer skip payloads older than an hour — the staleness gate
-        that replaced the old producer-side queue trim.
+        Idempotent: a dedup key (FORECAST_ENQUEUE_DEDUP_TTL_SECS, default 1h —
+        aligned with the consumer's staleness gate) prevents the same
+        (symbol, news-set) from re-enqueuing while a prior request is still
+        pending or fresh.  ``enqueued_at`` lets the consumer skip payloads
+        older than an hour — the staleness gate that replaced the old
+        producer-side queue trim.
         """
         if self._ml_cache is None:
             return
 
         dedup_key = f"cortex:forecast:batch:dedup:{cache_key}"
         try:
-            acquired = await self._ml_cache.set(dedup_key, "1", nx=True, ex=600)
+            acquired = await self._ml_cache.set(
+                dedup_key, "1", nx=True,
+                ex=get_settings().FORECAST_ENQUEUE_DEDUP_TTL_SECS,
+            )
             if not acquired:
                 return  # Already queued for this (symbol, news-set) combination
         except Exception as exc:

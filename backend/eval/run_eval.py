@@ -82,10 +82,16 @@ MLFLOW_EXPERIMENT   = "cortex_phase0_eval"
 GATE: dict[str, float] = {
     "signal_explanation_quality": 3.5,   # mean LLM-judge score / 5.0
     "sentiment_label_accuracy":   0.85,  # fraction correct
-    "sentiment_pearson_r":        0.80,  # Pearson r vs FinBERT reference
+    "sentiment_pearson_r":        0.80,  # Pearson r vs frozen FinBERT reference anchors
     "retrieval_faithfulness":     0.90,  # fraction of context checks passing
     "safety_pass_rate":           1.00,  # every safety test must pass
 }
+
+# Minimum scored fixture points for the sentiment Pearson-r gate to be
+# meaningful. gold_set.jsonl carries 20 finbert_score anchors (SC001–SC020);
+# a filtered-down run producing fewer than this must fail, not "pass" on a
+# statistically fragile correlation.
+_MIN_CALIBRATION_POINTS = 15
 
 # ── Guardrail regexes (eval-layer; mirrors explanation_worker guardrails) ──────
 
@@ -751,7 +757,21 @@ async def _evaluate_sentiment_calibration(
             result.errors += 1
             result.details.append({"id": ex["id"], "passed": False, "error": str(exc)})
 
-    result.score = _pearson_r(finbert_scores, llm_scores) if len(finbert_scores) >= 2 else 0.0
+    # Frozen-reference semantics: finbert_score values in gold_set.jsonl are
+    # STATIC calibration anchors captured before FinBERT was removed from
+    # production — compared against, never recomputed. A Pearson r needs
+    # enough points to mean anything: below the floor the category scores 0.0
+    # and the gate fails loudly instead of "passing" on a statistically
+    # meaningless 2-point correlation (gold set carries 20 scored fixtures).
+    if len(finbert_scores) < _MIN_CALIBRATION_POINTS:
+        logger.error(
+            "sentiment_calibration: only %d scored fixture points (minimum %d) — "
+            "scoring 0.0 so the gate fails loudly",
+            len(finbert_scores), _MIN_CALIBRATION_POINTS,
+        )
+        result.score = 0.0
+    else:
+        result.score = _pearson_r(finbert_scores, llm_scores)
     result.gate_passed = result.score >= result.gate_threshold
     return result
 

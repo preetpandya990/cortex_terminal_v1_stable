@@ -401,6 +401,7 @@ backend/models/cache/
 graphify-out/cache/
 graphify-out/GRAPH_REPORT.md
 graphify-out/graph.json
+backend/graphify-out/
 /node_modules/
 
 # ============================================
@@ -421,3 +422,7 @@ backend/eval/mlruns.db
 
 # Eval result JSON artifacts
 backend/eval/results/
+
+# Runtime lock files — mutable state, never version these. The retrain lock's
+# correctness rests on a held fcntl.flock (inode-scoped); git must not manage it.
+backend/.scheduled_retrain.lock

@@ -47,8 +47,15 @@ import { memo, useState, useCallback, useMemo } from 'react';
 import { Brain, Clock, ExternalLink, AlertTriangle, Sparkles } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { cn } from '@/lib/utils';
+import { sanitizeUrl } from '@/lib/sanitizeUrl';
 import { useTypewriter } from '@/hooks/useTypewriter';
 import type { ExplanationData, ExplanationSource } from '@/types/analysis';
+
+// Age past which a suggestion explanation earns the "Based on … · Xh ago"
+// staleness banner. Below this the signal is fresh enough that the banner is
+// noise; the banner is informational, the direction-mismatch banner (backend-
+// computed) is the strong contradiction signal.
+const STALENESS_BANNER_AFTER_MS = 60 * 60 * 1000; // 1 hour
 
 // ── Disclaimer separator ───────────────────────────────────────────────────────
 
@@ -158,12 +165,21 @@ function PanelSkeleton() {
   );
 }
 
+interface PanelFailedProps {
+  /** When provided (data carries a suggestion_id), renders a retry button
+      that re-fires the bypass endpoint — the WS7 failed state is terminal
+      only until the user asks again. */
+  onRetry?:   () => void;
+  retrying?:  boolean;
+}
+
 /**
  * Rendered when the explanation pipeline exhausted all retries and moved the
- * job to the dead-letter queue (``data.failed === true``).  Shows a static
- * non-animated state so the user is not left with an eternal skeleton.
+ * job to the dead-letter queue (``data.failed === true`` / status "failed").
+ * Shows a static non-animated state so the user is not left with an eternal
+ * skeleton, plus a retry CTA when the backing suggestion is known.
  */
-function PanelFailed() {
+function PanelFailed({ onRetry, retrying = false }: PanelFailedProps) {
   return (
     <Card className="border-slate-200/80 bg-white/90">
       <CardHeader className="pb-3">
@@ -174,14 +190,37 @@ function PanelFailed() {
       </CardHeader>
       <CardContent>
         <div
-          className="flex items-center gap-3 rounded-md border border-slate-200 bg-slate-50/80 px-4 py-3"
+          className="flex flex-col gap-3 rounded-md border border-slate-200 bg-slate-50/80 px-4 py-3"
           role="status"
           aria-label="Analysis unavailable"
         >
-          <AlertTriangle className="h-4 w-4 shrink-0 text-slate-400" />
-          <p className="text-sm text-slate-500">
-            Analysis unavailable for this signal.
-          </p>
+          <div className="flex items-center gap-3">
+            <AlertTriangle className="h-4 w-4 shrink-0 text-slate-400" />
+            <p className="text-sm text-slate-500">
+              Analysis unavailable for this signal.
+            </p>
+          </div>
+          {onRetry && (
+            <button
+              type="button"
+              onClick={onRetry}
+              disabled={retrying}
+              aria-label="Retry AI explanation generation"
+              aria-busy={retrying}
+              className={cn(
+                'self-start flex items-center gap-1.5 rounded-md px-3 py-1.5',
+                'text-xs font-medium transition-colors',
+                'focus-visible:outline-none focus-visible:ring-2',
+                'focus-visible:ring-violet-500 focus-visible:ring-offset-1',
+                retrying
+                  ? 'cursor-not-allowed bg-slate-100 text-slate-400'
+                  : 'border border-violet-200 bg-violet-50 text-violet-700 hover:bg-violet-100 active:bg-violet-200',
+              )}
+            >
+              <Sparkles className={cn('h-3.5 w-3.5', retrying && 'animate-pulse')} aria-hidden />
+              {retrying ? 'Retrying…' : 'Retry Analysis'}
+            </button>
+          )}
         </div>
       </CardContent>
     </Card>
@@ -276,27 +315,32 @@ function SourcesList({ sources }: SourcesListProps) {
       <p className="text-[10px] uppercase tracking-widest text-slate-400 font-medium mb-2">
         Sources
       </p>
-      {sources.map((src, i) => (
-        <div key={i} className="flex items-center gap-1.5 text-xs text-slate-500">
-          <span className="font-medium text-slate-600 truncate max-w-[200px]">
-            {src.source_name}
-          </span>
-          <span className="text-slate-300" aria-hidden>·</span>
-          <span className="shrink-0">{formatRelativeTime(src.as_of)}</span>
-          {src.source_url && (
-            <a
-              href={src.source_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              onClick={(e) => e.stopPropagation()}
-              className="ml-auto shrink-0 text-slate-400 hover:text-slate-600 transition-colors"
-              aria-label={`Open source: ${src.source_name}`}
-            >
-              <ExternalLink className="h-3 w-3" />
-            </a>
-          )}
-        </div>
-      ))}
+      {sources.map((src, i) => {
+        // Scheme allowlist (WS8): source URLs are third-party RSS content —
+        // anything but http(s) renders as plain text, never as an href.
+        const safeUrl = sanitizeUrl(src.source_url);
+        return (
+          <div key={i} className="flex items-center gap-1.5 text-xs text-slate-500">
+            <span className="font-medium text-slate-600 truncate max-w-[200px]">
+              {src.source_name}
+            </span>
+            <span className="text-slate-300" aria-hidden>·</span>
+            <span className="shrink-0">{formatRelativeTime(src.as_of)}</span>
+            {safeUrl && (
+              <a
+                href={safeUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={(e) => e.stopPropagation()}
+                className="ml-auto shrink-0 text-slate-400 hover:text-slate-600 transition-colors"
+                aria-label={`Open source: ${src.source_name}`}
+              >
+                <ExternalLink className="h-3 w-3" />
+              </a>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -309,12 +353,10 @@ interface StalenessBannerProps {
 }
 
 /**
- * Amber banner shown when the explanation is derived from a non-active
- * (expired or superseded) trade suggestion.
- *
- * Only rendered when context_type === 'suggestion_explanation' AND the
- * signal's generated_at differs from the explanation's generated_at —
- * indicating the signal is not the current live signal.
+ * Amber banner shown when a suggestion explanation is based on an AGED
+ * signal (older than STALENESS_BANNER_AFTER_MS) — informational ("Based on
+ * BUY signal · 6h ago"). The previous condition was presence-based and fired
+ * for every suggestion explanation regardless of age (WS8 fix).
  */
 function StalenessBanner({ signalDirection, signalGeneratedAt }: StalenessBannerProps) {
   if (!signalDirection || !signalGeneratedAt) return null;
@@ -384,8 +426,17 @@ function ExplanationContent({ data }: ContentProps) {
   // Streaming: text is still flowing in (available flips true on the final event).
   const isStreaming = !data.available;
   const isMarketContext = data.context_type === 'instrument_context';
+  // Age-based (WS8): banner only when the underlying signal is genuinely old —
+  // the old presence-based condition fired for every suggestion explanation.
+  const signalAgeMs = data.signal_generated_at
+    ? Date.now() - new Date(data.signal_generated_at).getTime()
+    : null;
   const showStalenessBanner =
-    data.context_type === 'suggestion_explanation' && !!data.signal_generated_at;
+    data.context_type === 'suggestion_explanation' &&
+    signalAgeMs !== null &&
+    signalAgeMs > STALENESS_BANNER_AFTER_MS;
+  // Backend-computed contradiction flag — the strong banner, independent of age.
+  const showMismatchBanner = data.direction_mismatch === true;
 
   return (
     <Card className="border-slate-200/80 bg-white/90">
@@ -414,7 +465,23 @@ function ExplanationContent({ data }: ContentProps) {
       </CardHeader>
 
       <CardContent className="space-y-4">
-        {/* Staleness indicator — shown for non-active suggestion explanations */}
+        {/* Direction-mismatch banner (Proposal B) — the live prediction now
+            contradicts the direction this narrative was written for. Rendered
+            ALONGSIDE (not replacing) the age banner. */}
+        {showMismatchBanner && (
+          <div
+            className="flex items-center gap-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs"
+            role="alert"
+          >
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-red-500" aria-hidden />
+            <span className="font-medium text-red-700">
+              Signal has changed since this explanation was generated — the live
+              prediction now points the other way.
+            </span>
+          </div>
+        )}
+
+        {/* Staleness indicator — shown when the underlying signal has aged */}
         {showStalenessBanner && (
           <StalenessBanner
             signalDirection={data.signal_direction}
@@ -519,9 +586,17 @@ function AIExplanationPanelComponent({
   }
 
   // Permanent failure — explanation pipeline exhausted all retries (DLQ fired).
-  // Render a static "unavailable" state so the user is not left with an eternal skeleton.
+  // Render a static "unavailable" state so the user is not left with an eternal
+  // skeleton; the retry CTA re-fires the bypass endpoint when the suggestion is known.
   if (data !== null && data.failed) {
-    return <div className={cn(className)}><PanelFailed /></div>;
+    return (
+      <div className={cn(className)}>
+        <PanelFailed
+          onRetry={onRequestExplanation ? handleWeakSignalRefresh : undefined}
+          retrying={refreshing}
+        />
+      </div>
+    );
   }
 
   // Weak signal — consensus_score below threshold; explanation was intentionally

@@ -369,7 +369,15 @@ async def _probe_data(session: AsyncSession) -> ProbeResult:
 
 
 def _probe_lock() -> ProbeResult:
-    """Non-blocking flock attempt on .scheduled_retrain.lock."""
+    """
+    Non-blocking flock attempt on .scheduled_retrain.lock.
+
+    A PASS is a point-in-time snapshot, not a reservation: the probe releases
+    the lock before returning, so a retrain can start between this check and
+    any subsequent launch (TOCTOU).  The authoritative concurrency guard is
+    the flock *held* for the duration of the run by scheduled_retrain.py —
+    treat this probe as advisory UI signal only, never as a launch gate.
+    """
     if _LOCK_PATH is None:
         return ProbeResult(
             name="lock", label="Run Lock", status=ProbeStatus.WARN,

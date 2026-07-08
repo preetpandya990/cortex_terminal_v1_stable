@@ -100,6 +100,19 @@ def _half_lives_for(event_type: str) -> tuple[int, int]:
     return _DECAY_HALF_LIVES.get(event_type, (_DEFAULT_FAST_HL, _DEFAULT_SLOW_HL))
 
 
+# Directional sentiment cue words as explicit word forms with \b anchors —
+# persisted via _detect_sentiment and consumed for Pathway-2 trade direction,
+# so substring false positives ("gain" in "again", "fall" in "shortfall")
+# would fabricate directional signals. Mirrors fake_news_detector's approach.
+_BULLISH_CUES_RE = re.compile(
+    r"\b(?:surges?|surged|soars?|soared|rall(?:y|ies|ied)|gains?|gained"
+    r"|beats?|positive|upgrades?|upgraded)\b"
+)
+_BEARISH_CUES_RE = re.compile(
+    r"\b(?:plunges?|plunged|crash(?:es|ed)?|falls?|fell|fallen|miss(?:es|ed)?"
+    r"|negative|loss(?:es)?|downgrades?|downgraded)\b"
+)
+
 _SYMBOL_RE = re.compile(r'^[A-Z0-9&\-]{2,20}$')
 # Minimum candidate length for name-based instrument_master lookup.
 # 2-char strings are validated by exact-match only (substring ILIKE on a
@@ -480,6 +493,7 @@ class EventClassifier:
                 impact_score=Decimal(str(classification_result["impact_score"])),
                 affected_symbols=validated_symbols,
                 classification_confidence=Decimal(str(classification_result["confidence"])),
+                sentiment=classification_result.get("sentiment"),
                 reasoning=classification_result.get("reasoning", ""),
                 decay_half_life_hours=fast_hl,
                 decay_slow_half_life_hours=slow_hl,
@@ -493,6 +507,7 @@ class EventClassifier:
             classification.classification_confidence = Decimal(
                 str(classification_result["confidence"])
             )
+            classification.sentiment = classification_result.get("sentiment")
             classification.reasoning = classification_result.get("reasoning", "")
             classification.decay_half_life_hours = fast_hl
             classification.decay_slow_half_life_hours = slow_hl
@@ -896,6 +911,7 @@ class EventClassifier:
                 "impact_score":     schema.impact_score,
                 "confidence":       schema.confidence,
                 "affected_symbols": schema.affected_symbols,
+                "sentiment":        schema.sentiment,
                 "reasoning":        schema.reasoning,
                 "decay_hours":      schema.decay_hours,
                 "decay_slow_hours": schema.decay_slow_hours,
@@ -929,6 +945,7 @@ class EventClassifier:
                 "event_type":       "general",
                 "impact_score":     50.0,
                 "affected_symbols": [],
+                "sentiment":        "neutral",
                 "reasoning":        "",
                 "decay_hours":      _DEFAULT_FAST_HL,
                 "decay_slow_hours": _DEFAULT_SLOW_HL,
@@ -1053,12 +1070,18 @@ class EventClassifier:
 
     @staticmethod
     def _detect_sentiment(content_lower: str) -> str:
-        if any(w in content_lower for w in (
-            "surge", "soar", "rally", "gain", "beat", "positive", "upgrade",
-        )):
+        """
+        Heuristic directional sentiment from cue words.
+
+        Word-boundary-anchored explicit forms (not raw substrings): this value
+        is persisted and drives Pathway-2 trade direction (WS5), so "gain"
+        matching inside "again" or "fall" inside "shortfall" would manufacture
+        directional signals from noise. Bullish cues are checked first; a
+        mixed article resolves bullish by construction (pre-existing behavior,
+        acceptable for a 0.60-0.75-confidence heuristic path).
+        """
+        if _BULLISH_CUES_RE.search(content_lower):
             return "bullish"
-        if any(w in content_lower for w in (
-            "plunge", "crash", "fall", "miss", "negative", "loss", "downgrade",
-        )):
+        if _BEARISH_CUES_RE.search(content_lower):
             return "bearish"
         return "neutral"
