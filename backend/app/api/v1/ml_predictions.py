@@ -194,13 +194,21 @@ async def admin_reload(
 
     loader = RegistryModelLoader(session=db, num_threads=4)
     new_ensemble = await loader.load_production_ensemble(force_reload=True)
-    new_predictor = EnsemblePredictor.from_loaded_ensemble(
-        new_ensemble,
-        cache=get_cache_service(),
-    )
+
+    # In-place swap: SignalScheduler (and any other long-lived holder) was
+    # handed this exact object at startup and keeps its own reference, so
+    # reassigning app.state.ml_predictor alone would leave those consumers
+    # silently stuck on the old model. Mutate the existing instance instead.
+    existing_predictor = getattr(request.app.state, "ml_predictor", None)
+    if existing_predictor is not None:
+        await existing_predictor.reload_from(new_ensemble)
+    else:
+        request.app.state.ml_predictor = EnsemblePredictor.from_loaded_ensemble(
+            new_ensemble,
+            cache=get_cache_service(),
+        )
 
     request.app.state.ml_ensemble = new_ensemble
-    request.app.state.ml_predictor = new_predictor
 
     logger.info(
         "Hot-reload complete: XGB=%s GRU=%s user=%s",

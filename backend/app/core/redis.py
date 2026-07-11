@@ -96,7 +96,16 @@ class RedisChannels:
     
     MODELS_DRIFT_ALERTS = "cai:models:drift_alerts"
     """Model drift detection alerts. Payload: {model_id, metric, threshold, value}"""
-    
+
+    ML_MODEL_PROMOTED = "cai:models:promoted"
+    """
+    ModelPromoter committed a promotion or rollback (ml_model_metadata authority).
+    Distinct from MODELS_STATE_CHANGES, which covers only ai_ml_models-table-only
+    admin force-transitions. Payload: {model_name, model_version, event}.
+    Consumed by the API/worker hot-reload watchers to swap the live ensemble
+    without a container restart.
+    """
+
     # ── Trade Suggestions ──────────────────────────────────────────────────────
     SUGGESTIONS_NEW = "cai:suggestions:new"
     """

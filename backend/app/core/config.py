@@ -725,7 +725,7 @@ class Settings(BaseSettings):
     # Model storage: plaintext binary artifacts with SHA-256 integrity verification
     # at load time (see registry_loader._sha256_file). No encryption-at-rest is
     # applied; access control is enforced at the filesystem and infrastructure level.
-    ML_MODEL_STORAGE_PATH: str = "backend/ml_models"
+    ML_MODEL_STORAGE_PATH: str = "models"   # root; orchestrator writes to <root>/production/{models,onnx,treelite}
     ML_FEATURE_VERSION: str = "1.0.0"
     ML_EVALUATION_THRESHOLD: float = Field(0.85, ge=0.0, le=1.0)
     ML_LATENCY_TARGET_MS: int = Field(250, ge=50, le=1000)

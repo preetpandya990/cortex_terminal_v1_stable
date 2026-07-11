@@ -266,7 +266,7 @@ class ProductionTrainingOrchestrator:
     ) -> None:
         self.db = db_session
         self.config = config or TrainingConfig()
-        self.output_dir = output_dir or Path("models/production")
+        self.output_dir = output_dir or (Path(get_settings().ML_MODEL_STORAGE_PATH) / "production")
 
         # Create output directories
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -3380,7 +3380,8 @@ async def main() -> None:
     )
     args = parser.parse_args()
 
-    output_dir = Path("models/production")
+    settings = get_settings()
+    output_dir = Path(settings.ML_MODEL_STORAGE_PATH) / "production"
 
     # Auto-detect whether a resumable checkpoint exists
     has_checkpoint = find_checkpoint(output_dir)
@@ -3395,7 +3396,6 @@ async def main() -> None:
     fresh = args.fresh or not has_checkpoint
 
     # Database setup
-    settings = get_settings()
     engine   = create_async_engine(
         str(settings.DATABASE_URL),
         echo=False,

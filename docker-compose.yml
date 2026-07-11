@@ -237,7 +237,7 @@ services:
     expose:
       - "8001"
     volumes:
-      - ml_models:/app/models
+      - ./backend/models:/app/models
       - ./.cache:/app/.cache
     depends_on:
       db:
@@ -279,7 +279,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ml_models:/app/models
+      - ./backend/models:/app/models
       - ./.cache:/app/.cache
     depends_on:
       db:
@@ -330,7 +330,6 @@ volumes:
     external: true
   redis_data:
   redpanda_data:
-  ml_models:
   prometheus_data:
   grafana_data:
 

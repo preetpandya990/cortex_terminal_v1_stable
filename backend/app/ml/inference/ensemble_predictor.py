@@ -15,6 +15,7 @@ Date: 2026-04-20
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import datetime, timezone
@@ -206,7 +207,69 @@ class EnsemblePredictor:
                 "yes" if xgb_calibrator else "no",
                 "yes" if gru_calibrator else "no",
             )
-    
+
+        # Guards reload_from() against overlapping reload triggers (e.g. a
+        # pub/sub message and the poll fallback firing close together).
+        self._reload_lock = asyncio.Lock()
+
+    @staticmethod
+    def _backends_from_loaded_ensemble(
+        loaded_ensemble: Any,
+    ) -> tuple["ModelBackend", "ModelBackend | None"]:
+        xgb_backend = TreeliteBackend(loaded_ensemble.xgboost_predictor)
+        gru_backend: ONNXBackend | None = None
+        if loaded_ensemble.gru_session is not None:
+            gru_backend = ONNXBackend(
+                session=loaded_ensemble.gru_session,
+                input_name=loaded_ensemble.gru_input_name,
+                output_names=loaded_ensemble.gru_output_names,
+            )
+        return xgb_backend, gru_backend
+
+    async def reload_from(self, loaded_ensemble: Any) -> None:
+        """
+        Hot-swap this predictor's backends/weights/calibrators in place.
+
+        Called after a new production model is promoted so that every
+        long-lived consumer already holding a reference to *this exact
+        object* (SignalScheduler, worker correlation_loop's SignalAssembler,
+        event_processing_loop's EventProcessor) sees the new model on their
+        very next predict() call — no call-site changes, no re-injection.
+
+        The reassignment block below contains no ``await``, so it is atomic
+        with respect to other coroutines under asyncio's cooperative
+        scheduling. ``_reload_lock`` exists to serialize concurrent reload
+        *triggers* against each other (a pub/sub message and the poll
+        fallback firing close together), not to protect predict() reads.
+        """
+        xgb_backend, gru_backend = self._backends_from_loaded_ensemble(loaded_ensemble)
+
+        async with self._reload_lock:
+            self.xgboost_backend = xgb_backend
+            self.gru_backend     = gru_backend
+            self.n_features      = loaded_ensemble.n_features
+            self.sequence_length = loaded_ensemble.sequence_length
+            self.feature_names   = loaded_ensemble.feature_names
+            self.xgb_calibrator  = loaded_ensemble.xgb_calibrator
+            self.gru_calibrator  = loaded_ensemble.gru_calibrator
+            self.xgboost_version = loaded_ensemble.xgboost_version or ""
+            self.gru_version     = loaded_ensemble.gru_version or ""
+
+            if gru_backend is None:
+                self.xgboost_weight = 1.0
+                self.gru_weight     = 0.0
+            else:
+                self.xgboost_weight = loaded_ensemble.xgboost_weight
+                self.gru_weight     = loaded_ensemble.gru_weight
+
+        logger.info(
+            "EnsemblePredictor reloaded in-place: XGBoost v%s (%.0f%%) + GRU v%s (%.0f%%) "
+            "| n_features=%d",
+            self.xgboost_version, self.xgboost_weight * 100,
+            self.gru_version or "none", self.gru_weight * 100,
+            self.n_features,
+        )
+
     @classmethod
     def from_loaded_ensemble(
         cls,
@@ -231,14 +294,7 @@ class EnsemblePredictor:
             >>> predictor = EnsemblePredictor.from_loaded_ensemble(ensemble, cache)
             >>> # Ready for inference
         """
-        xgb_backend = TreeliteBackend(loaded_ensemble.xgboost_predictor)
-        gru_backend: ONNXBackend | None = None
-        if loaded_ensemble.gru_session is not None:
-            gru_backend = ONNXBackend(
-                session=loaded_ensemble.gru_session,
-                input_name=loaded_ensemble.gru_input_name,
-                output_names=loaded_ensemble.gru_output_names,
-            )
+        xgb_backend, gru_backend = cls._backends_from_loaded_ensemble(loaded_ensemble)
 
         return cls(
             xgboost_backend  = xgb_backend,

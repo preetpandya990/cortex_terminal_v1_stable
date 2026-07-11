@@ -27,6 +27,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -157,6 +159,18 @@ _CANONICAL_SEP = (",", ":")   # compact + stable separators for deterministic SH
 
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _atomic_write_bytes(dest: Path, data: bytes) -> None:
+    """Write *data* to *dest* atomically (temp-file + os.replace).
+
+    Same convention as ``checkpoint_manager._atomic_json``: a concurrent
+    reader (e.g. RegistryModelLoader) can never observe a partially-written
+    artifact.
+    """
+    tmp = dest.with_name(f"{dest.name}.tmp-{uuid.uuid4().hex}")
+    tmp.write_bytes(data)
+    os.replace(tmp, dest)
 
 
 def _sha256_canonical(obj: Any) -> str:
@@ -527,14 +541,45 @@ class ModelPromoter:
         session:       AsyncSession,
         quality_gate:  QualityGate | None = None,
         audit_dir:     Path | None = None,
+        pubsub:        "PubSubClient | None" = None,
     ) -> None:
         self._session      = session
         self._quality_gate = quality_gate or QualityGate()
         # E2 — when provided, durable break-glass audit records are written here
         # in addition to the CRITICAL log.  None is safe: only the log fires.
         self._audit_dir: Path | None = audit_dir
+        # When omitted, lazily resolved from the process-wide Redis client at
+        # publish time — see _publish_promotion_event().
+        self._pubsub = pubsub
 
     # ── Internal ──────────────────────────────────────────────────────────────
+
+    async def _publish_promotion_event(
+        self, model_name: str, model_version: str, event: str
+    ) -> None:
+        """Best-effort pub/sub notification for the hot-reload watchers.
+
+        Called only after the DB commit has already succeeded, so a Redis
+        outage here can never affect the promotion itself — the 5-minute
+        poll fallback in the reload watchers covers a lost/never-sent message.
+        """
+        try:
+            pubsub = self._pubsub
+            if pubsub is None:
+                from app.core.redis import PubSubClient, get_redis
+                pubsub = PubSubClient(get_redis())
+            from app.core.redis import RedisChannels
+            await pubsub.publish_json(RedisChannels.ML_MODEL_PROMOTED, {
+                "model_name":    model_name,
+                "model_version": model_version,
+                "event":         event,
+            })
+        except Exception as exc:
+            logger.warning(
+                "Failed to publish ML_MODEL_PROMOTED for %s v%s (%s) — "
+                "hot-reload watchers will pick this up via their 5-minute poll fallback.",
+                model_name, model_version, exc,
+            )
 
     def _emit_break_glass_audit(
         self,
@@ -697,6 +742,7 @@ class ModelPromoter:
 
                 await self._session.commit()
                 await self._session.refresh(model)
+                await self._publish_promotion_event(model_name, model_version, "promoted")
                 logger.info(
                     "Promoted %s: staging → production/live (replaced: %s)",
                     model_version,
@@ -816,6 +862,7 @@ class ModelPromoter:
 
             await self._session.commit()
             await self._session.refresh(target)
+            await self._publish_promotion_event(model_name, target.model_version, "rollback")
             logger.warning(
                 "Rollback: %s  %s → %s",
                 model_name,
@@ -932,7 +979,7 @@ class ModelRegistry:
 
         training_raw  = artifact_path.read_bytes()
         training_dest = self._storage_path / f"{version}{artifact_path.suffix}"
-        training_dest.write_bytes(training_raw)
+        _atomic_write_bytes(training_dest, training_raw)
 
         # ── Inference artifact ───────────────────────────────────────────────
         if inference_artifact_path is not None:
@@ -941,7 +988,7 @@ class ModelRegistry:
                 raise FileNotFoundError(f"Inference artifact not found: {inference_path}")
             inference_raw  = inference_path.read_bytes()
             inference_dest = self._storage_path / f"{version}_inference{inference_path.suffix}"
-            inference_dest.write_bytes(inference_raw)
+            _atomic_write_bytes(inference_dest, inference_raw)
             onnx_dest = inference_dest
             checksum  = _sha256_bytes(inference_raw)
         else:
@@ -962,7 +1009,7 @@ class ModelRegistry:
                 raise FileNotFoundError(f"Calibrator artifact not found: {cal_src}")
             calibrator_raw  = cal_src.read_bytes()
             calibrator_dest = self._storage_path / f"{version}_calibrator{cal_src.suffix}"
-            calibrator_dest.write_bytes(calibrator_raw)
+            _atomic_write_bytes(calibrator_dest, calibrator_raw)
 
         # ── Artifact manifest (E2 — per-model integrity record) ──────────────
         # The manifest is stored in lineage["artifact_manifest"] so the registry
@@ -1167,6 +1214,9 @@ class ModelRegistry:
 
 def get_model_registry(
     session:            AsyncSession,
-    model_storage_path: str | Path = "backend/ml_models",
+    model_storage_path: str | Path | None = None,
 ) -> ModelRegistry:
+    if model_storage_path is None:
+        from app.core.config import get_settings
+        model_storage_path = Path(get_settings().ML_MODEL_STORAGE_PATH) / "production" / "models"
     return ModelRegistry(session, model_storage_path)

@@ -16,6 +16,7 @@ import onnxruntime as ort
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.metrics import model_state as model_deployment_state
 from app.ml.inference.calibrator import ConfidenceCalibrator
 from app.ml.monitoring.metrics import model_accuracy_score, model_load_failures_total
@@ -36,18 +37,18 @@ class ModelValidationError(Exception):
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
-_BACKEND_ROOT = Path(__file__).parent.parent.parent.parent  # .../backend/
+_MODEL_ROOT = Path(get_settings().ML_MODEL_STORAGE_PATH) / "production"  # single source of truth (config.ML_MODEL_STORAGE_PATH)
 
 _BOOTSTRAP_MODELS = {
     "xgboost": {
         "version": "1.0.0",
-        "artifact": _BACKEND_ROOT / "models/production/treelite/xgboost_model.so",
+        "artifact": _MODEL_ROOT / "treelite/xgboost_model.so",
         "valid_suffixes": {".so", ".dll", ".dylib"},
         "ensemble_weight": 0.75,
     },
     "gru": {
         "version": "1.0.0",
-        "artifact": _BACKEND_ROOT / "models/production/onnx/gru_optimized.onnx",
+        "artifact": _MODEL_ROOT / "onnx/gru_optimized.onnx",
         "valid_suffixes": {".onnx"},
         "ensemble_weight": 0.25,
     },

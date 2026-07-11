@@ -10,6 +10,8 @@ Pure task-coroutine module.  Contains:
 
   heartbeat_loop()           Writes worker:heartbeat to Redis every 30s.
   cache_invalidation_loop()  Event-driven suggestion cache flusher.
+  model_reload_watcher()     Pub/sub + 5-min poll; hot-reloads the ensemble
+                             predictor in place after a model promotion.
   expiry_loop()              Batch-marks expired TradeSuggestions every 60s.
   correlation_loop()         Bidirectional scanner→AI + news→AI consensus engine.
   feature_refresh_loop()     Daily ML feature store refresh at 16:00 IST.
@@ -358,6 +360,117 @@ async def cache_invalidation_loop(
         except Exception as exc:
             logger.warning("Error closing pub/sub connection: %s", exc)
         logger.info("Cache invalidation loop stopped")
+
+
+async def model_reload_watcher(
+    session_factory: async_sessionmaker,
+    redis_client,
+    ml_components: dict,
+    pause: PauseToken,
+    trigger: TriggerToken,
+    shutdown: asyncio.Event,
+    *,
+    on_cycle: Callable[[], None] | None = None,
+) -> None:
+    """
+    Hot-reloads the worker's EnsemblePredictor in place after a promotion.
+
+    Two paths, both converging on the same in-place ``reload_from()`` call so
+    every long-lived consumer holding a reference to this exact predictor
+    object (correlation_loop's SignalAssembler, event_processing_loop's
+    EventProcessor) sees the new model with no call-site changes:
+
+      - Fast path:      reacts immediately to ML_MODEL_PROMOTED pub/sub messages.
+      - Durable fallback: polls the DB every 5 minutes and reloads on drift.
+        Required because Redis pub/sub is at-most-once — a message that
+        arrives during a worker restart/reconnect window is otherwise lost
+        forever.
+
+    Cadence: real-time (pub/sub) + 300s poll (interruptible via trigger.fire())
+    """
+    logger.info("Model reload watcher started")
+
+    from app.core.redis import RedisChannels, PubSubClient
+    from app.ml.inference.registry_loader import RegistryModelLoader
+    from app.models.ml_data import MLModelMetadata
+
+    predictor = ml_components.get("ensemble_predictor")
+    if predictor is None:
+        logger.warning(
+            "Model reload watcher starting WITHOUT an ensemble_predictor — "
+            "nothing to reload against; exiting."
+        )
+        return
+
+    _POLL_INTERVAL_SECONDS = 300.0
+
+    async def _production_fingerprint() -> dict[str, tuple[str, str | None]]:
+        async with session_factory() as session:
+            stmt = select(
+                MLModelMetadata.model_name,
+                MLModelMetadata.model_id,
+                MLModelMetadata.checksum,
+            ).where(
+                MLModelMetadata.status == "production",
+                MLModelMetadata.is_active == True,  # noqa: E712
+            )
+            rows = (await session.execute(stmt)).all()
+        return {name: (model_id, checksum) for name, model_id, checksum in rows}
+
+    async def _reload(reason: str) -> None:
+        try:
+            async with session_factory() as session:
+                loader = RegistryModelLoader(session=session, num_threads=4)
+                new_ensemble = await loader.load_production_ensemble(force_reload=True)
+            await predictor.reload_from(new_ensemble)
+            logger.info(
+                "Model reload watcher: reloaded (%s) — XGBoost v%s + GRU v%s",
+                reason, new_ensemble.xgboost_version, new_ensemble.gru_version,
+            )
+            if on_cycle is not None:
+                on_cycle()
+        except Exception as exc:
+            logger.error(
+                "Model reload watcher: reload failed (%s): %s", reason, exc, exc_info=True
+            )
+
+    async def _pubsub_path() -> None:
+        pubsub = PubSubClient(redis_client._redis)
+        ps = await pubsub.subscribe(RedisChannels.ML_MODEL_PROMOTED)
+        logger.info("Model reload watcher subscribed to %s", RedisChannels.ML_MODEL_PROMOTED)
+        try:
+            async for _message in pubsub.listen(ps):
+                if shutdown.is_set():
+                    break
+                await pause.checkpoint()
+                await _reload("pubsub")
+        finally:
+            try:
+                await ps.unsubscribe(RedisChannels.ML_MODEL_PROMOTED)
+                await ps.aclose()
+            except Exception as exc:
+                logger.warning("Error closing model reload pub/sub connection: %s", exc)
+
+    async def _poll_path() -> None:
+        last_fingerprint: dict[str, tuple[str, str | None]] | None = None
+        while not shutdown.is_set():
+            await pause.checkpoint()
+            try:
+                fingerprint = await _production_fingerprint()
+                if last_fingerprint is not None and fingerprint != last_fingerprint:
+                    await _reload("poll-drift")
+                last_fingerprint = fingerprint
+            except Exception as exc:
+                logger.error("Model reload watcher: poll check failed: %s", exc, exc_info=True)
+            await trigger.wait_or_timeout(_POLL_INTERVAL_SECONDS)
+
+    try:
+        await asyncio.gather(_pubsub_path(), _poll_path())
+    except asyncio.CancelledError:
+        logger.info("Model reload watcher cancelled")
+        raise
+    finally:
+        logger.info("Model reload watcher stopped")
 
 
 async def expiry_loop(

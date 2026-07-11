@@ -52,6 +52,91 @@ setup_logging(
 logger = logging.getLogger(__name__)
 
 
+# ── ML hot-reload watcher ────────────────────────────────────────────────────
+async def _model_reload_watcher(app: FastAPI) -> None:
+    """
+    Hot-reloads app.state.ml_predictor in place after a model promotion.
+
+    Mirrors app.worker.model_reload_watcher: a fast pub/sub path reacts to
+    ML_MODEL_PROMOTED immediately, and a 5-minute poll fallback covers the
+    at-most-once nature of Redis pub/sub (a message during a restart/
+    reconnect window would otherwise be lost forever). No task-supervisor
+    framework exists on the API side, so this is a single asyncio.create_task
+    loop cancelled at shutdown, same as cai_listener_task below.
+    """
+    from app.core.database import AsyncSessionLocal
+    from app.core.redis import PubSubClient, RedisChannels, get_redis
+    from app.ml.inference.registry_loader import RegistryModelLoader
+    from app.models.ml_data import MLModelMetadata
+    from sqlalchemy import select
+
+    _POLL_INTERVAL_SECONDS = 300.0
+
+    async def _production_fingerprint() -> dict[str, tuple[str, str | None]]:
+        async with AsyncSessionLocal() as session:
+            stmt = select(
+                MLModelMetadata.model_name,
+                MLModelMetadata.model_id,
+                MLModelMetadata.checksum,
+            ).where(
+                MLModelMetadata.status == "production",
+                MLModelMetadata.is_active == True,  # noqa: E712
+            )
+            rows = (await session.execute(stmt)).all()
+        return {name: (model_id, checksum) for name, model_id, checksum in rows}
+
+    async def _reload(reason: str) -> None:
+        predictor = getattr(app.state, "ml_predictor", None)
+        if predictor is None:
+            return
+        try:
+            async with AsyncSessionLocal() as session:
+                loader = RegistryModelLoader(session=session, num_threads=4)
+                new_ensemble = await loader.load_production_ensemble(force_reload=True)
+            await predictor.reload_from(new_ensemble)
+            app.state.ml_ensemble = new_ensemble
+            logger.info(
+                "API model reload watcher: reloaded (%s) — XGBoost v%s + GRU v%s",
+                reason, new_ensemble.xgboost_version, new_ensemble.gru_version,
+            )
+        except Exception as exc:
+            logger.error(
+                "API model reload watcher: reload failed (%s): %s", reason, exc, exc_info=True
+            )
+
+    async def _pubsub_path() -> None:
+        pubsub = PubSubClient(get_redis())
+        ps = await pubsub.subscribe(RedisChannels.ML_MODEL_PROMOTED)
+        logger.info("API model reload watcher subscribed to %s", RedisChannels.ML_MODEL_PROMOTED)
+        try:
+            async for _message in pubsub.listen(ps):
+                await _reload("pubsub")
+        finally:
+            try:
+                await ps.unsubscribe(RedisChannels.ML_MODEL_PROMOTED)
+                await ps.aclose()
+            except Exception as exc:
+                logger.warning("Error closing API model reload pub/sub connection: %s", exc)
+
+    async def _poll_path() -> None:
+        last_fingerprint: dict[str, tuple[str, str | None]] | None = None
+        while True:
+            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+            try:
+                fingerprint = await _production_fingerprint()
+                if last_fingerprint is not None and fingerprint != last_fingerprint:
+                    await _reload("poll-drift")
+                last_fingerprint = fingerprint
+            except Exception as exc:
+                logger.error("API model reload watcher: poll check failed: %s", exc, exc_info=True)
+
+    try:
+        await asyncio.gather(_pubsub_path(), _poll_path())
+    except asyncio.CancelledError:
+        logger.info("API model reload watcher cancelled")
+        raise
+
+
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
@@ -157,6 +242,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             raise RuntimeError(f"Critical: failed to load production ML models: {exc}") from exc
         logger.warning("Continuing without ML models (non-production environment)")
 
+    # Model hot-reload watcher — picks up promotions without a restart.
+    app.state.model_reload_watcher_task = None
+    if app.state.ml_predictor is not None:
+        app.state.model_reload_watcher_task = asyncio.create_task(
+            _model_reload_watcher(app), name="model_reload_watcher"
+        )
+        logger.info("API model reload watcher started")
+
     # Signal Scheduler — automated generation for Nifty 50 + Next 50 every 15 min
     from app.services.signal_scheduler import SignalScheduler
     from app.core.redis import get_pubsub_client, get_redis
@@ -251,7 +344,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     logger.info("Cortex AI shutting down")
-    
+
+    # Cancel model reload watcher
+    if hasattr(app.state, "model_reload_watcher_task") and app.state.model_reload_watcher_task:
+        app.state.model_reload_watcher_task.cancel()
+        try:
+            await asyncio.wait_for(app.state.model_reload_watcher_task, timeout=5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
     # Cleanup ML models
     if hasattr(app.state, "ml_predictor") and app.state.ml_predictor:
         logger.info("Cleaning up ML models...")

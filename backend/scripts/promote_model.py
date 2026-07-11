@@ -790,12 +790,25 @@ async def main() -> None:
     """Main entry point."""
     parser = create_parser()
     args = parser.parse_args()
-    
+
     # Connect to database
     settings = get_settings()
     engine = create_async_engine(str(settings.DATABASE_URL), echo=False)
     Session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    
+
+    # Redis is required for ModelPromoter to publish ML_MODEL_PROMOTED so the
+    # running api/worker containers hot-reload without a restart. Best-effort:
+    # ModelPromoter degrades gracefully (5-minute poll fallback) if this fails.
+    from app.core.redis import init_redis, close_redis
+    redis_ready = False
+    try:
+        await init_redis()
+        redis_ready = True
+    except Exception as exc:
+        print(f"Warning: Redis unavailable ({exc}) — hot-reload notification will "
+              f"be skipped; running containers will pick up the change via their "
+              f"5-minute poll fallback instead.")
+
     try:
         async with Session() as session:
             if args.command == "staging":
@@ -837,9 +850,11 @@ async def main() -> None:
 
             elif args.command == "status":
                 await show_status(session, args.model_name)
-    
+
     finally:
         await engine.dispose()
+        if redis_ready:
+            await close_redis()
 
 
 if __name__ == "__main__":

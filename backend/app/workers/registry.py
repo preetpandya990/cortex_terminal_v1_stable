@@ -2,7 +2,7 @@
 Cortex AI — Worker Task Registry
 =================================
 
-Single source of truth for all 19 background tasks that run inside the worker
+Single source of truth for all 20 background tasks that run inside the worker
 sidecar.  Each entry is a zero-argument factory (a closure) so that:
 
   - The supervisor can call factory() to obtain a *fresh* coroutine on restart
@@ -12,10 +12,12 @@ sidecar.  Each entry is a zero-argument factory (a closure) so that:
 
 Task inventory
 ──────────────
-  Native (6)  — receive PauseToken + TriggerToken so the control plane can
+  Native (7)  — receive PauseToken + TriggerToken so the control plane can
                 pause, resume, and trigger them remotely:
     heartbeat              Writes worker:heartbeat to Redis every 30s (liveness).
     cache_invalidation     Pub/sub listener; invalidates suggestion list caches.
+    model_reload_watcher   Pub/sub + 5-min poll; hot-reloads the ensemble in place
+                           after a model promotion.
     suggestion_expiry      Batch-marks expired TradeSuggestions every 60s.
     correlation_engine     Bidirectional scanner→AI + news→AI consensus engine.
     fundamentals_refresh   Six-sub-loop fundamentals scheduler (see below).
@@ -68,6 +70,7 @@ TASK_NAMES: tuple[str, ...] = (
     # ── Native loops (pause/trigger-aware) ───────────────────────────────────
     "heartbeat",
     "cache_invalidation",
+    "model_reload_watcher",
     "suggestion_expiry",
     "correlation_engine",
     # ── Imported loops (CancelledError-only shutdown) ─────────────────────────
@@ -117,6 +120,7 @@ TASK_NAMES: tuple[str, ...] = (
 TASK_EXPECTED_INTERVAL_SECONDS: dict[str, int | None] = {
     "heartbeat": 90,                    # 30s x 3
     "cache_invalidation": None,         # event-driven (pub/sub)
+    "model_reload_watcher": 900,        # 300s poll fallback tick x 3 (fast path is pub/sub)
     "suggestion_expiry": 180,           # 60s x 3
     "correlation_engine": 900,          # max(30s market-hours, 300s off-hours) x 3
     "rss_ingestion": 2880,              # 960s max jittered poll x 3
@@ -190,6 +194,7 @@ def build_task_registry(
         expiry_loop,
         feature_refresh_loop,
         heartbeat_loop,
+        model_reload_watcher,
     )
 
     def _state(name: str) -> TaskState:
@@ -244,6 +249,15 @@ def build_task_registry(
             trigger=_state("cache_invalidation").trigger_token,
             shutdown=shutdown,
             on_cycle=_state("cache_invalidation").record_cycle,
+        ),
+        "model_reload_watcher": lambda: model_reload_watcher(
+            session_factory=session_factory,
+            redis_client=redis_client,
+            ml_components=ml_components,
+            pause=_state("model_reload_watcher").pause_token,
+            trigger=_state("model_reload_watcher").trigger_token,
+            shutdown=shutdown,
+            on_cycle=_state("model_reload_watcher").record_cycle,
         ),
         "suggestion_expiry": lambda: expiry_loop(
             session_factory=session_factory,
