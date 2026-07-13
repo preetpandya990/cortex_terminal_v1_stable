@@ -23,6 +23,10 @@ const REJECTION_LABELS: Record<string, string> = {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+function formatLatencyMs(ms: number): string {
+  return ms < 1_000 ? `${ms}ms` : `${(ms / 1_000).toFixed(1)}s`;
+}
+
 function formatRelativeTime(ts: number, now: number): string {
   const diff = Math.max(0, now - ts);
   if (diff < 8_000)   return "just now";
@@ -108,6 +112,26 @@ function DirectionChip({ direction }: { direction: "BUY" | "SELL" }) {
   );
 }
 
+function LatencyBadge({ latencies }: { latencies: NonNullable<MLActivityItem["latencies"]> }) {
+  const { scanner_ms, ai_ms, ml_ms } = latencies;
+  const total = (scanner_ms ?? 0) + (ai_ms ?? 0) + (ml_ms ?? 0);
+  if (total === 0) return null;
+
+  const parts: string[] = [];
+  if (scanner_ms !== undefined) parts.push(`Scanner ${formatLatencyMs(scanner_ms)}`);
+  if (ai_ms !== undefined) parts.push(`AI ${formatLatencyMs(ai_ms)}`);
+  if (ml_ms !== undefined) parts.push(`ML ${formatLatencyMs(ml_ms)}`);
+
+  return (
+    <span
+      title={parts.join(" · ")}
+      className="text-[10px] font-medium text-slate-400 tabular-nums cursor-help"
+    >
+      {formatLatencyMs(total)}
+    </span>
+  );
+}
+
 interface ActivityRowProps {
   item: MLActivityItem;
   now: number;
@@ -153,6 +177,7 @@ function ActivityRow({ item, now }: ActivityRowProps) {
                   {item.consensus_score.toFixed(1)}
                 </span>
               )}
+              {item.latencies && <LatencyBadge latencies={item.latencies} />}
             </>
           )}
 

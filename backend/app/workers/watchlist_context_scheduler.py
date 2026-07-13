@@ -33,18 +33,36 @@ WATCHLIST_SCHEDULER_FRESHNESS_MARGIN_MINUTES minutes.  This prevents
 redundant Gemini calls for instruments that were recently refreshed by
 the SSE pipeline (Stage 3 in ai_stream.py).
 
+Prediction snapshots — batched, not sequential
+-----------------------------------------------
+Each stale instrument's context job carries a live ML prediction snapshot
+(prediction_snapshot.get_prediction_snapshots_batch). Instruments are
+processed in chunks of WATCHLIST_SCHEDULER_CHUNK_SIZE: feature loading is
+concurrent (one short-lived DB session per instrument), and each chunk runs
+exactly ONE batched GPU inference call — never N sequential single-instrument
+calls, which risks VRAM fragmentation on the 4GB card (see
+EnsemblePredictor.predict_batch's docstring). A context job is always
+published per instrument, even when its snapshot is degraded/unavailable
+(no_model / insufficient_data / timeout) — instruments never silently drop
+out of the pipeline on a transient inference failure.
+
 Safety
 ------
 - WATCHLIST_SCHEDULER_BATCH_CAP hard-limits instruments per run; surplus
   deferred to the next scheduled slot.
-- shutdown event is checked before every sleep boundary.
+- shutdown event is checked before every sleep boundary AND between every
+  chunk within a batch, so a large run stays responsive to the control plane
+  instead of running to completion uninterruptibly.
 - All exceptions are caught; a failed batch does not crash the task.
-- Prometheus metrics surface run count, enqueued count, duration, and
-  last-run timestamp for Grafana alerting.
+- Prometheus metrics surface run count, enqueued count, duration, last-run
+  timestamp, snapshot-unavailable count (by reason), and publish-failure
+  count for Grafana alerting — snapshot degradation and publish failure are
+  tracked as distinct, separately observable failure modes.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -58,9 +76,12 @@ from app.core.metrics import (
     watchlist_scheduler_duration_seconds,
     watchlist_scheduler_instruments_queued_total,
     watchlist_scheduler_last_run_timestamp,
+    watchlist_scheduler_publish_failed_total,
     watchlist_scheduler_runs_total,
+    watchlist_scheduler_snapshot_unavailable_total,
 )
 from app.core.kafka import KafkaTopics, publish as kafka_publish
+from app.services.prediction_snapshot import get_prediction_snapshots_batch
 from app.workers.supervisor import PauseToken, TriggerToken
 
 logger = logging.getLogger(__name__)
@@ -163,6 +184,7 @@ class WatchlistContextScheduler:
     __slots__ = (
         "_session_factory",
         "_redis",
+        "_predictor",
         "_shutdown",
         "_pause",
         "_trigger",
@@ -173,6 +195,7 @@ class WatchlistContextScheduler:
         self,
         session_factory: async_sessionmaker,
         redis: Any,
+        predictor: Any,
         shutdown: asyncio.Event,
         pause: PauseToken,
         trigger: TriggerToken,
@@ -180,6 +203,7 @@ class WatchlistContextScheduler:
     ) -> None:
         self._session_factory = session_factory
         self._redis            = redis
+        self._predictor        = predictor
         self._shutdown         = shutdown
         self._pause            = pause
         self._trigger          = trigger
@@ -332,47 +356,88 @@ class WatchlistContextScheduler:
                     len(stale_keys), cap, cap,
                 )
 
-            # ── 3. Enqueue stale instruments on the context topic ─────────────
+            # ── 3. Enqueue stale instruments on the context topic, chunked ────
+            # Each chunk: concurrent feature loading + ONE batched GPU inference
+            # call (never N sequential single-instrument predict() calls — see
+            # EnsemblePredictor.predict_batch's VRAM-fragmentation docstring).
+            # Pause/shutdown are checked between chunks so a large run stays
+            # responsive to the control plane instead of running to completion
+            # uninterruptibly. A job is always published per instrument — even
+            # when the snapshot is degraded/unavailable — so instruments never
+            # silently drop out of the context pipeline on a transient failure.
+            chunk_size = settings.WATCHLIST_SCHEDULER_CHUNK_SIZE
             enqueued = 0
-            for instrument_key in to_enqueue:
-                symbol = (
-                    instrument_key.split("|")[-1]
-                    if "|" in instrument_key
-                    else instrument_key
+            interrupted = False
+            for chunk_start in range(0, len(to_enqueue), chunk_size):
+                await self._pause.checkpoint()
+                if self._shutdown.is_set():
+                    interrupted = True
+                    logger.info(
+                        "watchlist_scheduler: shutdown signalled mid-batch — "
+                        "stopping after %d/%d instruments enqueued",
+                        enqueued, len(to_enqueue),
+                    )
+                    break
+
+                chunk = to_enqueue[chunk_start:chunk_start + chunk_size]
+                snapshots = await get_prediction_snapshots_batch(
+                    instrument_keys=chunk,
+                    timeframe="1d",
+                    predictor=self._predictor,
+                    session_factory=self._session_factory,
+                    redis=self._redis,
+                    feature_concurrency=chunk_size,
                 )
-                try:
-                    await kafka_publish(
-                        KafkaTopics.CONTEXT_JOBS,
-                        {
-                            "instrument_key":  instrument_key,
-                            "symbol":          symbol,
-                            "prediction_data": "",
-                            "lock_key":        "",
-                            "lock_token":      "",
-                            "force":           "1",
-                            "source":          "watchlist_scheduler",
-                        },
-                        key=instrument_key,
+
+                for instrument_key in chunk:
+                    symbol = (
+                        instrument_key.split("|")[-1]
+                        if "|" in instrument_key
+                        else instrument_key
                     )
-                    enqueued += 1
-                except Exception as exc:
-                    logger.warning(
-                        "watchlist_scheduler: publish failed for instrument=%s: %s",
-                        instrument_key,
-                        exc,
-                    )
+                    snapshot = snapshots[instrument_key]
+                    if not snapshot.get("available", False):
+                        watchlist_scheduler_snapshot_unavailable_total.labels(
+                            reason=snapshot.get("unavailable_reason", "unknown"),
+                        ).inc()
+
+                    try:
+                        await kafka_publish(
+                            KafkaTopics.CONTEXT_JOBS,
+                            {
+                                "instrument_key": instrument_key,
+                                "symbol": symbol,
+                                "prediction_data": json.dumps(snapshot, default=str),
+                                "lock_key": "",
+                                "lock_token": "",
+                                "force": "1",
+                                "source": "watchlist_scheduler",
+                            },
+                            key=instrument_key,
+                        )
+                        enqueued += 1
+                    except Exception as exc:
+                        watchlist_scheduler_publish_failed_total.inc()
+                        logger.warning(
+                            "watchlist_scheduler: publish failed for instrument=%s: %s",
+                            instrument_key,
+                            exc,
+                        )
 
             # ── 4. Metrics + summary log ──────────────────────────────────────
             duration = time.monotonic() - t0
-            watchlist_scheduler_runs_total.labels(status="success").inc()
+            watchlist_scheduler_runs_total.labels(
+                status="interrupted" if interrupted else "success"
+            ).inc()
             watchlist_scheduler_instruments_queued_total.inc(enqueued)
             watchlist_scheduler_duration_seconds.observe(duration)
             watchlist_scheduler_last_run_timestamp.set(now_utc.timestamp())
 
             logger.info(
-                "watchlist_scheduler: %s batch complete — "
+                "watchlist_scheduler: %s batch %s — "
                 "total=%d fresh=%d stale=%d enqueued=%d skipped=%d duration_ms=%d",
                 run_kind,
+                "interrupted (shutdown)" if interrupted else "complete",
                 len(all_keys),
                 len(fresh_keys),
                 len(stale_keys),

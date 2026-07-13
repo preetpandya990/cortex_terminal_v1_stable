@@ -1157,9 +1157,9 @@ class EventCorrelationEngine:
         except Exception as e:
             logger.error("Failed to publish suggestion %s to Redis: %s", suggestion.suggestion_id, e)
 
-        # Publish correlation completion — powers the ML Activity live feed.
-        # Sent after SUGGESTIONS_NEW so the frontend card arrives before the
-        # activity row transitions to "completed".
+        # Publish correlation completion — carries per-agent latencies for the
+        # ML Activity feed. Sent after SUGGESTIONS_NEW: the frontend row is
+        # already "completed" via new_suggestion, this just attaches timing.
         await self._publish_correlation_event(
             RedisChannels.CORRELATIONS_COMPLETED,
             {

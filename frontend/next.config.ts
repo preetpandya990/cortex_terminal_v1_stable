@@ -9,6 +9,7 @@ const projectRoot = path.resolve(__dirname);
 const monorepoRoot = path.resolve(__dirname, "..");
 
 const nextConfig: NextConfig = {
+  output: "standalone",
   turbopack: {
     root: monorepoRoot,
     resolveAlias: {

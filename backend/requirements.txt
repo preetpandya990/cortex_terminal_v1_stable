@@ -29,7 +29,7 @@ redis[hiredis]==5.2.0           # Async Redis client with C parser
 aiokafka==0.14.0                # Async Kafka client — durable job queues on Redpanda
 
 # ── HTTP Client ────────────────────────────────────────────────────────────────
-httpx==0.27.2                   # Async HTTP client
+httpx==0.28.1                   # Matches the tested runtime and satisfies google-genai 2.8.0
 aiohttp==3.9.3                  # Alternative async HTTP (for RSS)
 ijson==3.3.0                    # Streaming JSON parser
 
@@ -40,13 +40,16 @@ sse-starlette==1.8.2            # Production-grade SSE (Server-Sent Events) for 
 
 # ── Security ───────────────────────────────────────────────────────────────────
 PyJWT==2.10.0                   # JWT encode/decode
-cryptography==42.0.5            # Fernet encryption for model artifacts
+cryptography==46.0.6            # Matches the tested runtime and satisfies MLflow's supported cryptography range
+bcrypt==5.0.0                   # Matches the tested runtime; password hashing used by app.core.security
+python-jose==3.3.0              # JWT/JWS handling used by the Upstox router auth flow
+email-validator==2.3.0          # Required by Pydantic EmailStr fields in auth/admin schemas
 
 # ── Rate Limiting & Resilience ─────────────────────────────────────────────────
 slowapi==0.1.9                  # Rate limiting with Redis backend
 tenacity==8.2.3                 # Retry logic with exponential backoff
 cachetools==7.1.1               # In-memory caching (LRU cache for pattern detection)
-aiobreaker>=1.3.0               # Async circuit breaker — already used in core/circuit_breaker.py; pinned here to prevent silent omission
+aiobreaker==1.2.0               # Matches the tested runtime; newer versions are not currently available on the active package index
 
 # ── ML & AI ────────────────────────────────────────────────────────────────────
 # TensorFlow with bundled CUDA/cuDNN (WSL2/Linux only — installs nvidia-*-cu12 packages)
@@ -69,6 +72,9 @@ torch==2.11.0                   # CPU build (+cpu) — see install note above
 onnxruntime-gpu==1.19.2         # ONNX GPU inference via CUDAExecutionProvider — do NOT also install onnxruntime (CPU); both write to the same onnxruntime/ namespace and the CPU uninstall removes shared __init__.py
 onnx==1.21.0                    # Verified with onnxruntime-gpu 1.19.2 (>=1.16 needed for TensorProto.INT4). The old hummingbird-ml<=1.16.1 cap no longer applies — hummingbird is unused in the codebase.
 evidently==0.4.33               # ML monitoring and drift detection
+matplotlib==3.10.9              # Installed in the tested runtime; plotting dependency used by training/evaluation paths
+mlflow==3.13.0                  # Installed in the tested runtime; admin training and ML lifecycle tracking
+tl2cgen==1.0.0                  # Installed in the tested runtime; tree-model compilation/inference loader
 
 # XGBoost — CPU only to avoid CUDA version conflicts with tensorflow[and-cuda].
 # The RTX 3050 (4GB) GPU budget is allocated exclusively to TF/GRU training.
@@ -100,18 +106,21 @@ scikit-learn==1.4.0             # Pinned to the numpy 1.26.x line. Do NOT bump t
 # Ollama chain (litellm + instructor) has been removed.
 google-genai==2.8.0             # Google Gen AI SDK — Gemini API client
 
-# ── NLP ────────────────────────────────────────────────────────────────────────
-spacy==3.7.2                    # NLP pipeline
-# Run after install: python -m spacy download en_core_web_sm
+# ── Vector Store & RAG ─────────────────────────────────────────────────────────
+pgvector==0.4.2                 # Matches the tested runtime; SQLAlchemy type support for pgvector/HALFVEC columns
+rank-bm25==0.2.2                # Installed in the tested runtime; hybrid lexical retrieval scorer
 
-# TA-Lib candlestick pattern detection (requires system lib first)
-# Ubuntu/Debian: sudo apt-get install libta-lib-dev
-# macOS: brew install ta-lib
-TA-Lib>=0.4.28                  # 61 candlestick patterns via C library
+# ── NLP ────────────────────────────────────────────────────────────────────────
+spacy==3.7.2                    # NLP pipeline runtime; this codebase does not currently require a separate en_core_web_sm model package
+
+# TA-Lib candlestick pattern detection.
+# The tested Python 3.11.15 runtime is on the wheel-backed 0.6.x line, which
+# bundles the native TA-Lib dependency for Linux and avoids distro-package drift.
+TA-Lib==0.6.8                   # 61 candlestick patterns via native extension
 
 # ── Data Processing ────────────────────────────────────────────────────────────
 numpy==1.26.4                   # Pinned <2.0: numpy 2.x breaks TensorFlow 2.21's compiled stack (ml-dtypes/ABI) and silently disables GPU training. 1.26.4 is the verified-good combo (TF 2.21 GPU detection confirmed). The previous numpy==2.1.3 spec was aspirational and never worked on this machine.
-pandas==3.0.2                   # Bleeding-edge (copy-on-write default; breaking changes). The working app runs on it; pinned to reality and functionally smoke-verified (parquet/feature pipeline). Revisit only with full re-validation.
+pandas==2.3.3                   # CRITICAL PIN <3: mlflow's entire 3.x line (verified 3.0.0-3.14.0) requires pandas<3 (wheel METADATA), a hard upstream constraint — not an environment snapshot. Do not bump without also resolving that conflict.
 pyarrow>=14.0.0                 # Parquet serialisation for checkpoint manager
 beautifulsoup4==4.12.3          # HTML parsing
 lxml==5.1.0                     # XML/HTML parser

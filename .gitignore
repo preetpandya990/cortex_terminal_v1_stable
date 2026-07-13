@@ -171,6 +171,10 @@ backend/hyperparameter_tuning/
 !backend/models/production/*.onnx
 !backend/models/production/metadata.json
 
+# Crash-dump debris from production_training_orchestrator.py failures —
+# debugging artifacts, never a committed deliverable.
+backend/models/production/error_state_*.json
+
 # Training logs
 backend/final_training_*.log
 backend/production_training_*.log

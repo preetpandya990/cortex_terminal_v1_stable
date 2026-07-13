@@ -448,6 +448,12 @@ class AIInstrumentContext(Base):
     context_full:    Mapped[str | None] = mapped_column(Text, nullable=True)
     model_used:      Mapped[str | None] = mapped_column(String(100), nullable=True)
 
+    # Learning-phase actionable suggestion (conditional monitoring trigger —
+    # no active signal exists for this pathway), gated behind
+    # Settings.SUGGESTED_ACTION_ENABLED (default False — see core/config.py).
+    # NULL when the flag is off or the generation didn't populate it.
+    suggested_action: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # [{source_name, as_of, source_url}] from the RAG retriever.
     # Persisted so the SSE push path can serve citation data without a DB round-trip.
     source_refs: Mapped[list | None] = mapped_column(JSONB, nullable=True)

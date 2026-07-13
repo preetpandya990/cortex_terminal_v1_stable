@@ -219,6 +219,7 @@ def build_task_registry(
     watchlist_scheduler_instance = WatchlistContextScheduler(
         session_factory=session_factory,
         redis=redis_client._redis,
+        predictor=ml_components.get("ensemble_predictor"),
         shutdown=shutdown,
         pause=_state("watchlist_scheduler").pause_token,
         trigger=_state("watchlist_scheduler").trigger_token,

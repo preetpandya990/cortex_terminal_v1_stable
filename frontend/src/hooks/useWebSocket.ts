@@ -92,7 +92,10 @@ export type WebSocketMessage =
       reason: string;
     }
   | {
-      /** Consensus reached — accompanies new_suggestion for latency telemetry. */
+      /**
+       * Consensus reached — arrives after new_suggestion, carrying per-agent
+       * latencies for the already-completed ML Activity row.
+       */
       type: 'correlation_completed';
       correlation_id: string;
       suggestion_id: string;

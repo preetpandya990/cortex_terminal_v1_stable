@@ -32,6 +32,7 @@ async def retrieve(
     symbol: str,
     window_hours: int | None = None,
     top_k: int | None = None,
+    sector_peers: frozenset[str] = frozenset(),
 ) -> list[RetrievedChunk]:
     """
     Retrieve the most relevant news chunks for a trading signal query.
@@ -42,6 +43,10 @@ async def retrieve(
         symbol:       NSE trading symbol (e.g. "RELIANCE").
         window_hours: Override RAG_WINDOW_HOURS from settings.
         top_k:        Override RAG_TOP_K from settings.
+        sector_peers: Other trading symbols sharing the queried instrument's
+                      resolved sector (see app.ai.rag.sector_resolver) — feeds
+                      the retriever's "sector" candidate tier. Empty by
+                      default when the caller has no sector to resolve.
 
     Returns:
         Ranked list of RetrievedChunk (best first).
@@ -53,6 +58,7 @@ async def retrieve(
         symbol=symbol,
         window_hours=window_hours if window_hours is not None else settings.RAG_WINDOW_HOURS,
         top_k=top_k if top_k is not None else settings.RAG_TOP_K,
+        sector_peers=sector_peers,
     )
 
 

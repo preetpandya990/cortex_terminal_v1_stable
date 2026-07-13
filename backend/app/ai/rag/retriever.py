@@ -1,7 +1,8 @@
 """
 RAG Retriever
 =============
-Hybrid BM25 + cosine-similarity retrieval with Reciprocal Rank Fusion (RRF).
+Hybrid BM25 + cosine-similarity retrieval with Reciprocal Rank Fusion (RRF),
+gated by a tiered relevance floor before ranking ever sees the candidates.
 
 Architecture
 ------------
@@ -9,20 +10,31 @@ At Cortex's current corpus size (9k–10k events, 25–130 candidates per symbol
 time-window query), loading the full filtered candidate set from the DB and
 performing ranking in Python is faster and simpler than two separate DB queries:
 
-  1. One SQL query fetches all candidates for (symbol, time_window):
-       SELECT embedding, raw_content, source_name, source_url, as_of_timestamp
-       FROM ai_document_embeddings JOIN ai_raw_events
-       WHERE (symbol = :s OR symbol IS NULL) AND as_of_timestamp >= :cutoff
+  1. One SQL query loads candidates for (symbol, time_window) in three tiers
+     (see _load_candidates): "exact" (symbol = :s), "sector" (symbol in the
+     instrument's resolved sector peers), "generic" (symbol IS NULL) — most
+     recent first, capped at _MAX_CANDIDATES.
 
-  2. BM25 (rank_bm25.BM25Okapi) ranks candidates by lexical match.
+  2. Relevance gate (see retrieve()): "exact"-tier candidates are trusted
+     outright (ingestion-time symbol tagging already validated them).
+     "sector" and "generic" candidates must independently clear
+     RAG_MIN_GENERIC_COSINE_SIMILARITY against the query embedding or they
+     are dropped from the candidate pool entirely, before either ranker
+     below ever sees them. This is what stops topically unrelated filler
+     (e.g. generic high-buzz market wire content with no real connection to
+     the instrument) from reaching the LLM prompt as if it were relevant —
+     see NEWS_CONTEXT_RELEVANCE_GAP_FINDING.md for the incident this fixed.
+
+  3. BM25 (rank_bm25.BM25Okapi) ranks the gated candidates by lexical match.
      Tokenization: lowercase whitespace split.  Appropriate for short financial
      texts where exact term matching (tickers, regulatory terms) is critical.
 
-  3. Cosine similarity (numpy matmul) ranks candidates by semantic proximity.
-     Query embedding: gemini-embedding-001 (768-dim) — see rag/embedder.py and
-     GEMINI_EMBED_MODEL / GEMINI_EMBED_DIM in core/config.py.
+  4. Cosine similarity (numpy matmul) ranks the gated candidates by semantic
+     proximity. Query embedding: gemini-embedding-001 (768-dim) — see
+     rag/embedder.py and GEMINI_EMBED_MODEL / GEMINI_EMBED_DIM in
+     core/config.py.
 
-  4. Reciprocal Rank Fusion (k=60, Cormack et al. 2009) merges the two ranked
+  5. Reciprocal Rank Fusion (k=60, Cormack et al. 2009) merges the two ranked
      lists into a single score without requiring score calibration.
 
 RRF formula:  score(d) = Σ_r  1 / (60 + rank_r(d))
@@ -30,6 +42,7 @@ RRF formula:  score(d) = Σ_r  1 / (60 + rank_r(d))
 
 Performance (at 130 candidates):
   - SQL query:     ~8ms
+  - Relevance gate: <1ms (one extra cosine-similarity pass, reused from step 4)
   - BM25 ranking:  <1ms
   - Cosine (numpy): <1ms
   - RRF merge:      <1ms
@@ -56,6 +69,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.ai.fusion.models import AIDocumentEmbedding, AIRawEvent
 from app.ai.intelligence.credibility_scorer import load_credibility_scores
 from app.ai.rag.embedder import embed_query
+from app.core.config import get_settings
+from app.core.metrics import rag_relevance_gate_total
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +138,12 @@ class _Candidate:
     embedding: list[float]
     symbol: str | None
     low_confidence: bool = False
+    # "exact" (doc tagged with the queried symbol at ingestion — trusted,
+    # exempt from the relevance floor), "sector" (doc tagged with a
+    # different symbol that shares the instrument's resolved sector), or
+    # "generic" (doc has no symbol tag at all). Sector and generic tiers
+    # both must clear RAG_MIN_GENERIC_COSINE_SIMILARITY — see retrieve().
+    tier: str = "generic"
 
 
 def _tokenize(text: str) -> list[str]:
@@ -160,16 +181,19 @@ def _bm25_rank(
     return ranked[:top_n].tolist()
 
 
-def _cosine_rank(
+def _cosine_similarities(
     candidates: list[_Candidate],
     query_vector: list[float],
-    top_n: int,
-) -> list[int]:
+) -> np.ndarray:
     """
-    Return indices into ``candidates`` sorted by cosine similarity (descending).
+    Cosine similarity of every candidate embedding against the query vector.
 
     Uses numpy matrix multiplication for efficient batch computation over the
-    full candidate set.  Normalisation is applied to handle non-unit vectors.
+    full candidate set. Normalisation is applied to handle non-unit vectors.
+
+    Single source of truth: both ranking (_cosine_rank) and the relevance
+    gate (retrieve()) compute similarity through this function, so the two
+    can never drift apart.
     """
     embeddings = np.array([c.embedding for c in candidates], dtype=np.float32)
     query = np.array(query_vector, dtype=np.float32)
@@ -182,7 +206,18 @@ def _cosine_rank(
     q_norm = np.linalg.norm(query)
     norm_query = query / q_norm if q_norm > 0 else query
 
-    similarities: np.ndarray = norm_embeddings @ norm_query
+    return norm_embeddings @ norm_query
+
+
+def _cosine_rank(
+    candidates: list[_Candidate],
+    query_vector: list[float],
+    top_n: int,
+) -> list[int]:
+    """
+    Return indices into ``candidates`` sorted by cosine similarity (descending).
+    """
+    similarities = _cosine_similarities(candidates, query_vector)
     ranked = np.argsort(-similarities)
     return ranked[:top_n].tolist()
 
@@ -267,25 +302,40 @@ async def _load_candidates(
     db: AsyncSession,
     symbol: str,
     cutoff: datetime,
+    sector_peers: frozenset[str] = frozenset(),
     limit: int = _MAX_CANDIDATES,
 ) -> list[_Candidate]:
     """
     Load embedding records + raw content for a given symbol and time window.
 
-    Strategy — prioritized symbol inclusion:
-      1. Fetch instrument-specific docs (symbol = :symbol) in the window,
-         most-recent first, capped at ``limit``. The cap keeps a heavily
-         covered symbol during earnings/M&A news flow (or a 168h swing
-         window) from loading thousands of rows into Python and blowing the
-         ~10ms/130-candidate performance model — hitting it truncates the
-         OLDEST docs in the window and logs a warning.
-      2. Fill remaining budget (limit - symbol_count) with general market docs
-         (symbol IS NULL), most-recent first.
+    Strategy — three-tier prioritized inclusion:
+      1. "exact" — docs tagged with the queried symbol (symbol = :symbol) in
+         the window, most-recent first, capped at ``limit``. The cap keeps a
+         heavily covered symbol during earnings/M&A news flow (or a 168h
+         swing window) from loading thousands of rows into Python and
+         blowing the ~10ms/130-candidate performance model — hitting it
+         truncates the OLDEST docs in the window and logs a warning.
+         Trusted at retrieval time (see retrieve()): ingestion-time symbol
+         tagging (event_classifier.normalize_and_validate_symbols) already
+         validated the doc-to-symbol relationship.
+      2. "sector" — docs tagged with a *different* symbol that shares the
+         queried instrument's resolved sector (``sector_peers``, resolved by
+         app.ai.rag.sector_resolver). Fills the budget remaining after step
+         1. This tier did not exist before this fix: genuinely relevant
+         company-specific news about a sector peer (tagged with its own real
+         symbol, never NULL) was previously invisible to retrieval entirely.
+         Not trusted like "exact" — sector adjacency is a candidate-
+         generation heuristic, not a relevance guarantee, so these still
+         have to clear the relevance floor in retrieve().
+      3. "generic" — docs with no symbol tag at all (symbol IS NULL), filling
+         whatever budget remains. Must also clear the relevance floor.
 
-    Without this two-step strategy a large general news pool (symbol IS NULL,
-    currently ~3.9k docs) would displace all symbol-specific docs from the 500-
-    candidate cap, causing the retriever to return unrelated market news for any
-    symbol query.
+    Without prioritized inclusion, the large general news pool (symbol IS
+    NULL, currently ~3.9k docs) would displace all symbol-specific docs from
+    the 500-candidate cap, causing the retriever to return unrelated market
+    news for any symbol query. ``sector_peers`` defaults to an empty set, so
+    callers that cannot resolve a sector get byte-identical exact→generic
+    behavior to before this fix.
     """
     _COLUMNS = (
         AIDocumentEmbedding.source_id,
@@ -298,8 +348,26 @@ async def _load_candidates(
         AIRawEvent.extra_data,
     )
 
-    # Step 1: symbol-specific docs in the time window, recency-capped.
-    symbol_stmt = (
+    def _to_candidates(rows: list, tier: str) -> list[_Candidate]:
+        return [
+            _Candidate(
+                source_id=row.source_id,
+                content=row.raw_content,
+                source_name=row.source_name,
+                source_url=row.source_url,
+                as_of_timestamp=row.as_of_timestamp,
+                embedding=row.embedding,
+                symbol=row.symbol,
+                low_confidence=bool(
+                    (row.extra_data or {}).get("low_confidence_source")
+                ),
+                tier=tier,
+            )
+            for row in rows
+        ]
+
+    # Step 1: exact-symbol docs in the time window, recency-capped.
+    exact_stmt = (
         select(*_COLUMNS)
         .join(AIRawEvent, AIRawEvent.id == AIDocumentEmbedding.source_id)
         .where(
@@ -309,17 +377,33 @@ async def _load_candidates(
         .order_by(AIDocumentEmbedding.as_of_timestamp.desc())
         .limit(limit)
     )
-    symbol_rows = (await db.execute(symbol_stmt)).all()
-    if len(symbol_rows) >= limit:
+    exact_rows = (await db.execute(exact_stmt)).all()
+    if len(exact_rows) >= limit:
         logger.warning(
-            "rag.retrieve: symbol-specific candidates for %s hit the %d cap — "
+            "rag.retrieve: exact-symbol candidates for %s hit the %d cap — "
             "oldest docs in the window were truncated",
             symbol,
             limit,
         )
 
-    # Step 2: general market docs to fill remaining budget.
-    general_limit = max(0, limit - len(symbol_rows))
+    # Step 2: sector-peer docs to fill remaining budget.
+    sector_limit = max(0, limit - len(exact_rows))
+    sector_rows: list = []
+    if sector_limit > 0 and sector_peers:
+        sector_stmt = (
+            select(*_COLUMNS)
+            .join(AIRawEvent, AIRawEvent.id == AIDocumentEmbedding.source_id)
+            .where(
+                AIDocumentEmbedding.symbol.in_(sector_peers),
+                AIDocumentEmbedding.as_of_timestamp >= cutoff,
+            )
+            .order_by(AIDocumentEmbedding.as_of_timestamp.desc())
+            .limit(sector_limit)
+        )
+        sector_rows = (await db.execute(sector_stmt)).all()
+
+    # Step 3: general market docs to fill whatever budget remains.
+    general_limit = max(0, limit - len(exact_rows) - len(sector_rows))
     general_rows: list = []
     if general_limit > 0:
         general_stmt = (
@@ -334,23 +418,46 @@ async def _load_candidates(
         )
         general_rows = (await db.execute(general_stmt)).all()
 
-    rows = symbol_rows + general_rows
+    return (
+        _to_candidates(exact_rows, "exact")
+        + _to_candidates(sector_rows, "sector")
+        + _to_candidates(general_rows, "generic")
+    )
 
-    return [
-        _Candidate(
-            source_id=row.source_id,
-            content=row.raw_content,
-            source_name=row.source_name,
-            source_url=row.source_url,
-            as_of_timestamp=row.as_of_timestamp,
-            embedding=row.embedding,
-            symbol=row.symbol,
-            low_confidence=bool(
-                (row.extra_data or {}).get("low_confidence_source")
-            ),
-        )
-        for row in rows
-    ]
+
+def _apply_relevance_gate(
+    candidates: list[_Candidate],
+    query_vector: list[float],
+    min_similarity: float,
+) -> tuple[list[_Candidate], dict[str, int], dict[str, int]]:
+    """
+    Split ``candidates`` into admitted vs. filtered by tier trust rules.
+
+    "exact"-tier candidates are exempt (ingestion-time symbol tagging already
+    validated relevance). "sector"/"generic" candidates must independently
+    clear ``min_similarity`` against ``query_vector`` or they're dropped from
+    the pool entirely — before either ranker ever sees them, so a
+    filtered-out candidate cannot leak back in via a nonzero BM25 score alone.
+
+    Returns (admitted_candidates, admitted_count_by_tier, filtered_count_by_tier).
+    """
+    trusted = [c for c in candidates if c.tier == "exact"]
+    gated = [c for c in candidates if c.tier != "exact"]
+
+    admitted: list[_Candidate] = []
+    admitted_by_tier: dict[str, int] = {"exact": len(trusted)}
+    filtered_by_tier: dict[str, int] = {}
+
+    if gated:
+        gated_sims = _cosine_similarities(gated, query_vector)
+        for c, s in zip(gated, gated_sims):
+            if s >= min_similarity:
+                admitted.append(c)
+                admitted_by_tier[c.tier] = admitted_by_tier.get(c.tier, 0) + 1
+            else:
+                filtered_by_tier[c.tier] = filtered_by_tier.get(c.tier, 0) + 1
+
+    return trusted + admitted, admitted_by_tier, filtered_by_tier
 
 
 async def retrieve(
@@ -359,6 +466,7 @@ async def retrieve(
     symbol: str,
     window_hours: int = 24,
     top_k: int = 5,
+    sector_peers: frozenset[str] = frozenset(),
 ) -> list[RetrievedChunk]:
     """
     Retrieve the top-k most relevant news chunks for a trading signal query.
@@ -366,6 +474,15 @@ async def retrieve(
     Combines BM25 lexical ranking (critical for exact ticker and regulatory term
     matching) with semantic cosine ranking (captures paraphrase and context) via
     Reciprocal Rank Fusion.
+
+    A relevance gate runs on the loaded candidate pool before either ranker
+    sees it (see the "exact"/"sector"/"generic" tiering in _load_candidates):
+    only "exact"-tier candidates are trusted outright; "sector" and "generic"
+    tier candidates must independently clear RAG_MIN_GENERIC_COSINE_SIMILARITY
+    against the query embedding or they are dropped from the pool entirely —
+    not merely down-ranked. This is what prevents topically unrelated filler
+    (e.g. generic "AI wave" market wire content) from ever reaching the LLM
+    prompt as if it were relevant instrument context.
 
     Args:
         db:           SQLAlchemy async session.
@@ -375,10 +492,15 @@ async def retrieve(
         window_hours: Freshness window.  Default 24h.  Use up to 168h (7 days)
                       for swing signals with slower information decay.
         top_k:        Number of chunks to return.  Default 5 (RAG_TOP_K config).
+        sector_peers: Other trading symbols sharing the queried instrument's
+                      resolved sector (see app.ai.rag.sector_resolver). Empty
+                      by default — callers that don't resolve a sector get
+                      the exact→generic-only behavior that existed before
+                      this parameter was introduced.
 
     Returns:
         List of RetrievedChunk ordered by descending RRF score.
-        Empty list if no embeddings exist for the given symbol/window.
+        Empty list if no candidates exist, or none clear the relevance gate.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
 
@@ -386,7 +508,7 @@ async def retrieve(
     import asyncio
 
     candidates_task = asyncio.create_task(
-        _load_candidates(db, symbol, cutoff)
+        _load_candidates(db, symbol, cutoff, sector_peers=sector_peers)
     )
     query_vector_task = asyncio.create_task(embed_query(query))
 
@@ -397,6 +519,31 @@ async def retrieve(
             "rag.retrieve: no candidates for symbol=%s window_hours=%d",
             symbol,
             window_hours,
+        )
+        return []
+
+    # ── Relevance gate ────────────────────────────────────────────────────
+    settings = get_settings()
+    candidates, admitted_by_tier, filtered_by_tier = _apply_relevance_gate(
+        candidates, query_vector, settings.RAG_MIN_GENERIC_COSINE_SIMILARITY
+    )
+
+    for tier_name in ("exact", "sector", "generic"):
+        if admitted_by_tier.get(tier_name):
+            rag_relevance_gate_total.labels(tier=tier_name, outcome="admitted").inc(
+                admitted_by_tier[tier_name]
+            )
+        if filtered_by_tier.get(tier_name):
+            rag_relevance_gate_total.labels(tier=tier_name, outcome="filtered").inc(
+                filtered_by_tier[tier_name]
+            )
+
+    if not candidates:
+        logger.info(
+            "rag.retrieve: all candidates for symbol=%s filtered below "
+            "RAG_MIN_GENERIC_COSINE_SIMILARITY (no exact-tier coverage) — "
+            "returning no news context",
+            symbol,
         )
         return []
 
@@ -426,9 +573,14 @@ async def retrieve(
     )
 
     logger.info(
-        "rag.retrieve symbol=%s candidates=%d bm25_ranked=%d vector_ranked=%d returned=%d",
+        "rag.retrieve symbol=%s candidates=%d (exact=%d sector=%d generic=%d) "
+        "gate_filtered=%d bm25_ranked=%d vector_ranked=%d returned=%d",
         symbol,
         len(candidates),
+        admitted_by_tier.get("exact", 0),
+        admitted_by_tier.get("sector", 0),
+        admitted_by_tier.get("generic", 0),
+        sum(filtered_by_tier.values()),
         len(bm25_ranks),
         len(vector_ranks),
         len(chunks),

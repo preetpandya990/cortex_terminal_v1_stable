@@ -5,7 +5,7 @@
 #              headers).  Nothing from this stage enters production.
 #   runtime  — slim image with only the installed venv and runtime system libs.
 #
-# Base:  python:3.11-slim  (Debian Bookworm).
+# Base:  python:3.11.15-slim-bookworm.
 # GPU:   tensorflow[and-cuda] and onnxruntime-gpu bundle their own CUDA/cuDNN
 #        wheels — no CUDA base image required.  At run time, pass --gpus all to
 #        the Docker daemon so the container inherits the host NVIDIA driver.
@@ -16,18 +16,15 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ──────────────────────────── Stage 1 · builder ───────────────────────────────
-FROM python:3.11-slim AS builder
+FROM python:3.11.15-slim-bookworm AS builder
 
-# Build toolchain + TA-Lib development headers.
-# TA-Lib (Technical Analysis Library) is not a pure-Python package; it wraps a
-# C library.  The Python TA-Lib wheel compiles against libta-lib headers at
-# install time and links to the shared library at run time.
-# libta-lib-dev is available in Debian Bookworm's official package repositories.
+# Build toolchain for any Python packages that still need native compilation.
+# TA-Lib is installed from the modern wheel-backed Python distribution pinned in
+# requirements.txt; it no longer depends on Debian libta-lib packages here.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         gcc \
-        libta-lib-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Isolate all Python packages inside a virtualenv so the runtime stage can
@@ -54,21 +51,13 @@ RUN pip install --no-cache-dir \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ── spaCy language model ──────────────────────────────────────────────────────
-# Downloaded once at image build time; the NLP engine references en_core_web_sm.
-RUN python -m spacy download en_core_web_sm
-
-
 # ──────────────────────────── Stage 2 · runtime ───────────────────────────────
-FROM python:3.11-slim AS runtime
+FROM python:3.11.15-slim-bookworm AS runtime
 
 # Runtime system dependencies only:
-#   libta-lib0  — shared library (.so) required by the compiled TA-Lib Python
-#                 C-extension at import time.
 #   curl        — used by Docker Compose healthcheck probes (curl -f /health).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        libta-lib0 \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -90,6 +79,13 @@ COPY --from=builder /venv /venv
 # Docker build context is ./backend (set in docker-compose.yml).
 WORKDIR /app
 COPY --chown=cortex:cortex . .
+
+# Writable runtime paths for logs, model artifacts, and local cache.
+# COPY --chown updates copied content ownership, but the /app directory itself
+# is still root-owned because WORKDIR created it earlier in the image build.
+# Ensure the non-root runtime user can create any missing subdirectories.
+RUN mkdir -p /app/logs /app/models /app/.cache \
+    && chown -R cortex:cortex /app
 
 # ── Runtime environment ───────────────────────────────────────────────────────
 ENV PATH="/venv/bin:$PATH" \

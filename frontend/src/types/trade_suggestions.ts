@@ -118,6 +118,8 @@ export interface TradeSuggestion {
   //   string/date → explanation ready   — render content
   llm_summary:              string | null;
   llm_explanation:          string | null;
+  /** Learning-phase actionable suggestion, gated server-side (default off). */
+  llm_suggested_action?:    string | null;
   explanation_model:        string | null;
   explanation_generated_at: string | null;
 }

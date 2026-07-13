@@ -40,11 +40,16 @@ _DEV_TXT  = _BACKEND / "requirements-dev.txt"
 _MAKEFILE = _BACKEND / "Makefile"
 
 # ── Critical ML pins — must never silently drift ──────────────────────────────
+# pandas is capped <3: mlflow's entire 3.x line (verified 3.0.0 through
+# 3.14.0, the latest at time of writing) declares `pandas<3` in its own
+# wheel metadata and will not co-resolve with pandas 3.x. This is a hard
+# upstream constraint, not an environment snapshot. Revisit once mlflow
+# adds pandas 3.x support upstream.
 _CRITICAL_PINS = {
     "numpy":        "1.26.4",
     "scikit-learn": "1.4.0",
     "tensorflow":   "2.21.0",
-    "pandas":       "3.0.2",
+    "pandas":       "2.3.3",
     "torch":        "2.11.0",  # accepts 2.11.0+cpu local version suffix
 }
 
@@ -71,7 +76,7 @@ class TestInFilesExist:
         assert "scikit-learn==1.4.0" in _REQ_IN.read_text()
 
     def test_requirements_in_pins_pandas(self) -> None:
-        assert "pandas==3.0.2" in _REQ_IN.read_text()
+        assert "pandas==2.3.3" in _REQ_IN.read_text()
 
     def test_requirements_in_pins_torch(self) -> None:
         assert "torch==2.11.0" in _REQ_IN.read_text()

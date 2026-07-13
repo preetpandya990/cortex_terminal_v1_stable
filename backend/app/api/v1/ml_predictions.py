@@ -10,9 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db, get_ml_predictor
 from app.core.auth import require_admin_role
+from app.core.database import AsyncSessionLocal
 from app.core.limiter import limiter
 from app.core.redis import get_redis
-from app.ml.inference.feature_loader import FeatureLoader
+from app.services.prediction_snapshot import get_prediction_snapshot
 from app.schemas.ml_predictions import PredictionRequest, PredictionResponse
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,6 @@ router = APIRouter(tags=["ML Predictions"])
 async def predict(
     request: Request,
     body: PredictionRequest,
-    db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     predictor=Depends(get_ml_predictor),
 ) -> PredictionResponse:
@@ -40,38 +40,12 @@ async def predict(
 
     try:
         redis = await get_redis()
-        feature_loader = FeatureLoader(
-            db=db,
-            redis=redis,
-            sequence_length=predictor.sequence_length,
-            n_features=predictor.n_features,
-            feature_names=predictor.feature_names,
-        )
-
-        try:
-            tabular, sequence, current_price, volatility = await feature_loader.load_features(
-                symbol=symbol,
-                timeframe=timeframe,
-            )
-        except ValueError as exc:
-            # No OHLCV history in the local DB yet — not an error, just no data.
-            # Return 200 with available=False so the frontend can display a
-            # meaningful message instead of treating this as an HTTP failure.
-            logger.info("No features available for %s: %s", symbol, exc)
-            return PredictionResponse(
-                symbol=symbol,
-                available=False,
-                unavailable_reason="insufficient_data",
-            )
-
-        prediction = await predictor.predict(
-            features_tabular=tabular,
-            features_sequence=sequence,
-            symbol=symbol,
-            current_price=current_price,
-            volatility=volatility,
+        snapshot = await get_prediction_snapshot(
+            instrument_key=symbol,
             timeframe=timeframe,
-            use_cache=True,
+            predictor=predictor,
+            session_factory=AsyncSessionLocal,
+            redis=redis,
         )
 
     except HTTPException:
@@ -85,27 +59,45 @@ async def predict(
 
     logger.info(
         "Prediction: user=%s symbol=%s direction=%s confidence=%.4f",
-        user_id, symbol, prediction["direction_label"], prediction["confidence"],
+        user_id,
+        symbol,
+        snapshot.get("direction"),
+        float(snapshot.get("confidence", 0.0)),
     )
 
-    probs = prediction.get("probabilities", {})
+    if not snapshot.get("available"):
+        return PredictionResponse(
+            symbol=symbol,
+            available=False,
+            unavailable_reason=snapshot.get("unavailable_reason"),
+        )
+
+    probs = snapshot.get("probabilities", {})
+    predicted_at_raw = snapshot.get("predicted_at")
+    predicted_at = (
+        datetime.fromisoformat(predicted_at_raw)
+        if isinstance(predicted_at_raw, str) and predicted_at_raw
+        else datetime.now(timezone.utc)
+    )
+
     return PredictionResponse(
         symbol=symbol,
-        direction=prediction["direction_label"],
-        confidence=float(prediction["confidence"]),
-        entry_price=float(prediction["entry_price"]),
-        stop_loss=float(prediction["stop_loss"]),
-        take_profit_1=float(prediction["tp1"]),
-        take_profit_2=float(prediction["tp2"]),
-        take_profit_3=float(prediction["tp3"]),
-        volatility=float(prediction["volatility"]),
+        available=True,
+        direction=snapshot.get("direction"),
+        confidence=float(snapshot.get("confidence", 0.0)),
+        entry_price=float(snapshot.get("entry_price", 0.0)),
+        stop_loss=float(snapshot.get("stop_loss", 0.0)),
+        take_profit_1=float(snapshot.get("tp1", 0.0)),
+        take_profit_2=float(snapshot.get("tp2", 0.0)),
+        take_profit_3=float(snapshot.get("tp3", 0.0)),
+        volatility=float(snapshot.get("volatility", 0.0)),
         probabilities={
-            "up":   float(probs.get("buy", 0.0)),
+            "up": float(probs.get("buy", 0.0)),
             "down": float(probs.get("sell", 0.0)),
             "hold": float(probs.get("hold", 0.0)),
         },
-        model_version=prediction.get("metadata", {}).get("model_version", "ensemble_v1.0"),
-        predicted_at=datetime.now(timezone.utc),
+        model_version=snapshot.get("xgboost_version") or "ensemble_v1.0",
+        predicted_at=predicted_at,
     )
 
 
@@ -225,67 +217,6 @@ async def admin_reload(
 
 # ── Prediction Card endpoint ───────────────────────────────────────────────────
 
-def serialize_prediction_card(raw: dict[str, Any], timeframe: str = "1d") -> dict[str, Any]:
-    """
-    Serialize raw EnsemblePredictor.predict() output into the ML Analysis Card
-    payload format.  Pure function — no I/O.  Used by both the REST endpoint
-    and the SSE stream so both sources emit an identical shape.
-    """
-    meta      = raw.get("metadata", {})
-    models_raw = raw.get("models", {})
-    probs     = raw.get("probabilities", {})
-
-    def _model_view(m: dict[str, Any]) -> dict[str, Any]:
-        mp = m.get("probabilities", {})
-        return {
-            "direction":        m.get("direction", "HOLD"),
-            "confidence":       round(float(m.get("confidence",       0.0)), 4),
-            "conviction_scale": round(float(m.get("conviction_scale", 0.0)), 4),
-            "threshold":        round(float(m.get("threshold",        0.6)), 4),
-            "probabilities": {
-                "buy":  round(float(mp.get("buy",  0.0)), 4),
-                "sell": round(float(mp.get("sell", 0.0)), 4),
-                "hold": round(float(mp.get("hold", 0.0)), 4),
-            },
-            "weight":  round(float(m.get("weight",  0.0)), 4),
-            "version": m.get("version", ""),
-        }
-
-    models: dict[str, Any] = {
-        "xgboost": _model_view(models_raw["xgboost"]) if "xgboost" in models_raw else None,
-        "gru":     _model_view(models_raw["gru"])     if "gru"     in models_raw else None,
-    }
-
-    effective_timeframe = meta.get("timeframe", timeframe)
-
-    return {
-        "available":         True,
-        "unavailable_reason": None,
-        "direction":          raw.get("direction_label", "HOLD"),
-        "confidence":         round(float(raw.get("confidence",       0.0)), 4),
-        "conviction_scale":   round(float(raw.get("conviction_scale", 0.0)), 4),
-        "threshold":          round(float(raw.get("threshold",        0.6)), 4),
-        "probabilities": {
-            "buy":  round(float(probs.get("buy",  0.0)), 4),
-            "sell": round(float(probs.get("sell", 0.0)), 4),
-            "hold": round(float(probs.get("hold", 0.0)), 4),
-        },
-        "entry_price": round(float(raw.get("entry_price", 0.0)), 2),
-        "stop_loss":   round(float(raw.get("stop_loss",   0.0)), 2),
-        "tp1":         round(float(raw.get("tp1",         0.0)), 2),
-        "tp2":         round(float(raw.get("tp2",         0.0)), 2),
-        "tp3":         round(float(raw.get("tp3",         0.0)), 2),
-        "volatility":  round(float(raw.get("volatility",  0.0)), 4),
-        "models": models,
-        "xgboost_version": meta.get("xgboost_version", ""),
-        "gru_version":     meta.get("gru_version"),
-        "xgboost_weight":  round(float(meta.get("xgboost_weight", 0.75)), 4),
-        "gru_weight":      round(float(meta.get("gru_weight",     0.25)), 4),
-        "timeframe":       effective_timeframe,
-        "predicted_at":    meta.get("predicted_at", ""),
-    }
-
-
 @router.get(
     "/prediction-card",
     status_code=status.HTTP_200_OK,
@@ -308,47 +239,20 @@ async def get_prediction_card(
     request: Request,
     instrument_key: str,
     timeframe: str = "1d",
-    db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> dict[str, Any]:
     user_id = current_user.get("user_id", "unknown")
 
     predictor = getattr(request.app.state, "ml_predictor", None)
-    if predictor is None:
-        return {"available": False, "unavailable_reason": "no_model"}
-
     try:
         redis = get_redis()
-        feature_loader = FeatureLoader(
-            db=db,
-            redis=redis,
-            sequence_length=predictor.sequence_length,
-            n_features=predictor.n_features,
-            feature_names=predictor.feature_names,
-        )
-
-        try:
-            tabular, sequence, current_price, volatility = await feature_loader.load_features(
-                symbol=instrument_key,
-                timeframe=timeframe,
-            )
-        except ValueError as exc:
-            logger.info(
-                "Prediction card — insufficient data: user=%s instrument=%s error=%s",
-                user_id, instrument_key, exc,
-            )
-            return {"available": False, "unavailable_reason": "insufficient_data"}
-
-        raw = await predictor.predict(
-            features_tabular=tabular,
-            features_sequence=sequence,
-            symbol=instrument_key,
-            current_price=current_price,
-            volatility=volatility,
+        snapshot = await get_prediction_snapshot(
+            instrument_key=instrument_key,
             timeframe=timeframe,
-            use_cache=True,
+            predictor=predictor,
+            session_factory=AsyncSessionLocal,
+            redis=redis,
         )
-
     except HTTPException:
         raise
     except Exception as exc:
@@ -361,8 +265,15 @@ async def get_prediction_card(
             detail={"error": "prediction_failed", "message": "Ensemble prediction failed"},
         )
 
+    if not snapshot.get("available"):
+        logger.info(
+            "Prediction card unavailable: user=%s instrument=%s reason=%s",
+            user_id, instrument_key, snapshot.get("unavailable_reason"),
+        )
+        return snapshot
+
     logger.info(
         "Prediction card: user=%s instrument=%s direction=%s confidence=%.4f",
-        user_id, instrument_key, raw.get("direction_label"), raw.get("confidence"),
+        user_id, instrument_key, snapshot.get("direction"), snapshot.get("confidence"),
     )
-    return serialize_prediction_card(raw, timeframe=timeframe)
+    return snapshot

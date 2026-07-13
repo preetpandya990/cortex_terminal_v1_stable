@@ -13,6 +13,8 @@
  * Message flow:
  *   correlation_started  → INSERT  (status: processing)
  *   new_suggestion       → MUTATE  (status: completed, enrich with direction/score)
+ *   correlation_completed→ MUTATE  (attach per-agent latencies; arrives after
+ *                           new_suggestion, so the row already exists)
  *   correlation_rejected → MUTATE  (status: rejected, enrich with reason)
  *
  * Eviction:
@@ -62,6 +64,8 @@ export interface MLActivityItem {
   confidence_level?: 'HIGH' | 'MEDIUM' | 'LOW';
   // ── rejected fields ───────────────────────────────────────────────────────
   rejection_reason?: string;
+  // ── latency telemetry (from correlation_completed) ──────────────────────────
+  latencies?: { scanner_ms?: number; ai_ms?: number; ml_ms?: number };
 }
 
 // ── Reducer ──────────────────────────────────────────────────────────────────
@@ -86,6 +90,11 @@ type ActivityAction =
       rejection_reason: string;
       consensus_score:  number;
       resolved_at:      number;
+    }
+  | {
+      type:           'LATENCIES';
+      correlation_id: string;
+      latencies:      { scanner_ms?: number; ai_ms?: number; ml_ms?: number };
     }
   | { type: 'EVICT'; cutoff: number };
 
@@ -166,6 +175,14 @@ function mlActivityReducer(
           rejection_reason: action.rejection_reason,
         });
       }
+      return next;
+    }
+
+    case 'LATENCIES': {
+      const existing = state.get(action.correlation_id);
+      if (!existing) return state; // No matching row (e.g. evicted already) — discard.
+      const next = new Map(state);
+      next.set(action.correlation_id, { ...existing, latencies: action.latencies });
       return next;
     }
 
@@ -280,6 +297,16 @@ export function useMLActivity({ seedItems }: UseMLActivityOptions = {}): UseMLAc
           confidence_level: msg.confidence_level,
           resolved_at:      now,
         });
+        break;
+
+      case 'correlation_completed':
+        if (msg.latencies) {
+          dispatch({
+            type:           'LATENCIES',
+            correlation_id: msg.correlation_id,
+            latencies:      msg.latencies,
+          });
+        }
         break;
 
       case 'correlation_rejected':

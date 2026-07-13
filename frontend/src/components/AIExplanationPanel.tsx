@@ -44,7 +44,7 @@
  */
 
 import { memo, useState, useCallback, useMemo } from 'react';
-import { Brain, Clock, ExternalLink, AlertTriangle, Sparkles } from 'lucide-react';
+import { Brain, Clock, ExternalLink, AlertTriangle, Sparkles, Lightbulb, FlaskConical } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { cn } from '@/lib/utils';
 import { sanitizeUrl } from '@/lib/sanitizeUrl';
@@ -68,6 +68,21 @@ const DISCLAIMER_MARKER = '⚠';
  */
 function splitExplanation(text: string): { body: string; disclaimer: string } {
   const idx = text.lastIndexOf(`\n\n${DISCLAIMER_MARKER}`);
+  if (idx === -1) return { body: text.trim(), disclaimer: '' };
+  return {
+    body:       text.slice(0, idx).trim(),
+    disclaimer: text.slice(idx).trim(),
+  };
+}
+
+/** Sentinel the explanation worker appends to suggested_action — deliberately
+ *  distinct from DISCLAIMER_MARKER so the two disclaimers are independently
+ *  splittable and visually distinguishable. */
+const SUGGESTED_ACTION_DISCLAIMER_MARKER = '🧪';
+
+/** Same split mechanics as splitExplanation, independent sentinel. */
+function splitSuggestedAction(text: string): { body: string; disclaimer: string } {
+  const idx = text.lastIndexOf(`\n\n${SUGGESTED_ACTION_DISCLAIMER_MARKER}`);
   if (idx === -1) return { body: text.trim(), disclaimer: '' };
   return {
     body:       text.slice(0, idx).trim(),
@@ -394,6 +409,49 @@ function TypingCursor() {
   );
 }
 
+// ── Suggested Action callout ───────────────────────────────────────────────────
+
+interface SuggestedActionCalloutProps {
+  action: string;
+}
+
+/**
+ * Visually distinct callout for the learning-phase suggested_action field —
+ * deliberately NOT blended into the 5-section narrative list above it, and
+ * styled differently (indigo, not amber) from the regulatory disclaimer box
+ * so the two warnings read as textually and visually separate concerns: one
+ * is a standing legal notice, the other is a live caveat about this specific,
+ * experimental suggestion.
+ */
+function SuggestedActionCallout({ action }: SuggestedActionCalloutProps) {
+  const { body, disclaimer } = useMemo(() => splitSuggestedAction(action), [action]);
+  if (!body) return null;
+
+  return (
+    <div
+      className="animate-in fade-in duration-300 space-y-2 rounded-lg border border-indigo-200 bg-gradient-to-br from-indigo-50 to-violet-50 px-4 py-3"
+      role="note"
+      aria-label="Suggested action"
+    >
+      <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-indigo-700">
+        <Lightbulb className="h-3.5 w-3.5" aria-hidden />
+        Suggested Action
+      </div>
+      <p className="text-sm leading-relaxed text-indigo-900 whitespace-pre-line">
+        {body}
+      </p>
+      {disclaimer && (
+        <div className="flex gap-2 rounded-md border border-indigo-200 bg-white/70 px-3 py-2">
+          <FlaskConical className="mt-0.5 h-3.5 w-3.5 shrink-0 text-indigo-500" aria-hidden />
+          <p className="text-[11px] leading-relaxed text-indigo-600">
+            {disclaimer.replace(new RegExp(`^${SUGGESTED_ACTION_DISCLAIMER_MARKER}\\s*`), '')}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 interface ContentProps {
   data: ExplanationData & { full_explanation: string };
 }
@@ -520,6 +578,14 @@ function ExplanationContent({ data }: ContentProps) {
             );
           })}
         </div>
+
+        {/* Suggested Action — learning-phase feature, gated server-side. Held
+            back until the narrative finishes typing, same reveal timing as
+            sources/disclaimer below, so it never appears ahead of the text
+            it's an addendum to. */}
+        {isTypingComplete && data.suggested_action && (
+          <SuggestedActionCallout action={data.suggested_action} />
+        )}
 
         {/* Source citations — held back until the narrative finishes typing
             so citations don't appear ahead of the text they support. */}

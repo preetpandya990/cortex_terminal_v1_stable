@@ -360,6 +360,21 @@ class Settings(BaseSettings):
             "within a single batch window at default Gemini Tier-1 quotas."
         ),
     )
+    WATCHLIST_SCHEDULER_CHUNK_SIZE: int = Field(
+        20,
+        ge=5,
+        le=50,
+        description=(
+            "Instruments per batched prediction-snapshot chunk when the "
+            "scheduler enqueues context jobs. Each chunk loads features "
+            "concurrently then runs exactly one batched GPU inference call "
+            "(EnsemblePredictor.predict_batch), avoiding the VRAM "
+            "fragmentation risk of N sequential single-item calls on the "
+            "4GB card. Also the granularity at which pause/shutdown "
+            "checkpoints are honored mid-run — mirrors "
+            "SIGNAL_SCHEDULER_FEATURE_CONCURRENCY."
+        ),
+    )
     WATCHLIST_CONTEXT_SERVE_MAX_AGE_HOURS: int = Field(
         24,
         ge=2,
@@ -561,6 +576,27 @@ class Settings(BaseSettings):
     # one-line filing notices) but carry metadata.low_confidence_source=true so
     # retrieval ranking can demote them.
     RAG_MIN_CONTENT_CHARS: int = Field(200, ge=0, le=2000)
+    # Absolute cosine-similarity floor for non-exact-symbol-tier RAG
+    # candidates ("sector" and "generic" tiers — see retriever.py's
+    # three-tier _load_candidates) before they may enter BM25/cosine ranking
+    # at all. Exact-symbol-tier candidates are exempt: ingestion-time symbol
+    # tagging (event_classifier.normalize_and_validate_symbols) already
+    # validated their relevance. Below-floor candidates are dropped from the
+    # pool, not merely down-ranked — this collapses to the existing "no news
+    # context" prompt branch rather than surfacing irrelevant filler (see
+    # NEWS_CONTEXT_RELEVANCE_GAP_FINDING.md for the incident this fixes).
+    # Calibrated 2026-07-11 via scripts/calibrate_rag_relevance_floor.py
+    # against the real gemini-embedding-001 corpus: negative anchor (COMSYN,
+    # the confirmed incident symbol) had a noise ceiling of 0.6707 among
+    # genuinely irrelevant generic-market/index docs; 13 manually-verified
+    # (headline-needle-confirmed, not raw top-1) genuine company-specific
+    # matches across the positive golden set (TCS, SBIN, VEDL, HDFCBANK,
+    # RELIANCE, INDIANB, TITAN, LT, BHARTIARTL, YESBANK, INDUSINDBK,
+    # KOTAKBANK, INFY) all scored >= 0.6959 — clean separation. 0.68 sits
+    # above the noise ceiling with margin and admits every verified match.
+    # Re-run the calibration script if the embedding model or corpus
+    # composition changes materially.
+    RAG_MIN_GENERIC_COSINE_SIMILARITY: float = Field(0.68, ge=0.0, le=1.0)
     # Time bound for the sentiment service's in-process L1 cache. Matches the
     # 900s L2 Redis TTL — without it, LRU-only eviction let a stale aggregate
     # persist in a long-lived worker process far past the intended 15 minutes.
@@ -603,6 +639,22 @@ class Settings(BaseSettings):
     # (scripts/compare_feedback_assessment.py + a full run_eval.py pass)
     # shows non-regression. Flag-off is bit-identical to pre-WS10 weights.
     FEEDBACK_LLM_ASSESSMENT_ENABLED: bool = False
+
+    # ── Suggested Action (learning-phase, SEBI RA-adjacent risk) ───────────────
+    # When True, both explanation paths generate an additional actionable
+    # suggested_action: real entry/stop/target (signal path) or a conditional
+    # monitoring trigger (context path). Materially higher regulatory exposure
+    # than the rest of the pipeline (SEBI Research-Analyst-adjacent territory
+    # in India; this platform is explicitly NOT a SEBI-registered advisor) —
+    # risk accepted knowingly. User decision 2026-07-12: keep this ON
+    # permanently going forward (set via SUGGESTED_ACTION_ENABLED=true in
+    # .env), made with full knowledge of the compliance tradeoff discussed
+    # during implementation. Default here stays False so any environment
+    # without that explicit .env override is unaffected. Flag-off is
+    # bit-identical to pre-feature output: suggested_action stays null
+    # everywhere, prompts don't request it, guardrails skip it, the frontend
+    # callout doesn't render.
+    SUGGESTED_ACTION_ENABLED: bool = False
     # 96 texts/call: 3× throughput vs. default 32, stays within gemini-embedding-001
     # input limits. Reduces embed API calls proportionally for the same corpus size.
     RAG_EMBED_BATCH_SIZE: int = Field(96, ge=1, le=128)

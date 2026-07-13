@@ -353,6 +353,12 @@ rag_retrievals_total = Counter(
     ['status'],  # success | empty | error
 )
 
+rag_relevance_gate_total = Counter(
+    'rag_relevance_gate_total',
+    'RAG candidate outcomes at the tiered relevance gate (see retriever.py)',
+    ['tier', 'outcome'],  # tier: exact|sector|generic ; outcome: admitted|filtered
+)
+
 llm_guardrail_events_total = Counter(
     'llm_guardrail_events_total',
     'Total LLM output guardrail events fired',
@@ -684,7 +690,7 @@ llm_explanation_worker_active = Gauge(
 watchlist_scheduler_runs_total = Counter(
     'watchlist_scheduler_runs_total',
     'Total watchlist context scheduler batch runs by final status',
-    ['status'],  # success | error | skipped_empty
+    ['status'],  # success | error | skipped_empty | skipped_on_demand | interrupted
 )
 
 watchlist_scheduler_instruments_queued_total = Counter(
@@ -701,6 +707,17 @@ watchlist_scheduler_duration_seconds = Histogram(
 watchlist_scheduler_last_run_timestamp = Gauge(
     'watchlist_scheduler_last_run_timestamp',
     'Unix timestamp of the last successful watchlist context scheduler run',
+)
+
+watchlist_scheduler_snapshot_unavailable_total = Counter(
+    'watchlist_scheduler_snapshot_unavailable_total',
+    'Instrument context jobs published with a degraded (unavailable) prediction snapshot, by reason',
+    ['reason'],  # no_model | insufficient_data | timeout
+)
+
+watchlist_scheduler_publish_failed_total = Counter(
+    'watchlist_scheduler_publish_failed_total',
+    'Instrument context jobs that failed to publish to Kafka (broker/network failure, not snapshot computation)',
 )
 
 

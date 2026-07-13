@@ -97,6 +97,10 @@ class TradeSuggestion(Base):
     # Frontend renders a loading skeleton when llm_summary is NULL on an active suggestion.
     llm_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     llm_explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Learning-phase actionable suggestion, gated behind
+    # Settings.SUGGESTED_ACTION_ENABLED (default False — see core/config.py).
+    # NULL when the flag is off or the generation didn't populate it.
+    llm_suggested_action: Mapped[str | None] = mapped_column(Text, nullable=True)
     explanation_model: Mapped[str | None] = mapped_column(String(100), nullable=True)
     explanation_generated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

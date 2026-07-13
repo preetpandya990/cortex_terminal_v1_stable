@@ -176,6 +176,14 @@ class TradeSuggestionResponse(BaseModel):
         None,
         description="Full narrative explanation with news context for the AI Analysis Cards panel",
     )
+    llm_suggested_action: str | None = Field(
+        None,
+        description=(
+            "Learning-phase actionable suggestion, gated behind "
+            "SUGGESTED_ACTION_ENABLED (default off). Null when the feature is "
+            "disabled or the generation didn't populate it."
+        ),
+    )
     explanation_model: str | None = Field(
         None,
         description="Model identifier that generated the explanation (e.g. nim/qwen3.5-122b-a10b)",
@@ -217,6 +225,17 @@ class TradeSuggestionResponse(BaseModel):
     @property
     def requires_risk_disclaimer(self) -> bool:
         return self.instrument_series in _RESTRICTED_NSE_SERIES
+
+    @computed_field(
+        description=(
+            "True when a suggested-action was generated for this suggestion "
+            "(feature is enabled and populated). Lets the frontend decide "
+            "whether to render the callout without string-sniffing."
+        )
+    )
+    @property
+    def suggested_action_available(self) -> bool:
+        return bool(self.llm_suggested_action)
 
     @field_validator("consensus_score", mode="before")
     @classmethod

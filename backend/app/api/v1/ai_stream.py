@@ -110,7 +110,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
 from app.ai.fusion.models import AIInstrumentContext
-from app.api.v1.ml_predictions import serialize_prediction_card
 from app.core.database import AsyncSessionLocal
 from app.ai.intelligence.explanation_service import (
     ensure_explanation,
@@ -120,8 +119,8 @@ from app.core.kafka import KafkaTopics, publish as kafka_publish
 from app.core.metrics import llm_sse_explanation_pushes_total
 from app.core.redis import RedisChannels, RedisStreams, get_redis
 from app.core.security import CortexInvalidTokenError, decode_token
-from app.ml.inference.feature_loader import FeatureLoader
 from app.models.trade_suggestions import TradeSuggestion
+from app.services.prediction_snapshot import get_prediction_snapshot
 from app.services.pattern_detection_service import PatternDetectionService
 from app.services.sentiment_analysis_service import SentimentAnalysisService
 
@@ -324,6 +323,7 @@ def _build_explanation_payload(
         "suggestion_id":      str(suggestion.suggestion_id),
         "summary":            suggestion.llm_summary,
         "full_explanation":   suggestion.llm_explanation,
+        "suggested_action":   suggestion.llm_suggested_action,
         "model":              suggestion.explanation_model,
         "generated_at": (
             suggestion.explanation_generated_at.isoformat()
@@ -357,6 +357,7 @@ def _build_context_payload(
         "status":             "ready" if available else "generating",
         "summary":            context.context_summary,
         "full_explanation":   context.context_full,
+        "suggested_action":   context.suggested_action,
         "model":              context.model_used,
         "generated_at": (
             context.generated_at.isoformat()
@@ -403,6 +404,7 @@ async def _fetch_explanation_for_instrument(
     instrument_key: str,
     symbol: str | None,
     redis: Any,
+    predictor: Any | None = None,
     prediction_snapshot: dict | None = None,
 ) -> dict[str, Any]:
     """
@@ -551,6 +553,16 @@ async def _fetch_explanation_for_instrument(
     # the payload so the context_worker's heartbeat can do an atomic
     # ownership-check before extending the TTL (Gap 6 fix).
     try:
+        if prediction_snapshot is None:
+            prediction_snapshot = await get_prediction_snapshot(
+                instrument_key=instrument_key,
+                timeframe="1d",
+                predictor=predictor,
+                session_factory=AsyncSessionLocal,
+                redis=redis,
+                timeout=_OPERATION_TIMEOUT_SECS,
+            )
+
         lock_key   = f"cortex:instrument_context:generating:{instrument_key}"
         lock_token = secrets.token_hex(16)
         acquired   = await redis.set(
@@ -711,49 +723,14 @@ async def analysis_stream(
         # ── Per-component refreshers ───────────────────────────────────────
         async def _refresh_prediction() -> None:
             predictor = getattr(request.app.state, "ml_predictor", None)
-            if predictor is None:
-                state.prediction = {"available": False, "unavailable_reason": "no_model"}
-                _emit_update()
-                return
-            try:
-                # Hold the session only for the feature load; release it before
-                # the (CPU/GPU-bound) inference call.
-                async with AsyncSessionLocal() as db:
-                    feat_loader = FeatureLoader(
-                        db=db,
-                        redis=redis,
-                        sequence_length=predictor.sequence_length,
-                        n_features=predictor.n_features,
-                        feature_names=predictor.feature_names,
-                    )
-                    tabular, sequence, current_price, vol = await feat_loader.load_features(
-                        symbol=instrument_key,
-                        timeframe="1d",
-                    )
-                raw_pred = await predictor.predict(
-                    features_tabular=tabular,
-                    features_sequence=sequence,
-                    symbol=instrument_key,
-                    current_price=current_price,
-                    volatility=vol,
-                    timeframe="1d",
-                    use_cache=True,
-                )
-                # Stamp the refresh time (WS7 §3): the snapshot can be up to
-                # _PREDICTION_REFRESH_SECS old when a context job is built
-                # from it — the prompt renders "as of <t>" so the LLM (and
-                # audit) know the read's actual age. Additive payload key.
-                state.prediction = {
-                    **serialize_prediction_card(raw_pred, timeframe="1d"),
-                    "prediction_generated_at": _now_iso(),
-                    "updated_at": _now_iso(),
-                }
-            except ValueError:
-                state.prediction = {
-                    "available": False,
-                    "unavailable_reason": "insufficient_data",
-                    "updated_at": _now_iso(),
-                }
+            state.prediction = await get_prediction_snapshot(
+                instrument_key=instrument_key,
+                timeframe="1d",
+                predictor=predictor,
+                session_factory=AsyncSessionLocal,
+                redis=redis,
+                timeout=_OPERATION_TIMEOUT_SECS,
+            )
             _emit_update()
 
         async def _refresh_pattern() -> None:
@@ -785,6 +762,7 @@ async def analysis_stream(
                     instrument_key,
                     symbol,
                     redis,
+                    predictor=getattr(request.app.state, "ml_predictor", None),
                     prediction_snapshot=state.prediction,
                 )
             if _should_apply_explanation(state.explanation, fetched):
@@ -1186,6 +1164,7 @@ async def get_explanation(
                     instrument_key=instrument_key,
                     symbol=symbol,
                     redis=redis,
+                    predictor=getattr(request.app.state, "ml_predictor", None),
                 ),
                 timeout=_OPERATION_TIMEOUT_SECS,
             )

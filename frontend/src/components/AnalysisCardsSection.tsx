@@ -305,6 +305,7 @@ export function AnalysisCardsSection({
         available:           true,
         summary:             suggestion.llm_summary          ?? null,
         full_explanation:    suggestion.llm_explanation,
+        suggested_action:    suggestion.llm_suggested_action ?? null,
         model:               suggestion.explanation_model    ?? null,
         generated_at:        suggestion.explanation_generated_at ?? null,
         sources:             [],   // sources arrive via SSE push path, not REST

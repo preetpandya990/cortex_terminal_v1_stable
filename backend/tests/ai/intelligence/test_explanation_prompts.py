@@ -19,14 +19,20 @@ from app.ai.intelligence.explanation_worker import (
     MLAssessmentOutput,
     NewsForecastOutput,
     _apply_guardrails,
+    _apply_suggested_action_guardrails,
     _build_context_prompt,
     _build_explanation_prompt,
+    _compute_move_threshold_pct,
     _CONTEXT_SYSTEM_PROMPT,
     _DEMAND_EXPLANATION_SYSTEM_PROMPT,
     _EXPLANATION_SYSTEM_PROMPT,
     _format_demand_context,
+    _MOVE_THRESHOLD_MONITOR_DAYS,
     _number_variants,
+    _REGULATORY_DISCLAIMER,
     _strip_ungrounded_numbers,
+    _SUGGESTED_ACTION_DISCLAIMER,
+    _SUGGESTED_ACTION_FALLBACK_TEXT,
     _summarize_price_action,
 )
 
@@ -41,6 +47,7 @@ def _suggestion(scanner_signal: dict | None = None) -> MagicMock:
     s.confidence_level = "HIGH"
     s.entry_price = None
     s.stop_loss = None
+    s.take_profit_1 = None
     s.risk_reward_ratio = None
     s.time_horizon = "intraday"
     s.regime_type = "high_volatility"
@@ -236,3 +243,210 @@ class TestContextPromptSnapshotAge:
             context="",
         )
         assert "Snapshot as of" not in prompt
+
+
+class TestContextPromptRelevanceGateCollapse:
+    """
+    The RAG relevance gate (retriever._apply_relevance_gate) drops candidates
+    that don't clear the bar entirely, rather than handing them to the LLM at
+    a lower confidence — so a fully-gated-out retrieval and a genuinely
+    empty retrieval look identical by the time they reach prompt building:
+    both produce context="". No third "marginal relevance" prompt branch is
+    needed; this test confirms the existing empty-context branch is what
+    fires in both cases.
+    """
+
+    def test_empty_context_states_no_news_available(self):
+        prompt = _build_context_prompt(
+            "NSE_EQ|COMSYN", "COMSYN",
+            {"available": True, "direction": "NEUTRAL", "confidence": 0.5},
+            context="",
+        )
+        assert "No recent news articles were found for this instrument" in prompt
+        assert "News context" in prompt
+
+    def test_nonempty_context_never_falls_back_to_no_news_language(self):
+        prompt = _build_context_prompt(
+            "NSE_EQ|RELIANCE", "RELIANCE",
+            {"available": True, "direction": "BUY", "confidence": 0.7},
+            context="[Source: Economic Times Markets | 2026-07-06 10:00 UTC]\n"
+                    "Reliance Industries reports record quarterly profit.",
+        )
+        assert "No recent news articles were found" not in prompt
+
+
+class TestSuggestedActionPromptInjection:
+    """
+    suggested_action is a materially higher-risk feature (SEBI RA-adjacent) —
+    gated behind Settings.SUGGESTED_ACTION_ENABLED. These tests confirm the
+    '## Suggested Action Inputs' block is only injected when explicitly
+    requested AND the required real data is present — never fabricated.
+    """
+
+    def test_explanation_prompt_omits_block_when_not_requested(self):
+        s = _suggestion()
+        s.entry_price = Decimal("100.00")
+        s.stop_loss = Decimal("95.00")
+        prompt = _build_explanation_prompt(s, context="", include_suggested_action=False)
+        assert "## Suggested Action Inputs" not in prompt
+
+    def test_explanation_prompt_omits_block_when_requested_but_no_entry_stop(self):
+        s = _suggestion()  # entry_price/stop_loss stay None
+        prompt = _build_explanation_prompt(s, context="", include_suggested_action=True)
+        assert "## Suggested Action Inputs" not in prompt
+
+    def test_explanation_prompt_includes_block_when_requested_and_data_present(self):
+        s = _suggestion()
+        s.entry_price = Decimal("100.00")
+        s.stop_loss = Decimal("95.00")
+        s.take_profit_1 = Decimal("110.00")
+        s.risk_reward_ratio = Decimal("2.0")
+        prompt = _build_explanation_prompt(s, context="", include_suggested_action=True)
+        assert "## Suggested Action Inputs" in prompt
+        assert "₹100.00" in prompt
+        assert "₹95.00" in prompt
+        assert "Exit/Profit-Booking Level 1: ₹110.00" in prompt
+        # The instructional line steers the model away from the blocked phrase.
+        assert 'Do not use the words "target price"' in prompt
+
+    def test_context_prompt_omits_block_without_price_and_threshold(self):
+        prompt = _build_context_prompt(
+            "NSE_EQ|X", "X", {"available": True, "direction": "SELL", "volatility": 0.2},
+            context="",
+        )
+        assert "## Suggested Action Inputs" not in prompt
+
+    def test_context_prompt_includes_block_when_price_and_threshold_present(self):
+        prompt = _build_context_prompt(
+            "NSE_EQ|X", "X", {"available": True, "direction": "SELL", "volatility": 0.2},
+            context="", current_price=450.0, move_threshold_pct=3.2, monitor_days=5,
+        )
+        assert "## Suggested Action Inputs" in prompt
+        assert "₹450.00" in prompt
+        assert "±3.2%" in prompt
+        assert "5-day window" in prompt
+        assert "Never state an entry, stop-loss, or profit target" in prompt
+
+
+class TestMoveThresholdComputation:
+    def test_known_volatility_matches_hand_computation(self):
+        import math
+        vol = 0.20
+        days = 5
+        expected = vol * math.sqrt(days / 252) * 100.0
+        assert _compute_move_threshold_pct(vol, days) == pytest.approx(expected)
+
+    def test_default_monitor_days_used_when_omitted(self):
+        assert _compute_move_threshold_pct(0.20) == pytest.approx(
+            _compute_move_threshold_pct(0.20, _MOVE_THRESHOLD_MONITOR_DAYS)
+        )
+
+    def test_zero_volatility_yields_zero_threshold(self):
+        assert _compute_move_threshold_pct(0.0) == 0.0
+
+    def test_monotonic_in_volatility(self):
+        assert _compute_move_threshold_pct(0.10) < _compute_move_threshold_pct(0.30)
+
+    def test_monotonic_in_days(self):
+        assert _compute_move_threshold_pct(0.20, 5) < _compute_move_threshold_pct(0.20, 20)
+
+
+class TestSuggestedActionGuardrails:
+    PROMPT = "Entry Zone:     ₹100.00\nStop Loss:      ₹95.00\nExit/Profit-Booking Level 1: ₹110.00"
+
+    def test_guarantee_language_stripped(self):
+        filtered, events = _apply_suggested_action_guardrails(
+            "This is a guaranteed profit opportunity.", self.PROMPT,
+        )
+        assert "suggested_action_guarantee_filter" in events
+        assert "guaranteed" not in (filtered or "").lower()
+
+    def test_exit_level_wording_not_stripped(self):
+        text = "Entry near ₹100.00 with stop-loss ₹95.00 and exit level ₹110.00."
+        filtered, events = _apply_suggested_action_guardrails(text, self.PROMPT)
+        assert filtered == text
+        assert events == []
+
+    def test_ungrounded_price_figure_stripped(self):
+        text = "Entry near ₹100.00. A great exit would be ₹999.00."
+        filtered, _events = _apply_suggested_action_guardrails(text, self.PROMPT)
+        assert "₹999.00" not in filtered
+        assert "₹100.00" in filtered
+
+    def test_all_stripped_returns_fallback_never_empty(self):
+        text = "This is a guaranteed profit. It will definitely reach ₹9999.00."
+        filtered, events = _apply_suggested_action_guardrails(text, self.PROMPT)
+        assert filtered == _SUGGESTED_ACTION_FALLBACK_TEXT
+        assert filtered  # never empty/None
+        assert "suggested_action_fallback_default" in events
+
+    def test_none_input_returns_none_no_events(self):
+        filtered, events = _apply_suggested_action_guardrails(None, self.PROMPT)
+        assert filtered is None
+        assert events == []
+
+
+class TestSuggestedActionDisclaimer:
+    def test_disclaimer_always_appended_when_field_present(self):
+        raw = ExplanationOutput(
+            summary="s", full_explanation="### What the models saw\nfine.",
+            suggested_action="Entry near ₹100.00 with stop-loss ₹95.00.",
+        )
+        final, _events = _apply_guardrails(
+            raw, has_context=False,
+            prompt="Entry Zone: ₹100.00\nStop Loss: ₹95.00",
+        )
+        assert "🧪" in final.suggested_action
+
+    def test_disclaimer_absent_when_field_not_populated(self):
+        raw = ExplanationOutput(
+            summary="s", full_explanation="### What the models saw\nfine.",
+        )
+        final, _events = _apply_guardrails(raw, has_context=False)
+        assert final.suggested_action is None
+
+    def test_wording_materially_distinct_from_regulatory_disclaimer(self):
+        # Beyond trivial shared words, the two disclaimers should not overlap —
+        # they cover different concerns (system-immaturity vs. generic
+        # informational-purposes notice).
+        trivial = {
+            "this", "is", "a", "the", "and", "not", "does", "to", "your", "own",
+            "for", "of", "in", "on", "results", "future", "advice", "financial",
+        }
+        words_a = {w.strip(".,!⚠🧪").lower() for w in _SUGGESTED_ACTION_DISCLAIMER.split()}
+        words_b = {w.strip(".,!⚠🧪").lower() for w in _REGULATORY_DISCLAIMER.split()}
+        overlap = (words_a & words_b) - trivial - {""}
+        assert overlap == set(), f"unexpected wording overlap: {overlap}"
+
+    def test_sentinel_distinct_from_regulatory_marker(self):
+        assert "🧪" in _SUGGESTED_ACTION_DISCLAIMER
+        assert "⚠" not in _SUGGESTED_ACTION_DISCLAIMER
+        assert "🧪" not in _REGULATORY_DISCLAIMER
+
+
+class TestSuggestedActionFlagOffRegression:
+    """Flag-off (the shipped default) must be bit-identical to pre-feature
+    behavior: suggested_action stays null everywhere the flag isn't threaded
+    through, and _apply_guardrails never touches full_explanation/summary
+    differently because the field exists on the schema now."""
+
+    def test_prompt_builders_omit_block_by_default(self):
+        s = _suggestion()
+        s.entry_price = Decimal("100.00")
+        s.stop_loss = Decimal("95.00")
+        prompt = _build_explanation_prompt(s, context="")  # include_suggested_action defaults False
+        assert "## Suggested Action Inputs" not in prompt
+
+        ctx_prompt = _build_context_prompt(
+            "NSE_EQ|X", "X", {"available": True, "direction": "SELL", "volatility": 0.2},
+            context="",
+        )  # current_price/move_threshold_pct/monitor_days default None
+        assert "## Suggested Action Inputs" not in ctx_prompt
+
+    def test_guardrails_leave_suggested_action_none_when_unset(self):
+        raw = ExplanationOutput(
+            summary="s", full_explanation="### What the models saw\nfine.",
+        )
+        final, events = _apply_guardrails(raw, has_context=False)
+        assert final.suggested_action is None
+        assert not any("suggested_action" in e for e in events)

@@ -257,6 +257,12 @@ export interface ExplanationData {
   streaming?:       boolean;
   summary:          string | null;
   full_explanation: string | null;
+  /**
+   * Learning-phase actionable suggestion, gated server-side behind
+   * SUGGESTED_ACTION_ENABLED (default off). Null when the feature is
+   * disabled or the generation didn't populate it — renders nothing.
+   */
+  suggested_action?: string | null;
   model:            string | null;
   /** ISO-8601 UTC timestamp when the explanation was written */
   generated_at:     string | null;
