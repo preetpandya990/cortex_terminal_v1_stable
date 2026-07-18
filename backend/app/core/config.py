@@ -326,6 +326,41 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ── Explanation Reconciliation (legacy-mode orphan recovery) ──────────────
+    # In legacy mode (EXPLANATION_ON_DEMAND=False) the correlation engine
+    # auto-publishes the explanation job as a best-effort side effect after
+    # committing the suggestion. A publish failure (broker blip, uninitialized
+    # producer) is deliberately non-fatal so it never rolls back a committed
+    # suggestion — but with no recovery path, the suggestion is silently
+    # orphaned forever (infinite "generating" skeleton). These two settings
+    # drive both recovery layers: ensure_explanation()'s self-heal-on-read
+    # branch and the periodic ExplanationReconciliationSweep task.
+    EXPLANATION_RECONCILE_STALENESS_SECS: int = Field(
+        300,
+        ge=60,
+        le=3600,
+        description=(
+            "Age (seconds since created_at) past which an unexplained active "
+            "legacy-mode suggestion is treated as possibly orphaned and "
+            "eligible for republish. Must comfortably exceed a single Gemini "
+            "call (LLM_CALL_TIMEOUT_SECS) but does not need to exceed the "
+            "full multi-attempt retry budget — EXPLANATION_INFLIGHT_KEY, "
+            "refreshed by the worker on every attempt, is the actual guard "
+            "against racing a suggestion that's genuinely still retrying."
+        ),
+    )
+    EXPLANATION_RECONCILE_SWEEP_INTERVAL_SECS: int = Field(
+        120,
+        ge=30,
+        le=1800,
+        description=(
+            "Fixed polling interval for the explanation_reconciliation_sweep "
+            "worker task, which republishes orphaned legacy-mode suggestions "
+            "found via idx_trade_suggestions_explanation_pending as a backstop "
+            "independent of whether any user ever views the affected panel."
+        ),
+    )
+
     # ── Watchlist Context Scheduler ────────────────────────────────────────────
     # Pre-warms AI market context for all watchlist instruments on a fixed
     # intraday schedule.  Fires 4× per NSE trading day; only instruments whose

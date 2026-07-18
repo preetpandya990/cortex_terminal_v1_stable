@@ -1,0 +1,536 @@
+{
+  "report_kind": "c2_promotion_report",
+  "generated_at": "2026-07-18T07:02:13.164165+00:00",
+  "run_id": "20260717_204256",
+  "mlflow_run_id": "",
+  "status": "BLOCKED",
+  "challengers": {
+    "xgboost": {
+      "model_version": "1.2.0_xgboost",
+      "model_name": "xgboost",
+      "status": "development",
+      "training_samples": 3650616,
+      "metrics": {
+        "accuracy": 0.7345666666666667,
+        "precision": {
+          "down": 0.7293013675115867,
+          "up": 0.7419148766270063
+        },
+        "recall": {
+          "down": 0.7977218675679059,
+          "up": 0.6626016260162602
+        },
+        "f1_score": {
+          "down": 0.7619787774622627,
+          "up": 0.7000188359389715
+        },
+        "confusion_matrix": [
+          [
+            12746,
+            3232
+          ],
+          [
+            4731,
+            9291
+          ]
+        ],
+        "log_loss": 0.5736218512454715,
+        "sharpe_ratio": 1.3398036265880293,
+        "sortino_ratio": 13.034880926860435,
+        "max_drawdown": 0.7726218318637058,
+        "win_rate": 0.7419148766270063,
+        "profit_factor": 4.550873477203766,
+        "total_return": 1.1323126017184268e+166,
+        "n_samples": 30000,
+        "n_trades": 12523,
+        "avg_return_per_trade": 0.044055721587470606,
+        "auc_pr": 0.793158563672519,
+        "deflated_sharpe": 1.0,
+        "pbo": 0.48,
+        "path_sharpes": null,
+        "ensemble_weight": 1.0,
+        "ensemble_net_dsr": 1.0,
+        "ensemble_accretive": false,
+        "ece_after": 0.0011406964222964774,
+        "symbol_coverage": 0.7828302626421011
+      },
+      "gate": {
+        "passed": false,
+        "failed_checks": {
+          "symbol_coverage": "symbol_coverage 78.3% < 85.0% \u2014 insufficient symbol universe"
+        },
+        "message": "Model '1.2.0_xgboost' failed 1 quality gate(s): symbol_coverage"
+      },
+      "gate_status": "BLOCKED"
+    },
+    "gru": {
+      "model_version": "1.2.0_gru",
+      "model_name": "gru",
+      "status": "development",
+      "training_samples": 3650616,
+      "metrics": {
+        "accuracy": 0.6006333333333334,
+        "precision": {
+          "down": 0.6541695595155442,
+          "up": 0.5598990432587897
+        },
+        "recall": {
+          "down": 0.5307297534109401,
+          "up": 0.6802881186706604
+        },
+        "f1_score": {
+          "down": 0.586019833454269,
+          "up": 0.6142502978202775
+        },
+        "confusion_matrix": [
+          [
+            8480,
+            7498
+          ],
+          [
+            4483,
+            9539
+          ]
+        ],
+        "log_loss": 0.7934723573093148,
+        "sharpe_ratio": 0.7436479013691669,
+        "sortino_ratio": 4.771834330299585,
+        "max_drawdown": 0.997263520963405,
+        "win_rate": 0.5598990432587897,
+        "profit_factor": 1.7924247191891303,
+        "total_return": 2.7128580045498878e+57,
+        "n_samples": 30000,
+        "n_trades": 17037,
+        "avg_return_per_trade": 0.017708242465993118,
+        "auc_pr": 0.5837290848050769,
+        "deflated_sharpe": 1.0,
+        "pbo": 0.26,
+        "path_sharpes": null,
+        "ensemble_weight": 0.0,
+        "ensemble_net_dsr": 1.0,
+        "ensemble_accretive": false,
+        "ece_after": 0.05403029963287806,
+        "symbol_coverage": 0.7828302626421011
+      },
+      "gate": {
+        "passed": false,
+        "failed_checks": {
+          "calibration_ece": "ece_after 0.0540 > 0.0500 \u2014 calibration too poor for reliable position sizing",
+          "symbol_coverage": "symbol_coverage 78.3% < 85.0% \u2014 insufficient symbol universe",
+          "ap_degradation": "auc_pr dropped 0.1193 vs champion (max allowed 0.0500)",
+          "accuracy_degradation": "accuracy dropped 0.0632 vs champion (max allowed 0.0500)"
+        },
+        "message": "Model '1.2.0_gru' failed 4 quality gate(s): calibration_ece, symbol_coverage, ap_degradation, accuracy_degradation"
+      },
+      "gate_status": "BLOCKED"
+    }
+  },
+  "champions": {
+    "xgboost": {
+      "model_version": "1.1.1_xgboost",
+      "model_name": "xgboost",
+      "status": "production",
+      "training_samples": 3758747,
+      "metrics": {
+        "accuracy": 0.6395,
+        "precision": {
+          "down": 0.6562964799206743,
+          "up": 0.6199509521061742
+        },
+        "recall": {
+          "down": 0.6677596317548395,
+          "up": 0.6078070857789407
+        },
+        "f1_score": {
+          "down": 0.6619784341303329,
+          "up": 0.6138189608998393
+        },
+        "confusion_matrix": [
+          [
+            10590,
+            5269
+          ],
+          [
+            5546,
+            8595
+          ]
+        ],
+        "log_loss": 0.6428126340992746,
+        "sharpe_ratio": 0.9738236266412308,
+        "sortino_ratio": 8.146012137254091,
+        "max_drawdown": 0.9550357858347787,
+        "win_rate": 0.6199509521061742,
+        "profit_factor": 2.743773332014588,
+        "total_return": 6.502678770125836e+104,
+        "n_samples": 30000,
+        "n_trades": 13864,
+        "avg_return_per_trade": 0.03475861258572236,
+        "auc_pr": 0.6677760852769787,
+        "deflated_sharpe": 0.6831572863937517,
+        "pbo": 0.485,
+        "path_sharpes": null,
+        "ensemble_weight": 0.510622164492684,
+        "ensemble_net_dsr": 0.7276179589602374,
+        "ensemble_accretive": true,
+        "ece_after": 0.0018019305859027237,
+        "symbol_coverage": 0.7883183065464524
+      }
+    },
+    "gru": {
+      "model_version": "1.1.1_gru",
+      "model_name": "gru",
+      "status": "production",
+      "training_samples": 3758747,
+      "metrics": {
+        "accuracy": 0.6638666666666667,
+        "precision": {
+          "down": 0.7071823204419889,
+          "up": 0.6262840067235261
+        },
+        "recall": {
+          "down": 0.6214767639825967,
+          "up": 0.7114065483346298
+        },
+        "f1_score": {
+          "down": 0.6615653107799705,
+          "up": 0.6661369355052311
+        },
+        "confusion_matrix": [
+          [
+            9856,
+            6003
+          ],
+          [
+            4081,
+            10060
+          ]
+        ],
+        "log_loss": 0.6147661829399328,
+        "sharpe_ratio": 1.0198946056411111,
+        "sortino_ratio": 8.526288518166416,
+        "max_drawdown": 0.9369802319290566,
+        "win_rate": 0.6262840067235261,
+        "profit_factor": 2.5948208123001035,
+        "total_return": 7.069840224620848e+114,
+        "n_samples": 30000,
+        "n_trades": 16063,
+        "avg_return_per_trade": 0.030914854290144043,
+        "auc_pr": 0.7030255649268293,
+        "deflated_sharpe": 0.7246131469427235,
+        "pbo": 0.095,
+        "path_sharpes": null,
+        "ensemble_weight": 0.48937783550731595,
+        "ensemble_net_dsr": 0.7276179589602374,
+        "ensemble_accretive": true,
+        "ece_after": 0.04968497805277586,
+        "symbol_coverage": 0.7883183065464524
+      }
+    }
+  },
+  "deltas": {
+    "xgboost": {
+      "auc_pr": 0.1253824783955403,
+      "deflated_sharpe": 0.31684271360624827,
+      "pbo": -0.0050000000000000044,
+      "ece_after": -0.0006612341636062463
+    },
+    "gru": {
+      "auc_pr": -0.11929648012175242,
+      "deflated_sharpe": 0.2753868530572765,
+      "pbo": 0.165,
+      "ece_after": 0.004345321580102202
+    }
+  },
+  "dsr_distribution": {
+    "xgboost": {
+      "path_sharpes": [],
+      "deflated_sharpe": 1.0,
+      "pbo": 0.48,
+      "ensemble_net_dsr": 1.0,
+      "ensemble_accretive": false
+    },
+    "gru": {
+      "path_sharpes": [],
+      "deflated_sharpe": 1.0,
+      "pbo": 0.26,
+      "ensemble_net_dsr": 1.0,
+      "ensemble_accretive": false
+    }
+  },
+  "lineage": {
+    "xgboost": {
+      "feature_version": "2.0.0",
+      "feedback_bundle": {
+        "sha256": "d78463afce04785e228f0313d231c4ae816ec157f09db86a6f661859101eea4b",
+        "row_count": 32,
+        "created_at": "2026-07-17T15:12:49.912367+00:00",
+        "window_end": "2026-06-16",
+        "bundle_path": "/home/preet/code/Cortex_Merge_AI-ML/backend/feedback_bundles/feedback_weights_20260717T151249Z.parquet",
+        "window_start": "2026-05-12"
+      },
+      "artifact_manifest": {
+        "training": {
+          "path": "/home/preet/code/Cortex_Merge_AI-ML/backend/models/production/models/1.2.0_xgboost.json",
+          "sha256": "7fd7bb0e521f2660e2917d75bfa144aab19617494a084ce8c3864edf988ff924",
+          "size_bytes": 8174084
+        },
+        "inference": {
+          "path": "/home/preet/code/Cortex_Merge_AI-ML/backend/models/production/models/1.2.0_xgboost_inference.so",
+          "sha256": "41ad3dc3818cbd701b5bcab99460bb82a815c54199251ddffc23aaa8f97f7677",
+          "size_bytes": 3440576
+        },
+        "calibrator": {
+          "path": "/home/preet/code/Cortex_Merge_AI-ML/backend/models/production/models/1.2.0_xgboost_calibrator.pkl",
+          "sha256": "0a9e6aff05cd4b1a43864a2cbca7e593f9585eaa4a9c90067e5fa4b2c0be82fb",
+          "size_bytes": 180
+        },
+        "key_scheme": "sha256_checksum_only",
+        "registered_at": "2026-07-18T06:56:16.697242+00:00",
+        "schema_version": 1,
+        "feature_manifest": {
+          "sha256": "33caa463a1d85263b28ca7e4d25dd197556162240046a22d2fce0f6ad2fd61c7",
+          "n_features": 66
+        }
+      }
+    },
+    "gru": {
+      "feature_version": "2.0.0",
+      "feedback_bundle": {
+        "sha256": "d78463afce04785e228f0313d231c4ae816ec157f09db86a6f661859101eea4b",
+        "row_count": 32,
+        "created_at": "2026-07-17T15:12:49.912367+00:00",
+        "window_end": "2026-06-16",
+        "bundle_path": "/home/preet/code/Cortex_Merge_AI-ML/backend/feedback_bundles/feedback_weights_20260717T151249Z.parquet",
+        "window_start": "2026-05-12"
+      },
+      "artifact_manifest": {
+        "training": {
+          "path": "/home/preet/code/Cortex_Merge_AI-ML/backend/models/production/models/1.2.0_gru.keras",
+          "sha256": "5d7da2016fbfd87b3bfd623827ec6778c3a12b6e8be5fdf40c2a91f178730ba8",
+          "size_bytes": 4865472
+        },
+        "inference": {
+          "path": "/home/preet/code/Cortex_Merge_AI-ML/backend/models/production/models/1.2.0_gru_inference.onnx",
+          "sha256": "470030055477534eb6e5ffd1c18f267e698897000666602b4ba08e9bb16791d4",
+          "size_bytes": 1643555
+        },
+        "calibrator": {
+          "path": "/home/preet/code/Cortex_Merge_AI-ML/backend/models/production/models/1.2.0_gru_calibrator.pkl",
+          "sha256": "c1ffc365e52ebf4008621308091a5d07f4aa6c384c1169f0998a0fbe477aa3ee",
+          "size_bytes": 160
+        },
+        "key_scheme": "sha256_checksum_only",
+        "registered_at": "2026-07-18T06:56:16.750824+00:00",
+        "schema_version": 1,
+        "feature_manifest": {
+          "sha256": "33caa463a1d85263b28ca7e4d25dd197556162240046a22d2fce0f6ad2fd61c7",
+          "n_features": 66
+        }
+      }
+    }
+  },
+  "drift_advisory": {
+    "xgboost": {
+      "challenger_recommended": false,
+      "drift_recommendation": null,
+      "last_check": "2026-07-15T14:59:31.582268+00:00",
+      "last_drift_score": 0.0,
+      "live_metrics": {
+        "realised_net_ir": {
+          "since": "2026-06-01T06:19:32.238460+00:00",
+          "threshold": -0.5,
+          "triggered": false,
+          "trade_count": 10,
+          "std_return_pct": 6.574347480857767,
+          "mean_return_pct": 0.6002711868086341,
+          "min_samples_met": false,
+          "information_ratio": 0.09130505933195908
+        },
+        "realised_accuracy": {
+          "live": 0.4,
+          "since": "2026-06-01T06:19:32.238460+00:00",
+          "drop_pp": 0.2395,
+          "triggered": false,
+          "trade_count": 10,
+          "min_samples_met": false,
+          "training_baseline": 0.6395
+        },
+        "distribution_shift": {
+          "note": "Insufficient MLPrediction data (minimum 10 required)",
+          "z_score": 0.0,
+          "triggered": false,
+          "current_std": null,
+          "sample_size": 0,
+          "baseline_std": 1.0,
+          "current_mean": null,
+          "baseline_mean": 0.0,
+          "lookback_hours": 24,
+          "threshold_sigma": 2.0
+        }
+      }
+    },
+    "gru": {
+      "challenger_recommended": false,
+      "drift_recommendation": null,
+      "last_check": "2026-07-15T14:59:31.590430+00:00",
+      "last_drift_score": 0.0,
+      "live_metrics": {
+        "realised_net_ir": {
+          "since": "2026-06-01T06:19:32.238460+00:00",
+          "threshold": -0.5,
+          "triggered": false,
+          "trade_count": 10,
+          "std_return_pct": 6.574347480857767,
+          "mean_return_pct": 0.6002711868086341,
+          "min_samples_met": false,
+          "information_ratio": 0.09130505933195908
+        },
+        "realised_accuracy": {
+          "live": 0.4,
+          "since": "2026-06-01T06:19:32.238460+00:00",
+          "drop_pp": 0.2639,
+          "triggered": false,
+          "trade_count": 10,
+          "min_samples_met": false,
+          "training_baseline": 0.6638666666666667
+        },
+        "distribution_shift": {
+          "note": "Insufficient MLPrediction data (minimum 10 required)",
+          "z_score": 0.0,
+          "triggered": false,
+          "current_std": null,
+          "sample_size": 0,
+          "baseline_std": 1.0,
+          "current_mean": null,
+          "baseline_mean": 0.0,
+          "lookback_hours": 24,
+          "threshold_sigma": 2.0
+        }
+      }
+    }
+  },
+  "event_backtest": {
+    "path_net_sharpes_per_period": [
+      0.001816592347913825,
+      0.022593390216744624,
+      0.022430931753642164,
+      0.021274914507518186,
+      0.02514618133703952,
+      0.023964450065634083,
+      0.0018444213518950495
+    ],
+    "path_net_sharpes_annualised": [
+      0.028837509516977434,
+      0.3586589507240759,
+      0.3560800025735947,
+      0.3377287977063199,
+      0.39918325344444155,
+      0.38042385108055976,
+      0.029279281259591113
+    ],
+    "path_gross_sharpes_annualised": [
+      0.03622915235077124,
+      0.5079018699322744,
+      0.4998973565617589,
+      0.47475222192323346,
+      0.5641154906494347,
+      0.5409414061931269,
+      0.03484181989370593
+    ],
+    "path_total_returns": [
+      Infinity,
+      Infinity,
+      Infinity,
+      Infinity,
+      Infinity,
+      Infinity,
+      Infinity
+    ],
+    "path_n_fills": [
+      826081,
+      790144,
+      760690,
+      775827,
+      924426,
+      774058,
+      887041
+    ],
+    "path_win_rates": [
+      0.511848111746911,
+      0.5115105601004374,
+      0.51307234221562,
+      0.5113214672858769,
+      0.5078405410492565,
+      0.5114978464146097,
+      0.5096618983789927
+    ],
+    "path_max_drawdowns": [
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN
+    ],
+    "mean_net_sharpe_per_period": 0.01701012594005535,
+    "mean_net_sharpe_annualised": 0.27002737804365146,
+    "std_net_sharpe_per_period": 0.010441475608635765,
+    "total_fills": 5738267,
+    "mean_win_rate": 0.5109646810273862,
+    "mean_max_drawdown": NaN,
+    "mean_total_return": Infinity,
+    "vectorized_mean_sharpe_per_period": 0.019761667352898964,
+    "sharpe_divergence_absolute": 0.002751541412843613,
+    "sharpe_divergence_relative_pct": 13.92362984209413,
+    "agreement_status": "PASS",
+    "agreement_tolerance_pct": 20.0,
+    "latency_bars": 1,
+    "mode": "long_only",
+    "product_type": "CNC",
+    "notional": 100000.0,
+    "entry_price": 1000.0,
+    "slippage_bps": 5.0,
+    "periods_per_year": 252,
+    "n_paths": 7
+  },
+  "operator_guidance": "One or more challengers failed the A6 quality gate.\nThis report cannot be used for a standard production promotion.\nRemediation options:\n\n  xgboost: failed gates = symbol_coverage\n  gru: failed gates = calibration_ece, symbol_coverage, ap_degradation, accuracy_degradation\n\nOptions:\n  1. Retrain with corrective actions and use the new report.\n  2. Audited break-glass (CRITICAL audit entry emitted):\n     python scripts/promote_model.py production \\\n       --version <ver> --model-name <name> \\\n       --report-path <this_report_path> \\\n       --skip-gates --reason '<documented justification>'",
+  "bundle_sha256": "1fc6b8af516242b695b0c207a67250c5cd8f197a632da1a1f5a9e5182473c8e9",
+  "bundle_manifest": {
+    "inference_artifacts": {
+      "xgboost": {
+        "path": "/home/preet/code/Cortex_Merge_AI-ML/backend/models/production/models/1.2.0_xgboost_inference.so",
+        "sha256": "41ad3dc3818cbd701b5bcab99460bb82a815c54199251ddffc23aaa8f97f7677",
+        "size_bytes": 3440576
+      },
+      "gru": {
+        "path": "/home/preet/code/Cortex_Merge_AI-ML/backend/models/production/models/1.2.0_gru_inference.onnx",
+        "sha256": "470030055477534eb6e5ffd1c18f267e698897000666602b4ba08e9bb16791d4",
+        "size_bytes": 1643555
+      }
+    },
+    "calibrators": {
+      "xgboost": {
+        "path": "/home/preet/code/Cortex_Merge_AI-ML/backend/models/production/models/calibrator_xgb.pkl",
+        "sha256": "absent",
+        "size_bytes": 0
+      },
+      "gru": {
+        "path": "/home/preet/code/Cortex_Merge_AI-ML/backend/models/production/models/calibrator_gru.pkl",
+        "sha256": "absent",
+        "size_bytes": 0
+      }
+    },
+    "feature_manifest": {
+      "n_features": 66,
+      "sha256": "33caa463a1d85263b28ca7e4d25dd197556162240046a22d2fce0f6ad2fd61c7"
+    },
+    "lineage": {
+      "sha256": "67e02e84da58a955d4f177aeed31aa97f06188bb8b95ac50a08fe4d56f0f17b2"
+    },
+    "report_body": {
+      "sha256": "574fbc71c235aef6850735f4fdb15d3beff39574925bdbcfe787618c6c13492b"
+    }
+  },
+  "report_path": "/home/preet/code/Cortex_Merge_AI-ML/backend/incident_reports/promotion_report_1.2.0_xgboost_1.2.0_gru_20260718T070213Z.json"
+}

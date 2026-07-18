@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.exceptions import DatabaseError, SyncSanityError, UpstoxAPIError
 from app.models.upstox_data import UpstoxOHLCV, InstrumentMaster
+from app.services.instrument_classifier import AssetClass, classify_asset
 from app.services.upstox_client import UpstoxClient
 
 logger = logging.getLogger(__name__)
@@ -92,6 +93,11 @@ class InstrumentSyncResult:
     active_before: int     # active rows before the sync (basis for the guard)
     active_after: int      # active rows after the sync
     total_after: int       # all rows after the sync (active + inactive)
+    unclassified: int      # in-scope rows this run whose asset_class could not
+                            # be determined (missing/unrecognised ISIN) — should
+                            # stay near zero; a growing count signals upstream
+                            # data drift, since UNCLASSIFIED rows are excluded
+                            # from scanning/signal generation (fail-closed).
 
 
 async def sync_instrument_master(
@@ -174,21 +180,28 @@ async def sync_instrument_master(
 
         # 3. Upsert ────────────────────────────────────────────────────────────
         # Present rows are (re)activated and watermarked; mutable fields refreshed.
+        # asset_class is classified once here, at sync time, and persisted —
+        # never re-derived at query time (see instrument_classifier).
+        unclassified = 0
         for i in range(0, total_seen, size):
-            batch = [
-                {
+            batch = []
+            for row in instruments[i : i + size]:
+                asset_class = classify_asset(row.get("isin"), row["trading_symbol"])
+                if asset_class is AssetClass.UNCLASSIFIED:
+                    unclassified += 1
+                batch.append({
                     "instrument_key": row["instrument_key"],
                     "trading_symbol": row["trading_symbol"],
                     "name": row["name"],
                     "exchange": row["exchange"],
                     "instrument_type": row["instrument_type"],
+                    "isin": row.get("isin"),
+                    "asset_class": asset_class.value,
                     "is_active": True,
                     "delisted_at": None,
                     "last_seen_at": sync_started_at,
                     "updated_at": sync_started_at,
-                }
-                for row in instruments[i : i + size]
-            ]
+                })
             ins = pg_insert(InstrumentMaster)
             stmt = ins.values(batch).on_conflict_do_update(
                 index_elements=["instrument_key"],
@@ -197,6 +210,8 @@ async def sync_instrument_master(
                     "name": ins.excluded.name,
                     "exchange": ins.excluded.exchange,
                     "instrument_type": ins.excluded.instrument_type,
+                    "isin": ins.excluded.isin,
+                    "asset_class": ins.excluded.asset_class,
                     "is_active": ins.excluded.is_active,
                     "delisted_at": ins.excluded.delisted_at,
                     "last_seen_at": ins.excluded.last_seen_at,
@@ -258,12 +273,21 @@ async def sync_instrument_master(
         active_before=active_before,
         active_after=active_after,
         total_after=total_after,
+        unclassified=unclassified,
     )
     logger.info(
         "Instrument master sync complete: seen=%d inserted=%d updated=%d "
-        "reactivated=%d delisted=%d active=%d->%d",
+        "reactivated=%d delisted=%d active=%d->%d unclassified=%d",
         total_seen, inserted, updated, reactivated, delisted, active_before, active_after,
+        unclassified,
     )
+    if unclassified:
+        logger.warning(
+            "Instrument sync produced %d UNCLASSIFIED row(s) — these are "
+            "excluded from scanning/signal generation until reclassified; "
+            "investigate if this count is non-trivial or growing",
+            unclassified,
+        )
     return result
 
 

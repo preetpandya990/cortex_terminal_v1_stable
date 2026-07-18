@@ -1,0 +1,9 @@
+{
+  "event": "break_glass",
+  "operation": "promote_to_production",
+  "model_version": "1.2.0_xgboost",
+  "model_name": "xgboost",
+  "reason": "Operator-directed 1.2.0 cutover to the (paper-trading) live tier for the 2-week evaluation. Report BLOCKED solely on symbol_coverage 78.3%<85% \u2014 denominator stale (n_symbols=2551 calibrated for ETF-inclusive universe; STOCK-only pool 2936, 1997 qualified \u224887% of realistic target). Ablation passed on corrected daily-basis DSR (OOF SR 0.2236 vs control 0.1915). No real capital: learning phase, suggestions+paper trades only.",
+  "timestamp": "2026-07-18T18:06:56.914056+00:00",
+  "audit_sha256": "597045f8b8d31226cf8439431534546f4cc5042c267d1ba09af6a271e92f6654"
+}

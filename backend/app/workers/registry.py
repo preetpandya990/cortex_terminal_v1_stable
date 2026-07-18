@@ -24,6 +24,10 @@ Task inventory
     watchlist_scheduler    Pre-warms AI context for watchlist instruments 4×/day.
     ai_processing_safety_net  Daily fallback dispatch for the 3 demand-driven
                               Tier-2 Gemini queues (sentiment/forecast/classification).
+    explanation_reconciliation_sweep  2-min backstop that republishes orphaned
+                              legacy-mode explanation jobs (auto-publish failed
+                              silently at suggestion creation, no user ever
+                              viewed the panel to trigger the on-read self-heal).
 
   Imported (11) — respond to CancelledError only:
     rss_ingestion       RSS news feed ingestion.
@@ -98,6 +102,9 @@ TASK_NAMES: tuple[str, ...] = (
     # Daily 09:00 IST fallback sweep — dispatches sentiment/forecast/
     # classification queues independently when any crosses its threshold.
     "ai_processing_safety_net",
+    # ── Explanation reconciliation sweep (pause/trigger-aware) ────────────────
+    # 2-min backstop republishing orphaned legacy-mode explanation jobs.
+    "explanation_reconciliation_sweep",
 )
 
 
@@ -138,6 +145,7 @@ TASK_EXPECTED_INTERVAL_SECONDS: dict[str, int | None] = {
     "watchlist_scheduler": 64800,       # 21600s typical gap (4x/day) x 3
     "forecast_batch": 180,              # 60s batch window x 3
     "ai_processing_safety_net": 259200, # 86400s (daily) x 3
+    "explanation_reconciliation_sweep": 360,  # 120s poll interval x 3
 }
 
 if set(TASK_EXPECTED_INTERVAL_SECONDS.keys()) != set(TASK_NAMES):
@@ -234,6 +242,16 @@ def build_task_registry(
         pause=_state("ai_processing_safety_net").pause_token,
         trigger=_state("ai_processing_safety_net").trigger_token,
         on_cycle=_state("ai_processing_safety_net").record_cycle,
+    )
+
+    from app.workers.explanation_reconciliation_sweep import ExplanationReconciliationSweep
+    explanation_reconciliation_sweep_instance = ExplanationReconciliationSweep(
+        session_factory=session_factory,
+        redis=redis_client._redis,
+        shutdown=shutdown,
+        pause=_state("explanation_reconciliation_sweep").pause_token,
+        trigger=_state("explanation_reconciliation_sweep").trigger_token,
+        on_cycle=_state("explanation_reconciliation_sweep").record_cycle,
     )
 
     registry: dict[str, Callable[[], Coroutine]] = {
@@ -341,6 +359,8 @@ def build_task_registry(
         ),
         # ── Demand-driven AI processing safety net — pause/trigger-aware ──────
         "ai_processing_safety_net": lambda: ai_processing_safety_net_instance.run(),
+        # ── Explanation reconciliation sweep — pause/trigger-aware ────────────
+        "explanation_reconciliation_sweep": lambda: explanation_reconciliation_sweep_instance.run(),
     }
 
     if set(registry.keys()) != set(TASK_NAMES):

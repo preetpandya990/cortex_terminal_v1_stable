@@ -519,6 +519,41 @@ ai_processing_safety_net_last_run_timestamp = Gauge(
 )
 
 
+# ── Explanation Reconciliation Metrics ────────────────────────────────────────
+# Recovery layer for legacy-mode (EXPLANATION_ON_DEMAND=False) suggestions
+# whose auto-publish attempt silently failed (non-fatal by design, so the
+# suggestion commit is never rolled back). Two triggers republish an orphaned
+# job: a user viewing the panel (self_heal) or the periodic sweep.
+
+explanation_reconciliation_republish_total = Counter(
+    'explanation_reconciliation_republish_total',
+    'Orphaned legacy-mode explanation jobs republished, by trigger source',
+    ['trigger_source'],  # sweep | self_heal
+)
+
+explanation_reconciliation_sweep_runs_total = Counter(
+    'explanation_reconciliation_sweep_runs_total',
+    'Total explanation reconciliation sweep runs by final status',
+    ['status'],  # success | error
+)
+
+explanation_reconciliation_sweep_duration_seconds = Histogram(
+    'explanation_reconciliation_sweep_duration_seconds',
+    'Wall-clock duration of each explanation reconciliation sweep (seconds)',
+    buckets=(0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0),
+)
+
+explanation_reconciliation_sweep_last_run_timestamp = Gauge(
+    'explanation_reconciliation_sweep_last_run_timestamp',
+    'Unix timestamp of the last explanation reconciliation sweep',
+)
+
+explanation_reconciliation_pending_gauge = Gauge(
+    'explanation_reconciliation_pending',
+    'Orphan candidates found by the most recent explanation reconciliation sweep',
+)
+
+
 # ── Instrument Sync Metrics ─────────────────────────────────────────────────────
 instrument_sync_total = Counter(
     'instrument_sync_total',
@@ -545,6 +580,13 @@ instrument_delisted_count = Gauge(
 instrument_sync_last_success_timestamp = Gauge(
     'instrument_sync_last_success_timestamp',
     'Unix timestamp of the last successful instrument-master sync (for staleness alerting)'
+)
+
+instrument_unclassified_count = Gauge(
+    'instrument_unclassified_count',
+    'Rows from the last sync whose asset_class could not be determined '
+    '(missing/unrecognised ISIN) — excluded from scanning/signal generation; '
+    'should stay near zero, alert if non-trivial or growing'
 )
 
 

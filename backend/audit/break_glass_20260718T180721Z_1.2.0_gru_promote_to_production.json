@@ -1,0 +1,9 @@
+{
+  "event": "break_glass",
+  "operation": "promote_to_production",
+  "model_version": "1.2.0_gru",
+  "model_name": "gru",
+  "reason": "1.2.0 GRU registered at production tier DORMANT (is_active=false): A5 net-DSR weighting judged it non-accretive (weight 0.0) \u2014 serving is XGBoost-only via the single-active-member pattern. Gates bypassed: symbol_coverage stale-denominator (see XGB reason) + calibration_ece 0.054 marginal and moot for a non-serving member.",
+  "timestamp": "2026-07-18T18:07:21.111211+00:00",
+  "audit_sha256": "34ca1f970f289dd6e2c296922bd55d6c042e9c31655a788274ba210fc4c7fef6"
+}

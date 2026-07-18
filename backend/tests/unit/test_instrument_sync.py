@@ -12,6 +12,8 @@ Reconcile (app.services.data_ingestion.sync_instrument_master):
   - insert / update / soft-delete (delist) / reactivate semantics
   - exact, arithmetically-consistent counts
   - idempotency, dry-run (no writes), and the sanity guard (rollback)
+  - asset_class is classified per-row at sync time (STOCK/ETF_FUND/
+    TRUST_UNIT/UNCLASSIFIED) and the unclassified count is reported
 
 Concurrency (app.services.instrument_sync_service):
   - the advisory lock admits exactly one holder at a time
@@ -19,6 +21,9 @@ Concurrency (app.services.instrument_sync_service):
 Consumers (app.services.symbol_validator):
   - the eligibility gate excludes delisted instruments
   - resolvers default to active-only and opt in via include_inactive
+  - the eligibility gate excludes non-STOCK asset classes (ETFs/fund units,
+    REIT/InvIT trust units) even when active — see test_instrument_classifier.py
+    for the pure classification-function tests
 
 Reconcile/consumer tests run inside the rolled-back ``db_session`` transaction
 and start from a clean ``instrument_master`` (the truncate is part of the
@@ -46,7 +51,7 @@ def _gz(payload) -> bytes:
     return gzip.compress(json.dumps(payload).encode())
 
 
-def _raw(instrument_key: str, trading_symbol: str, *, segment="NSE_EQ", itype="EQ", name="ACME") -> dict:
+def _raw(instrument_key: str, trading_symbol: str, *, segment="NSE_EQ", itype="EQ", name="ACME", isin=None) -> dict:
     return {
         "segment": segment,
         "instrument_type": itype,
@@ -54,10 +59,11 @@ def _raw(instrument_key: str, trading_symbol: str, *, segment="NSE_EQ", itype="E
         "trading_symbol": trading_symbol,
         "name": name,
         "exchange": "NSE",
+        "isin": isin,
     }
 
 
-def _norm(instrument_key: str, trading_symbol: str, *, name="ACME", itype="EQ") -> dict:
+def _norm(instrument_key: str, trading_symbol: str, *, name="ACME", itype="EQ", isin=None) -> dict:
     """A normalized instrument dict as produced by the fetcher / consumed by the reconciler."""
     return {
         "instrument_key": instrument_key,
@@ -65,6 +71,7 @@ def _norm(instrument_key: str, trading_symbol: str, *, name="ACME", itype="EQ") 
         "name": name,
         "exchange": "NSE",
         "instrument_type": itype,
+        "isin": isin,
     }
 
 
@@ -190,7 +197,7 @@ async def _clean_slate(session):
     await session.commit()
 
 
-async def _seed(session, key, symbol, *, is_active=True, last_seen=None, itype="EQ"):
+async def _seed(session, key, symbol, *, is_active=True, last_seen=None, itype="EQ", asset_class="STOCK"):
     session.add(
         InstrumentMaster(
             instrument_key=key,
@@ -198,6 +205,7 @@ async def _seed(session, key, symbol, *, is_active=True, last_seen=None, itype="
             name=symbol,
             exchange="NSE",
             instrument_type=itype,
+            asset_class=asset_class,
             is_active=is_active,
             last_seen_at=last_seen or datetime.now(timezone.utc),
             delisted_at=None if is_active else datetime.now(timezone.utc),
@@ -276,6 +284,26 @@ async def test_counts_are_arithmetically_consistent(db_session):
     assert result.inserted == 1 and result.delisted == 1 and result.reactivated == 1
 
 
+async def test_sync_classifies_asset_class_per_row(db_session):
+    await _clean_slate(db_session)
+    result = await sync_instrument_master(
+        db_session,
+        [
+            _norm("NSE_EQ|INE001", "STOCKA", isin="INE001A01036"),   # corporate ISIN -> STOCK
+            _norm("NSE_EQ|INF001", "MSCI360", isin="INF579M01BP5"),  # AMFI ISIN -> ETF_FUND
+            _norm("NSE_EQ|INE002", "BIRET", isin="INE0FDU25010"),    # curated registry -> TRUST_UNIT
+            _norm("NSE_EQ|INE003", "NOISIN", isin=None),             # missing ISIN -> UNCLASSIFIED
+        ],
+        min_instruments=1,
+    )
+
+    assert result.unclassified == 1
+    assert (await _row(db_session, "NSE_EQ|INE001")).asset_class == "STOCK"
+    assert (await _row(db_session, "NSE_EQ|INF001")).asset_class == "ETF_FUND"
+    assert (await _row(db_session, "NSE_EQ|INE002")).asset_class == "TRUST_UNIT"
+    assert (await _row(db_session, "NSE_EQ|INE003")).asset_class == "UNCLASSIFIED"
+
+
 async def test_dry_run_writes_nothing(db_session):
     await _clean_slate(db_session)
     await _seed(db_session, "NSE_EQ|INE001", "AAA",
@@ -343,6 +371,34 @@ async def test_eligibility_and_resolvers_respect_is_active(db_session):
     # Resolver default (active-only) hides the delisted symbol; include_inactive reveals it.
     assert await sv.get_instrument_key("DEAD", db_session) is None
     assert await sv.get_instrument_key("DEAD", db_session, include_inactive=True) == "NSE_EQ|INE200"
+
+
+async def test_eligibility_excludes_non_stock_asset_classes(db_session):
+    """
+    ETFs and REIT/InvIT trust units must be ineligible even when active and
+    otherwise indistinguishable from a stock at the instrument_type level —
+    NSE's EQ series covers all of these identically, so asset_class is the
+    only signal that separates them.
+    """
+    from app.services.symbol_validator import symbol_validator as sv
+
+    await _clean_slate(db_session)
+    await _seed(db_session, "NSE_EQ|INE100", "REALSTOCK", asset_class="STOCK")
+    await _seed(db_session, "NSE_EQ|INF200", "SOMEETF", asset_class="ETF_FUND")
+    await _seed(db_session, "NSE_EQ|INE201", "SOMEREIT", asset_class="TRUST_UNIT")
+    await _seed(db_session, "NSE_EQ|INE202", "SOMEUNCLASSIFIED", asset_class="UNCLASSIFIED")
+
+    assert await sv._db_check_single("REALSTOCK", db_session) is True
+    assert await sv._db_check_single("SOMEETF", db_session) is False
+    assert await sv._db_check_single("SOMEREIT", db_session) is False
+    assert await sv._db_check_single("SOMEUNCLASSIFIED", db_session) is False
+
+    assert await sv._db_check_batch(
+        ["REALSTOCK", "SOMEETF", "SOMEREIT", "SOMEUNCLASSIFIED"], db_session
+    ) == {"REALSTOCK"}
+
+    assert await sv.get_instrument_key("SOMEETF", db_session) is None
+    assert await sv.get_company_name("SOMEREIT", db_session) is None
 
 
 async def test_validator_accepts_all_nse_equity_series(db_session):

@@ -367,6 +367,13 @@ class MarketScannerService:
               -- Exclude known-delisted instruments (keep active rows and any
               -- OHLCV instrument that has no master row).
               AND  im.is_active IS DISTINCT FROM FALSE
+              -- Stock-only universe: excludes ETFs/mutual-fund units and
+              -- REIT/InvIT trust units (see instrument_classifier), and — since
+              -- this is a strict equality, not IS DISTINCT FROM — also excludes
+              -- any OHLCV instrument with no instrument_master row at all, which
+              -- is intentional here: an instrument we can't classify must not
+              -- silently enter the scan universe (fail closed).
+              AND  im.asset_class = 'STOCK'
             ORDER BY o.instrument_key, o.timestamp DESC
         """)
         try:

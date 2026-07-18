@@ -27,7 +27,8 @@ def _cfg(**overrides):
         "sequence_length": 60,
         "include_fundamentals": True,
         "model_version": "1.0.0",
-        "n_symbols": 100,  # operational (non-model-affecting) key
+        "n_symbols": 100,           # model-affecting since WS2 (smoke-run isolation)
+        "xgboost_trials": 100,      # operational (non-model-affecting) key
     }
     base.update(overrides)
     return base
@@ -74,10 +75,20 @@ class TestCheckpointSchemaGate:
     def test_non_model_affecting_drift_does_not_abort(self, tmp_path):
         _write_checkpoint(tmp_path, {
             "run_id": "r", "schema_version": SCHEMA_VERSION,
-            "completed_steps": [], "config": _cfg(n_symbols=100),
+            "completed_steps": [], "config": _cfg(xgboost_trials=100),
         })
-        # n_symbols is operational, not model-affecting → warn-only, no raise.
-        CheckpointManager(tmp_path, _cfg(n_symbols=2551), fresh=False)
+        # xgboost_trials is operational, not model-affecting → warn-only, no raise.
+        CheckpointManager(tmp_path, _cfg(xgboost_trials=50), fresh=False)
+
+    def test_n_symbols_drift_aborts_since_ws2(self, tmp_path):
+        """WS2 made n_symbols model-affecting: a --n-symbols smoke checkpoint
+        must never resume into (or be resumed by) a full-universe run."""
+        _write_checkpoint(tmp_path, {
+            "run_id": "r", "schema_version": SCHEMA_VERSION,
+            "completed_steps": [], "config": _cfg(n_symbols=20),
+        })
+        with pytest.raises(StaleCheckpointError, match="n_symbols"):
+            CheckpointManager(tmp_path, _cfg(n_symbols=2551), fresh=False)
 
 
 class TestEvaluatorHonestFinancials:

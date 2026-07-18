@@ -146,6 +146,12 @@ class InstrumentMaster(Base):
             "trading_symbol",
             postgresql_where=text("is_active"),
         ),
+        # Partial index backing the stock-only eligibility gate (migration 0055).
+        Index(
+            "idx_instrument_stock_active",
+            "trading_symbol",
+            postgresql_where=text("is_active AND asset_class = 'STOCK'"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -154,6 +160,19 @@ class InstrumentMaster(Base):
     name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     exchange: Mapped[str] = mapped_column(String(20), nullable=False)
     instrument_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # ── Asset classification (migration 0055) ───────────────────────────────
+    # ISIN as reported by the sync source; NULL for rows synced before this
+    # column existed, until the next sync backfills it.
+    isin: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    # STOCK / ETF_FUND / TRUST_UNIT / UNCLASSIFIED — see
+    # app.services.instrument_classifier. Only STOCK is eligible for
+    # scanning/signal generation; UNCLASSIFIED is a fail-closed default,
+    # never treated as tradeable.
+    asset_class: Mapped[str] = mapped_column(
+        String(20),
+        server_default=text("'UNCLASSIFIED'"),
+        nullable=False,
+    )
     # ── Lifecycle (migration 0045) ──────────────────────────────────────────
     # is_active is derived state: true iff the instrument was present in the
     # most recent successful sync. The daily Upstox BOD file drops delisted

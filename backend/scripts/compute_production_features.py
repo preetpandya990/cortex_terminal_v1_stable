@@ -16,6 +16,7 @@ Date: 2026-04-14
 """
 import argparse
 import asyncio
+import json
 import logging
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -27,10 +28,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy import text, select
 import numpy as np
+import pandas as pd
 
 from app.core.config import get_settings
+from app.ml.config import ML_FEATURE_SET_VERSION
+from app.ml.features.cross_sectional_stats import (
+    persist_cross_sectional_stats,
+    rank_normalize_panel,
+)
 from app.ml.features.feature_pipeline import compute_features_for_symbol
-from app.ml.features.feature_store import save_features_to_db
+from app.ml.features.feature_store import FEATURE_VERSION, save_features_to_db
+from app.ml.features.fundamental_features import FUNDAMENTAL_FEATURE_NAMES_V2
 
 logging.basicConfig(
     level=logging.INFO,
@@ -201,6 +209,11 @@ class FeatureComputationPipeline:
                 end_date=end_date,
                 timeframe='1D',
                 db=session,
+                # Under v2 the store rows carry RAW point-in-time fundamentals
+                # (pe/pb/ev keys disappear); serving is protected either way —
+                # v1 models hard-zero fundamentals, v2 models rank-transform
+                # them through the grids persisted by the post-pass below.
+                feature_set_version=ML_FEATURE_SET_VERSION,
             )
             
             if features_df.empty:
@@ -261,6 +274,67 @@ class FeatureComputationPipeline:
         
         return processed_results
     
+    async def persist_cross_sectional_pass(self, as_of: date) -> int:
+        """
+        Build + persist the day's cross-sectional rank grids (WS2c).
+
+        Re-reads the day's RAW fundamental values from ml_features across the
+        whole universe (robust to partial-loop crashes and future parallelism
+        — whatever landed in the store is what serving will see), computes
+        per-feature 101-point quantile grids, and upserts them into
+        ml_feature_cross_stats for feature_version="2.0.0". Inference maps raw
+        values through these grids to reproduce training's rank transform.
+
+        Returns the number of grid rows written. Failures must be handled by
+        the caller as non-fatal: the read path degrades to the newest earlier
+        grid, so a missed day hurts freshness, never correctness.
+        """
+        day_start = datetime.combine(as_of, datetime.min.time())
+        day_end = day_start + timedelta(days=1)
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                text("""
+                    SELECT DISTINCT ON (symbol) symbol, timestamp, feature_vector
+                    FROM ml_features
+                    WHERE feature_version = :fv
+                      AND timestamp >= :day_start AND timestamp < :day_end
+                    ORDER BY symbol, timestamp DESC
+                """),
+                {"fv": FEATURE_VERSION, "day_start": day_start, "day_end": day_end},
+            )
+            rows = result.fetchall()
+            if not rows:
+                logger.warning(
+                    "Cross-sectional pass: no ml_features rows for %s — no grids written",
+                    as_of,
+                )
+                return 0
+
+            results: dict[str, pd.DataFrame] = {}
+            for symbol, ts, vector in rows:
+                if not isinstance(vector, dict):
+                    vector = json.loads(vector)
+                results[symbol] = pd.DataFrame({
+                    "timestamp": [ts],
+                    **{
+                        feat: [vector.get(feat)]
+                        for feat in FUNDAMENTAL_FEATURE_NAMES_V2
+                    },
+                })
+
+            # rank_normalize_panel's in-place transform is discarded — only
+            # the raw-value grids matter here; store rows stay raw.
+            stats = rank_normalize_panel(results, list(FUNDAMENTAL_FEATURE_NAMES_V2))
+            written = await persist_cross_sectional_stats(session, stats, "2.0.0")
+            await session.commit()
+
+        logger.info(
+            "✓ Cross-sectional pass: %d grid rows persisted for %s (%d symbols)",
+            written, as_of, len(rows),
+        )
+        return written
+
     def print_progress(self):
         """Print progress statistics."""
         if self.total_symbols == 0:
@@ -334,7 +408,18 @@ class FeatureComputationPipeline:
                 
                 # Print progress
                 self.print_progress()
-            
+
+            # ── Cross-sectional grid pass (WS2c, v2 only, non-fatal) ─────────
+            if ML_FEATURE_SET_VERSION == "2.0.0":
+                try:
+                    await self.persist_cross_sectional_pass(date.today())
+                except Exception:
+                    logger.error(
+                        "Cross-sectional grid pass failed — inference will "
+                        "degrade to the newest earlier grid (non-fatal)",
+                        exc_info=True,
+                    )
+
             # Final summary
             elapsed = (datetime.now() - self.start_time).total_seconds()
             logger.info("")

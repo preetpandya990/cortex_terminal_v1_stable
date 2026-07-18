@@ -1411,6 +1411,22 @@ async def _generate_explanation(
         llm_explanation_dedup_total.labels(layer="inflight_key").inc()
         return
 
+    # Refresh the reconciliation-visible in-flight lock on every attempt
+    # (initial delivery AND every retry redelivery) — this is what lets
+    # explanation_service's legacy self-heal branch and the periodic
+    # reconciliation sweep tell "genuinely still retrying" apart from
+    # "orphaned" without coupling to MAX_ATTEMPTS/backoff timing. Plain SET
+    # (not NX): this call always owns the attempt, so it always refreshes.
+    from app.ai.intelligence.explanation_service import (
+        EXPLANATION_INFLIGHT_KEY,
+        EXPLANATION_INFLIGHT_TTL_SECS,
+    )
+    with contextlib.suppress(Exception):
+        await _redis.set(
+            EXPLANATION_INFLIGHT_KEY.format(suggestion_id=suggestion_id),
+            "1", ex=EXPLANATION_INFLIGHT_TTL_SECS,
+        )
+
     # ── Phase 2: LLM call (no DB session held open) ───────────────────────────
     t0 = time.monotonic()
     error_message: str | None = None
@@ -1686,9 +1702,19 @@ async def _generate_explanation(
         # Free the explanation_service demand lock so a later viewer can
         # re-trigger if this attempt ultimately fails (retries hold their own
         # worker inflight key per attempt).
-        from app.ai.intelligence.explanation_service import DEMAND_INFLIGHT_KEY
+        from app.ai.intelligence.explanation_service import EXPLANATION_INFLIGHT_KEY
         with contextlib.suppress(Exception):
-            await _redis.delete(DEMAND_INFLIGHT_KEY.format(suggestion_id=suggestion_id))
+            await _redis.delete(EXPLANATION_INFLIGHT_KEY.format(suggestion_id=suggestion_id))
+    elif final_output is not None:
+        # Non-demand (auto/reconciliation) success: release now. On a
+        # retryable failure this key must stay held — it's refreshed again
+        # at the start of the next attempt (see acquisition point above) —
+        # otherwise the reconciliation sweep / self-heal-on-read could race
+        # a suggestion that's still legitimately retrying through backoff.
+        # True give-up (DLQ) releases it explicitly in _publish_failed_state.
+        from app.ai.intelligence.explanation_service import EXPLANATION_INFLIGHT_KEY
+        with contextlib.suppress(Exception):
+            await _redis.delete(EXPLANATION_INFLIGHT_KEY.format(suggestion_id=suggestion_id))
 
     if error_message is not None:
         if _is_quota_exhausted:
@@ -2093,11 +2119,12 @@ async def _publish_failed_state(
     }
     await _write_sse_explanation_event(redis, suggestion_id, failed_payload)
 
-    # Free the demand-trigger lock so the retry button (or a later view) can
+    # Terminal give-up (DLQ) — always free the lock regardless of trigger so
+    # the retry button, a later view, or the next reconciliation sweep can
     # re-request generation without waiting for the TTL.
-    from app.ai.intelligence.explanation_service import DEMAND_INFLIGHT_KEY
+    from app.ai.intelligence.explanation_service import EXPLANATION_INFLIGHT_KEY
     with contextlib.suppress(Exception):
-        await redis.delete(DEMAND_INFLIGHT_KEY.format(suggestion_id=suggestion_id))
+        await redis.delete(EXPLANATION_INFLIGHT_KEY.format(suggestion_id=suggestion_id))
 
     try:
         ready_channel = RedisChannels.LLM_EXPLANATION_READY.format(

@@ -497,9 +497,14 @@ def _simulate_path(
     )
 
     if len(net_returns) > 0:
-        cum    = np.cumprod(1.0 + net_returns)
+        # log1p/clip keeps the equity curve finite even for pathological
+        # inputs (a ≤ −100% return would otherwise zero/negate the curve and
+        # emit invalid-value warnings in the division below).
+        cum    = np.exp(np.cumsum(np.log1p(np.clip(net_returns, -0.9999, None))))
         cummax = np.maximum.accumulate(cum)
-        max_dd = float(abs(((cum - cummax) / np.where(cummax > 0, cummax, 1.0)).min()))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            dd = np.nan_to_num((cum - cummax) / np.where(cummax > 0, cummax, 1.0))
+        max_dd = float(abs(dd.min()))
     else:
         max_dd = 0.0
 

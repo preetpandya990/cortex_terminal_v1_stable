@@ -215,6 +215,7 @@ class SignalScheduler:
                         sequence_length=getattr(self._ml_predictor, "sequence_length", 60),
                         n_features=getattr(self._ml_predictor, "n_features", 49),
                         feature_names=getattr(self._ml_predictor, "feature_names", ()),
+                        feature_version=getattr(self._ml_predictor, "feature_version", "1.0.0"),
                     )
                     tabular, sequence, current_price, volatility = (
                         await loader.load_features(symbol=symbol, timeframe="1d")
@@ -336,6 +337,7 @@ class SignalScheduler:
                         sequence_length=getattr(self._ml_predictor, "sequence_length", 60),
                         n_features=getattr(self._ml_predictor, "n_features", 49),
                         feature_names=getattr(self._ml_predictor, "feature_names", ()),
+                        feature_version=getattr(self._ml_predictor, "feature_version", "1.0.0"),
                     )
                     if self._ml_predictor
                     else None

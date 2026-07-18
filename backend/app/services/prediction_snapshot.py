@@ -140,6 +140,7 @@ async def _compute_prediction_snapshot_inner(
             sequence_length=predictor.sequence_length,
             n_features=predictor.n_features,
             feature_names=predictor.feature_names,
+            feature_version=getattr(predictor, "feature_version", "1.0.0"),
         )
 
         try:
@@ -193,6 +194,7 @@ async def _load_features_safe(
                     sequence_length=predictor.sequence_length,
                     n_features=predictor.n_features,
                     feature_names=predictor.feature_names,
+                    feature_version=getattr(predictor, "feature_version", "1.0.0"),
                 )
                 tabular, sequence, current_price, volatility = await feature_loader.load_features(
                     symbol=instrument_key,

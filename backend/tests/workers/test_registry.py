@@ -1,7 +1,7 @@
 """
 Tests for app.workers.registry
 ================================
-Validates that build_task_registry() produces exactly 19 callable factories
+Validates that build_task_registry() produces exactly 21 callable factories
 matching TASK_NAMES, and that the key migrated tasks are present.
 """
 from __future__ import annotations
@@ -87,8 +87,8 @@ def task_states():
 # ── TASK_NAMES ─────────────────────────────────────────────────────────────────
 
 class TestTaskNames:
-    def test_has_19_tasks(self):
-        assert len(TASK_NAMES) == 19
+    def test_has_21_tasks(self):
+        assert len(TASK_NAMES) == 21
 
     def test_is_tuple(self):
         assert isinstance(TASK_NAMES, tuple)
@@ -152,7 +152,7 @@ class TestBuildTaskRegistry:
                 task_states=task_states,
             )
 
-    def test_builds_all_19_tasks(
+    def test_builds_all_21_tasks(
         self, mock_session_factory, mock_redis_client, mock_ml_components,
         mock_upstox_client, shutdown_event, task_states,
     ):
@@ -160,7 +160,7 @@ class TestBuildTaskRegistry:
             mock_session_factory, mock_redis_client, mock_ml_components,
             mock_upstox_client, shutdown_event, task_states,
         )
-        assert len(registry) == 19
+        assert len(registry) == 21
         assert set(registry.keys()) == set(TASK_NAMES)
 
     def test_factories_are_callable(

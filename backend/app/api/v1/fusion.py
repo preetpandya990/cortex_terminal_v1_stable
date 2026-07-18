@@ -145,6 +145,7 @@ async def generate_signal(
             sequence_length=ml_predictor.sequence_length,
             n_features=ml_predictor.n_features,
             feature_names=ml_predictor.feature_names,
+            feature_version=getattr(ml_predictor, "feature_version", "1.0.0"),
         )
         if ml_predictor
         else None

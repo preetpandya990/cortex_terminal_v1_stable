@@ -155,6 +155,7 @@ class TokenBucketRateLimiter:
 
     def __init__(self, requests_per_minute: int) -> None:
         self._rate = requests_per_minute / 60.0   # tokens per second
+        self._capacity = float(requests_per_minute)  # max burst = 1 min of tokens
         self._tokens = 0.0                        # start empty — no startup burst
         self._last_refill = time.monotonic()
         self._lock = asyncio.Lock()
@@ -163,16 +164,21 @@ class TokenBucketRateLimiter:
         async with self._lock:
             now = time.monotonic()
             elapsed = now - self._last_refill
-            self._tokens = min(
-                settings.DATA_INGESTION_REQUESTS_PER_MINUTE,
-                self._tokens + elapsed * self._rate,
-            )
+            self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
             self._last_refill = now
 
             if self._tokens < 1.0:
                 wait = (1.0 - self._tokens) / self._rate
                 await asyncio.sleep(wait)
                 self._tokens = 0.0
+                # CRITICAL: advance the refill clock past the sleep. The
+                # tokens that accrued DURING the sleep were consumed by THIS
+                # request; without this line the next waiter re-credits the
+                # same interval and effective throughput becomes
+                # rate × concurrency (observed live 2026-07-17: 120/min at
+                # a configured 60 with concurrency=2 — invisible before
+                # because the worker always ran concurrency=1).
+                self._last_refill = time.monotonic()
             else:
                 self._tokens -= 1.0
 
@@ -361,12 +367,22 @@ class DataIngestionWorker:
     async def _load_coverage(
         session: AsyncSession, timeframe: str
     ) -> dict[str, tuple[date, date]]:
-        """Returns {instrument_key: (earliest_date, latest_date)} for one timeframe."""
+        """Returns {instrument_key: (earliest_date, latest_date)} for one timeframe.
+
+        Dates are taken in **IST**, not UTC: Upstox stamps a trading day's bar
+        at midnight IST, which is 18:30 UTC of the *previous* calendar day. A
+        plain UTC ``::date`` therefore reported coverage one day behind the
+        trading date, and ``detect_gaps`` re-fetched the already-stored latest
+        bar for EVERY instrument on EVERY scan — an eternal off-by-one that
+        made each hourly maintenance cycle re-download ~3,270 bars it already
+        had (~82 min/cycle at 40 req/min). Found live 2026-07-17 when a
+        backfill's second pass re-detected an identical 3,266-chunk "gap".
+        """
         result = await session.execute(
             text(
                 "SELECT instrument_key, "
-                "       MIN(timestamp)::date AS earliest, "
-                "       MAX(timestamp)::date AS latest "
+                "       MIN(timestamp AT TIME ZONE 'Asia/Kolkata')::date AS earliest, "
+                "       MAX(timestamp AT TIME ZONE 'Asia/Kolkata')::date AS latest "
                 "FROM upstox_ohlcv "
                 "WHERE timeframe = :tf "
                 "GROUP BY instrument_key"

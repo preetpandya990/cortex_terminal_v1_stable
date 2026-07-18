@@ -2,11 +2,13 @@
 Explanation service tests (WS7)
 ===============================
 The demand-side state machine: ready/generating/weak_signal/failed
-classification, first-viewer-publishes semantics, lock contention, and the
-fail-open/fail-terminal policies.
+classification, first-viewer-publishes semantics, lock contention, the
+fail-open/fail-terminal policies, and the legacy-mode self-heal-on-read
+reconciliation branch (orphaned-suggestion recovery).
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
@@ -14,18 +16,21 @@ from uuid import uuid4
 import pytest
 
 from app.ai.intelligence.explanation_service import (
-    DEMAND_INFLIGHT_KEY,
+    EXPLANATION_INFLIGHT_KEY,
     ensure_explanation,
     publish_explanation_job,
 )
 
 pytestmark = pytest.mark.unit
 
+_STALENESS_SECS = 300
+
 
 def _suggestion(
     *,
     llm_summary: str | None = None,
     consensus_score: str = "82.0",
+    age_secs: float = 0.0,
 ) -> MagicMock:
     s = MagicMock()
     s.suggestion_id = uuid4()
@@ -34,6 +39,7 @@ def _suggestion(
     s.symbol = "RELIANCE"
     s.llm_summary = llm_summary
     s.consensus_score = Decimal(consensus_score)
+    s.created_at = datetime.now(timezone.utc) - timedelta(seconds=age_secs)
     return s
 
 
@@ -41,6 +47,7 @@ def _settings(on_demand: bool, threshold: float = 75.0) -> MagicMock:
     settings = MagicMock()
     settings.EXPLANATION_ON_DEMAND = on_demand
     settings.EXPLANATION_CONSENSUS_THRESHOLD = threshold
+    settings.EXPLANATION_RECONCILE_STALENESS_SECS = _STALENESS_SECS
     return settings
 
 
@@ -70,7 +77,9 @@ class TestLegacyMode:
         assert state["status"] == "weak_signal"
 
     @pytest.mark.asyncio
-    async def test_strong_signal_is_generating_without_publish(self):
+    async def test_fresh_strong_signal_is_generating_without_publish(self):
+        """Within the staleness window: trust the engine's own auto-publish,
+        don't touch Kafka or Redis at all."""
         redis = AsyncMock()
         with (
             _patch(False),
@@ -79,10 +88,92 @@ class TestLegacyMode:
                 new=AsyncMock(),
             ) as publish,
         ):
-            state = await ensure_explanation(redis, _suggestion(consensus_score="90.0"))
+            state = await ensure_explanation(
+                redis, _suggestion(consensus_score="90.0", age_secs=10.0)
+            )
         assert state["status"] == "generating"
         publish.assert_not_awaited()  # legacy: the engine already published
-        redis.set.assert_not_awaited()  # no demand lock in legacy mode
+        redis.set.assert_not_awaited()  # no reconciliation lock while fresh
+
+    @pytest.mark.asyncio
+    async def test_stale_strong_signal_self_heals_by_republishing(self):
+        """Past the staleness window with no explanation — the original
+        auto-publish is presumed orphaned; self-heal republishes it."""
+        redis = AsyncMock()
+        redis.set = AsyncMock(return_value=True)  # lock acquired
+        suggestion = _suggestion(consensus_score="90.0", age_secs=_STALENESS_SECS + 1)
+        with (
+            _patch(False),
+            patch(
+                "app.ai.intelligence.explanation_service.kafka_publish",
+                new=AsyncMock(),
+            ) as publish,
+        ):
+            state = await ensure_explanation(redis, suggestion)
+
+        assert state["status"] == "generating"
+        publish.assert_awaited_once()
+        _topic, payload = publish.await_args.args
+        assert payload["trigger"] == "reconciliation"
+        assert payload["suggestion_id"] == str(suggestion.suggestion_id)
+
+    @pytest.mark.asyncio
+    async def test_stale_signal_still_in_flight_skips_duplicate_publish(self):
+        """The worker refreshes EXPLANATION_INFLIGHT_KEY on every retry
+        attempt — if it's still held, the suggestion is genuinely retrying,
+        not orphaned, so self-heal must not duplicate-publish."""
+        redis = AsyncMock()
+        redis.set = AsyncMock(return_value=None)  # lock already held
+        with (
+            _patch(False),
+            patch(
+                "app.ai.intelligence.explanation_service.kafka_publish",
+                new=AsyncMock(),
+            ) as publish,
+        ):
+            state = await ensure_explanation(
+                redis, _suggestion(consensus_score="90.0", age_secs=_STALENESS_SECS + 1)
+            )
+
+        assert state["status"] == "generating"
+        publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stale_signal_publish_failure_frees_lock_and_reports_failed(self):
+        redis = AsyncMock()
+        redis.set = AsyncMock(return_value=True)
+        suggestion = _suggestion(consensus_score="90.0", age_secs=_STALENESS_SECS + 1)
+        with (
+            _patch(False),
+            patch(
+                "app.ai.intelligence.explanation_service.kafka_publish",
+                new=AsyncMock(side_effect=RuntimeError("broker down")),
+            ),
+        ):
+            state = await ensure_explanation(redis, suggestion)
+
+        assert state["status"] == "failed"
+        redis.delete.assert_awaited_once_with(
+            EXPLANATION_INFLIGHT_KEY.format(suggestion_id=str(suggestion.suggestion_id))
+        )
+
+    @pytest.mark.asyncio
+    async def test_weak_signal_takes_priority_over_staleness(self):
+        """A stale-but-weak suggestion must not attempt to reconcile — the
+        engine never intended to auto-publish it in the first place."""
+        redis = AsyncMock()
+        with (
+            _patch(False),
+            patch(
+                "app.ai.intelligence.explanation_service.kafka_publish",
+                new=AsyncMock(),
+            ) as publish,
+        ):
+            state = await ensure_explanation(
+                redis, _suggestion(consensus_score="60.0", age_secs=_STALENESS_SECS + 1)
+            )
+        assert state["status"] == "weak_signal"
+        publish.assert_not_awaited()
 
 
 class TestOnDemandMode:
@@ -156,7 +247,7 @@ class TestOnDemandMode:
 
         assert state["status"] == "failed"
         redis.delete.assert_awaited_once_with(
-            DEMAND_INFLIGHT_KEY.format(suggestion_id=str(suggestion.suggestion_id))
+            EXPLANATION_INFLIGHT_KEY.format(suggestion_id=str(suggestion.suggestion_id))
         )
 
     @pytest.mark.asyncio

@@ -44,7 +44,7 @@ def _make_training_config():
     import sys
     sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
     from production_training_orchestrator import TrainingConfig
-    return TrainingConfig(n_symbols=10, lookback_years=1, model_version="1.0.0")
+    return TrainingConfig(n_symbols=10, lookback_years=1, model_version="1.0.0", feature_set_version="1.0.0")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -96,8 +96,12 @@ class TestCheckpointMLflowRunId:
         assert cp2.mlflow_run_id == "no-compat-break"
 
     def test_schema_version_unchanged(self, tmp_path):
+        # v4 was E3's contract; v5 is the deliberate WS2 bump (feature-set
+        # versioning — see checkpoint_manager's SCHEMA_VERSION changelog).
+        # This test still guards against ACCIDENTAL bumps: update it only
+        # alongside a documented schema change.
         from app.ml.training.checkpoint_manager import SCHEMA_VERSION
-        assert SCHEMA_VERSION == 4, "E3 must NOT bump SCHEMA_VERSION"
+        assert SCHEMA_VERSION == 5, "SCHEMA_VERSION must only change with a documented migration"
 
 
 # ══════════════════════════════════════════════════════════════════════════════

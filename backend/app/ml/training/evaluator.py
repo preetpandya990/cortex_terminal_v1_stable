@@ -76,7 +76,9 @@ class ModelEvaluator:
         y_true: np.ndarray,
         y_pred: np.ndarray,
         y_proba: Optional[np.ndarray] = None,
-        returns: Optional[np.ndarray] = None
+        returns: Optional[np.ndarray] = None,
+        timestamps: Optional[np.ndarray] = None,
+        horizon_days: int = 1,
     ) -> EvaluationResults:
         """
         Comprehensive evaluation
@@ -100,7 +102,9 @@ class ModelEvaluator:
         # that previously let a model ship with no financial validation.
         if returns is not None:
             fin_metrics = calculate_financial_metrics(
-                y_pred, returns, self.daily_risk_free_rate
+                y_pred, returns, self.daily_risk_free_rate,
+                timestamps=timestamps,
+                horizon_days=horizon_days,
             )
         else:
             fin_metrics = {
@@ -251,6 +255,8 @@ def calculate_financial_metrics(
     entry_price: float = 1_000.0,
     notional: float = 100_000.0,
     slippage_bps: float = 5.0,
+    timestamps: Optional[np.ndarray] = None,
+    horizon_days: int = 1,
 ) -> Dict:
     """
     Calculate financial performance metrics using cost-aware backtesting.
@@ -291,23 +297,63 @@ def calculate_financial_metrics(
             'n_trades': 0, 'avg_return_per_trade': 0.0,
         }
 
-    # Cumulative return
-    cumulative = (1.0 + net_rets).cumprod()
-    total_return = float(cumulative[-1] - 1.0)
+    # ── Time-series metrics: require a genuine DAILY series ────────────────────
+    # The eval stream is a pooled (symbol × day) PANEL. Compounding or
+    # annualising over pooled rows treats the cross-section as extra time
+    # periods: total_return overflowed to ~1e+104 and Sharpe/√252 lost meaning
+    # (observed on the 1.2.0/0.49.0 runs, 2026-07-18). When timestamps are
+    # provided, collapse to the equal-weight daily portfolio first; otherwise
+    # fall back to the legacy per-row basis with a loud warning.
+    if timestamps is not None:
+        from app.ml.evaluation.backtest import aggregate_daily_portfolio
+        pred_arr = np.asarray(predictions)
+        # h-bar forward returns stamped daily → per-day carry (÷h), then
+        # non-overlapping h-day blocks for annualised ratios (overlap
+        # autocorrelation otherwise understates variance ~h-fold).
+        h = max(int(horizon_days), 1)
+        daily_carry = aggregate_daily_portfolio(net_rets / h, timestamps, pred_arr != 0)
+        if h > 1 and len(daily_carry) >= 2 * h:
+            n_blocks = len(daily_carry) // h
+            series = daily_carry[: n_blocks * h].reshape(n_blocks, h).sum(axis=1)
+            periods_per_year_eff = 252 // h
+        else:
+            series = daily_carry
+            periods_per_year_eff = 252
+        ts_basis = "daily_portfolio"
+    else:
+        if len(net_rets) > 1000:
+            logger.warning(
+                "calculate_financial_metrics: %d pooled panel rows with no "
+                "timestamps — time-series metrics (sharpe/sortino/drawdown/"
+                "total_return) are computed on the LEGACY per-row basis and "
+                "are unreliable at this width. Pass timestamps=.",
+                len(net_rets),
+            )
+        series = net_rets
+        periods_per_year_eff = 252
+        ts_basis = "pooled_rows_legacy"
+
+    # Cumulative return (log-space: overflow-proof even on the legacy basis)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_growth = np.log1p(np.clip(series, -0.9999, None))
+    total_return = float(np.expm1(log_growth.sum()))
 
     # Annualised Sharpe (ddof=1 for unbiased std)
-    excess = net_rets - risk_free_rate
+    excess = series - risk_free_rate
     std_exc = float(excess.std(ddof=1))
-    sharpe = float(np.sqrt(252) * excess.mean() / std_exc) if std_exc > 0.0 else 0.0
+    sharpe = float(np.sqrt(periods_per_year_eff) * excess.mean() / std_exc) if std_exc > 0.0 else 0.0
 
     # Annualised Sortino (downside deviation)
     downside = excess[excess < 0.0]
     std_down = float(downside.std(ddof=1)) if len(downside) > 1 else 0.0
-    sortino = float(np.sqrt(252) * excess.mean() / std_down) if std_down > 0.0 else 0.0
+    sortino = float(np.sqrt(periods_per_year_eff) * excess.mean() / std_down) if std_down > 0.0 else 0.0
 
-    # Max drawdown
+    # Max drawdown (guarded: equity can only be ≤ 0 after a −100% day, which
+    # the clip above prevents; errstate silences transient 0/0 on flat starts)
+    cumulative = np.exp(np.cumsum(log_growth))
     cummax = np.maximum.accumulate(cumulative)
-    drawdown = (cumulative - cummax) / cummax
+    with np.errstate(divide="ignore", invalid="ignore"):
+        drawdown = np.nan_to_num((cumulative - cummax) / np.where(cummax > 0, cummax, 1.0))
     max_dd = float(abs(drawdown.min()))
 
     # Active-bar trade stats (flat bars excluded from win-rate / profit factor)

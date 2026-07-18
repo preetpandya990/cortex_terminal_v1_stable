@@ -12,10 +12,17 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy import select, and_
 import logging
 
+from app.ml.features.cross_sectional_stats import rank_normalize_panel
+from app.ml.features.db_errors import (
+    is_transient_connection_error,
+    safe_close,
+    safe_rollback,
+)
+from app.ml.features.fundamental_features import FUNDAMENTAL_FEATURE_NAMES_V2
 from app.models.upstox_data import UpstoxOHLCV
 from app.ml.features.ohlcv_features import compute_all_technical_features, get_feature_names
 from app.ml.features.sentiment_features import compute_sentiment_features, merge_sentiment_with_ohlcv
@@ -25,8 +32,11 @@ from app.ml.features.sentiment_features import (
     merge_sentiment_with_ohlcv
 )
 from app.ml.features.fundamental_features import (
+    FUNDAMENTAL_FEATURE_NAMES_V2,
     compute_fundamental_features,
+    compute_fundamental_features_series,
     get_fundamental_feature_names,
+    merge_fundamentals_asof,
 )
 
 logger = logging.getLogger(__name__)
@@ -92,6 +102,7 @@ async def compute_features_for_symbol(
     db: AsyncSession,
     include_sentiment: bool = True,
     include_fundamentals: bool = True,
+    feature_set_version: str = "1.0.0",
 ) -> pd.DataFrame:
     """
     Compute the full feature set for a single symbol.
@@ -148,9 +159,22 @@ async def compute_features_for_symbol(
         sentiment_df = await compute_sentiment_features(symbol, start_date, end_date, db)
         features_df = merge_sentiment_with_ohlcv(features_df, sentiment_df)
 
-    # ── +20 fundamental features (cross-sectional; broadcast to all rows) ──────
+    # ── + fundamental features ─────────────────────────────────────────────────
     fund_col_set: frozenset[str] = frozenset()
-    if include_fundamentals:
+    if include_fundamentals and feature_set_version == "2.0.0":
+        # v2: point-in-time series merged backward-asof onto the daily rows —
+        # each row carries the fundamentals as the market knew them that day
+        # (effective_date = period_date + reporting lag). Rows before the
+        # first effective_date stay NaN; the cross-sectional rank pass in
+        # compute_features_batch maps NaN to neutral 0.
+        series = await compute_fundamental_features_series(
+            symbol, start_date.date(), end_date.date(), db
+        )
+        features_df = merge_fundamentals_asof(features_df, series)
+        fund_col_set = frozenset(FUNDAMENTAL_FEATURE_NAMES_V2)
+    elif include_fundamentals:
+        # v1 (legacy): 20 features computed once as of end_date, broadcast to
+        # every row.
         fund_feats = await compute_fundamental_features(symbol, end_date.date(), db)
         fund_col_set = frozenset(get_fundamental_feature_names())
         for feat_name, feat_val in fund_feats.items():
@@ -175,12 +199,52 @@ async def compute_features_batch(
     start_date: datetime,
     end_date: datetime,
     timeframe: str,
-    db: AsyncSession,
+    db: Optional[AsyncSession] = None,
     include_sentiment: bool = True,
     include_fundamentals: bool = True,
+    *,
+    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    chunk_size: int = 50,
+    feature_set_version: str = "1.0.0",
 ) -> Dict[str, pd.DataFrame]:
     """
     Compute features for multiple symbols in batch.
+
+    Fundamental normalization by feature-set version
+    ------------------------------------------------
+    ``feature_set_version="1.0.0"`` (default): legacy cross-sectional median
+    imputation (below) — kept verbatim for the 69-feature contract.
+
+    ``feature_set_version="2.0.0"``: per-date cross-sectional rank
+    normalization of FUNDAMENTAL_FEATURE_NAMES_V2 to [-1, 1] (Gu–Kelly–Xiu;
+    ``cross_sectional_stats.rank_normalize_panel``), NaN → neutral 0. No
+    imputation — a missing fundamental is a fact, not a gap to fill. Ranked
+    columns must then be **excluded** from rolling z-score by the caller
+    (they are already normalized); serving-side grids are persisted by the
+    daily feature-computation post-pass, not here.
+
+    Session strategy
+    ----------------
+    Two mutually compatible modes (exactly one of ``db`` / ``session_factory``
+    is required; ``session_factory`` wins when both are given):
+
+    ``db`` only (legacy)
+        Every symbol runs on the caller's single session.  A per-symbol
+        failure rolls the session back before continuing so one poisoned
+        transaction can no longer cascade ``PendingRollbackError`` into every
+        subsequent symbol.
+
+    ``session_factory`` (long batch runs — the training orchestrator)
+        Symbols are processed in chunks of ``chunk_size``, each chunk on its
+        own short-lived session.  On a *transient connection error* (dead
+        socket, invalidated pool connection — see
+        ``db_errors.is_transient_connection_error``) the chunk's session is
+        abandoned, a fresh one is opened, and the failed symbol is retried
+        exactly once; a second failure skips the symbol (existing semantics).
+        SQLAlchemy cannot resurrect a connection mid-transaction, so retry-on-
+        fresh-session is the only correct recovery — a single logical session
+        across a multi-hour run is exactly what killed the 2026-07-15 run at
+        symbol 803/2234.
 
     Fundamental imputation
     ----------------------
@@ -201,35 +265,105 @@ async def compute_features_batch(
         Dict mapping symbol → feature DataFrame.  All DataFrames are guaranteed
         to have no NaN values on return.
     """
+    if db is None and session_factory is None:
+        raise ValueError(
+            "compute_features_batch requires either `db` or `session_factory`"
+        )
+
     logger.info("Computing features for %d symbols...", len(symbols))
 
     results: Dict[str, pd.DataFrame] = {}
 
-    for i, symbol in enumerate(symbols, 1):
-        try:
-            logger.info("Processing %d/%d: %s", i, len(symbols), symbol)
-            features_df = await compute_features_for_symbol(
-                symbol, start_date, end_date, timeframe, db,
-                include_sentiment=include_sentiment,
-                include_fundamentals=include_fundamentals,
+    async def _compute_one(symbol: str, session: AsyncSession) -> None:
+        features_df = await compute_features_for_symbol(
+            symbol, start_date, end_date, timeframe, session,
+            include_sentiment=include_sentiment,
+            include_fundamentals=include_fundamentals,
+            feature_set_version=feature_set_version,
+        )
+        if not features_df.empty:
+            results[symbol] = features_df
+        else:
+            logger.warning("No features computed for %s", symbol)
+
+    if session_factory is None:
+        # Legacy single-session path: rollback on failure so one bad symbol
+        # cannot poison the shared session for every symbol after it.
+        for i, symbol in enumerate(symbols, 1):
+            try:
+                logger.info("Processing %d/%d: %s", i, len(symbols), symbol)
+                await _compute_one(symbol, db)
+            except Exception as exc:
+                logger.error("Error computing features for %s: %s", symbol, exc, exc_info=True)
+                await safe_rollback(db, symbol)
+                continue
+    else:
+        n_retried = 0
+        n_recovered = 0
+        position = 0
+        for chunk_start in range(0, len(symbols), chunk_size):
+            chunk = symbols[chunk_start:chunk_start + chunk_size]
+            session = session_factory()
+            try:
+                for symbol in chunk:
+                    position += 1
+                    logger.info("Processing %d/%d: %s", position, len(symbols), symbol)
+                    try:
+                        await _compute_one(symbol, session)
+                    except Exception as exc:
+                        await safe_rollback(session, symbol)
+                        if not is_transient_connection_error(exc):
+                            logger.error(
+                                "Error computing features for %s: %s",
+                                symbol, exc, exc_info=True,
+                            )
+                            continue
+
+                        # Transient connection fault: the session is dead.
+                        # Abandon it, retry this symbol once on a fresh one.
+                        logger.warning(
+                            "Transient connection error on %s — retrying once "
+                            "on a fresh session: %s", symbol, exc,
+                        )
+                        await safe_close(session, symbol)
+                        session = session_factory()
+                        n_retried += 1
+                        try:
+                            await _compute_one(symbol, session)
+                            n_recovered += 1
+                        except Exception as retry_exc:
+                            logger.error(
+                                "Retry failed for %s — skipping: %s",
+                                symbol, retry_exc, exc_info=True,
+                            )
+                            await safe_rollback(session, symbol)
+                            if is_transient_connection_error(retry_exc):
+                                # The fresh session died too; replace it so the
+                                # rest of the chunk doesn't run on a corpse.
+                                await safe_close(session, symbol)
+                                session = session_factory()
+            finally:
+                await safe_close(session, f"chunk ending at {position}/{len(symbols)}")
+
+        if n_retried:
+            logger.info(
+                "Transient-connection retries: %d attempted, %d recovered",
+                n_retried, n_recovered,
             )
-            if not features_df.empty:
-                results[symbol] = features_df
-            else:
-                logger.warning("No features computed for %s", symbol)
-        except Exception as exc:
-            logger.error("Error computing features for %s: %s", symbol, exc, exc_info=True)
-            continue
 
     logger.info("Per-symbol computation complete: %d/%d symbols", len(results), len(symbols))
 
-    # ── Cross-sectional median imputation for fundamental features ─────────────
+    # ── v2: cross-sectional rank normalization (replaces imputation) ───────────
+    if include_fundamentals and results and feature_set_version == "2.0.0":
+        rank_normalize_panel(results, FUNDAMENTAL_FEATURE_NAMES_V2)
+
+    # ── v1 (legacy): cross-sectional median imputation ──────────────────────────
     # Fundamental columns may be NaN for symbols with insufficient history.
     # We collect one representative value per symbol (all rows carry the same
     # broadcast value, so iloc[0] of a non-NaN series is sufficient), compute
     # the universe median per feature, and fill.  Symbols with no valid peers
     # for a given feature receive 0 as the final fallback.
-    if include_fundamentals and results:
+    if include_fundamentals and results and feature_set_version != "2.0.0":
         fund_cols = get_fundamental_feature_names()
 
         medians: Dict[str, float] = {}
@@ -438,6 +572,7 @@ def create_sequences(
 def get_all_feature_names(
     include_sentiment: bool = True,
     include_fundamentals: bool = True,
+    feature_set_version: str = "1.0.0",
 ) -> List[str]:
     """
     Return the ordered feature name list used by the ML models.
@@ -445,9 +580,9 @@ def get_all_feature_names(
     Counts (confirmed from source):
       44 technical (ohlcv_features.get_feature_names)
        5 sentiment (sentiment_features.get_sentiment_feature_names)
-      20 fundamental (fundamental_features.get_fundamental_feature_names)
+      20 fundamental (v1)  /  17 fundamental (v2 — pe/pb/ev dropped)
       ──
-      69 total (when all flags are True)
+      69 total (v1)  /  66 total (v2)   when all flags are True
     """
     features = get_feature_names()  # 44 technical features
 
@@ -455,9 +590,30 @@ def get_all_feature_names(
         features.extend(get_sentiment_feature_names())  # +5 = 49
 
     if include_fundamentals:
-        features.extend(get_fundamental_feature_names())  # +20 = 69
+        features.extend(get_fundamental_feature_names(feature_set_version))
 
     return features
+
+
+def zscore_feature_cols(
+    feature_names: List[str],
+    feature_set_version: str = "1.0.0",
+) -> List[str]:
+    """
+    Columns that rolling z-score normalization should touch.
+
+    Under v2 the 17 fundamentals arrive cross-sectionally rank-normalized in
+    [-1, 1] and MUST be excluded — z-scoring them would destroy the calibrated
+    scale (and, for near-constant stretches, recreate the v1 zero-out bug).
+    Under v1 every feature is z-scored, exactly as before.
+
+    Shared by the training orchestrator and the inference FeatureLoader so
+    the exclusion can never drift between the two.
+    """
+    if feature_set_version == "2.0.0":
+        excluded = frozenset(FUNDAMENTAL_FEATURE_NAMES_V2)
+        return [f for f in feature_names if f not in excluded]
+    return list(feature_names)
 
 
 async def prepare_training_data(
@@ -471,6 +627,7 @@ async def prepare_training_data(
     include_fundamentals: bool = True,
     normalize: bool = True,
     precomputed_features: Optional[Dict[str, pd.DataFrame]] = None,
+    feature_set_version: str = "1.0.0",
 ) -> Dict[str, Dict[str, np.ndarray]]:
     """
     Prepare complete training data for multiple symbols.
@@ -505,11 +662,13 @@ async def prepare_training_data(
             symbols, start_date, end_date, timeframe, db,
             include_sentiment=include_sentiment,
             include_fundamentals=include_fundamentals,
+            feature_set_version=feature_set_version,
         )
 
     feature_names = get_all_feature_names(
         include_sentiment=include_sentiment,
         include_fundamentals=include_fundamentals,
+        feature_set_version=feature_set_version,
     )
     
     # Process each symbol
@@ -517,9 +676,12 @@ async def prepare_training_data(
     
     for symbol, features_df in features_dict.items():
         try:
-            # Normalize features
+            # Normalize features (v2: rank-normalized fundamentals excluded)
             if normalize:
-                features_df = normalize_features(features_df, method='rolling', window=60)
+                features_df = normalize_features(
+                    features_df, method='rolling', window=60,
+                    feature_cols=zscore_feature_cols(feature_names, feature_set_version),
+                )
             
             # Create sequences
             X, timestamps, _ = create_sequences(

@@ -61,6 +61,7 @@ from scipy import stats
 
 from app.ml.evaluation.backtest import (
     TRAINING_DECISION_THRESHOLD,
+    aggregate_daily_portfolio,
     per_period_sharpe,
     path_sharpe,
     strategy_returns,
@@ -329,6 +330,15 @@ def probability_of_backtest_overfitting(path_sharpes: np.ndarray) -> float:
     return float((s <= 0.0).sum() / s.size)
 
 
+def _to_decision_periods(daily: np.ndarray, horizon_days: int) -> np.ndarray:
+    """Aggregate a daily carry series into non-overlapping horizon blocks."""
+    h = max(int(horizon_days), 1)
+    if h == 1 or len(daily) < 2 * h:
+        return daily
+    n_blocks = len(daily) // h
+    return daily[: n_blocks * h].reshape(n_blocks, h).sum(axis=1)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Orchestrated computation from CPCV OOF artifacts
 # ──────────────────────────────────────────────────────────────────────────────
@@ -344,6 +354,7 @@ def compute_dsr_and_pbo(
     periods_per_year: int = 252,
     risk_free_rate_annual: float = 0.05,
     trial_sharpes: np.ndarray | None = None,
+    horizon_days: int = 1,
 ) -> dict[str, Any]:
     """
     Compute DSR and OOS stability diagnostics from CPCV OOF path artifacts.
@@ -447,9 +458,16 @@ def compute_dsr_and_pbo(
 
     daily_rfr = (1.0 + risk_free_rate_annual) ** (1.0 / periods_per_year) - 1.0
 
+    # Timestamps enable the panel → daily-portfolio collapse. Without them the
+    # legacy pooled-row basis is used, which OVERSTATES T by the cross-
+    # sectional width and saturates DSR — hence the loud warning below.
+    has_timestamps = all("timestamp" in p for p in cpcv_oof_paths)
+
     per_period_srs: list[float] = []
     annualised_srs: list[float] = []
     all_net_rets: list[np.ndarray] = []
+    all_ts: list[np.ndarray] = []
+    all_active: list[np.ndarray] = []
     obs_counts: list[int] = []
 
     for i, path in enumerate(cpcv_oof_paths):
@@ -470,14 +488,28 @@ def compute_dsr_and_pbo(
             entry_price=entry_price,
             slippage_bps=slippage_bps,
         ).astype(np.float64)
+        active = pred != 0
 
-        pp_sr = per_period_sharpe(net, daily_rfr=daily_rfr)
+        if has_timestamps:
+            ts = np.asarray(path["timestamp"])
+            # Per-path SR on the path's own daily portfolio series so the
+            # OOS-loss-rate diagnostic shares the corrected basis.
+            path_daily = _to_decision_periods(
+                aggregate_daily_portfolio(net / max(horizon_days, 1), ts, active),
+                horizon_days,
+            )
+            pp_sr = per_period_sharpe(path_daily, daily_rfr=daily_rfr * horizon_days)
+            all_ts.append(ts)
+            all_active.append(active)
+            obs_counts.append(len(path_daily))
+        else:
+            pp_sr = per_period_sharpe(net, daily_rfr=daily_rfr)
+            obs_counts.append(len(net))
+
         ann_sr = pp_sr * (periods_per_year ** 0.5)
-
         per_period_srs.append(pp_sr)
         annualised_srs.append(ann_sr)
         all_net_rets.append(net)
-        obs_counts.append(len(net))
 
     if not per_period_srs:
         raise ValueError(
@@ -490,12 +522,42 @@ def compute_dsr_and_pbo(
     # _path_of[(combo_id, g)] map in cpcv.py is injective over panel rows).
     # Simple concatenation therefore gives the complete, non-repeated OOS stream.
     pooled_returns = np.concatenate(all_net_rets)
-    sr_candidate = per_period_sharpe(pooled_returns, daily_rfr=daily_rfr)
-    T_candidate = len(pooled_returns)
+
+    if has_timestamps:
+        # Collapse the pooled panel to ONE daily portfolio return series, then
+        # to NON-OVERLAPPING horizon blocks — sr, T, skew, kurtosis must all
+        # describe this genuine, serially de-overlapped time series.
+        #
+        # forward_return rows are h-bar (h=horizon_days) returns stamped on
+        # EVERY day: naively compounding them counts each position h times,
+        # and the h-day overlap autocorrelation understates variance. The
+        # per-day carry (÷h) fixes the compounding; blocking at h restores
+        # approximate serial independence for the CLT behind the DSR.
+        pooled_daily = aggregate_daily_portfolio(
+            pooled_returns / max(horizon_days, 1),
+            np.concatenate(all_ts),
+            np.concatenate(all_active),
+        )
+        candidate_series = _to_decision_periods(pooled_daily, horizon_days)
+        daily_rfr = daily_rfr * horizon_days      # rfr per h-day block
+        periods_per_year = max(periods_per_year // max(horizon_days, 1), 1)
+        dsr_basis = "daily_portfolio"
+    else:
+        logger.warning(
+            "compute_dsr_and_pbo: paths carry no 'timestamp' — falling back "
+            "to the LEGACY pooled-row basis. T is inflated by the cross-"
+            "sectional width and the DSR WILL saturate toward 1.0; treat the "
+            "result as unreliable. Re-run with timestamped OOF paths."
+        )
+        candidate_series = pooled_returns
+        dsr_basis = "pooled_rows_legacy"
+
+    sr_candidate = per_period_sharpe(candidate_series, daily_rfr=daily_rfr)
+    T_candidate = len(candidate_series)
 
     # All four statistical objects must come from the same series.
-    skew = float(stats.skew(pooled_returns))
-    kurt_raw = float(stats.kurtosis(pooled_returns, fisher=False))
+    skew = float(stats.skew(candidate_series))
+    kurt_raw = float(stats.kurtosis(candidate_series, fisher=False))
 
     # Per-path array (for OOS loss rate and informational distribution)
     pp_arr = np.array(per_period_srs, dtype=np.float64)
@@ -581,10 +643,10 @@ def compute_dsr_and_pbo(
     }
 
     logger.info(
-        "DSR (Phase-B corrected) — "
-        "pooled_SR=%.4f  T=%d  N=1→DSR=%.4f  N=%d→DSR=%.4f  "
+        "DSR (daily-portfolio basis: %s) — "
+        "SR=%.4f  T=%d  N=1→DSR=%.4f  N=%d→DSR=%.4f  "
         "oos_loss_rate=%.4f  paths=%d  skew=%.3f  kurt_raw=%.3f",
-        sr_candidate, T_candidate,
+        dsr_basis, sr_candidate, T_candidate,
         dsr_n1, _N_HPO_TRIALS_UPPER, dsr_n_upper,
         oos_loss_rate, n_cpcv_paths, skew, kurt_raw,
     )
@@ -594,6 +656,9 @@ def compute_dsr_and_pbo(
         "deflated_sharpe":        dsr_n1,
         "pooled_oos_sharpe":      float(sr_candidate),
         "n_obs_pooled":           T_candidate,
+        # "daily_portfolio" (panel collapsed to a genuine daily time series)
+        # or "pooled_rows_legacy" (no timestamps — T inflated, DSR unreliable).
+        "dsr_basis":              dsr_basis,
 
         # ── DSR sensitivity band ──────────────────────────────────────────────
         "dsr_sensitivity":        dsr_sensitivity,

@@ -134,6 +134,8 @@ class EnsembleTrainer:
         l2: float = 0.10,
         grid_points: int = 201,
         backtest: Optional[Dict[str, Any]] = None,
+        timestamps: Optional[np.ndarray] = None,
+        horizon_days: int = 1,
     ) -> Dict[str, Any]:
         """Select blend weights on the leakage-free joint OOF set.
 
@@ -294,9 +296,9 @@ class EnsembleTrainer:
 
         # Net DSR (the bar): A3 is the single authority — no duplicated maths.
         ens_p = w_xgb * p_xgb + w_gru * p_gru
-        ens_dsr = self._net_dsr(ens_p, fwd_ret, path_id, bt)
-        solo_xgb = self._net_dsr(p_xgb, fwd_ret, path_id, bt)
-        solo_gru = self._net_dsr(p_gru, fwd_ret, path_id, bt)
+        ens_dsr = self._net_dsr(ens_p, fwd_ret, path_id, bt, timestamps, horizon_days)
+        solo_xgb = self._net_dsr(p_xgb, fwd_ret, path_id, bt, timestamps, horizon_days)
+        solo_gru = self._net_dsr(p_gru, fwd_ret, path_id, bt, timestamps, horizon_days)
 
         standalone = {"xgboost": solo_xgb, "gru": solo_gru}
         best_name = max(standalone, key=lambda m: standalone[m]["deflated_sharpe"])
@@ -362,18 +364,30 @@ class EnsembleTrainer:
         fwd_ret: np.ndarray,
         path_id: np.ndarray,
         bt: Dict[str, Any],
+        timestamps: Optional[np.ndarray] = None,
+        horizon_days: int = 1,
     ) -> Dict[str, Any]:
         """Net Deflated Sharpe + PBO for a probability vector, via the A3
-        authority. Paths = per-symbol purged windows."""
+        authority. Paths = per-symbol purged windows.
+
+        ``timestamps`` (row-aligned) enable the daily-portfolio DSR basis in
+        compute_dsr_and_pbo; without them the legacy pooled-row basis
+        saturates DSR toward 1.0 (see deflated_sharpe.py, 2026-07-18).
+        """
         paths = [
             {
                 "proba":          proba[path_id == pid],
                 "forward_return": fwd_ret[path_id == pid],
+                **(
+                    {"timestamp": timestamps[path_id == pid]}
+                    if timestamps is not None else {}
+                ),
             }
             for pid in np.unique(path_id)
         ]
         return compute_dsr_and_pbo(
             paths,
+            horizon_days=horizon_days,
             mode=bt["mode"],
             notional=bt["notional"],
             product_type=bt["product_type"],

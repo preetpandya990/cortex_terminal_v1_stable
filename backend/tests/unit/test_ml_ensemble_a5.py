@@ -272,8 +272,10 @@ def test_fail_loud_on_empty_inputs():
 # 7 — Checkpoint v4 round-trip (cpcv_oof symbol + GRU sub-A join keys)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_schema_version_is_four():
-    assert SCHEMA_VERSION == 4
+def test_schema_version_is_five():
+    # v4 was A5's contract; v5 is the deliberate WS2 bump (feature-set
+    # versioning). Update only alongside a documented schema change.
+    assert SCHEMA_VERSION == 5
 
 
 def test_cpcv_oof_carries_symbol_round_trip(tmp_path: Path):

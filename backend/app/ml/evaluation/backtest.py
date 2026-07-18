@@ -202,6 +202,52 @@ def strategy_returns(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Daily portfolio aggregation  (panel → time series)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def aggregate_daily_portfolio(
+    net_returns: np.ndarray,
+    timestamps: np.ndarray,
+    active_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Collapse pooled panel rows (symbol × day) into ONE daily portfolio
+    return series — the statistically honest object for Sharpe / DSR /
+    drawdown / compounding.
+
+    Why this exists (2026-07-18): pooled CPCV/eval streams hold ~30k
+    (symbol, day) rows spanning only ~150 distinct sessions. Treating those
+    rows as sequential periods (a) compounds "30,000 periods" →
+    ``total_return`` overflows to 1e+104, and (b) feeds T=30,000 into the
+    DSR's √(T−1), saturating DSR at exactly 1.0 for ANY positive pooled
+    Sharpe — observed on all four 1.2.0/0.49.0 models, including one with
+    annualised Sharpe 0.338. Same-day rows across symbols are cross-
+    sectionally correlated, so they are not independent observations.
+
+    Semantics: for each calendar day, the portfolio return is the EQUAL-WEIGHT
+    mean of net returns over the rows the strategy was active on that day
+    (``active_mask``; falls back to all rows). Days with no active rows
+    contribute 0.0 (capital idle in cash) so the time axis — and therefore
+    annualisation and T — stays honest. Output is ordered by day.
+    """
+    net = np.asarray(net_returns, dtype=np.float64)
+    ts = np.asarray(timestamps).astype("datetime64[D]")
+    if active_mask is None:
+        active_mask = np.ones(len(net), dtype=bool)
+    else:
+        active_mask = np.asarray(active_mask, dtype=bool)
+
+    days, inverse = np.unique(ts, return_inverse=True)
+    sums = np.zeros(len(days), dtype=np.float64)
+    counts = np.zeros(len(days), dtype=np.int64)
+    np.add.at(sums, inverse[active_mask], net[active_mask])
+    np.add.at(counts, inverse[active_mask], 1)
+
+    daily = np.where(counts > 0, sums / np.maximum(counts, 1), 0.0)
+    return daily
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Sharpe helpers  (used by deflated_sharpe.py)
 # ──────────────────────────────────────────────────────────────────────────────
 

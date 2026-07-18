@@ -74,3 +74,32 @@ class TestSignalAssembler:
         m = {"score":  0.0, "confidence": 0.5}
         t = {"score":  5.0, "confidence": 0.5}
         assert a.fuse_signals(e, m, t)["action"] == "HOLD"
+
+    def test_fuse_signals_exact_positive_boundary_is_buy(self):
+        """fused_score == +50 exactly → BUY (inclusive threshold)."""
+        a = SignalAssembler()
+        e = {"score": 50.0, "confidence": 0.5, "events": []}
+        m = {"score": 50.0, "confidence": 0.5}
+        t = {"score": 50.0, "confidence": 0.5}
+        result = a.fuse_signals(e, m, t)
+        assert abs(result["fused_score"] - 50.0) < 1e-9
+        assert result["action"] == "BUY"
+
+    def test_fuse_signals_exact_negative_boundary_is_sell(self):
+        """fused_score == -50 exactly → SELL (inclusive threshold)."""
+        a = SignalAssembler()
+        e = {"score": -50.0, "confidence": 0.5, "events": []}
+        m = {"score": -50.0, "confidence": 0.5}
+        t = {"score": -50.0, "confidence": 0.5}
+        result = a.fuse_signals(e, m, t)
+        assert abs(result["fused_score"] + 50.0) < 1e-9
+        assert result["action"] == "SELL"
+
+    def test_fuse_signals_just_inside_boundary_is_hold(self):
+        """Scores strictly inside (-50, +50) remain HOLD."""
+        a = SignalAssembler()
+        for score, expected in ((49.99, "HOLD"), (-49.99, "HOLD")):
+            e = {"score": score, "confidence": 0.5, "events": []}
+            m = {"score": score, "confidence": 0.5}
+            t = {"score": score, "confidence": 0.5}
+            assert a.fuse_signals(e, m, t)["action"] == expected

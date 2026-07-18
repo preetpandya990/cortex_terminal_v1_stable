@@ -229,6 +229,7 @@ class TestResumeTrainingSamplesInvariant:
                 "include_fundamentals": True,
                 "model_version":        "1.0.0",
                 "n_symbols":            1000,
+                "feature_set_version":  "1.0.0",
             },
         }
         (checkpoint_dir / "checkpoint.json").write_text(json.dumps(checkpoint))
@@ -272,6 +273,7 @@ class TestResumeTrainingSamplesInvariant:
                 "include_fundamentals": True,
                 "model_version":        "1.0.0",
                 "n_symbols":            1000,
+                "feature_set_version":  "1.0.0",
             },
         }
         (checkpoint_dir / "checkpoint.json").write_text(json.dumps(checkpoint))
@@ -290,7 +292,7 @@ class TestResumeTrainingSamplesInvariant:
 
         # model_version must match the fixture (1.0.0) — it's a model-affecting
         # key, so any drift triggers StaleCheckpointError before the A7 check.
-        config = TrainingConfig(n_symbols=1000, min_symbol_coverage=0.85, model_version="1.0.0")
+        config = TrainingConfig(n_symbols=1000, min_symbol_coverage=0.85, model_version="1.0.0", feature_set_version="1.0.0")
         orc = ProductionTrainingOrchestrator(
             db_session=AsyncMock(),
             config=config,
@@ -315,7 +317,7 @@ class TestResumeTrainingSamplesInvariant:
         checkpoint_dir = output_dir / "checkpoints"
         self._write_valid_step2_checkpoint(checkpoint_dir, total_rows=150_000)
 
-        config = TrainingConfig(n_symbols=1000, min_symbol_coverage=0.85, model_version="1.0.0")
+        config = TrainingConfig(n_symbols=1000, min_symbol_coverage=0.85, model_version="1.0.0", feature_set_version="1.0.0")
         orc = ProductionTrainingOrchestrator(
             db_session=AsyncMock(),
             config=config,

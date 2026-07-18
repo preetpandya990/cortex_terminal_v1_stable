@@ -100,7 +100,13 @@ PIPELINE_STEPS: List[str] = [
 #        sub-A eval arrays carry per-row ``symbol`` + ``timestamp``. These are
 #        the join keys for the leakage-free ensemble net-DSR weighting; a v3
 #        checkpoint lacks them, so its step-5/6 artifacts cannot drive A5.
-SCHEMA_VERSION = 4
+#   v5 — WS2 (ML_FIX_IMPLEMENTATION_PLAN.md): the feature contract became
+#        version-selected (66-feature PIT rank-normalized v2 vs legacy 69).
+#        A v4 checkpoint's feature/sequence/target artifacts carry no
+#        feature-set provenance, so resuming one under v5 code could silently
+#        train on the wrong contract. StaleCheckpointError is the correct,
+#        loud outcome for every pre-existing run dir.
+SCHEMA_VERSION = 5
 
 # Config keys whose value determines the shape/meaning of every downstream
 # artifact (features, sequences, targets, models). Changing any of them makes a
@@ -111,6 +117,12 @@ _MODEL_AFFECTING_KEYS = frozenset({
     "sequence_length",
     "include_fundamentals",
     "model_version",
+    # WS2 — the feature-set contract (66 PIT rank-normalized vs legacy 69)
+    # changes every artifact from step 2 onward.
+    "feature_set_version",
+    # Smoke runs (--n-symbols) shrink the universe; a smoke checkpoint must
+    # never resume into (or be resumed by) a full run.
+    "n_symbols",
 })
 
 

@@ -18,6 +18,7 @@ from sqlalchemy.orm import selectinload
 import logging
 
 from app.ai.fusion.models import AIProcessedEvent, AINLPResult, AIEventClassification
+from app.ml.features.db_errors import is_transient_connection_error, safe_rollback
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,13 @@ class SentimentFeatureExtractor:
             
         except Exception as e:
             logger.error(f"Error extracting sentiment features for {symbol}: {e}")
+            await safe_rollback(db, f"sentiment extract {symbol}")
+            # A dead connection is not "no sentiment data" — swallowing it here
+            # poisons the caller's session and (pre-2026-07-15 fix) cascaded
+            # PendingRollbackError across the whole batch.  Re-raise so the
+            # batch-level fresh-session retry in compute_features_batch can act.
+            if is_transient_connection_error(e):
+                raise
             return self._create_empty_features(start_date, end_date)
     
     async def _fetch_sentiment_data(
@@ -158,6 +166,12 @@ class SentimentFeatureExtractor:
             
         except Exception as e:
             logger.error(f"Database query failed for {symbol}: {e}")
+            await safe_rollback(db, f"sentiment fetch {symbol}")
+            # Transient connection faults must propagate: returning an empty
+            # frame here is what silently swallowed the root error of the
+            # 2026-07-15 scheduled-retrain crash (symbol 803/2234).
+            if is_transient_connection_error(e):
+                raise
             return pd.DataFrame()
     
     def _compute_features(

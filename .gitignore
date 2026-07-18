@@ -185,6 +185,9 @@ backend/validation_output.log
 backend/models/production/checkpoints/**
 !backend/models/production/checkpoints/
 !backend/models/production/checkpoints/.gitkeep
+# Archived training checkpoint dumps are local artifacts and can exceed
+# GitHub's file size limits; never commit them.
+backend/models/production/checkpoints_archive_*/
 
 # Keep test_artifacts directory structure, but do not commit artifact contents
 backend/test_artifacts/**

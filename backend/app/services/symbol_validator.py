@@ -7,6 +7,9 @@ A symbol is eligible if it exists in instrument_master as:
   - exchange = 'NSE'
   - instrument_type in {EQ, BE, BZ, SM, ST}  (the full NSE cash-equity universe)
   - is_active = True
+  - asset_class = 'STOCK'  (excludes ETFs/mutual-fund units and REIT/InvIT
+                            trust units — see app.services.instrument_classifier;
+                            NSE's own series taxonomy does not distinguish these)
 
 The full series set matches instrument_fetch._ALLOWED_TYPES — any change to the
 tradeable universe must be mirrored there and in schemas.trade_suggestions._RESTRICTED_NSE_SERIES.
@@ -41,6 +44,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.upstox_data import InstrumentMaster
+from app.services.instrument_classifier import AssetClass
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +224,7 @@ class SymbolValidatorService:
                 InstrumentMaster.trading_symbol == symbol,
                 InstrumentMaster.exchange == _EXCHANGE,
                 InstrumentMaster.instrument_type.in_(_ELIGIBLE_INSTRUMENT_TYPES),
+                InstrumentMaster.asset_class == AssetClass.STOCK.value,
             )
             .limit(1)
         )
@@ -264,6 +269,7 @@ class SymbolValidatorService:
                 InstrumentMaster.trading_symbol == symbol,
                 InstrumentMaster.exchange == _EXCHANGE,
                 InstrumentMaster.instrument_type.in_(_ELIGIBLE_INSTRUMENT_TYPES),
+                InstrumentMaster.asset_class == AssetClass.STOCK.value,
             )
             .limit(1)
         )
@@ -302,6 +308,7 @@ class SymbolValidatorService:
                 InstrumentMaster.trading_symbol.in_(unique),
                 InstrumentMaster.exchange == _EXCHANGE,
                 InstrumentMaster.instrument_type.in_(_ELIGIBLE_INSTRUMENT_TYPES),
+                InstrumentMaster.asset_class == AssetClass.STOCK.value,
                 InstrumentMaster.name.isnot(None),
             )
         )
@@ -322,6 +329,9 @@ class SymbolValidatorService:
                     InstrumentMaster.instrument_type.in_(_ELIGIBLE_INSTRUMENT_TYPES),
                     # Eligibility gate: a delisted instrument is not tradeable.
                     InstrumentMaster.is_active.is_(True),
+                    # Eligibility gate: ETFs/REITs/InvITs are not single-company
+                    # stocks — this system is scoped to stocks only.
+                    InstrumentMaster.asset_class == AssetClass.STOCK.value,
                 )
                 .limit(1)
             )
@@ -344,6 +354,9 @@ class SymbolValidatorService:
                 InstrumentMaster.instrument_type.in_(_ELIGIBLE_INSTRUMENT_TYPES),
                 # Eligibility gate: only active (live) instruments are tradeable.
                 InstrumentMaster.is_active.is_(True),
+                # Eligibility gate: ETFs/REITs/InvITs are not single-company
+                # stocks — this system is scoped to stocks only.
+                InstrumentMaster.asset_class == AssetClass.STOCK.value,
             )
             result = await db.execute(stmt)
             return {row.trading_symbol for row in result.all()}

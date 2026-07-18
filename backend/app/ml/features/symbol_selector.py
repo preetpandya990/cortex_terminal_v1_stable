@@ -51,7 +51,8 @@ import pandas as pd
 from sqlalchemy import func, select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.upstox_data import UpstoxOHLCV
+from app.models.upstox_data import InstrumentMaster, UpstoxOHLCV
+from app.services.instrument_classifier import AssetClass
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,26 @@ _TRADING_DAY_RATIO: float = 252 / 365   # ≈ 0.6904
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
+
+def _tradeable_stock_subquery():
+    """Semi-join filter: instrument_keys of active, single-company equities.
+
+    Cortex is scoped to STOCK only (see instrument_classifier / migration
+    0055). Liquid ETFs rank at the very top of any raw volume ordering, so
+    selecting from upstox_ohlcv without this filter silently trains on fund
+    units the system will never scan or suggest — 229 ETFs + 14 UNCLASSIFIED
+    made it into a 2,245-symbol universe when this gate was missing
+    (found live 2026-07-17, training run stopped and restarted).
+
+    UNCLASSIFIED is excluded deliberately: the asset-class design is
+    fail-closed — an instrument the classifier could not identify is never
+    silently treated as a tradeable stock.
+    """
+    return select(InstrumentMaster.instrument_key).where(
+        InstrumentMaster.is_active.is_(True),
+        InstrumentMaster.asset_class == AssetClass.STOCK.value,
+    )
+
 
 async def get_top_liquid_symbols(
     db: AsyncSession,
@@ -155,6 +176,8 @@ async def get_top_liquid_symbols(
                 UpstoxOHLCV.timeframe == timeframe,
                 UpstoxOHLCV.timestamp >= start_date,
                 UpstoxOHLCV.timestamp <= end_date,
+                # STOCK-only universe — see _tradeable_stock_subquery.
+                UpstoxOHLCV.instrument_key.in_(_tradeable_stock_subquery()),
             )
         )
         .group_by(UpstoxOHLCV.instrument_key)
@@ -296,6 +319,8 @@ async def get_recently_listed_symbols(
                 UpstoxOHLCV.timeframe  == timeframe,
                 UpstoxOHLCV.timestamp  >= start_date,
                 UpstoxOHLCV.timestamp  <= end_date,
+                # STOCK-only universe — see _tradeable_stock_subquery.
+                UpstoxOHLCV.instrument_key.in_(_tradeable_stock_subquery()),
             )
         )
         .group_by(UpstoxOHLCV.instrument_key)

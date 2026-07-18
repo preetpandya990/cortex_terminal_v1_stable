@@ -226,6 +226,7 @@ class InstrumentSyncService:
 
             metrics.instrument_active_count.set(result.active_after)
             metrics.instrument_delisted_count.set(result.total_after - result.active_after)
+            metrics.instrument_unclassified_count.set(result.unclassified)
             metrics.instrument_sync_last_success_timestamp.set(time.time())
             result_label = "success"
             return result

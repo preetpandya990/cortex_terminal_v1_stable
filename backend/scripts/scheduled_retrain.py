@@ -63,6 +63,13 @@ _ORCHESTRATOR_CMD: tuple[str, ...] = (
     "--fresh",
 )
 
+# Subprocess command for the B1+B2 feedback-weight bundle builder (WS3).
+# Isolated in its own process for the same reason the orchestrator is: a
+# builder crash must never take the retrain down with it.
+_FEEDBACK_BUILDER_CMD: tuple[str, ...] = (
+    "scripts/build_feedback_weights.py",
+)
+
 
 def _utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -140,6 +147,112 @@ def _resolve_project_root() -> Path:
     return Path(__file__).parent.parent
 
 
+def _build_feedback_bundle(cwd: Path, log_dir: Path) -> int:
+    """Subprocess-invoke the feedback-weight builder, tee'd to its own log.
+
+    Returns the builder's exit code (0 ok / 1 no-data / 2 error — see
+    build_feedback_weights.py). The caller treats every non-zero code as
+    "train unweighted", never as a retrain failure.
+    """
+    log_file = log_dir / f"feedback_build_{_utc_stamp()}.log"
+    LOG.info("Feedback bundle build  log: %s", log_file)
+    return _tee_subprocess(
+        cmd=[sys.executable, *_FEEDBACK_BUILDER_CMD],
+        cwd=cwd,
+        log_file=log_file,
+    )
+
+
+def _select_newest_bundle(
+    bundle_dir: Path,
+    max_age_days: int = 7,
+) -> Path | None:
+    """Newest usable feedback bundle in *bundle_dir*, or None.
+
+    Usable = a ``*.parquet`` whose ``.meta.json`` sidecar exists (an orphan
+    parquet means ``write_bundle`` died mid-write — skip it and consider the
+    next-newest) AND whose mtime is within *max_age_days*. Staleness is
+    checked only on the newest sidecar-complete bundle: anything older is
+    staler still, so falling back further would defeat the guard's purpose
+    (never silently train on week-old weights because tonight's build
+    exited non-zero).
+    """
+    if not bundle_dir.is_dir():
+        return None
+
+    # Bundle filenames encode a UTC stamp, so name order == chronological.
+    for parquet in sorted(bundle_dir.glob("*.parquet"), reverse=True):
+        sidecar = parquet.with_name(parquet.stem + ".meta.json")
+        if not sidecar.is_file():
+            LOG.warning("Skipping orphan bundle (no .meta.json sidecar): %s", parquet.name)
+            continue
+        age = datetime.now(timezone.utc) - datetime.fromtimestamp(
+            parquet.stat().st_mtime, tz=timezone.utc
+        )
+        if age.days >= max_age_days:
+            LOG.warning(
+                "Newest complete bundle %s is %d day(s) old (max %d) — "
+                "rejecting as stale; training will be unweighted.",
+                parquet.name, age.days, max_age_days,
+            )
+            return None
+        return parquet
+    return None
+
+
+def _assemble_orchestrator_cmd(
+    project_root: Path,
+    log_dir: Path,
+    *,
+    dry_run: bool = False,
+) -> list[str]:
+    """Base orchestrator command + optional --feedback-weights (WS3).
+
+    Builder failure → WARN and train unweighted; regardless of the builder's
+    exit code the newest usable bundle (which may predate this run) is used.
+    Only the retrain's own exit code ever drives the wrapper's 0/1/2.
+    """
+    cmd = list(_ORCHESTRATOR_CMD)
+
+    version_pin = SCHEDULED_RETRAIN.get("model_version_override")
+    if version_pin:
+        # One-shot pin; the orchestrator self-heals if it is already taken.
+        LOG.info("Model version pin from config: %s", version_pin)
+        cmd += ["--model-version", version_pin]
+
+    if not SCHEDULED_RETRAIN.get("enable_feedback_weights", True):
+        LOG.info("Feedback weights disabled by config — training unweighted.")
+        return cmd
+
+    bundle_dir = project_root / SCHEDULED_RETRAIN["feedback_bundle_dir"]
+    max_age = SCHEDULED_RETRAIN["feedback_bundle_max_age_days"]
+
+    if dry_run:
+        LOG.info(
+            "[DRY-RUN] would build feedback bundle (%s) then select newest "
+            "from %s (max age %dd)",
+            " ".join(_FEEDBACK_BUILDER_CMD), bundle_dir, max_age,
+        )
+        return cmd
+
+    build_rc = _build_feedback_bundle(project_root, log_dir)
+    if build_rc != 0:
+        LOG.warning(
+            "Feedback bundle build exited %d — falling back to the newest "
+            "existing bundle (if any); the retrain proceeds regardless.",
+            build_rc,
+        )
+
+    bundle = _select_newest_bundle(bundle_dir, max_age)
+    if bundle is None:
+        LOG.warning("No usable feedback bundle — training unweighted.")
+        return cmd
+
+    LOG.info("Feedback weights bundle: %s", bundle)
+    cmd += ["--feedback-weights", str(bundle)]
+    return cmd
+
+
 def run_one_challenger(
     *,
     dry_run:      bool = False,
@@ -172,7 +285,8 @@ def run_one_challenger(
     LOG.info("log_dir:   %s", log_dir)
 
     if dry_run:
-        LOG.info("[DRY-RUN] would acquire lock then exec: %s", " ".join(_ORCHESTRATOR_CMD))
+        planned = _assemble_orchestrator_cmd(project_root, log_dir, dry_run=True)
+        LOG.info("[DRY-RUN] would acquire lock then exec: %s", " ".join(planned))
         LOG.info("[DRY-RUN] no subprocess invoked; lock NOT acquired; no state mutated.")
         return 0
 
@@ -195,19 +309,30 @@ def run_one_challenger(
     )
     lock_fh.flush()
 
-    # ── Invoke the orchestrator subprocess with per-run log capture ───────────
+    # ── Build feedback bundle + assemble command (under the lock, WS3) ────────
     log_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        orchestrator_cmd = _assemble_orchestrator_cmd(project_root, log_dir)
+    except Exception:
+        # Belt-and-braces: nothing in the feedback path may kill the retrain.
+        LOG.error(
+            "Feedback-weight preparation raised unexpectedly — "
+            "training unweighted.", exc_info=True,
+        )
+        orchestrator_cmd = list(_ORCHESTRATOR_CMD)
+
+    # ── Invoke the orchestrator subprocess with per-run log capture ───────────
     log_file = log_dir / f"scheduled_retrain_{_utc_stamp()}.log"
     LOG.info("Per-run log: %s", log_file)
     LOG.info(
         "Launching: %s  (cwd=%s)",
-        " ".join(_ORCHESTRATOR_CMD), project_root,
+        " ".join(orchestrator_cmd), project_root,
     )
     LOG.info("Orchestrator output streamed live below ↓")
 
     try:
         rc = _tee_subprocess(
-            cmd=[sys.executable, *_ORCHESTRATOR_CMD],
+            cmd=[sys.executable, *orchestrator_cmd],
             cwd=project_root,
             log_file=log_file,
         )

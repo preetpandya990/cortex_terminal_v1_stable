@@ -125,6 +125,7 @@ def _normalize_instrument(item: dict[str, Any]) -> dict[str, Any] | None:
         "name": item.get("name") or "",
         "exchange": item.get("exchange") or "NSE",
         "instrument_type": item.get("instrument_type"),
+        "isin": item.get("isin"),
     }
 
 

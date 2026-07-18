@@ -35,6 +35,28 @@ class ModelValidationError(Exception):
     pass
 
 
+def _resolve_ensemble_feature_version(xgb_meta: Any, gru_meta: Any | None) -> str:
+    """Resolve the ensemble's feature-set contract from its members (WS2c).
+
+    ``ml_model_metadata.feature_version`` is NULL for models registered
+    before migration 0056 — those are by definition legacy "1.0.0". A
+    version mismatch between the members is a hard load failure: the
+    FeatureLoader applies ONE preprocessing contract per ensemble, so mixed
+    versions would silently feed one model wrongly-scaled fundamentals.
+    """
+    xgb_version = getattr(xgb_meta, "feature_version", None) or "1.0.0"
+    if gru_meta is not None:
+        gru_version = getattr(gru_meta, "feature_version", None) or "1.0.0"
+        if xgb_version != gru_version:
+            raise ModelLoadError(
+                f"Feature-version mismatch between ensemble members: "
+                f"XGBoost was trained on feature set {xgb_version!r}, "
+                f"GRU on {gru_version!r}. Both models must share one "
+                f"feature-set contract."
+            )
+    return xgb_version
+
+
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
 _MODEL_ROOT = Path(get_settings().ML_MODEL_STORAGE_PATH) / "production"  # single source of truth (config.ML_MODEL_STORAGE_PATH)
@@ -195,6 +217,11 @@ class LoadedEnsemble:
     feature_names:     tuple[str, ...]             = field(default_factory=tuple)
     xgb_calibrator:    ConfidenceCalibrator | None = field(default=None)
     gru_calibrator:    ConfidenceCalibrator | None = field(default=None)
+    # Feature-set contract the ensemble was trained on, from the persisted
+    # ml_model_metadata.feature_version column (WS2c). NULL → "1.0.0".
+    # FeatureLoader gates its fundamental-feature handling on this value:
+    # "1.0.0" → hard-zero legacy fundamentals; "2.0.0" → grid rank transform.
+    feature_version:   str                         = field(default="1.0.0")
 
     @property
     def gru_input_name(self) -> str:
@@ -295,7 +322,16 @@ class RegistryModelLoader:
                         f"Both models must be trained on the same feature set."
                     )
             n_features = xgb_n_features
-            logger.info("Ensemble feature contract: n_features=%d", n_features)
+
+            # ── Feature-set version contract (WS2c) ───────────────────────────
+            # Same spirit as the n_features check above: both members must
+            # share one feature-set contract or inference preprocessing would
+            # be wrong for one of them.
+            feature_version = _resolve_ensemble_feature_version(xgb_meta, gru_meta)
+            logger.info(
+                "Ensemble feature contract: n_features=%d feature_version=%s",
+                n_features, feature_version,
+            )
 
             # ── Ensemble weights ──────────────────────────────────────────────
             xgb_w = float((xgb_meta.training_metrics or {}).get("ensemble_weight", 0.75))
@@ -351,6 +387,7 @@ class RegistryModelLoader:
                 feature_names     = feature_names,
                 xgb_calibrator    = xgb_cal,
                 gru_calibrator    = gru_cal,
+                feature_version   = feature_version,
             )
             ensemble.validate()
 

@@ -847,9 +847,13 @@ class SignalAssembler:
             # corroboration.
             fused_confidence = min(fused_confidence, 0.85)
 
-        if fused_score > 50:
+        # Inclusive thresholds: a score of exactly ±50 is actionable.  Source
+        # scores are frequently pinned to round values (technical scoring emits
+        # exactly ±50), so an exclusive comparison silently demoted legitimate
+        # boundary signals to HOLD.
+        if fused_score >= 50:
             action = "BUY"
-        elif fused_score < -50:
+        elif fused_score <= -50:
             action = "SELL"
         else:
             action = "HOLD"

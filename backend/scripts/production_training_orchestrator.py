@@ -52,11 +52,11 @@ import json
 # Add backend to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy import text
 
 from app.core.config import get_settings
+from app.ml.config import ML_FEATURE_SET_VERSION
 from app.ml.features.symbol_selector import (
     get_top_liquid_symbols,
     get_recently_listed_symbols,
@@ -109,8 +109,24 @@ class TrainingConfig:
     n_symbols: int = 2557
     lookback_years: int = 10
     sequence_length: int = 60
-    n_features: int = 69  # 44 technical + 5 sentiment + 20 fundamental
+    # Feature-set contract for THIS training run. Defaults to the config
+    # switch (the WS2 revert lever); "1.0.0" = legacy 69-feature,
+    # "2.0.0" = PIT rank-normalized 66-feature.
+    feature_set_version: str = ML_FEATURE_SET_VERSION
+    # None → derived from feature_set_version + include_fundamentals in
+    # __post_init__ (69 for v1, 66 for v2, 49 without fundamentals). An
+    # explicit int still overrides.
+    n_features: Optional[int] = None
     include_fundamentals: bool = True
+
+    def __post_init__(self) -> None:
+        if self.n_features is None:
+            from app.ml.features.feature_pipeline import get_all_feature_names
+            self.n_features = len(get_all_feature_names(
+                include_sentiment=True,
+                include_fundamentals=self.include_fundamentals,
+                feature_set_version=self.feature_set_version,
+            ))
 
     # Walk-forward validation
     initial_train_days: int = 730  # 2 years
@@ -263,8 +279,23 @@ class ProductionTrainingOrchestrator:
         *,
         fresh: bool = False,
         feedback_weights_path: Optional[str] = None,
+        session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+        symbol_cap: Optional[int] = None,
+        explicit_symbols: Optional[List[str]] = None,
     ) -> None:
         self.db = db_session
+        # Smoke-run controls (WS2c/SMOKE): cap the universe after step-1
+        # selection, or replace selection with an explicit deterministic list.
+        # No other behavior changes; n_symbols in config should be set to the
+        # effective universe size by the caller so coverage math stays honest.
+        self._symbol_cap = symbol_cap
+        self._explicit_symbols = list(explicit_symbols) if explicit_symbols else None
+        # When provided, step 2 runs feature computation session-per-chunk with
+        # a one-shot fresh-session retry on transient connection errors —
+        # required for the multi-hour scheduled run to survive a dropped
+        # connection (2026-07-15 crash at symbol 803/2234).  Without it the
+        # legacy single-session path is used.
+        self.session_factory = session_factory
         self.config = config or TrainingConfig()
         self.output_dir = output_dir or (Path(get_settings().ML_MODEL_STORAGE_PATH) / "production")
 
@@ -664,7 +695,26 @@ class ProductionTrainingOrchestrator:
                 )
             else:
                 t0 = time.monotonic()
-                await self._select_symbols_and_assess_quality()
+                if self._explicit_symbols is not None:
+                    # Smoke path: deterministic operator-supplied universe.
+                    self.symbols = list(self._explicit_symbols)
+                    self._symbol_coverage = 1.0
+                    self._n_symbols_established = len(self.symbols)
+                    self._n_symbols_short_history = 0
+                    logger.info(
+                        "→ --symbols override: %d explicit symbol(s), selection skipped",
+                        len(self.symbols),
+                    )
+                else:
+                    await self._select_symbols_and_assess_quality()
+                    if self._symbol_cap is not None and len(self.symbols) > self._symbol_cap:
+                        # Smoke path: cap AFTER quality selection so the subset
+                        # is the deterministic top of the ranked universe.
+                        self.symbols = self.symbols[: self._symbol_cap]
+                        logger.info(
+                            "→ --n-symbols cap applied: universe reduced to %d symbol(s)",
+                            len(self.symbols),
+                        )
                 cp.save_symbols(self.symbols)
                 _dur1 = time.monotonic() - t0
                 cp.mark_done("step_1_symbols", _dur1)
@@ -1350,6 +1400,8 @@ class ProductionTrainingOrchestrator:
             db=self.db,
             include_sentiment=True,
             include_fundamentals=self.config.include_fundamentals,
+            session_factory=self.session_factory,
+            feature_set_version=self.config.feature_set_version,
         )
 
         self._rebuild_features_meta_from_raw()
@@ -1531,12 +1583,18 @@ class ProductionTrainingOrchestrator:
             logger.info("✓ raw_features_data released (~1.3 GB freed)")
 
     async def _train_xgboost_with_optimization(self, cv_plan: Dict[str, Any]) -> Dict[str, Any]:
-        from app.ml.features.feature_pipeline import normalize_features, get_all_feature_names
+        from app.ml.features.feature_pipeline import (
+            normalize_features, get_all_feature_names, zscore_feature_cols,
+        )
 
         feature_names = get_all_feature_names(
             include_sentiment=True,
             include_fundamentals=self.config.include_fundamentals,
+            feature_set_version=self.config.feature_set_version,
         )
+        # v2: rank-normalized fundamentals are already in [-1, 1] — z-scoring
+        # them would destroy the calibrated scale. v1: identical to before.
+        zscore_cols = zscore_feature_cols(feature_names, self.config.feature_set_version)
 
         # ── Panel build — features, labels, AND the per-row timestamp +
         # forward-return arrays CPCV / the OOF backtest paths need (the old
@@ -1551,7 +1609,7 @@ class ProductionTrainingOrchestrator:
             r      = entry['forward_return']
             ts     = df_raw['timestamp'].values
             norm_df = normalize_features(
-                df_raw, method='rolling', window=60, feature_cols=feature_names
+                df_raw, method='rolling', window=60, feature_cols=zscore_cols
             )
             available = [c for c in feature_names if c in norm_df.columns]
             X_tab = norm_df[available].values.astype(np.float32)
@@ -1793,13 +1851,16 @@ class ProductionTrainingOrchestrator:
         configure_gpu()
 
         from app.ml.features.feature_pipeline import (
-            normalize_features, create_sequences, get_all_feature_names,
+            normalize_features, create_sequences, get_all_feature_names, zscore_feature_cols,
         )
 
         feature_names = get_all_feature_names(
             include_sentiment=True,
             include_fundamentals=self.config.include_fundamentals,
+            feature_set_version=self.config.feature_set_version,
         )
+        # v2: rank-normalized fundamentals excluded from rolling z-score.
+        zscore_cols = zscore_feature_cols(feature_names, self.config.feature_set_version)
         seq_len       = self.config.sequence_length
         n_feat        = len(feature_names)
         VAL_CAP       = 30_000
@@ -1898,7 +1959,7 @@ class ProductionTrainingOrchestrator:
                 y_sym  = self.targets_data[symbol]['target']
                 r_sym  = self.targets_data[symbol]['forward_return']
                 norm_df = normalize_features(
-                    df_raw, method='rolling', window=seq_len, feature_cols=feature_names
+                    df_raw, method='rolling', window=seq_len, feature_cols=zscore_cols
                 )
                 # seq_ts[i] is the timestamp of the LAST bar of sequence i —
                 # identical to the XGBoost panel's per-row timestamp for the
@@ -2003,7 +2064,7 @@ class ProductionTrainingOrchestrator:
             df_raw  = self.targets_data[symbol]['features_df']
             y_sym   = self.targets_data[symbol]['target']
             norm_df = normalize_features(
-                df_raw, method='rolling', window=seq_len, feature_cols=feature_names
+                df_raw, method='rolling', window=seq_len, feature_cols=zscore_cols
             )
             # Keep seq_ts (last-bar timestamp per sequence) for feedback weight lookup.
             X_seq, seq_ts, _ = create_sequences(norm_df, seq_len, feature_names)
@@ -2510,6 +2571,8 @@ class ProductionTrainingOrchestrator:
                 fwd_ret=joint_r,
                 path_id=path_id,
                 l2=self.config.a5_l2_prior,
+                timestamps=self.gru_eval_timestamp[matched_mask],
+                horizon_days=self.config.cpcv_horizon,
             )
             optimized_weights = diagnostics["weights"]
             accretive = True
@@ -2591,14 +2654,14 @@ class ProductionTrainingOrchestrator:
         else:
             xgb_proba = xgb_raw
         xgb_pred = np.argmax(xgb_proba, axis=1)
-        xgb_res  = self.model_evaluator.evaluate(y_true=y_test, y_pred=xgb_pred, y_proba=xgb_proba, returns=test_returns)
+        xgb_res  = self.model_evaluator.evaluate(y_true=y_test, y_pred=xgb_pred, y_proba=xgb_proba, returns=test_returns, timestamps=self.gru_eval_timestamp, horizon_days=self.config.cpcv_horizon)
         evaluation_results['xgboost'] = xgb_res
         logger.info("  XGBoost  acc=%.4f  F1(up)=%.4f  F1(down)=%.4f  Sharpe=%.4f", xgb_res.accuracy, xgb_res.f1_score.get('up', 0), xgb_res.f1_score.get('down', 0), xgb_res.sharpe_ratio)
 
         # GRU
         gru_proba = self.gru_trainer.model.predict(X_test_seq, verbose=0)
         gru_pred  = np.argmax(gru_proba, axis=1)
-        gru_res   = self.model_evaluator.evaluate(y_true=y_test, y_pred=gru_pred, y_proba=gru_proba, returns=test_returns)
+        gru_res   = self.model_evaluator.evaluate(y_true=y_test, y_pred=gru_pred, y_proba=gru_proba, returns=test_returns, timestamps=self.gru_eval_timestamp, horizon_days=self.config.cpcv_horizon)
         evaluation_results['gru'] = gru_res
         logger.info("  GRU      acc=%.4f  F1(up)=%.4f  F1(down)=%.4f  Sharpe=%.4f", gru_res.accuracy, gru_res.f1_score.get('up', 0), gru_res.f1_score.get('down', 0), gru_res.sharpe_ratio)
 
@@ -2606,7 +2669,7 @@ class ProductionTrainingOrchestrator:
         ens_pred, ens_proba = self.ensemble_trainer.predict(
             X_test_tab, X_test_seq, apply_confidence_threshold=False
         )
-        ens_res = self.model_evaluator.evaluate(y_true=y_test, y_pred=ens_pred, y_proba=ens_proba, returns=test_returns)
+        ens_res = self.model_evaluator.evaluate(y_true=y_test, y_pred=ens_pred, y_proba=ens_proba, returns=test_returns, timestamps=self.gru_eval_timestamp, horizon_days=self.config.cpcv_horizon)
         evaluation_results['ensemble'] = ens_res
         logger.info(
             "  Ensemble acc=%.4f  F1(up)=%.4f  F1(down)=%.4f  Sharpe=%.4f",
@@ -2870,10 +2933,25 @@ class ProductionTrainingOrchestrator:
             feature_names = get_all_feature_names(
                 include_sentiment=include_sentiment,
                 include_fundamentals=include_fundamentals,
+                feature_set_version=self.config.feature_set_version,
             )
+            # Hard guard: the manifest MUST describe the matrices the models
+            # were actually trained on. A drift here (e.g. a call site missing
+            # the feature_set_version, as happened in the 2026-07-17 smoke
+            # run) would register a lying manifest that the loader then
+            # discards at serve time.
+            if len(feature_names) != self.config.n_features:
+                raise ValueError(
+                    f"Feature manifest length {len(feature_names)} != "
+                    f"config.n_features {self.config.n_features} "
+                    f"(feature_set_version={self.config.feature_set_version!r}) — "
+                    f"refusing to register a manifest that does not match the "
+                    f"trained artifacts."
+                )
             logger.info(
-                "  Feature manifest: %d features (sentiment=%s, fundamentals=%s)",
+                "  Feature manifest: %d features (sentiment=%s, fundamentals=%s, version=%s)",
                 len(feature_names), include_sentiment, include_fundamentals,
+                self.config.feature_set_version,
             )
 
             _fb_meta = None
@@ -2905,7 +2983,7 @@ class ProductionTrainingOrchestrator:
                     "n_features":       len(feature_names),
                     "training_samples": self._calculate_total_samples(),
                 },
-                feature_version      = "1.0.0",
+                feature_version      = self.config.feature_set_version,
                 status               = "development",
                 overwrite            = True,
                 feedback_bundle_meta = _fb_meta,
@@ -2938,7 +3016,7 @@ class ProductionTrainingOrchestrator:
                     "n_features":       len(feature_names),
                     "training_samples": self._calculate_total_samples(),
                 },
-                feature_version      = "1.0.0",
+                feature_version      = self.config.feature_set_version,
                 status               = "development",
                 overwrite            = True,
                 feedback_bundle_meta = _fb_meta,
@@ -3271,6 +3349,7 @@ async def _resolve_model_version(
     db_session: AsyncSession,
     output_dir: Path,
     fresh: bool,
+    requested: Optional[str] = None,
 ) -> str:
     """Return the model version that this training run should use.
 
@@ -3314,6 +3393,14 @@ async def _resolve_model_version(
                     "will query registry instead): %s", exc,
                 )
 
+    # Validate any operator pin BEFORE the fallback-guarded block below —
+    # a malformed pin is an operator error and must fail loudly, never be
+    # swallowed into the seed fallback.
+    if requested and not _SEMVER_PREFIX_RE.match(requested):
+        raise ValueError(
+            f"--model-version {requested!r} is not a valid semver prefix (X.Y.Z)"
+        )
+
     # Fresh run (or checkpoint unreadable) — derive the next version from the DB.
     seed = TrainingConfig().model_version
     try:
@@ -3321,6 +3408,29 @@ async def _resolve_model_version(
             text("SELECT model_version FROM ml_model_metadata")
         )
         rows: list[str] = [r for r in result.scalars().all() if r]
+
+        # ── Operator pin (--model-version / config override) ──────────────────
+        # One-shot, self-healing: honored only while NO registered version
+        # carries the requested semver prefix. Once the pinned run has
+        # registered (e.g. next week's scheduled run with a stale override),
+        # the pin is ignored with a warning and normal auto-increment resumes —
+        # a forgotten override can never overwrite an existing model.
+        if requested:
+            m = _SEMVER_PREFIX_RE.match(requested)
+            already = [
+                raw for raw in rows
+                if (pm := _SEMVER_PREFIX_RE.match(raw)) and pm.group(0) == m.group(0)
+            ]
+            if already:
+                logger.warning(
+                    "Version resolution — requested pin %s already registered "
+                    "(%d row(s), e.g. %s): ignoring the pin and auto-incrementing "
+                    "instead. Clear the override once the pinned run has landed.",
+                    requested, len(already), already[0],
+                )
+            else:
+                logger.info("Version resolution — operator pin honored: %s", requested)
+                return requested
 
         highest: tuple[int, int, int] = (0, 0, 0)
         for raw in rows:
@@ -3378,7 +3488,59 @@ async def main() -> None:
             "GRU (tf.data pipeline) training.  Omit for unweighted training."
         ),
     )
+    parser.add_argument(
+        "--no-fundamentals",
+        action="store_true",
+        help=(
+            "Ablation control: train on 49 features (44 technical + 5 "
+            "sentiment, no fundamentals) with the same pipeline, gates, and "
+            "seeds. Used to prove whether the fundamental features earn "
+            "their place (DSR on purged CV decides — see the v2.0.0 "
+            "promotion criteria)."
+        ),
+    )
+    parser.add_argument(
+        "--model-version",
+        metavar="X.Y.Z",
+        default=None,
+        help=(
+            "Pin this run's model version instead of auto-incrementing the "
+            "registry's highest patch. One-shot and self-healing: if the "
+            "requested version is already registered the pin is ignored with "
+            "a warning and auto-increment resumes."
+        ),
+    )
+    parser.add_argument(
+        "--n-symbols",
+        type=int,
+        metavar="INT",
+        default=None,
+        help=(
+            "Smoke-run cap: keep only the top-N symbols after step-1 quality "
+            "selection.  n_symbols in the run config is set to N so coverage "
+            "math and the checkpoint identity reflect the reduced universe."
+        ),
+    )
+    parser.add_argument(
+        "--symbols",
+        metavar="A,B,C",
+        default=None,
+        help=(
+            "Explicit comma-separated instrument list — replaces step-1 "
+            "selection entirely (deterministic smoke/debug runs).  "
+            "Mutually exclusive with --n-symbols."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.symbols and args.n_symbols:
+        parser.error("--symbols and --n-symbols are mutually exclusive")
+
+    explicit_symbols: Optional[List[str]] = None
+    if args.symbols:
+        explicit_symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+        if not explicit_symbols:
+            parser.error("--symbols provided but no symbols parsed")
 
     settings = get_settings()
     output_dir = Path(settings.ML_MODEL_STORAGE_PATH) / "production"
@@ -3403,18 +3565,28 @@ async def main() -> None:
         pool_size=10,
         max_overflow=20,
     )
-    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async_session = async_sessionmaker(engine, expire_on_commit=False)
 
     async with async_session() as session:
-        model_version = await _resolve_model_version(session, output_dir, fresh)
+        model_version = await _resolve_model_version(
+            session, output_dir, fresh, requested=args.model_version
+        )
+
+    if explicit_symbols:
+        effective_n_symbols = len(explicit_symbols)
+    elif args.n_symbols:
+        effective_n_symbols = args.n_symbols
+    else:
+        effective_n_symbols = 2551
 
     config = TrainingConfig(
-        n_symbols=2551,
+        n_symbols=effective_n_symbols,
         lookback_years=10,
         xgboost_trials=100,
         gru_trials=5,
         gru_n_symbols=200,
         model_version=model_version,
+        include_fundamentals=not args.no_fundamentals,
     )
 
     async with async_session() as session:
@@ -3424,6 +3596,9 @@ async def main() -> None:
             output_dir=output_dir,
             fresh=fresh,
             feedback_weights_path=args.feedback_weights,
+            session_factory=async_session,
+            symbol_cap=args.n_symbols,
+            explicit_symbols=explicit_symbols,
         )
 
         try:

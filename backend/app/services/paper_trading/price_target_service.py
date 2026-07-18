@@ -217,6 +217,7 @@ async def compute_price_targets_ml(
         sequence_length=ensemble.sequence_length,
         n_features=ensemble.n_features,
         feature_names=ensemble.feature_names,
+        feature_version=ensemble.feature_version,
     )
     tabular, sequence, current_price, ml_volatility = await feature_loader.load_features(
         symbol=instrument_key,

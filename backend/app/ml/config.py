@@ -11,6 +11,22 @@ from __future__ import annotations
 
 from typing import Any
 
+# ── Feature-set version (WS2 — ML_FIX_IMPLEMENTATION_PLAN.md) ─────────────────
+# Selects the fundamental-feature contract used by TRAINING:
+#
+#   "1.0.0" — legacy 69-feature set: 20 broadcast-constant fundamentals,
+#             cross-sectional median imputation, rolling z-score everywhere.
+#   "2.0.0" — 66-feature set: 17 point-in-time fundamentals (pe/pb/ev dropped),
+#             per-date cross-sectional rank normalization to [-1, 1],
+#             fundamentals excluded from rolling z-score.
+#
+# THIS IS THE WS2 PANIC-BUTTON REVERT LEVER: setting "1.0.0" reverts training
+# to the exact legacy pipeline and registers 1.0.0 models. It does NOT affect
+# inference — serving gates on each model's persisted
+# ml_model_metadata.feature_version, never on this flag, so live models keep
+# their trained behavior no matter what this says.
+ML_FEATURE_SET_VERSION: str = "2.0.0"
+
 # ── Feature Definitions ────────────────────────────────────────────────────────
 # Dictionary mapping feature names to their configuration
 # Features are registered dynamically in the Feature Store
@@ -345,6 +361,27 @@ SCHEDULED_RETRAIN: dict[str, Any] = {
     # Per-run stdout/stderr capture from the orchestrator subprocess.
     # systemd journal also captures the wrapper's own logs.
     "log_dir": "logs/scheduled_retrain",
+
+    # One-shot model-version pin passed to the orchestrator as
+    # --model-version. Self-healing: once ANY registered model carries this
+    # semver prefix the orchestrator ignores the pin (with a warning) and
+    # auto-increments, so a stale value can never overwrite an existing model.
+    # Set to None after the pinned run has landed (housekeeping, not safety).
+    # 2026-07-17: pinned so Saturday's challenger registers as 1.2.0 (the
+    # first 66-feature v2.0.0 model) instead of auto-bumping to 1.1.4.
+    "model_version_override": "1.2.0",
+
+    # ── Feedback weights (WS3) ────────────────────────────────────────────
+    # When enabled, each scheduled run first subprocess-invokes
+    # scripts/build_feedback_weights.py (crash-isolated — a builder failure
+    # can never kill the retrain), then passes the newest valid bundle to
+    # the orchestrator via --feedback-weights. A bundle is valid only with
+    # its .meta.json sidecar present and younger than the max age below —
+    # never silently train on week-old weights because tonight's build failed.
+    "enable_feedback_weights": True,
+    # Relative to backend/ — matches feedback_loader._DEFAULT_BUNDLES_DIR.
+    "feedback_bundle_dir": "feedback_bundles",
+    "feedback_bundle_max_age_days": 7,
 }
 
 

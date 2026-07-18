@@ -147,6 +147,7 @@ async def worker_lifespan() -> AsyncGenerator[tuple[async_sessionmaker, AsyncSes
             "ensemble_sequence_length":  ensemble.sequence_length,
             "ensemble_n_features":       ensemble.n_features,
             "ensemble_feature_names":    ensemble.feature_names,  # tuple[str, ...]
+            "ensemble_feature_version":  ensemble.feature_version,
         }
 
         logger.info(
@@ -742,6 +743,7 @@ async def correlation_loop(
         _seq_len         = ml_components.get("ensemble_sequence_length", 60)
         _n_features      = ml_components.get("ensemble_n_features", 37)
         _feature_names   = ml_components.get("ensemble_feature_names", ())
+        _feature_version = ml_components.get("ensemble_feature_version", "1.0.0")
         _ml_available    = _ml_predictor is not None
 
         if not _ml_available:
@@ -800,6 +802,7 @@ async def correlation_loop(
                             sequence_length=_seq_len,
                             n_features=_n_features,
                             feature_names=_feature_names,
+                            feature_version=_feature_version,
                         )
 
                     # ── Pathway 1: Scanner Anomalies (market-hours only) ──────

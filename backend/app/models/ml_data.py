@@ -4,7 +4,22 @@ Database models for ML system data.
 
 from datetime import datetime, timezone
 from uuid import UUID
-from sqlalchemy import Column, Integer, String, Float, DateTime, JSON, Boolean, Text, Numeric, func
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Column,
+    Date,
+    DateTime,
+    Float,
+    Index,
+    Integer,
+    JSON,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import UUID as PGUUID, JSONB
 from app.core.database import Base
 
@@ -149,6 +164,13 @@ class MLModelMetadata(Base):
     checksum = Column(String(64))  # SHA-256 of the inference artifact
     encrypted = Column(Boolean, default=False)
 
+    # Feature-set contract the model was trained on (migration 0056):
+    # '1.0.0' legacy 69-feature, '2.0.0' PIT rank-normalized 66-feature.
+    # NULL is read as '1.0.0' by the registry loader. Inference gates on this
+    # persisted value — never on the training config flag — so live 1.0.0
+    # models keep exact legacy behavior regardless of what training does.
+    feature_version = Column(String(16), nullable=True)
+
     # Status
     is_active = Column(Boolean, default=False)
     deployed_at = Column(DateTime(timezone=True))
@@ -160,6 +182,48 @@ class MLModelMetadata(Base):
 
     def __repr__(self):
         return f"<MLModelMetadata(id={self.id}, model_id={self.model_id}, status={self.status})>"
+
+
+class MLFeatureCrossStats(Base):
+    """
+    Per-(date, feature, version) cross-sectional rank grid (migration 0056).
+
+    Written by training's rank-normalization pass (WS2b) and the daily
+    feature-computation post-pass; read by inference (FeatureLoader) to map a
+    raw fundamental value through the newest grid with as_of_date <= row date,
+    reproducing the training-time rank transform exactly.
+
+    ``quantiles`` holds 101 raw-value floats (p0..p100) of that day's
+    cross-section; inference interpolates rank = np.interp(raw, quantiles,
+    linspace(-1, 1, 101)), clipped to [-1, 1].
+    """
+    __tablename__ = "ml_feature_cross_stats"
+    __table_args__ = (
+        UniqueConstraint(
+            "as_of_date", "feature_name", "feature_version",
+            name="uq_ml_feature_cross_stats_date_feature_version",
+        ),
+        Index(
+            "idx_ml_feature_cross_stats_feature_date",
+            "feature_name", "as_of_date",
+        ),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    as_of_date = Column(Date, nullable=False)
+    feature_name = Column(String(64), nullable=False)
+    feature_version = Column(String(16), nullable=False)
+    quantiles = Column(JSONB, nullable=False)  # 101 raw-value floats, p0..p100
+    median = Column(Float, nullable=False)
+    n_obs = Column(Integer, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    def __repr__(self):
+        return (
+            f"<MLFeatureCrossStats(as_of_date={self.as_of_date}, "
+            f"feature={self.feature_name}, version={self.feature_version}, "
+            f"n_obs={self.n_obs})>"
+        )
 
 
 class MLPredictionOutcome(Base):

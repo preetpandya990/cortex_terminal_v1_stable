@@ -231,6 +231,7 @@ async def event_processing_loop(
     _seq_len        = _mc.get("ensemble_sequence_length", 60)
     _n_features     = _mc.get("ensemble_n_features", 37)
     _feature_names  = _mc.get("ensemble_feature_names", ())
+    _feature_version = _mc.get("ensemble_feature_version", "1.0.0")
     _ml_available   = _ml_predictor is not None
 
     try:
@@ -275,6 +276,7 @@ async def event_processing_loop(
                             sequence_length=_seq_len,
                             n_features=_n_features,
                             feature_names=_feature_names,
+                            feature_version=_feature_version,
                         )
 
                     processed_count = await processor.process_batch(db)

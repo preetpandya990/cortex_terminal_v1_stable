@@ -147,6 +147,7 @@ class EnsemblePredictor:
         gru_calibrator:   ConfidenceCalibrator | None = None,
         xgboost_version:  str = "",
         gru_version:      str = "",
+        feature_version:  str = "1.0.0",
     ):
         """
         Initialize ensemble predictor with pre-loaded backends.
@@ -181,6 +182,9 @@ class EnsemblePredictor:
         self.gru_calibrator   = gru_calibrator
         self.xgboost_version  = xgboost_version
         self.gru_version      = gru_version
+        # Feature-set contract from LoadedEnsemble (WS2c) — consumed by
+        # FeatureLoader constructions downstream.
+        self.feature_version  = feature_version
 
         if gru_backend is None:
             # XGBoost-only mode — normalise weights regardless of what was passed in.
@@ -250,6 +254,7 @@ class EnsemblePredictor:
             self.n_features      = loaded_ensemble.n_features
             self.sequence_length = loaded_ensemble.sequence_length
             self.feature_names   = loaded_ensemble.feature_names
+            self.feature_version = loaded_ensemble.feature_version
             self.xgb_calibrator  = loaded_ensemble.xgb_calibrator
             self.gru_calibrator  = loaded_ensemble.gru_calibrator
             self.xgboost_version = loaded_ensemble.xgboost_version or ""
@@ -309,6 +314,7 @@ class EnsemblePredictor:
             gru_calibrator   = loaded_ensemble.gru_calibrator,
             xgboost_version  = loaded_ensemble.xgboost_version or "",
             gru_version      = loaded_ensemble.gru_version or "",
+            feature_version  = loaded_ensemble.feature_version,
         )
 
     async def predict(

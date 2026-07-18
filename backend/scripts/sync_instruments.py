@@ -75,20 +75,23 @@ async def _run(*, force: bool, dry_run: bool) -> int:
                 if dry_run:
                     logger.info(
                         "DRY RUN — no changes written. Planned: seen=%d inserted=%d "
-                        "updated=%d reactivated=%d delisted=%d active=%d->%d",
+                        "updated=%d reactivated=%d delisted=%d active=%d->%d "
+                        "unclassified=%d",
                         result.total_seen, result.inserted, result.updated,
                         result.reactivated, result.delisted,
                         result.active_before, result.active_after,
+                        result.unclassified,
                     )
                 else:
                     # Persist validators only after a real, successful sync.
                     await persist_validators(redis, fetched.etag, fetched.last_modified)
                     logger.info(
                         "Sync complete: seen=%d inserted=%d updated=%d reactivated=%d "
-                        "delisted=%d active=%d->%d",
+                        "delisted=%d active=%d->%d unclassified=%d",
                         result.total_seen, result.inserted, result.updated,
                         result.reactivated, result.delisted,
                         result.active_before, result.active_after,
+                        result.unclassified,
                     )
                 return _EXIT_OK
             finally:

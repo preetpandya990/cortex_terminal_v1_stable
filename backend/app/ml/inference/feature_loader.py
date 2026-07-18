@@ -31,8 +31,21 @@ from contextlib import asynccontextmanager
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.ml.features.cross_sectional_stats import (
+    CrossStat,
+    load_cross_sectional_stats,
+    rank_transform_with_grid,
+)
 from app.ml.features.feature_store import load_features_from_db
-from app.ml.features.feature_pipeline import compute_features_for_symbol, normalize_features
+from app.ml.features.feature_pipeline import (
+    compute_features_for_symbol,
+    normalize_features,
+    zscore_feature_cols,
+)
+from app.ml.features.fundamental_features import (
+    FUNDAMENTAL_FEATURE_NAMES,
+    FUNDAMENTAL_FEATURE_NAMES_V2,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +74,7 @@ class FeatureLoader:
         sequence_length:  int = 60,
         n_features:       int = 49,
         feature_names:    tuple[str, ...] | list[str] = (),
+        feature_version:  str = "1.0.0",
     ) -> None:
         self.db               = db
         self.redis            = redis
@@ -68,6 +82,16 @@ class FeatureLoader:
         self.sequence_length  = sequence_length
         self.n_features       = n_features
         self.feature_names    = list(feature_names)
+        # Feature-set contract of the LOADED MODEL (WS2c) — from
+        # LoadedEnsemble.feature_version, never from training config:
+        #   "1.0.0" → legacy fundamentals hard-zeroed (their trained
+        #              distribution is exactly 0; the feature store may now
+        #              hold PIT-varying raw values a v1 model has never seen)
+        #   "2.0.0" → raw fundamentals mapped through persisted cross-
+        #              sectional rank grids, excluded from z-score
+        self.feature_version  = feature_version
+        # Lazy per-instance grid cache: (start, end) → per-date CrossStats.
+        self._grid_cache: dict[tuple[Any, Any], dict] = {}
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -110,6 +134,8 @@ class FeatureLoader:
                     "Feature store hit for %s → %s (%d rows)",
                     symbol, instrument_key, len(features_df),
                 )
+                if self.feature_version == "2.0.0":
+                    features_df = await self._apply_rank_transform(features_df)
                 return self._prepare_features(
                     features_df, indicator_snapshot_out=indicator_snapshot_out
                 )
@@ -132,6 +158,8 @@ class FeatureLoader:
             )
             features_df = await self._compute_on_demand(instrument_key, timeframe)
             if not features_df.empty and len(features_df) >= 20:
+                if self.feature_version == "2.0.0":
+                    features_df = await self._apply_rank_transform(features_df)
                 return self._prepare_features(
                     features_df, indicator_snapshot_out=indicator_snapshot_out
                 )
@@ -289,9 +317,78 @@ class FeatureLoader:
                 end_date=end_date,
                 timeframe=db_timeframe,
                 db=db,
+                # v2 models need the PIT series here, not the legacy broadcast:
+                # a broadcast would flatten the 60-step sequence tail where the
+                # model learned real rank steps at statement boundaries.
+                feature_set_version=self.feature_version,
             )
 
     # ── Private: feature preparation ───────────────────────────────────────────
+
+    # ── v2: cross-sectional rank transform (WS2c) ─────────────────────────────
+
+    async def _apply_rank_transform(self, features_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Map each row's raw fundamental values through the newest persisted
+        rank grid with ``as_of_date <= row date`` — reproducing exactly the
+        cross-sectional rank normalization the v2.0.0 model saw in training.
+
+        Grids come from ``ml_feature_cross_stats`` (written by the daily
+        feature-computation post-pass). When NO grid exists at all the
+        fundamentals degrade to neutral 0 with a loud warning — degraded but
+        never wrong-scale.
+        """
+        features_df = features_df.copy()
+        fund_cols = [
+            c for c in FUNDAMENTAL_FEATURE_NAMES_V2
+            if not self.feature_names or c in self.feature_names
+        ]
+        for col in fund_cols:
+            if col not in features_df.columns:
+                features_df[col] = np.nan
+
+        ts = pd.to_datetime(features_df["timestamp"])
+        if ts.dt.tz is not None:
+            ts = ts.dt.tz_localize(None)
+        row_dates = ts.dt.normalize().dt.date
+
+        # Buffer before the window start so the first rows can still find a
+        # grid published on an earlier day (grids are daily; 14d covers
+        # weekends/holidays/skipped runs generously).
+        start = min(row_dates) - timedelta(days=14)
+        end = max(row_dates)
+        cache_key = (start, end)
+        if cache_key not in self._grid_cache:
+            self._grid_cache[cache_key] = await load_cross_sectional_stats(
+                self.db, fund_cols, start, end, "2.0.0",
+            )
+        stats_by_date = self._grid_cache[cache_key]
+
+        if not stats_by_date:
+            logger.warning(
+                "NO cross-sectional rank grids found in ml_feature_cross_stats "
+                "for %s → %s — v2.0.0 fundamentals degrade to neutral 0. "
+                "Run the daily feature pipeline's persist_cross_sectional_pass.",
+                start, end,
+            )
+            features_df[fund_cols] = 0.0
+            return features_df
+
+        grid_dates = np.array(sorted(stats_by_date))
+        # Newest grid at or before each row's date (searchsorted, right side).
+        grid_idx = np.searchsorted(grid_dates, row_dates.to_numpy(), side="right") - 1
+
+        for col in fund_cols:
+            raw = features_df[col].to_numpy(dtype=float)
+            out = np.zeros(len(raw), dtype=float)
+            for i, (value, gi) in enumerate(zip(raw, grid_idx)):
+                stat: CrossStat | None = (
+                    stats_by_date[grid_dates[gi]].get(col) if gi >= 0 else None
+                )
+                out[i] = rank_transform_with_grid(value, stat)
+            features_df[col] = out
+
+        return features_df
 
     def _prepare_features(
         self,
@@ -342,6 +439,24 @@ class FeatureLoader:
             if "close" in features_df.columns and not pd.isna(latest.get("close")):
                 indicator_snapshot_out["close"] = float(latest["close"])
 
+        # ── Version-gated fundamental handling (WS2c) ───────────────────────────
+        # Gate on the LOADED MODEL's feature_version — never on training config.
+        if self.feature_version == "2.0.0":
+            # Fundamentals arrive rank-normalized in [-1, 1] from
+            # _apply_rank_transform — exclude them from z-score to preserve
+            # the calibrated scale (mirrors training's exclusion exactly).
+            norm_cols = zscore_feature_cols(list(feature_cols), "2.0.0")
+        else:
+            # v1.0.0 (and NULL→"1.0.0") models trained on broadcast-constant
+            # fundamentals whose z-scored distribution is exactly 0. The
+            # feature store may now hold PIT-varying raw values, so relying
+            # on "z-score of a constant → 0" no longer holds: force the
+            # trained distribution deterministically, whatever the store says.
+            legacy_fund = [c for c in feature_cols if c in set(FUNDAMENTAL_FEATURE_NAMES)]
+            if legacy_fund:
+                features_df[legacy_fund] = 0.0
+            norm_cols = [c for c in feature_cols if c not in set(legacy_fund)]
+
         # ── Rolling z-score normalization (must match training) ─────────────────
         # normalize_features updates feature_cols in-place on the DataFrame copy;
         # metadata columns (timestamp, symbol, close) are preserved untouched.
@@ -349,7 +464,7 @@ class FeatureLoader:
             features_df,
             method="rolling",
             window=60,
-            feature_cols=list(feature_cols),
+            feature_cols=list(norm_cols),
         )
 
         # ── Build feature matrix ───────────────────────────────────────────────
@@ -413,6 +528,7 @@ def create_feature_loader(
     sequence_length:  int = 60,
     n_features:       int = 49,
     feature_names:    tuple[str, ...] = (),
+    feature_version:  str = "1.0.0",
 ) -> FeatureLoader:
     """
     Convenience factory for FeatureLoader.
@@ -432,4 +548,5 @@ def create_feature_loader(
         sequence_length=sequence_length,
         n_features=n_features,
         feature_names=feature_names,
+        feature_version=feature_version,
     )

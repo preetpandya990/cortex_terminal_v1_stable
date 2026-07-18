@@ -65,50 +65,57 @@ class TestDryRunNoSideEffects:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestRealInvocation:
+    """
+    Patches ``_tee_subprocess`` — the actual seam the wrapper launches
+    through. (These tests originally patched ``subprocess.call``, which the
+    Popen-based ``_tee_subprocess`` never uses, so they silently launched
+    REAL orchestrator subprocesses during test runs. Fixed 2026-07-17
+    alongside WS3.) ``_build_feedback_bundle`` is patched so the feedback
+    builder subprocess is never launched either; with no bundle in tmp_path
+    the wrapper trains unweighted, exercising the assembly fallback.
+    """
+
+    @staticmethod
+    def _invoke(tmp_path: Path, tee_rc: int = 0):
+        with (
+            patch(
+                "scripts.scheduled_retrain._tee_subprocess", return_value=tee_rc
+            ) as tee,
+            patch(
+                "scripts.scheduled_retrain._build_feedback_bundle", return_value=0
+            ),
+        ):
+            rc = run_one_challenger(dry_run=False, project_root=tmp_path)
+        return rc, tee
 
     def test_real_run_subprocesses_orchestrator(self, tmp_path: Path) -> None:
-        with patch(
-            "scripts.scheduled_retrain.subprocess.call", return_value=0
-        ) as mock_call:
-            rc = run_one_challenger(dry_run=False, project_root=tmp_path)
+        rc, tee = self._invoke(tmp_path)
         assert rc == 0
-        mock_call.assert_called_once()
+        tee.assert_called_once()
 
     def test_real_run_uses_fresh_flag(self, tmp_path: Path) -> None:
         """``--fresh`` is the only acceptable flag — `_ORCHESTRATOR_CMD` carries it."""
-        with patch(
-            "scripts.scheduled_retrain.subprocess.call", return_value=0
-        ) as mock_call:
-            run_one_challenger(dry_run=False, project_root=tmp_path)
-        cmd_args = mock_call.call_args[0][0]   # positional list arg to subprocess.call
-        assert _ORCHESTRATOR_CMD[0] in cmd_args[1]    # orchestrator script path
-        assert "--fresh" in cmd_args
+        _rc, tee = self._invoke(tmp_path)
+        cmd = tee.call_args.kwargs["cmd"]
+        assert _ORCHESTRATOR_CMD[0] in cmd[1]    # orchestrator script path
+        assert "--fresh" in cmd
 
     def test_real_run_uses_project_root_cwd(self, tmp_path: Path) -> None:
         """Orchestrator must be invoked with cwd = project root."""
-        with patch(
-            "scripts.scheduled_retrain.subprocess.call", return_value=0
-        ) as mock_call:
-            run_one_challenger(dry_run=False, project_root=tmp_path)
-        assert mock_call.call_args.kwargs["cwd"] == tmp_path
+        _rc, tee = self._invoke(tmp_path)
+        assert tee.call_args.kwargs["cwd"] == tmp_path
 
-    def test_real_run_creates_per_run_log_file(self, tmp_path: Path) -> None:
-        """A timestamped log file must appear under SCHEDULED_RETRAIN['log_dir']."""
-        with patch(
-            "scripts.scheduled_retrain.subprocess.call", return_value=0
-        ):
-            run_one_challenger(dry_run=False, project_root=tmp_path)
-        log_dir = tmp_path / "logs" / "scheduled_retrain"
-        assert log_dir.exists()
-        logs = list(log_dir.glob("scheduled_retrain_*.log"))
-        assert len(logs) == 1
+    def test_real_run_targets_per_run_log_file(self, tmp_path: Path) -> None:
+        """The tee target must be a timestamped file under SCHEDULED_RETRAIN['log_dir']."""
+        _rc, tee = self._invoke(tmp_path)
+        log_file = tee.call_args.kwargs["log_file"]
+        assert log_file.parent == tmp_path / "logs" / "scheduled_retrain"
+        assert log_file.name.startswith("scheduled_retrain_")
+        assert log_file.name.endswith(".log")
 
     def test_subprocess_nonzero_returns_2(self, tmp_path: Path) -> None:
         """Failed orchestrator run → wrapper exit code 2 (distinct from 0/1)."""
-        with patch(
-            "scripts.scheduled_retrain.subprocess.call", return_value=137
-        ):
-            rc = run_one_challenger(dry_run=False, project_root=tmp_path)
+        rc, _tee = self._invoke(tmp_path, tee_rc=137)
         assert rc == 2
 
 

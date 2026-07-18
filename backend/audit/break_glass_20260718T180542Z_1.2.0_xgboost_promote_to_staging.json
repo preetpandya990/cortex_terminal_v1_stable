@@ -1,0 +1,9 @@
+{
+  "event": "break_glass",
+  "operation": "promote_to_staging",
+  "model_version": "1.2.0_xgboost",
+  "model_name": "1.2.0_xgboost",
+  "reason": "symbol_coverage denominator stale: n_symbols=2551 was calibrated for the ETF-inclusive universe; STOCK-only pool (asset-class exclusion 2026-07-14 + selector gate 2026-07-17) holds 2936 instruments of which 1997 passed quality = 78.3% of the stale target, ~87% of the realistic STOCK-only target. Gate recalibration tracked.",
+  "timestamp": "2026-07-18T18:05:42.841004+00:00",
+  "audit_sha256": "736a9a8d42085ee5e24f38e5636a9e7055b2d15b58438b8a12e68515ad921a59"
+}

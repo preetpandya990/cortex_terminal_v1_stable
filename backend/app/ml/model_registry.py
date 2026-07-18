@@ -35,6 +35,7 @@ from typing import Any
 
 import numpy as np
 from sqlalchemy import select, update as _sa_update
+from sqlalchemy.dialects.postgresql import insert as _pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ml_data import MLModelMetadata as MLModel
@@ -58,6 +59,29 @@ _ML_TO_GOVERNANCE_STATE: dict[str, str] = {
     "development": "shadow",
 }
 
+#: Governance rows are named 'cortex_<type>_<tf>' (see drift_detector.py).
+#: The ensemble is 1D-only today; every existing governance row uses '1d'.
+_GOVERNANCE_TIMEFRAME = "1d"
+
+
+def _metric_scalar(value: Any) -> float | None:
+    """Flatten a training metric into a scalar for ai_ml_models' Numeric columns.
+
+    ml_model_metadata stores precision/recall/f1 per class
+    (``{"up": .., "down": ..}``); the governance table holds one scalar per
+    metric, so dicts collapse to the macro (unweighted) mean of their numeric
+    values. Scalars pass through; anything else becomes NULL.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, dict):
+        nums = [v for v in value.values() if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        if nums:
+            return float(sum(nums) / len(nums))
+    return None
+
 
 async def _project_to_ai_ml_models(
     session:   AsyncSession,
@@ -71,11 +95,19 @@ async def _project_to_ai_ml_models(
     Matches governance rows by ``model_type == model.model_name``
     (e.g. 'xgboost', 'gru').
 
-    Returns the number of rows updated (0 when no governance record exists yet,
-    which is expected on the very first registration).
+    When no governance row exists for the model type, one is **created**
+    (WS4 hardening).  The previous warning-only behavior is how ai_ml_models
+    went permanently dark: a lifecycle transition that found no row logged a
+    WARN and moved on, so governance stayed blind forever after.  The INSERT
+    uses ``ON CONFLICT (model_name) DO UPDATE`` so a concurrent projection of
+    the same model type cannot raise a unique violation.
+
+    Returns the number of governance rows now reflecting the transition
+    (always >= 1 on success).
     """
     from app.ai.fusion.models import AIMLModel as _GovernanceModel  # lazy — avoids circular
 
+    now = datetime.now(timezone.utc)
     deployment_state = _ML_TO_GOVERNANCE_STATE.get(ml_status, ml_status)
     result = await session.execute(
         _sa_update(_GovernanceModel)
@@ -87,16 +119,53 @@ async def _project_to_ai_ml_models(
             # ai_ml_models.ml_model_metadata_id always points at the authoritative
             # ml_model_metadata record that owns the current artifact + metrics.
             ml_model_metadata_id=model.id,
-            updated_at=datetime.now(timezone.utc),
+            updated_at=now,
         )
         .execution_options(synchronize_session=False)
     )
     rows: int = result.rowcount
     if rows == 0:
-        logger.warning(
-            "projection: no ai_ml_models row for model_type=%s — "
-            "governance record may not exist yet (expected on first registration)",
-            model.model_name,
+        metrics = model.training_metrics or {}
+        governance_name = f"cortex_{model.model_name}_{_GOVERNANCE_TIMEFRAME}"
+        insert_stmt = (
+            _pg_insert(_GovernanceModel)
+            .values(
+                model_name=governance_name,
+                model_type=model.model_name,
+                deployment_state=deployment_state,
+                model_version=model.model_version,
+                model_path=model.model_path,
+                timeframe=_GOVERNANCE_TIMEFRAME,
+                training_date=model.trained_at,
+                accuracy=_metric_scalar(metrics.get("accuracy")),
+                precision=_metric_scalar(metrics.get("precision")),
+                recall=_metric_scalar(metrics.get("recall")),
+                f1_score=_metric_scalar(metrics.get("f1_score")),
+                governance_metadata={
+                    "auto_created_by": "_project_to_ai_ml_models",
+                    "auto_created_at": now.isoformat(),
+                    "source_ml_status": ml_status,
+                },
+                ml_model_metadata_id=model.id,
+                updated_at=now,
+            )
+            .on_conflict_do_update(
+                index_elements=["model_name"],
+                set_={
+                    "deployment_state":     deployment_state,
+                    "model_version":        model.model_version,
+                    "ml_model_metadata_id": model.id,
+                    "updated_at":           now,
+                },
+            )
+        )
+        await session.execute(insert_stmt)
+        rows = 1
+        logger.info(
+            "projection: no ai_ml_models row for model_type=%s — created %s "
+            "(state=%s, version=%s, fk=%s)",
+            model.model_name, governance_name,
+            deployment_state, model.model_version, model.id,
         )
     else:
         logger.info(
@@ -1033,7 +1102,13 @@ class ModelRegistry:
         # Merge into existing lineage (None → empty dict) without clobbering
         # provenance fields written by A0.2 or future pipeline stages.
         existing_lineage: dict[str, Any] = {}  # populated from existing record if overwrite
-        merged_lineage: dict[str, Any] = {**existing_lineage, "artifact_manifest": artifact_manifest}
+        merged_lineage: dict[str, Any] = {
+            **existing_lineage,
+            "artifact_manifest": artifact_manifest,
+            # WS2c — feature-set contract provenance. Duplicated from the
+            # dedicated column so lineage stays self-contained for audits.
+            "feature_version": feature_version,
+        }
 
         # Phase 2: inject feedback bundle provenance when this model was trained
         # with feedback-weighted samples.  Surfaced by C2 promotion report so
@@ -1056,6 +1131,9 @@ class ModelRegistry:
             encrypted              = False,
             is_active              = (status == "production"),
             lineage                = merged_lineage,
+            # WS2c — was silently dropped before migration 0056 added the
+            # column. Inference gates on THIS persisted value.
+            feature_version        = feature_version,
         )
         self._session.add(model)
         await self._session.commit()

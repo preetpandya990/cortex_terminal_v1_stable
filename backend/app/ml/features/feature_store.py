@@ -259,9 +259,11 @@ async def delete_features(
         params['end_date'] = end_date
     
     where_clause = " AND ".join(conditions)
-    
+
+    from sqlalchemy import text
+
     result = await db.execute(
-        f"DELETE FROM ml_features WHERE {where_clause}",
+        text(f"DELETE FROM ml_features WHERE {where_clause}"),
         params
     )
     await db.commit()
