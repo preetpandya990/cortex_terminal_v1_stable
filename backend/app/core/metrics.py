@@ -763,6 +763,41 @@ watchlist_scheduler_publish_failed_total = Counter(
 )
 
 
+# ── Portfolio Insight ML-Param Refresher Metrics (B2) ────────────────────────
+# Observability for the worker-sidecar task that caches P(hit TP before SL)
+# inputs (prob_up, sigma) for open paper positions. "sweep" = periodic
+# freshness-driven pass; "ondemand" = single-instrument push after a fill.
+
+insight_mlparams_refresh_runs_total = Counter(
+    'insight_mlparams_refresh_runs_total',
+    'Total Portfolio-Insight ML-param sweep runs by trigger and final status',
+    ['trigger', 'status'],  # trigger: sweep|ondemand  status: success|error|skipped_empty|skipped_disabled|interrupted
+)
+
+insight_mlparams_scored_total = Counter(
+    'insight_mlparams_scored_total',
+    'Total instruments successfully scored and written to the ML-param cache',
+    ['trigger'],  # sweep | ondemand
+)
+
+insight_mlparams_refresh_duration_seconds = Histogram(
+    'insight_mlparams_refresh_duration_seconds',
+    'Wall-clock duration of each Portfolio-Insight ML-param sweep run (seconds)',
+    buckets=(0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0),
+)
+
+insight_mlparams_last_run_timestamp = Gauge(
+    'insight_mlparams_last_run_timestamp',
+    'Unix timestamp of the last completed Portfolio-Insight ML-param sweep',
+)
+
+insight_mlparams_snapshot_unavailable_total = Counter(
+    'insight_mlparams_snapshot_unavailable_total',
+    'Open-position instruments whose prediction snapshot was degraded (not cached), by reason',
+    ['reason'],  # no_model | insufficient_data | timeout | unknown
+)
+
+
 # ── Event Classification Pipeline Metrics ────────────────────────────────────
 # Full visibility across all four classification paths, enabling quota-burn
 # attribution and heuristic coverage measurement in Grafana.

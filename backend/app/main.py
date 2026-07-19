@@ -23,7 +23,8 @@ from app.api.v1 import (
     admin_ai_processing, admin_strategies, admin_training, admin_users, admin_worker, auth,
     cai, fusion, fundamentals,
     governance, hawk_eye, ingestion, intelligence, market_data, ml_drift, ml_patterns,
-    ml_predictions, paper_trading, safety, scanner, strategies, strategy, trade_suggestions,
+    ml_predictions, paper_trading, portfolio_insight, safety, scanner, strategies, strategy,
+    trade_suggestions,
     upstox, health, users, watchlist, ai_sentiment, ai_stream,
 )
 from app.core.config import get_settings
@@ -511,6 +512,7 @@ def create_app() -> FastAPI:
     app.include_router(ml_patterns.router, prefix=settings.API_V1_PREFIX, tags=["ML Pattern Analysis"])
     app.include_router(ml_drift.router, prefix=settings.API_V1_PREFIX, tags=["ML Drift"])
     app.include_router(paper_trading.router, prefix=f"{settings.API_V1_PREFIX}/paper-trading", tags=["Paper Trading"])
+    app.include_router(portfolio_insight.router, prefix=f"{settings.API_V1_PREFIX}/portfolio-insight", tags=["Portfolio Insight & Advise"])
     app.include_router(paper_trading.ws_router, prefix=settings.API_V1_PREFIX, tags=["Paper Trading WebSocket"])
     
     # API routes - AI Analysis Cards

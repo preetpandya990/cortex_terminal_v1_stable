@@ -2,7 +2,9 @@
 
 import { useState } from 'react';
 import { useAuth } from '@/contexts/AuthContext';
+import { PnLStreamProvider } from "@/contexts/PnLStreamContext";
 import { OpenPositionsTable } from "@/components/paper-trading/OpenPositionsTable";
+import { PortfolioInsightSection } from "@/components/paper-trading/PortfolioInsightSection";
 import { InstrumentSearchCombobox } from "@/components/market/InstrumentSearchCombobox";
 import { DetailPane } from "@/app/hawk-eye-radar/components/DetailPane";
 import type { UpstoxInstrument } from "@/types/upstox";
@@ -31,8 +33,14 @@ export default function Home() {
         />
       )}
 
-      {/* Paper Trading — Open Positions with live P&L stream */}
-      {isAuthReady && isAuthenticated && <OpenPositionsTable />}
+      {/* Paper Trading — Open Positions + Portfolio Insight share one live P&L
+          stream via PnLStreamProvider (single socket, single source of truth). */}
+      {isAuthReady && isAuthenticated && (
+        <PnLStreamProvider>
+          <OpenPositionsTable />
+          <PortfolioInsightSection />
+        </PnLStreamProvider>
+      )}
 
       {/* Detail Pane Overlay */}
       {selectedInstrument && (

@@ -2,7 +2,7 @@
 Cortex AI — Worker Task Registry
 =================================
 
-Single source of truth for all 20 background tasks that run inside the worker
+Single source of truth for all 22 background tasks that run inside the worker
 sidecar.  Each entry is a zero-argument factory (a closure) so that:
 
   - The supervisor can call factory() to obtain a *fresh* coroutine on restart
@@ -22,6 +22,9 @@ Task inventory
     correlation_engine     Bidirectional scanner→AI + news→AI consensus engine.
     fundamentals_refresh   Six-sub-loop fundamentals scheduler (see below).
     watchlist_scheduler    Pre-warms AI context for watchlist instruments 4×/day.
+    insight_mlparams_refresher  Keeps P(hit TP before SL) inputs (prob_up, sigma)
+                              warm in Redis for open paper positions — 60s sweep
+                              + on-demand push after a fill. Gated by INSIGHT_ENABLED.
     ai_processing_safety_net  Daily fallback dispatch for the 3 demand-driven
                               Tier-2 Gemini queues (sentiment/forecast/classification).
     explanation_reconciliation_sweep  2-min backstop that republishes orphaned
@@ -93,6 +96,10 @@ TASK_NAMES: tuple[str, ...] = (
     "sl_tp_worker",
     # ── Watchlist pre-warmer (pause/trigger-aware) ────────────────────────────
     "watchlist_scheduler",
+    # ── Portfolio-Insight ML-param refresher (pause/trigger-aware) ────────────
+    # Keeps P(hit TP before SL) inputs (prob_up, sigma) warm in Redis for open
+    # paper positions; sweep + on-demand push. Gated by INSIGHT_ENABLED.
+    "insight_mlparams_refresher",
     # ── Async batch news forecaster ───────────────────────────────────────────
     # Drains the cortex.forecast.batch Kafka topic; fires one Gemini call per
     # batch of symbols (≤NEWS_FORECAST_BATCH_SIZE) rather than one call per
@@ -143,6 +150,7 @@ TASK_EXPECTED_INTERVAL_SECONDS: dict[str, int | None] = {
     "pnl_worker": None,                 # event-driven, market-hours gated
     "sl_tp_worker": None,               # event-driven (sub-second tick; ratio system not meaningful)
     "watchlist_scheduler": 64800,       # 21600s typical gap (4x/day) x 3
+    "insight_mlparams_refresher": 180,  # 60s sweep tick x 3 (liveness; scoring is freshness-gated)
     "forecast_batch": 180,              # 60s batch window x 3
     "ai_processing_safety_net": 259200, # 86400s (daily) x 3
     "explanation_reconciliation_sweep": 360,  # 120s poll interval x 3
@@ -232,6 +240,17 @@ def build_task_registry(
         pause=_state("watchlist_scheduler").pause_token,
         trigger=_state("watchlist_scheduler").trigger_token,
         on_cycle=_state("watchlist_scheduler").record_cycle,
+    )
+
+    from app.services.paper_trading.insight_mlparams_refresher import InsightMLParamsRefresher
+    insight_mlparams_refresher_instance = InsightMLParamsRefresher(
+        session_factory=session_factory,
+        redis=redis_client._redis,
+        predictor=ml_components.get("ensemble_predictor"),
+        shutdown=shutdown,
+        pause=_state("insight_mlparams_refresher").pause_token,
+        trigger=_state("insight_mlparams_refresher").trigger_token,
+        on_cycle=_state("insight_mlparams_refresher").record_cycle,
     )
 
     from app.workers.ai_processing_safety_net import AIProcessingSafetyNet
@@ -350,6 +369,8 @@ def build_task_registry(
         ),
         # ── Watchlist pre-warmer — pause/trigger-aware via WatchlistContextScheduler
         "watchlist_scheduler": lambda: watchlist_scheduler_instance.run(),
+        # ── Portfolio-Insight ML-param refresher — pause/trigger-aware ─────────
+        "insight_mlparams_refresher": lambda: insight_mlparams_refresher_instance.run(),
         # ── Async batch news forecaster ───────────────────────────────────────
         "forecast_batch": lambda: forecast_batch_loop(
             redis=redis_client._redis,

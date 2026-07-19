@@ -416,6 +416,11 @@ export interface LivePositionPnL {
   pnl_pct: number;
   stop_loss: number | null;
   target_price_1: number | null;
+  // Portfolio-Insight live edge — present only when INSIGHT_ENABLED (backend B3).
+  /** P(price touches TP1 before SL) ∈ [0,1]; null when the metric is undefined. */
+  hit_probability?: number | null;
+  /** True when hit_probability used no live ML edge (neutral distance-ratio value; de-emphasise). */
+  hit_prob_stale?: boolean | null;
 }
 
 export interface LivePnLUpdate {

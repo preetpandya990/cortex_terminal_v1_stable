@@ -1113,6 +1113,27 @@ class LivePositionPnL(BaseModel):
     stop_loss: float | None = None
     target_price_1: float | None = None
 
+    # ── Portfolio-Insight live edge (present only when INSIGHT_ENABLED) ────────
+    hit_probability: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "P(price touches target_price_1 before stop_loss) under the "
+            "horizon-free double-barrier model, in [0, 1]. None when the metric "
+            "is undefined (TP1/SL absent, non-positive price, invalid barriers)."
+        ),
+    )
+    hit_prob_stale: bool | None = Field(
+        default=None,
+        description=(
+            "True when hit_probability was computed without a live ML edge "
+            "(cached prob_up unavailable) — the value is the neutral "
+            "distance-ratio estimate and the UI should de-emphasise it. None "
+            "when the insight feature is disabled."
+        ),
+    )
+
 
 class LivePnLUpdate(BaseModel):
     """

@@ -375,6 +375,24 @@ class RedisChannels:
         }
     """
 
+    PAPER_INSIGHT_REFRESH_REQUEST = "cai:paper:insight:refresh_request"
+    """
+    Requests the Portfolio-Insight ML-param refresher (worker sidecar) to score
+    a single instrument immediately and repopulate its cached ML params, rather
+    than waiting for the next periodic sweep.
+
+    Published (best-effort, post-commit) after a BUY fill opens/adds a paper
+    position — see app.api.v1.paper_trading.place_order and
+    app.services.paper_trading.insight_cache.request_refresh.  The periodic
+    sweep remains the safety net for any open path that does not publish
+    (e.g. matching-engine fills of pending DAY orders).
+
+    Payload:
+        {
+            "instrument_key": "NSE_EQ|INE002A01018"
+        }
+    """
+
     @staticmethod
     def signals_for_symbol(symbol: str) -> str:
         """Get per-symbol signals channel."""

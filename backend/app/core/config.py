@@ -690,6 +690,51 @@ class Settings(BaseSettings):
     # everywhere, prompts don't request it, guardrails skip it, the frontend
     # callout doesn't render.
     SUGGESTED_ACTION_ENABLED: bool = False
+
+    # ── Portfolio Insight & Advise — hit-probability edge sensitivity ──────────
+    # Edge sensitivity λ mapping the ensemble's calibrated prob_up to the drift-to-
+    # variance ratio ρ of the double-barrier P(hit TP before SL) estimate:
+    #     ρ = INSIGHT_EDGE_LAMBDA · (2·prob_up − 1)   ⇒   ρ ∈ [−λ, +λ]
+    # The geometric log-distance ratio dominates the estimate by design; λ only lets
+    # the ML edge *nudge* P within a bounded band, so a miscalibrated model can never
+    # manufacture a misleadingly confident number. Default 3.0 is a moderate, bounded
+    # tilt (at prob_up = 1.0, ρ = 3.0 shifts P by a few points for typical 2–15%
+    # barrier spreads); 0.0 disables the ML tilt entirely (pure distance ratio).
+    INSIGHT_EDGE_LAMBDA: float = Field(3.0, ge=0.0, le=20.0)
+
+    # Master gate for the Portfolio Insight & Advise layer (staged rollout).
+    # When False (default): the sidecar ML-param refresher and the on-open
+    # refresh trigger no-op, so the mlparams cache stays empty and B3 degrades
+    # every position to the neutral (distance-ratio) estimate — i.e. the whole
+    # feature is dormant and bit-safe until an operator flips this on.
+    INSIGHT_ENABLED: bool = False
+    # TTL of a cached ML-param entry (cai:paper:insight:mlparams:*). Features are
+    # daily, so 30 min is generous; the refresher re-scores before expiry. This
+    # TTL is the sole staleness boundary — once it lapses B3 sees no key and
+    # falls back to the neutral estimate with a stale flag.
+    INSIGHT_MLPARAMS_TTL_SECONDS: int = Field(1800, ge=300, le=7200)
+    # How often the refresher sweeps open-position instruments. Cheap: a Redis
+    # TTL check per instrument; ML inference runs only for stale/missing ones.
+    # 60 s bounds a freshly-opened position's warm-up when the on-open push is
+    # unavailable (e.g. matching-engine fills of pending DAY orders).
+    INSIGHT_MLPARAMS_SWEEP_INTERVAL_SECONDS: int = Field(60, ge=15, le=900)
+    # Re-score an instrument when its cached params expire within this margin, so
+    # they are refreshed before B3 would ever see the key absent. Keep < TTL.
+    INSIGHT_MLPARAMS_REFRESH_MARGIN_SECONDS: int = Field(600, ge=60, le=3600)
+    # Hard cap on instruments scored per sweep; surplus deferred to the next one.
+    INSIGHT_MLPARAMS_BATCH_CAP: int = Field(200, ge=10, le=1000)
+    # Instruments per batched prediction-snapshot chunk. Each chunk loads
+    # features concurrently then runs exactly one batched inference call
+    # (EnsemblePredictor.predict_batch), avoiding the VRAM-fragmentation risk of
+    # N sequential single-item calls on the 4 GB card.
+    INSIGHT_MLPARAMS_CHUNK_SIZE: int = Field(20, ge=1, le=50)
+    # AI-advice cache safety cap (POST /portfolio-insight/advice). Advice is
+    # regenerated when the portfolio materially changes (holdings/qty or a stat
+    # crossing a bucket boundary); this TTL bounds how long unchanged-portfolio
+    # advice is served before a refresh, so it still tracks slow market drift.
+    # Every miss is one HIGH-priority Gemini call, so keep this generous.
+    INSIGHT_ADVICE_CACHE_TTL_SECONDS: int = Field(21600, ge=300, le=86400)  # 6h
+
     # 96 texts/call: 3× throughput vs. default 32, stays within gemini-embedding-001
     # input limits. Reduces embed API calls proportionally for the same corpus size.
     RAG_EMBED_BATCH_SIZE: int = Field(96, ge=1, le=128)

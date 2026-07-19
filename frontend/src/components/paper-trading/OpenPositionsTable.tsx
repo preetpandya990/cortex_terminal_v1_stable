@@ -14,12 +14,11 @@
  *  - First visit (no portfolio): renders CreatePortfolioModal inline prompt.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   Activity,
   AlertCircle,
   ChevronRight,
-  Clock,
   Loader2,
   Plus,
   TrendingDown,
@@ -30,7 +29,7 @@ import {
 import { useAuth } from "@/contexts/AuthContext";
 import { useToast } from "@/components/ui/toast";
 import { usePortfolioSummary, usePositions, usePendingOrders } from "@/hooks/usePaperTrading";
-import { usePnLWebSocket } from "@/hooks/usePnLWebSocket";
+import { usePnLStream } from "@/contexts/PnLStreamContext";
 import { PortfolioSummaryCard } from "./PortfolioSummaryCard";
 import { CreatePortfolioModal } from "./CreatePortfolioModal";
 import { ClosePositionModal } from "./ClosePositionModal";
@@ -302,7 +301,7 @@ function ClosedPositionRow({
 type ActiveTab = "open" | "closed" | "pending";
 
 export function OpenPositionsTable() {
-  const { accessToken, isAuthenticated, isAuthReady, refreshToken } = useAuth();
+  const { isAuthenticated, isAuthReady } = useAuth();
   const toast = useToast();
 
   const [activeTab,         setActiveTab]         = useState<ActiveTab>("open");
@@ -330,7 +329,7 @@ export function OpenPositionsTable() {
   });
 
   const noPortfolio =
-    portfolioError && (portfolioErr as any)?.statusCode === 404;
+    portfolioError && (portfolioErr as { statusCode?: number } | null)?.statusCode === 404;
 
   // Single call — no status filter — returns all positions.
   // split client-side to avoid two round-trips.
@@ -348,6 +347,8 @@ export function OpenPositionsTable() {
 
   // ── WebSocket live P&L ────────────────────────────────────────────────────
 
+  // Live P&L from the shared stream (single socket for the whole dashboard —
+  // see PnLStreamProvider). Auth-recovery on 4001 is handled by the provider.
   const {
     isConnected:     wsConnected,
     connectionState: wsState,
@@ -356,28 +357,7 @@ export function OpenPositionsTable() {
     portfolioStats,
     onOrderFilled,
     onOrderExpired,
-    reconnect: wsReconnect,
-  } = usePnLWebSocket(
-    portfolio?.id,
-    accessToken,
-    isAuthReady && isAuthenticated && !!portfolio?.id,
-  );
-
-  // Single recovery attempt on auth failure (4001).
-  // Refreshes the access token once and reconnects. If the refresh itself
-  // fails the feed stays "Offline" — the user's session has genuinely expired.
-  // The flag resets on every successful connection so future auth errors
-  // (e.g. after a very long idle period) can also self-heal once.
-  const wsAuthRecoveredRef = useRef(false);
-  useEffect(() => {
-    if (wsState === 'connected') {
-      wsAuthRecoveredRef.current = false;
-      return;
-    }
-    if (wsState !== 'error' || wsAuthRecoveredRef.current) return;
-    wsAuthRecoveredRef.current = true;
-    void refreshToken().then((ok) => { if (ok) wsReconnect(); });
-  }, [wsState, refreshToken, wsReconnect]);
+  } = usePnLStream();
 
   // Attach WS order lifecycle callbacks — stable ref assignment, no re-render.
   useEffect(() => {

@@ -77,8 +77,11 @@ from uuid import UUID
 from redis.asyncio import Redis
 from sqlalchemy import and_, select
 
+from app.core.config import get_settings
 from app.core.database import WorkerSessionLocal
 from app.core.redis import RedisChannels
+from app.services.paper_trading import insight_cache
+from app.services.paper_trading.hit_probability import hit_tp_before_sl
 
 logger = logging.getLogger(__name__)
 
@@ -298,6 +301,8 @@ async def _recompute_portfolio_pnl(redis: Redis, portfolio_id: UUID) -> None:
     """
     from app.models.paper_trading import PaperPosition, Portfolio
 
+    settings = get_settings()
+
     async with WorkerSessionLocal() as session:
         # Fetch portfolio + open positions
         portfolio_stmt = select(Portfolio).where(Portfolio.id == portfolio_id)
@@ -346,7 +351,7 @@ async def _recompute_portfolio_pnl(redis: Redis, portfolio_id: UUID) -> None:
             if exit_reason:
                 auto_close_queue.append((pos, exit_reason, exit_price))
 
-            position_frames.append({
+            frame = {
                 "position_id": str(pos.id),
                 "symbol": pos.symbol,
                 "quantity": pos.quantity,
@@ -357,7 +362,20 @@ async def _recompute_portfolio_pnl(redis: Redis, portfolio_id: UUID) -> None:
                 "pnl_pct": pnl_pct,
                 "stop_loss": float(pos.stop_loss) if pos.stop_loss else None,
                 "target_price_1": float(pos.target_price_1) if pos.target_price_1 else None,
-            })
+            }
+
+            # Portfolio-Insight live edge metric — additive, gated. When the
+            # feature is off the frame is bit-identical to the pre-feature
+            # payload (existing consumers unaffected); when on, each row carries
+            # the live P(hit TP before SL) and its staleness flag.
+            if settings.INSIGHT_ENABLED:
+                hit_probability, hit_prob_stale = await _hit_probability_fields(
+                    redis, pos, last_price, settings.INSIGHT_EDGE_LAMBDA
+                )
+                frame["hit_probability"] = hit_probability
+                frame["hit_prob_stale"] = hit_prob_stale
+
+            position_frames.append(frame)
 
         await session.flush()
 
@@ -448,6 +466,42 @@ def _check_sl_tp_breach(
             return reason, last_price
 
     return None, _ZERO
+
+
+async def _hit_probability_fields(
+    redis: Redis,
+    position: "PaperPosition",
+    last_price: Decimal,
+    edge_lambda: float,
+) -> tuple[float | None, bool]:
+    """
+    Compute the live ``P(hit TP before SL)`` metric for one position.
+
+    Take-profit is ``target_price_1`` — the first target, whose breach fully
+    closes the position (see ``_check_sl_tp_breach``) — so it is the operative
+    barrier for the double-barrier model.
+
+    The ML drift input (``prob_up``) is read from the B2 cache with a single
+    Redis GET; the calculation itself is a pure microsecond call. Returns
+    ``(hit_probability, hit_prob_stale)``:
+
+      • ``hit_probability`` — probability in ``[0, 1]``, or ``None`` when the
+        metric is undefined (missing TP1/SL, non-positive price, etc.).
+      • ``hit_prob_stale``  — ``True`` when no cached ML edge was available, so
+        the value is the neutral distance-ratio estimate (``prob_up`` = neutral)
+        and the UI should de-emphasise it. ``False`` when a live edge was used.
+    """
+    params = await insight_cache.read_mlparams(redis, position.instrument_key)
+    prob_up = params.get("prob_up") if params else None
+    hit_probability = hit_tp_before_sl(
+        current_price=float(last_price),
+        tp=float(position.target_price_1) if position.target_price_1 is not None else None,
+        sl=float(position.stop_loss) if position.stop_loss is not None else None,
+        side=position.side,
+        prob_up=prob_up,
+        edge_lambda=edge_lambda,
+    )
+    return hit_probability, params is None
 
 
 async def _auto_close_position(

@@ -32,6 +32,10 @@ import type {
   UserStrategySubscription,
 } from '@/types/strategies';
 import type {
+  PortfolioInsightStats,
+  PortfolioAdvice,
+} from '@/types/portfolio_insight';
+import type {
   CreatePortfolioRequest,
   UpdatePortfolioSettingsRequest,
   PlaceOrderRequest,
@@ -880,6 +884,22 @@ export const paperTradingAPI = {
     requestData(
       api.put<MonitoringConfigResponse>('/paper-trading/monitor-config', payload),
       'Failed to update monitoring config'
+    ),
+};
+
+// Portfolio Insight & Advise API (read-only advisory layer)
+// Both endpoints 404 when the backend feature flag INSIGHT_ENABLED is off.
+export const portfolioInsightAPI = {
+  getStats: async (): Promise<PortfolioInsightStats> =>
+    requestData(
+      api.get<PortfolioInsightStats>('/portfolio-insight/stats'),
+      'Failed to fetch portfolio insight stats'
+    ),
+
+  getAdvice: async (): Promise<PortfolioAdvice> =>
+    requestData(
+      api.post<PortfolioAdvice>('/portfolio-insight/advice'),
+      'Failed to fetch portfolio advice'
     ),
 };
 

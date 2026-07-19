@@ -500,6 +500,14 @@ async def place_order(
             json.dumps({"instrument_key": paper_order.instrument_key}),
         )
 
+    # A BUY fill just opened/added a position — ask the Portfolio-Insight
+    # refresher to warm this instrument's ML params so the live P(hit TP before
+    # SL) metric shows its ML-tilted value immediately. Best-effort, post-commit,
+    # gated by INSIGHT_ENABLED; the periodic sweep is the safety net.
+    if fill is not None and paper_order.transaction_type == "BUY":
+        from app.services.paper_trading import insight_cache
+        await insight_cache.request_refresh(redis, paper_order.instrument_key)
+
     return PaperOrderResponse.model_validate(paper_order)
 
 
